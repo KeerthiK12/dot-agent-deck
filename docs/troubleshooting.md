@@ -54,8 +54,35 @@ Hooks are **auto-installed on every startup** — most users never need to think
 
 - **Claude Code** (`~/.claude/` detected) — writes entries into `~/.claude/settings.json` for hook types: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, PreCompact, SubagentStart, SubagentStop.
 - **OpenCode** (`~/.opencode/` detected) — creates a JS plugin at `~/.opencode/plugin/dot-agent-deck/index.js` that forwards session, tool, and permission events.
+- **Codex** (`codex` found on `PATH`) — writes a `hooks.json` into your Codex home (`$CODEX_HOME`, or `~/.codex`) whose hooks forward prompt, tool, and turn events to the dashboard, and records trust for **exactly those hooks** in that home's `config.toml` (Codex only runs hooks it trusts). Both happen at startup and again whenever the deck launches a Codex pane, so they work however you launch Codex. Your own hooks are preserved (the deck merges, it never overwrites), and `config.toml` is edited surgically — comments, your model choice, and any trust records you made yourself are left byte-for-byte intact. The deck never trusts a hook it didn't author: a third-party hook sitting in the same file stays untrusted.
 
 Auto-install is idempotent and best-effort — if an agent directory is missing the step is silently skipped, and errors are logged without blocking startup.
+
+### Codex events not showing
+
+Codex only runs hooks it *trusts*, and the deck handles that for you: it records trust for its own hook entries — and only those — in your Codex home's `config.toml`. This is independent of how you start Codex, so a launcher (`devbox run codex-big`, a `run_codex_agent.sh`, an alias, a path whose name isn't `codex`) needs **nothing** added to it. Launch Codex however you already do.
+
+If a Codex card still shows only coarse status with no tool or prompt detail, check these in order:
+
+1. **Is `codex` on the deck's `PATH`?** The setup step self-skips when it isn't. Run `codex --version` from the same shell you start the deck from, then restart the deck.
+2. **Does your launcher re-export `CODEX_HOME`?** The deck pins the home it prepared onto the process it starts, but a script can override that before running `codex` — and the deck's hooks and trust records live in the *original* home. Drop the re-export, or point it at the same home the deck uses (`$CODEX_HOME`, else `~/.codex`).
+3. **Re-run the install manually** to see any error the silent startup step swallowed: `dot-agent-deck hooks install --agent codex`.
+4. **Approve them by hand as a fallback:** run Codex once and approve the deck's hooks in its interactive `/hooks` review. Codex remembers that trust for subsequent runs.
+
+Trust is pinned to each hook's exact content, so it deliberately fails *closed*: if a definition changes underneath a trust record, Codex refuses to run it and the card falls back to coarse status rather than running something unreviewed. Re-running the install re-records trust for the new content.
+
+### Codex as a role or worker: allow sandbox network access
+
+Codex is usable as an orchestrator **role** or a delegated **worker**. In those flows the Codex agent has to reach the dashboard daemon — it runs `dot-agent-deck delegate …` to hand work to another pane and `dot-agent-deck work-done …` to report completion, both of which connect to the daemon over its local socket. Codex's `workspace-write` sandbox blocks that connection by default, so those commands silently fail and the orchestration pipeline never moves.
+
+Launch Codex with `workspace-write`, non-interactive approvals, **and** sandbox network access so the deck's CLI can reach the daemon:
+
+```bash
+codex --sandbox workspace-write --ask-for-approval never \
+  -c "sandbox_workspace_write.network_access=true"
+```
+
+The `-c "sandbox_workspace_write.network_access=true"` override is the important part — without it, `delegate` / `work-done` can't reach the daemon even though the pane itself looks healthy. Point a role at Codex by setting that full command as the role's `command` in `.dot-agent-deck.toml`.
 
 ### Manual Management
 
@@ -65,15 +92,17 @@ The `hooks install` and `hooks uninstall` commands are available when you need t
 # Install manually
 dot-agent-deck hooks install                    # Claude Code
 dot-agent-deck hooks install --agent opencode   # OpenCode
+dot-agent-deck hooks install --agent codex      # Codex
 
 # Remove hooks
 dot-agent-deck hooks uninstall                    # Claude Code
 dot-agent-deck hooks uninstall --agent opencode   # OpenCode
+dot-agent-deck hooks uninstall --agent codex      # Codex
 ```
 
 > **Note:** If you uninstall hooks manually, the next dashboard launch will re-install them automatically.
 
-## A bare command like `claude`, `opencode`, or `pi` fails to spawn
+## A bare command like `claude`, `opencode`, `pi`, or `codex` fails to spawn
 
 If a pane comes up with an error such as *"Unable to spawn `claude` because it doesn't exist on the filesystem and was not found in PATH"*, the daemon couldn't resolve that bare command against its `PATH`.
 
