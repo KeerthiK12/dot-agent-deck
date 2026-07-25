@@ -762,7 +762,9 @@ fn child_pre_exec(ctty_fd: RawFd) -> std::io::Result<()> {
     }
     // SAFETY: async-signal-safe; `ctty_fd` is one of the child's std fds backed
     // by the inner PTY slave. Acquire it as the controlling terminal.
-    if ctty_fd >= 0 && unsafe { libc::ioctl(ctty_fd, libc::TIOCSCTTY, 0) } == -1 {
+    // `TIOCSCTTY`'s integer type differs by platform (e.g. `c_ulong` on Linux,
+    // `c_uint` on macOS); cast to `ioctl`'s request type so this compiles on both.
+    if ctty_fd >= 0 && unsafe { libc::ioctl(ctty_fd, libc::TIOCSCTTY as _, 0) } == -1 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
@@ -774,7 +776,7 @@ fn child_pre_exec(ctty_fd: RawFd) -> std::io::Result<()> {
 fn open_inner_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
-    let ws = libc::winsize {
+    let mut ws = libc::winsize {
         ws_row: rows,
         ws_col: cols,
         ws_xpixel: 0,
@@ -783,12 +785,15 @@ fn open_inner_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
     // SAFETY: `openpty` fills both descriptors on success; each is turned into an
     // `OwnedFd` exactly once so ownership (and close-on-drop) is unambiguous.
     let rc = unsafe {
+        // macOS declares `termp`/`winp` as `*mut` while Linux uses `*const`;
+        // `null_mut()` and `&mut ws` satisfy the `*mut` signature and coerce to
+        // `*const` on Linux, so this call compiles on both.
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &ws,
+            std::ptr::null_mut(),
+            std::ptr::addr_of_mut!(ws),
         )
     };
     if rc != 0 {
