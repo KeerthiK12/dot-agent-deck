@@ -60,6 +60,34 @@ jobs:
       # `cargo xtask docs` steps — those stay on the Linux job.
       - run: cargo nextest run
 
+  # macOS (host = aarch64-apple-darwin) compile + clippy + unit-test gate,
+  # mirroring build-windows. macOS is otherwise built ONLY in the release
+  # workflow (release.yml builds both apple targets), so a macOS-only break —
+  # e.g. the libc *mut/*const `openpty` and `ioctl` request-type differences in
+  # src/wrap.rs — stayed invisible on PRs and first surfaced at release time
+  # (broke the v0.34.0 build). This job closes that gap. The runner is Apple
+  # Silicon, so this covers aarch64-apple-darwin exactly; x86_64-apple-darwin
+  # shares the same libc apple bindings, so a host build catches the same class.
+  #
+  # Unlike build-windows (where the unix daemon/attach/e2e suites are gated to
+  # Unix at the source level and compile to empty crates), macOS *is* unix, so
+  # `cargo nextest run` runs the same test-fast tier as the Linux `build` job.
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo build
+      # Match the Linux `build` job's clippy invocation (no --all-targets) so a
+      # test-only lint can't fail macOS-only and be unreproducible on the Linux
+      # pre-push gate.
+      - run: cargo clippy -- -D warnings
+      - run: cargo nextest run
+
   security:
     runs-on: ubuntu-latest
     steps:
