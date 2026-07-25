@@ -1709,10 +1709,15 @@ mod tests {
     fn raw_mode_guard_restores_termios_on_drop() {
         let (_master, slave) = open_inner_pty(24, 80).expect("open inner pty");
         let fd = slave.as_raw_fd();
+        // PENDIN/FLUSHO are driver-managed status bits, not line-discipline mode
+        // bits: macOS's tty layer sets PENDIN as a side effect of a canonical-mode
+        // change, while Linux leaves them clear. RawModeGuard restores the exact
+        // termios it saved; mask these transient bits so the assertion checks the
+        // mode the guard actually manages rather than driver status.
         let read_lflag = || {
             let mut t: libc::termios = unsafe { std::mem::zeroed() };
             assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0, "tcgetattr");
-            t.c_lflag
+            t.c_lflag & !(libc::PENDIN | libc::FLUSHO)
         };
         let before = read_lflag();
         {

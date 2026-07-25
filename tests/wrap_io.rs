@@ -393,9 +393,22 @@ fn run_signal_case(
         "deliver {signal_name} to wrapper pid {wrapper_pid}"
     );
 
-    let wrapper_exited = common::wait_until(Duration::from_secs(5), || {
-        !common::process_running(wrapper_pid)
-    });
+    // The wrapper is our own child, so detect its exit by reaping it through the
+    // owned handle rather than probing by pid: common::process_running() cannot see
+    // a zombie on non-Linux (its kill(pid, 0) fallback treats an exited-but-unreaped
+    // pid as alive), so on macOS an exited-but-unreaped wrapper looks like it never
+    // exited. try_wait() reaps the wrapper and reports its exit portably.
+    let wrapper_exited = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match wrapper.try_wait() {
+                Ok(Some(_)) => break true,
+                Err(_) => break false,
+                Ok(None) if Instant::now() >= deadline => break false,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    };
     let child_gone = common::wait_until(Duration::from_secs(3), || {
         !common::process_running(child_pid)
     });
