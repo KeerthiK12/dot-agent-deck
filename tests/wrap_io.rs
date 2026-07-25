@@ -37,12 +37,15 @@ fn open_pty() -> (File, File) {
     // SAFETY: `openpty` initializes both owned descriptors on success. The
     // resulting `File`s take ownership exactly once.
     let rc = unsafe {
+        // macOS declares `termp`/`winp` as `*mut` while Linux uses `*const`;
+        // `null_mut()` satisfies the `*mut` signature and coerces to `*const` on
+        // Linux, so this compiles on both (see `open_inner_pty` in src/wrap.rs).
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
     assert_eq!(
