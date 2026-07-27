@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::Mutex as TokioMutex;
-
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{create_worktree, remove_worktree, WorktreeCreation};
@@ -16,10 +14,14 @@ fn sanitize_name(name: &str) -> String {
         .replace('\\', "-")
         .replace("..", "_")
         .replace('\0', "");
-    if sanitized.is_empty() || sanitized.chars().all(|c| c == '-') {
+    let slug_chars: String = sanitized
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    if slug_chars.is_empty() || slug_chars.chars().all(|c| c == '-') {
         "dispatch".to_string()
     } else {
-        sanitized
+        slug_chars.trim_matches('-').to_string()
     }
 }
 
@@ -50,12 +52,12 @@ pub struct DispatchContext {
     pub registry: Arc<AgentPtyRegistry>,
     pub event_tx: tokio::sync::broadcast::Sender<BroadcastMsg>,
     pub worktrees: Arc<std::sync::Mutex<HashMap<PathBuf, PathBuf>>>,
-    pub callbacks: Arc<TokioMutex<HashMap<String, String>>>,
+    pub callbacks: std::collections::HashMap<String, String>,
 }
 
 pub async fn handle_dispatch(
     ctx: &DispatchContext,
-    caller_pane_id: &str,
+    _caller_pane_id: &str,
     name: &str,
     task: Option<&str>,
 ) -> DispatchResult {
@@ -84,7 +86,7 @@ pub async fn handle_dispatch(
     }
 
     {
-        let mut wts = ctx.worktrees.lock().unwrap();
+        let mut wts = ctx.worktrees.lock().unwrap_or_else(|e| e.into_inner());
         wts.insert(paths.worktree_dir.clone(), clone_dir.clone());
     }
 
@@ -105,31 +107,20 @@ pub async fn handle_dispatch(
     let notifier = StderrNotifier;
 
     match spawn(req, &ctx.registry, &notifier, Some(&ctx.event_tx), false).await {
-        Ok(_handle) => {
-            let dispatch_id = format!("dispatch-{name}");
-            {
-                let mut cb = ctx.callbacks.lock().await;
-                cb.insert(
-                    dispatch_id.clone(),
-                    caller_pane_id.to_string(),
-                );
-            }
-
-            DispatchResult {
-                worktree_dir: paths.worktree_dir.clone(),
-                success: true,
-                message: format!(
-                    "dispatch: spawned isolated orchestration for '{}' in {}",
-                    name,
-                    paths.worktree_dir.display()
-                ),
-            }
-        }
+        Ok(_handle) => DispatchResult {
+            worktree_dir: paths.worktree_dir.clone(),
+            success: true,
+            message: format!(
+                "dispatch: spawned isolated orchestration for '{}' in {}",
+                name,
+                paths.worktree_dir.display()
+            ),
+        },
         Err(e) => {
             let _ = remove_worktree(&paths.worktree_dir, &clone_dir).await;
 
             {
-                let mut wts = ctx.worktrees.lock().unwrap();
+                let mut wts = ctx.worktrees.lock().unwrap_or_else(|e| e.into_inner());
                 wts.remove(&paths.worktree_dir);
             }
 

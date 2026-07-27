@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -9,7 +8,7 @@ use tracing::warn;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
-    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, DispatchSignal,
+    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal,
     EventType, LiveTarget, OrchestrationSurface, WorkDoneSignal, Writable,
 };
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
@@ -1008,6 +1007,8 @@ impl AppState {
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
         self.pane_orchestration_map.remove(pane_id);
+        // PRD #220: clean up dispatch callbacks keyed by this pane.
+        self.dispatch_callbacks.retain(|_, v| v != pane_id);
     }
 
     /// Handle an orchestrator's delegate signal: validate the sender, look
@@ -1139,7 +1140,7 @@ impl AppState {
     /// `done: true` from the orchestrator pane itself signals the whole
     /// orchestration is complete; we log and exit without writing back a
     /// "completed" prompt to the orchestrator (it just issued it).
-    pub async fn handle_work_done(&self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
+    pub async fn handle_work_done(&mut self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
         let role_name = match self.pane_role_map.get(&signal.pane_id) {
             Some(name) => name.clone(),
             None => {
@@ -1195,11 +1196,8 @@ impl AppState {
                             "dispatch: failed to route work-done to caller pane"
                         );
                     }
-                    // Mark callback as consumed so we don't double-deliver.
-                    // (dispatch_callbacks is behind AppState; we can't mutate
-                    // from &self here, but the next dispatch for the same name
-                    // overwrites the entry anyway — and the cleanup-on-close
-                    // path removes the stale callback.)
+                    // Consume the callback so we don't double-deliver.
+                    self.dispatch_callbacks.remove(orch_name);
                     return; // routed to caller — skip normal orchestrator delivery
                 }
             }
@@ -1248,58 +1246,11 @@ impl AppState {
         }
     }
 
-    pub async fn handle_dispatch(
-        &mut self,
-        signal: DispatchSignal,
-        registry: &Arc<AgentPtyRegistry>,
-        event_tx: &broadcast::Sender<BroadcastMsg>,
-        worktree_registry: &crate::issue_dispatch_run::WorktreeRegistry,
-    ) {
-        use crate::dispatch::{self, DispatchContext};
-
-        let cwd = match self.pane_cwd_map.get(&signal.pane_id) {
-            Some(c) => c.clone(),
-            None => {
-                warn!(pane_id = %signal.pane_id, "dispatch from unknown pane");
-                return;
-            }
-        };
-
-        let ctx = DispatchContext {
-            working_dir: PathBuf::from(&cwd),
-            registry: registry.clone(),
-            event_tx: event_tx.clone(),
-            worktrees: worktree_registry.clone(),
-            callbacks: Arc::new(tokio::sync::Mutex::new(std::mem::take(
-                &mut self.dispatch_callbacks,
-            ))),
-        };
-
-        let task = signal.task.as_deref();
-        let result = dispatch::handle_dispatch(&ctx, &signal.pane_id, &signal.name, task).await;
-
-        if let Ok(cbs) = Arc::try_unwrap(ctx.callbacks) {
-            self.dispatch_callbacks = cbs.into_inner();
-        }
-
-        if !result.success {
-            warn!(
-                name = %signal.name,
-                message = %result.message,
-                "dispatch failed"
-            );
-        }
-
-        if let Err(e) = registry
-            .write_to_pane_and_submit(&signal.pane_id, &result.message)
-            .await
-        {
-            warn!(
-                pane_id = %signal.pane_id,
-                error = %e,
-                "dispatch: failed to write result into caller pane"
-            );
-        }
+    /// PRD #220: record a dispatch callback so that when the dispatched
+    /// orchestration emits work-done, the result is routed back to the caller.
+    pub fn register_dispatch_callback(&mut self, dispatch_id: &str, caller_pane_id: &str) {
+        self.dispatch_callbacks
+            .insert(dispatch_id.to_string(), caller_pane_id.to_string());
     }
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {

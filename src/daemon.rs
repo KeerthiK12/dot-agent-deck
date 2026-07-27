@@ -889,12 +889,66 @@ async fn run_hook_loop(
                                         name = %signal.name,
                                         "Received dispatch signal"
                                     );
-                                    state.write().await.handle_dispatch(
-                                        signal,
-                                        &pty_registry,
-                                        &event_tx,
-                                        &worktree_registry,
-                                    ).await;
+                                    use crate::dispatch::{self, DispatchContext};
+                                    
+                                    use std::path::PathBuf;
+
+                                    // Phase 1: read cwd under a short-lived read lock.
+                                    let cwd = {
+                                        let st = state.read().await;
+                                        st.pane_cwd_map
+                                            .get(&signal.pane_id)
+                                            .cloned()
+                                    };
+                                    let cwd = match cwd {
+                                        Some(c) => c,
+                                        None => {
+                                            warn!(pane_id = %signal.pane_id, "dispatch from unknown pane");
+                                            continue;
+                                        }
+                                    };
+
+                                    // Phase 2: do the slow I/O (git worktree + spawn)
+                                    // OUTSIDE any AppState lock so concurrent hook
+                                    // processing is never stalled.
+                                    let ctx = DispatchContext {
+                                        working_dir: PathBuf::from(&cwd),
+                                        registry: pty_registry.clone(),
+                                        event_tx: event_tx.clone(),
+                                        worktrees: worktree_registry.clone(),
+                                        callbacks: std::collections::HashMap::new(),
+                                    };
+                                    let task = signal.task.as_deref();
+                                    let result = dispatch::handle_dispatch(
+                                        &ctx,
+                                        &signal.pane_id,
+                                        &signal.name,
+                                        task,
+                                    )
+                                    .await;
+
+                                    // Phase 3: under a short write lock, record the
+                                    // callback only (the slow work is already done).
+                                    if result.success {
+                                        let dispatch_id = format!("dispatch-{}", signal.name);
+                                        state.write().await.register_dispatch_callback(
+                                            &dispatch_id,
+                                            &signal.pane_id,
+                                        );
+                                    }
+
+                                    // Deliver result to the caller pane (doesn't need
+                                    // any AppState lock — uses the PTY registry).
+                                    if let Err(e) = pty_registry
+                                        .write_to_pane_and_submit(&signal.pane_id, &result.message)
+                                        .await
+                                    {
+                                        warn!(
+                                            pane_id = %signal.pane_id,
+                                            error = %e,
+                                            "dispatch: failed to write result into caller pane"
+                                        );
+                                    }
                                 }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
@@ -902,7 +956,7 @@ async fn run_hook_loop(
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
-                                    state.read().await.handle_work_done(signal, &pty_registry).await;
+                                    state.write().await.handle_work_done(signal, &pty_registry).await;
                                 }
                                 DaemonMessage::GetSeed(req) => {
                                     // PRD #201 native prompt delivery: hand the
