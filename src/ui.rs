@@ -484,6 +484,56 @@ Rules:
 - CONFIRM the full entry (every field, especially repo and max_per_run) with the user before you call `schedule add`.
 - AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, each dispatched issue surfaces live as its own tab on the deck.";
 
+/// PRD #220: display name of the built-in "dispatcher" authoring option in the
+/// new-pane Mode cycler — appended after `schedule: issues`. Selecting it opens
+/// a dispatcher tab: a seeded agent that decomposes work into parallel units and
+/// calls `dot-agent-deck dispatch <name>` per unit.
+const DISPATCHER_MODE_NAME: &str = "dispatcher";
+
+/// PRD #220 M3.0: the seed prompt for the dispatcher mode. Teaches the agent:
+/// decompose work → `dispatch` per unit → isolation is automatic → don't do the
+/// work yourself.
+const DISPATCHER_SEED_PROMPT: &str = "\
+You are a parallel-work dispatcher. Your job is to decompose a task into independent units, then dispatch each unit into its own isolated git worktree where a fresh agent can work on it without interference.
+
+## What you do
+1. Understand the user's goal.
+2. Break it into independent, parallel-ready units of work.
+3. For each unit, call:
+   dot-agent-deck dispatch <name> --task \"<detailed task description with file paths, constraints, and expected outcome>\"
+   - <name> is a short slug (e.g. `fix-auth-bug`, `add-rate-limiter`).
+   - The --task text must be self-contained — the dispatched agent has NO context about other units or the parent conversation.
+4. Report back to the user: which units were dispatched, where each worktree lives.
+
+## Rules
+- NEVER do the work yourself. You ONLY decompose and dispatch.
+- Each unit MUST be independent — if unit B depends on unit A, they are NOT parallel-ready.
+- The dispatch command creates a git worktree, spawns an agent in it, and returns immediately — it is fire-and-forget.
+- Keep the number of units reasonable (2-6). Too many units overwhelm the system.
+- After dispatching all units, tell the user each unit is running in its own isolated worktree and will report back when done.
+
+## Dispatch command reference
+  dot-agent-deck dispatch <name> [--task <text>] [--task-file <path>]";
+
+/// PRD #220: build the dispatcher `ModeConfig` — a seeded single-agent mode
+/// that teaches the agent to decompose work and call `dispatch` per unit.
+fn build_dispatcher_mode(working_dir: &std::path::Path) -> ModeConfig {
+    let seed = format!(
+        "{seed}\n\nworking_dir: {dir}\n\nThe repo at this path is where worktrees will be created under .worktrees/.",
+        seed = DISPATCHER_SEED_PROMPT,
+        dir = working_dir.display(),
+    );
+    ModeConfig {
+        name: DISPATCHER_MODE_NAME.to_string(),
+        init_command: None,
+        seed_prompt: Some(seed),
+        panes: Vec::new(),
+        rules: Vec::new(),
+        reactive_panes: 0,
+    }
+}
+
+
 // ---------------------------------------------------------------------------
 // "Scheduled Tasks" management dialog (PRD #127 M3.3)
 // ---------------------------------------------------------------------------
@@ -726,6 +776,13 @@ struct NewPaneFormState {
     /// offers the `schedule: issues` option after `schedule`; when false it is
     /// hidden and the cycler shape is byte-for-byte the pre-feature baseline.
     show_issue_dispatch: bool,
+    /// PRD #220: the built-in "dispatcher" authoring mode, appended after
+    /// `schedule: issues` in the cycler. Carries the authoring seed prompt
+    /// that teaches the agent to decompose work and call `dispatch` per unit.
+    dispatcher_authoring: ModeConfig,
+    /// PRD #220: when true the cycler offers the `dispatcher` option after
+    /// `schedule: issues`. Gated behind the experimental feature flag.
+    show_dispatcher: bool,
     selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations, then "schedule" [, "schedule: issues"]
     /// PRD #20 finding #8: the selected agent's index into
     /// [`crate::agent_registry::ALL`], or `None` when the user hasn't picked one
@@ -817,6 +874,10 @@ impl NewPaneFormState {
             // render wrapper once at construction so the count/name/cycler-cap
             // all observe one consistent value.
             show_issue_dispatch: crate::features::show_issue_dispatch_authoring(),
+            dispatcher_authoring: build_dispatcher_mode(&dir),
+            // PRD #220: gated behind the same experimental flag as issue-dispatch
+            // for now; can be promoted to permanent when the feature stabilizes.
+            show_dispatcher: crate::features::show_issue_dispatch_authoring(),
             selection_index: 0,
             agent_selection: None,
             has_mode_field,
@@ -873,6 +934,8 @@ impl NewPaneFormState {
             // only — the issue-dispatch option lives on the `Ctrl+n` cycler, and
             // the locked form hides the cycler entirely, so it never appears here.
             show_issue_dispatch: false,
+            dispatcher_authoring: build_dispatcher_mode(&dir),
+            show_dispatcher: false,
             selection_index: 0,
             agent_selection: None,
             has_mode_field: true,
@@ -900,6 +963,13 @@ impl NewPaneFormState {
         self.schedule_index() + 1
     }
 
+    /// PRD #220: cycler index of the dispatcher option — appended after
+    /// `schedule: issues`. Only meaningful when `show_dispatcher` is true.
+    fn dispatcher_index(&self) -> usize {
+        self.issue_dispatch_index()
+            + if self.show_issue_dispatch { 1 } else { 0 }
+    }
+
     /// Whether the built-in "schedule" authoring option is currently selected.
     fn is_schedule_selected(&self) -> bool {
         self.selection_index == self.schedule_index()
@@ -910,20 +980,27 @@ impl NewPaneFormState {
         self.show_issue_dispatch && self.selection_index == self.issue_dispatch_index()
     }
 
+    /// PRD #220: whether the dispatcher option is selected.
+    fn is_dispatcher_selected(&self) -> bool {
+        self.show_dispatcher && self.selection_index == self.dispatcher_index()
+    }
+
     /// PRD #120: whether the current selection is a throwaway authoring option
-    /// (plain `schedule` OR `schedule: issues`). Drives the shared
+    /// (plain `schedule` OR `schedule: issues` OR `dispatcher`). Drives the shared
     /// "↳ authoring (one-off)" hint + its reserved render row.
     fn is_authoring_selected(&self) -> bool {
-        self.is_schedule_selected() || self.is_issue_dispatch_selected()
+        self.is_schedule_selected() || self.is_issue_dispatch_selected() || self.is_dispatcher_selected()
     }
 
     fn mode_option_count(&self) -> usize {
         // +1 for the built-in "schedule" authoring option appended at the end,
-        // +1 more for the flag-gated "schedule: issues" option when shown.
+        // +1 more for the flag-gated "schedule: issues" option when shown,
+        // +1 more for the dispatcher option (PRD #220).
         1 + self.modes.len()
             + self.orchestrations.len()
             + 1
             + if self.show_issue_dispatch { 1 } else { 0 }
+            + if self.show_dispatcher { 1 } else { 0 }
     }
 
     fn select_next_mode(&mut self) {
@@ -937,6 +1014,11 @@ impl NewPaneFormState {
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
+        // PRD #220: the dispatcher mode — checked first since it is appended
+        // after the schedule options in the cycler.
+        if self.is_dispatcher_selected() {
+            return Some(&self.dispatcher_authoring);
+        }
         // PRD #120: the flag-gated issue-dispatch authoring option — its synthetic
         // mode supplies the cycler's title/chip ("schedule: issues mode"); the
         // spawned request swaps in the issue-dispatch seed (see
@@ -985,6 +1067,9 @@ impl NewPaneFormState {
         } else if self.show_issue_dispatch && idx == self.issue_dispatch_index() {
             // PRD #120: the flag-gated issue-dispatch authoring option.
             ISSUE_DISPATCH_MODE_NAME.to_string()
+        } else if self.show_dispatcher && idx == self.dispatcher_index() {
+            // PRD #220: the dispatcher mode.
+            DISPATCHER_MODE_NAME.to_string()
         } else {
             // PRD #127 M3.2: built-in "schedule" authoring option.
             SCHEDULE_MODE_NAME.to_string()
@@ -4864,6 +4949,24 @@ fn record_candidate(command: &str) -> Option<String> {
 /// Shared by the Enter-submit key arm and the `[Submit]` button
 /// ([`Action::FormSubmit`]) so click and key spawn an identical pane.
 fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> NewPaneRequest {
+    // PRD #220: the dispatcher mode — a seeded single-agent tab that teaches
+    // the agent to decompose work into independent units and call
+    // `dot-agent-deck dispatch <name>` per unit. Spawned as a mode tab
+    // carrying the dispatcher seed prompt via `ModeConfig::seed_prompt`.
+    if form.is_dispatcher_selected() {
+        return NewPaneRequest {
+            dir: form.dir.clone(),
+            name: form.name.clone(),
+            command: if form.command.trim().is_empty() {
+                resolve_authoring_command(default_command)
+            } else {
+                form.command.clone()
+            },
+            mode_config: Some(build_dispatcher_mode(&form.dir)),
+            orchestration_config: None,
+            seed_prompt: None,
+        };
+    }
     // PRD #120: the flag-gated "schedule: issues" authoring option — like the
     // plain "schedule" option it is a throwaway single-agent authoring CARD, but
     // its seed authors an ISSUE-DISPATCH task (`schedule add --repo …`) instead

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -8,8 +9,8 @@ use tracing::warn;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
-    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    LiveTarget, OrchestrationSurface, WorkDoneSignal, Writable,
+    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, DispatchSignal,
+    EventType, LiveTarget, OrchestrationSurface, WorkDoneSignal, Writable,
 };
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
@@ -284,6 +285,14 @@ pub struct AppState {
     /// can neither restore a stale id nor clear a newer one, and a delayed
     /// prior-generation `SessionEnd` cannot wipe the current generation.
     pane_hook_session: HashMap<String, (String, DateTime<Utc>)>,
+    /// PRD #220: worktree directory → clone directory for dispatch-created
+    /// worktrees. Used by the attach server to clean up worktrees when the
+    /// last pane in a dispatch orchestration is closed.
+    pub dispatch_worktrees: HashMap<PathBuf, PathBuf>,
+    /// PRD #220 M2.0: dispatch-id → caller pane_id for return-edge routing.
+    /// When a dispatch-spawned orchestration emits `work-done`, the daemon
+    /// resolves the caller pane from this map and routes the result there.
+    pub dispatch_callbacks: HashMap<String, String>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -1206,6 +1215,64 @@ impl AppState {
                 role = %role_name,
                 error = %e,
                 "work-done: failed to write feedback into orchestrator pane"
+            );
+        }
+    }
+
+    pub async fn handle_dispatch(
+        &mut self,
+        signal: DispatchSignal,
+        registry: &Arc<AgentPtyRegistry>,
+        event_tx: &broadcast::Sender<BroadcastMsg>,
+    ) {
+        use crate::dispatch::{self, DispatchContext};
+
+        let cwd = match self.pane_cwd_map.get(&signal.pane_id) {
+            Some(c) => c.clone(),
+            None => {
+                warn!(pane_id = %signal.pane_id, "dispatch from unknown pane");
+                return;
+            }
+        };
+
+        let ctx = DispatchContext {
+            working_dir: PathBuf::from(&cwd),
+            registry: registry.clone(),
+            event_tx: event_tx.clone(),
+            worktrees: Arc::new(tokio::sync::Mutex::new(std::mem::take(
+                &mut self.dispatch_worktrees,
+            ))),
+            callbacks: Arc::new(tokio::sync::Mutex::new(std::mem::take(
+                &mut self.dispatch_callbacks,
+            ))),
+        };
+
+        let task = signal.task.as_deref();
+        let result = dispatch::handle_dispatch(&ctx, &signal.pane_id, &signal.name, task).await;
+
+        if let Ok(wts) = Arc::try_unwrap(ctx.worktrees) {
+            self.dispatch_worktrees = wts.into_inner();
+        }
+        if let Ok(cbs) = Arc::try_unwrap(ctx.callbacks) {
+            self.dispatch_callbacks = cbs.into_inner();
+        }
+
+        if !result.success {
+            warn!(
+                name = %signal.name,
+                message = %result.message,
+                "dispatch failed"
+            );
+        }
+
+        if let Err(e) = registry
+            .write_to_pane_and_submit(&signal.pane_id, &result.message)
+            .await
+        {
+            warn!(
+                pane_id = %signal.pane_id,
+                error = %e,
+                "dispatch: failed to write result into caller pane"
             );
         }
     }

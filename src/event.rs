@@ -585,6 +585,12 @@ pub enum DaemonMessage {
     /// and does NOT move the attach `PROTOCOL_VERSION`.
     #[serde(rename = "get_seed")]
     GetSeed(GetSeedRequest),
+    /// PRD #220: agent-callable dispatch — creates a git worktree and spawns a
+    /// fully-isolated orchestration inside it. One-step parallel line of work:
+    /// the agent calls `dispatch <name>` and the daemon handles worktree
+    /// lifecycle (create, spawn, cleanup on tab close).
+    #[serde(rename = "dispatch")]
+    Dispatch(DispatchSignal),
 }
 
 /// PRD #201: payload of [`DaemonMessage::GetSeed`] — the pane whose pending
@@ -686,6 +692,18 @@ pub struct OrchestrationSurfaceRole {
     pub role_name: String,
     /// Whether this is the start (orchestrator) role.
     pub is_start_role: bool,
+}
+
+/// PRD #220: signal sent by an agent via `dot-agent-deck dispatch`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchSignal {
+    pub pane_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub task: Option<String>,
+    #[serde(default)]
+    pub to_orchestration: Option<String>,
+    pub timestamp: DateTime<Utc>,
 }
 
 /// Signal sent by a worker via `dot-agent-deck work-done`.

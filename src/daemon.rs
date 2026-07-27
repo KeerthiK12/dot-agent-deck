@@ -881,6 +881,18 @@ async fn run_hook_loop(
                                         .handle_delegate(signal, &pty_registry, &event_tx)
                                         .await;
                                 }
+                                DaemonMessage::Dispatch(signal) => {
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        name = %signal.name,
+                                        "Received dispatch signal"
+                                    );
+                                    state.write().await.handle_dispatch(
+                                        signal,
+                                        &pty_registry,
+                                        &event_tx,
+                                    ).await;
+                                }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
                                         pane_id = %signal.pane_id,

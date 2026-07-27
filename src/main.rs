@@ -118,6 +118,23 @@ enum Commands {
         #[arg(long)]
         to: Vec<String>,
     },
+    /// Create a git worktree and spawn an isolated orchestration inside it.
+    /// Agent-callable one-step parallel line of work (PRD #220).
+    Dispatch {
+        /// Short name for the dispatch unit (used for worktree naming).
+        name: String,
+        /// Task description with context, file paths, and constraints.
+        /// Mutually exclusive with --task-file.
+        #[arg(long, conflicts_with = "task_file")]
+        task: Option<String>,
+        /// Read the task text verbatim from a file (or `-` for stdin).
+        /// Mutually exclusive with --task.
+        #[arg(long = "task-file", value_name = "PATH")]
+        task_file: Option<String>,
+        /// Target orchestration name for return-edge routing (PRD #220 M2.0).
+        #[arg(long = "to")]
+        to: Option<String>,
+    },
     /// Signal task completion back to the orchestrator
     WorkDone {
         /// Summary of what was accomplished. Mutually exclusive with
@@ -656,6 +673,50 @@ fn main() -> ExitCode {
             };
             if dot_agent_deck::hook::send_to_socket(&json).is_none() {
                 eprintln!("Failed to send delegate signal to daemon socket.");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Some(Commands::Dispatch {
+            name,
+            task,
+            task_file,
+            to,
+        }) => {
+            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!(
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\n\
+                         This command should be run from within a dot-agent-deck managed pane."
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            let task_text = match resolve_task(task, task_file, std::io::stdin().lock()) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let signal = dot_agent_deck::event::DispatchSignal {
+                pane_id,
+                name,
+                task: Some(task_text),
+                to_orchestration: to,
+                timestamp: chrono::Utc::now(),
+            };
+            let msg = dot_agent_deck::event::DaemonMessage::Dispatch(signal);
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Failed to serialize dispatch signal: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
+                eprintln!("Failed to send dispatch signal to daemon socket.");
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS

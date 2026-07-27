@@ -580,7 +580,7 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
 /// a concurrent fire had already claimed it (the benign TOCTOU race below),
 /// which the caller surfaces as a skip rather than a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorktreeCreation {
+pub enum WorktreeCreation {
     Created,
     AlreadyClaimed,
 }
@@ -604,7 +604,7 @@ enum WorktreeCreation {
 /// [`WorktreeCreation::AlreadyClaimed`] (→ skip) instead of a hard failure. A
 /// genuine add failure (bad ref, permissions, …) leaves the dir absent and
 /// still propagates as `Err`.
-async fn create_worktree(
+pub async fn create_worktree(
     clone_dir: &Path,
     worktree_dir: &Path,
     branch: &str,
