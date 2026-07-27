@@ -862,6 +862,7 @@ impl NewPaneFormState {
             rules: Vec::new(),
             reactive_panes: 0,
         };
+        let dispatcher_authoring = build_dispatcher_mode(&dir);
         Self {
             dir,
             name,
@@ -874,7 +875,7 @@ impl NewPaneFormState {
             // render wrapper once at construction so the count/name/cycler-cap
             // all observe one consistent value.
             show_issue_dispatch: crate::features::show_issue_dispatch_authoring(),
-            dispatcher_authoring: build_dispatcher_mode(&dir),
+            dispatcher_authoring,
             // PRD #220: gated behind the same experimental flag as issue-dispatch
             // for now; can be promoted to permanent when the feature stabilizes.
             show_dispatcher: crate::features::show_issue_dispatch_authoring(),
@@ -922,6 +923,7 @@ impl NewPaneFormState {
             rules: Vec::new(),
             reactive_panes: 0,
         };
+        let dispatcher_authoring = build_dispatcher_mode(&dir);
         let mut form = Self {
             dir,
             name: SCHEDULE_MODE_NAME.to_string(),
@@ -934,7 +936,7 @@ impl NewPaneFormState {
             // only — the issue-dispatch option lives on the `Ctrl+n` cycler, and
             // the locked form hides the cycler entirely, so it never appears here.
             show_issue_dispatch: false,
-            dispatcher_authoring: build_dispatcher_mode(&dir),
+            dispatcher_authoring,
             show_dispatcher: false,
             selection_index: 0,
             agent_selection: None,
