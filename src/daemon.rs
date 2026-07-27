@@ -566,7 +566,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     });
 
-    let result = run_hook_loop(listener, state, event_tx, pty_registry.clone(), shutdown).await;
+    let result = run_hook_loop(listener, state, event_tx, pty_registry.clone(), shutdown, worktree_registry.clone()).await;
 
     if let Some(h) = attach_handle {
         h.abort();
@@ -826,6 +826,7 @@ async fn run_hook_loop(
     event_tx: broadcast::Sender<BroadcastMsg>,
     pty_registry: Arc<AgentPtyRegistry>,
     shutdown: Arc<Notify>,
+    worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
 ) -> Result<(), DaemonError> {
     loop {
         tokio::select! {
@@ -843,6 +844,7 @@ async fn run_hook_loop(
                 let state = state.clone();
                 let event_tx = event_tx.clone();
                 let pty_registry = pty_registry.clone();
+                let worktree_registry = worktree_registry.clone();
                 tokio::spawn(async move {
                     // PRD #201: split so the read-only `get-seed` verb can write
                     // a reply back on the same connection. Every other message
@@ -891,6 +893,7 @@ async fn run_hook_loop(
                                         signal,
                                         &pty_registry,
                                         &event_tx,
+                                        &worktree_registry,
                                     ).await;
                                 }
                                 DaemonMessage::WorkDone(signal) => {
@@ -1079,7 +1082,8 @@ mod hook_ingestion_tests {
 
         let handle = tokio::spawn({
             let registry = registry.clone();
-            async move { run_hook_loop(listener, state, event_tx, registry, shutdown).await }
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
         });
 
         // Synthetic SessionStart for the shell pane, carrying the real type.
@@ -1162,7 +1166,8 @@ mod hook_ingestion_tests {
         let shutdown = Arc::new(Notify::new());
         let handle = tokio::spawn({
             let registry = registry.clone();
-            async move { run_hook_loop(listener, state, event_tx, registry, shutdown).await }
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
         });
 
         // Helper: send one get_seed request line and read the single reply line.

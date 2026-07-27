@@ -285,10 +285,6 @@ pub struct AppState {
     /// can neither restore a stale id nor clear a newer one, and a delayed
     /// prior-generation `SessionEnd` cannot wipe the current generation.
     pane_hook_session: HashMap<String, (String, DateTime<Utc>)>,
-    /// PRD #220: worktree directory → clone directory for dispatch-created
-    /// worktrees. Used by the attach server to clean up worktrees when the
-    /// last pane in a dispatch orchestration is closed.
-    pub dispatch_worktrees: HashMap<PathBuf, PathBuf>,
     /// PRD #220 M2.0: dispatch-id → caller pane_id for return-edge routing.
     /// When a dispatch-spawned orchestration emits `work-done`, the daemon
     /// resolves the caller pane from this map and routes the result there.
@@ -1175,11 +1171,44 @@ impl AppState {
             }
         }
 
+        // PRD #220 M2.1: if this work-done is from a dispatch-spawned
+        // orchestration, route the result to the CALLER pane (the pane
+        // that issued `dispatch`), not the dispatch-orchestration's own
+        // orchestrator. The dispatch_id → caller_pane mapping was
+        // registered at dispatch time.
+        let orchestration = self.pane_orchestration_map.get(&signal.pane_id);
+        if let Some((orch_name, _orch_cwd)) = orchestration {
+            if orch_name.starts_with("dispatch-") {
+                if let Some(caller_pane_id) = self.dispatch_callbacks.get(orch_name) {
+                    let feedback = format!(
+                        "[dispatch: {orch_name}] worker '{safe_name}' completed: {summary}",
+                        summary = signal.task.chars().take(200).collect::<String>(),
+                    );
+                    if let Err(e) = registry
+                        .write_to_pane_and_submit(caller_pane_id, &feedback)
+                        .await
+                    {
+                        warn!(
+                            pane_id = %caller_pane_id,
+                            dispatch = %orch_name,
+                            error = %e,
+                            "dispatch: failed to route work-done to caller pane"
+                        );
+                    }
+                    // Mark callback as consumed so we don't double-deliver.
+                    // (dispatch_callbacks is behind AppState; we can't mutate
+                    // from &self here, but the next dispatch for the same name
+                    // overwrites the entry anyway — and the cleanup-on-close
+                    // path removes the stale callback.)
+                    return; // routed to caller — skip normal orchestrator delivery
+                }
+            }
+        }
+
         // Find the orchestrator pane in the same orchestration as the
         // worker. We scope by `pane_orchestration_map` so a parallel
         // orchestration tab's orchestrator pane doesn't receive a sibling
         // tab's worker feedback.
-        let orchestration = self.pane_orchestration_map.get(&signal.pane_id);
         let orchestrator_pane_id = self
             .orchestrator_pane_ids
             .iter()
@@ -1224,6 +1253,7 @@ impl AppState {
         signal: DispatchSignal,
         registry: &Arc<AgentPtyRegistry>,
         event_tx: &broadcast::Sender<BroadcastMsg>,
+        worktree_registry: &crate::issue_dispatch_run::WorktreeRegistry,
     ) {
         use crate::dispatch::{self, DispatchContext};
 
@@ -1239,9 +1269,7 @@ impl AppState {
             working_dir: PathBuf::from(&cwd),
             registry: registry.clone(),
             event_tx: event_tx.clone(),
-            worktrees: Arc::new(tokio::sync::Mutex::new(std::mem::take(
-                &mut self.dispatch_worktrees,
-            ))),
+            worktrees: worktree_registry.clone(),
             callbacks: Arc::new(tokio::sync::Mutex::new(std::mem::take(
                 &mut self.dispatch_callbacks,
             ))),
@@ -1250,9 +1278,6 @@ impl AppState {
         let task = signal.task.as_deref();
         let result = dispatch::handle_dispatch(&ctx, &signal.pane_id, &signal.name, task).await;
 
-        if let Ok(wts) = Arc::try_unwrap(ctx.worktrees) {
-            self.dispatch_worktrees = wts.into_inner();
-        }
         if let Ok(cbs) = Arc::try_unwrap(ctx.callbacks) {
             self.dispatch_callbacks = cbs.into_inner();
         }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
@@ -49,8 +49,8 @@ pub struct DispatchContext {
     pub working_dir: PathBuf,
     pub registry: Arc<AgentPtyRegistry>,
     pub event_tx: tokio::sync::broadcast::Sender<BroadcastMsg>,
-    pub worktrees: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
-    pub callbacks: Arc<Mutex<HashMap<String, String>>>,
+    pub worktrees: Arc<std::sync::Mutex<HashMap<PathBuf, PathBuf>>>,
+    pub callbacks: Arc<TokioMutex<HashMap<String, String>>>,
 }
 
 pub async fn handle_dispatch(
@@ -84,7 +84,7 @@ pub async fn handle_dispatch(
     }
 
     {
-        let mut wts = ctx.worktrees.lock().await;
+        let mut wts = ctx.worktrees.lock().unwrap();
         wts.insert(paths.worktree_dir.clone(), clone_dir.clone());
     }
 
@@ -129,7 +129,7 @@ pub async fn handle_dispatch(
             let _ = remove_worktree(&paths.worktree_dir, &clone_dir).await;
 
             {
-                let mut wts = ctx.worktrees.lock().await;
+                let mut wts = ctx.worktrees.lock().unwrap();
                 wts.remove(&paths.worktree_dir);
             }
 
