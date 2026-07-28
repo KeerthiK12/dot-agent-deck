@@ -5,7 +5,12 @@ const sidebars = {
     'installation',
     'session-management',
     'keyboard-shortcuts',
-    'orchestration',
+    {
+      type: 'category',
+      label: 'Orchestration',
+      link: { type: 'doc', id: 'orchestration' },
+      items: ['idle-workers-and-notifications'],
+    },
     'workspace-modes',
     'scheduled-tasks',
     'configuration',

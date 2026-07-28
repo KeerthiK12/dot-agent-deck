@@ -24,6 +24,43 @@ pub struct ProjectConfig {
     pub modes: Vec<ModeConfig>,
     #[serde(default)]
     pub orchestrations: Vec<OrchestrationConfig>,
+    /// PRD #126: how long the daemon waits for a delegated worker to send
+    /// `work-done` before injecting an idle prompt into the orchestrator's
+    /// pane (see [`crate::state::worker_response_timeout`]). Absent from a
+    /// config means the [`DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES`] default,
+    /// so existing configs keep working untouched.
+    ///
+    /// **Accepted values** (PRD #126 M1 audit finding 4 — must flow into the
+    /// M3.1 docs page):
+    ///
+    /// * `0` — **detector disabled**. No idle watch is armed for this
+    ///   orchestration's delegations, so a silent worker is never reported and
+    ///   no timer is created. `0` does NOT mean "report immediately": that
+    ///   raced the worker's own dispatch and reported every worker as stuck
+    ///   before it had a chance to answer.
+    /// * `1` ..=
+    ///   [`MAX_WORKER_RESPONSE_TIMEOUT_MINUTES`](crate::state::MAX_WORKER_RESPONSE_TIMEOUT_MINUTES)
+    ///   (7 days) — honored as written.
+    /// * anything larger — rejected with a warning; the daemon falls back to
+    ///   [`DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES`]. Such a value is
+    ///   indistinguishable from "disabled" while still costing a live watch
+    ///   task, so it is treated as a misconfiguration rather than honored.
+    ///
+    /// ⚠️ TOML placement: this is a **top-level scalar**, so it must appear
+    /// *before* the first table header (`[[modes]]` / `[[orchestrations]]`).
+    /// Appended at the end of the file it would silently become a key of the
+    /// last table and be ignored.
+    #[serde(default = "default_worker_response_timeout_minutes")]
+    pub worker_response_timeout_minutes: u64,
+}
+
+/// PRD #126: two hours — long enough that a worker chewing through a real
+/// task is never nagged, short enough that a genuinely stuck delegation
+/// surfaces within one working session.
+pub const DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES: u64 = 120;
+
+fn default_worker_response_timeout_minutes() -> u64 {
+    DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES
 }
 
 #[derive(Debug, Clone, Deserialize)]
