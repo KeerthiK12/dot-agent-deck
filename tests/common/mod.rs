@@ -1518,8 +1518,43 @@ pub fn check_opencode_available() -> Result<(), String> {
     )
 }
 
-/// Cheap model used by Codex availability probes and real-agent e2e coverage.
-pub const CODEX_TEST_MODEL: &str = "gpt-5.1-codex-mini";
+/// Compiled-in default cheap model for Codex availability probes and real-agent
+/// e2e coverage. Correct for a ChatGPT-subscription (oauth) `~/.codex/auth.json`,
+/// which is what most dev boxes here log in with.
+const CODEX_TEST_MODEL_DEFAULT: &str = "gpt-5.1-codex-mini";
+
+/// Env var that overrides [`codex_test_model`] on a host whose Codex credentials
+/// cannot reach the default.
+pub const CODEX_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_CODEX_TEST_MODEL";
+
+/// Cheap model used by Codex availability probes and real-agent e2e coverage —
+/// [`CODEX_TEST_MODEL_DEFAULT`] unless `DOT_AGENT_DECK_CODEX_TEST_MODEL` is set
+/// to a non-empty value, which wins.
+///
+/// The override exists because the `codex-*` model family is served only to
+/// ChatGPT-subscription (oauth) credentials. With an **API-key**
+/// `~/.codex/auth.json`, `codex exec --model gpt-5.1-codex-mini` answers
+/// `404 Not Found: Model not found gpt-5.1-codex-mini` from
+/// `https://api.openai.com/v1/responses`, so [`check_codex_available`] fails its
+/// probe and every real-agent Codex test SKIPS — a silent no-coverage outcome
+/// that reads as a pass. Such a host exports e.g.
+/// `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5-nano` (an equally cheap model an API
+/// key *can* reach). The default is deliberately left alone so subscription-auth
+/// environments keep running codex-mini.
+///
+/// Single source of truth: [`check_codex_available`] probes the model this
+/// returns, so the availability gate and the model the tests actually launch can
+/// never disagree.
+pub fn codex_test_model() -> &'static str {
+    static MODEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODEL.get_or_init(|| {
+        std::env::var(CODEX_TEST_MODEL_ENV)
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| CODEX_TEST_MODEL_DEFAULT.to_string())
+    })
+}
 
 /// Runtime-skip helper for real Codex coverage. A version check alone is not
 /// enough: this verifies persisted auth and performs one minimal model request,
@@ -1565,7 +1600,7 @@ pub fn check_codex_available() -> Result<(), String> {
             "--sandbox",
             "read-only",
             "--model",
-            CODEX_TEST_MODEL,
+            codex_test_model(),
             "-c",
             "model_reasoning_effort=\"low\"",
             "--color",
@@ -1596,7 +1631,11 @@ pub fn check_codex_available() -> Result<(), String> {
         .any(|marker| lower.contains(marker))
     {
         return Err(format!(
-            "Codex could not reach model {CODEX_TEST_MODEL} with the current authentication"
+            "Codex could not reach model {} with the current authentication — if this host's \
+             ~/.codex/auth.json is an API key rather than a ChatGPT subscription, set {} to a \
+             model the key can reach (e.g. gpt-5-nano)",
+            codex_test_model(),
+            CODEX_TEST_MODEL_ENV,
         ));
     }
     Ok(())
@@ -3367,6 +3406,92 @@ pub fn wait_for_path(path: &Path, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     path.exists()
+}
+
+/// Human description of what `path` holds *right now* — missing, unreadable,
+/// or its exact contents. Used by the content-polling waiters below so a
+/// timeout says whether the file never appeared, appeared empty, or simply
+/// carried the wrong text.
+#[allow(dead_code)]
+fn describe_file(path: &Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => format!("{} contains {contents:?}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("{} does not exist", path.display())
+        }
+        Err(e) => format!("{} is unreadable: {e}", path.display()),
+    }
+}
+
+/// Bounded poll until `path` is readable AND `matches` accepts its contents.
+/// `Ok(())` on match; on timeout, `Err(`[`describe_file`]`)`.
+///
+/// Prefer this over [`wait_for_path`] + an immediate `read_to_string` whenever
+/// the assertion is about the file's CONTENTS. An agent that writes a sentinel
+/// with a shell redirect — `printf 'X' > sentinel.txt` — has the shell CREATE
+/// the file before `printf` writes into it, so a reader that waits only for
+/// EXISTENCE can win the race and observe an empty string (PRD #225; this is
+/// exactly how `orchestration/delegate/009` failed in-suite while passing in
+/// isolation). Polling the content closes that window.
+#[allow(dead_code)]
+fn wait_for_file_matching(
+    path: &Path,
+    timeout: Duration,
+    matches: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && matches(&contents)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(describe_file(path));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Bounded poll until `path`'s TRIMMED contents equal `expected` exactly.
+/// See [`wait_for_file_matching`] for why content — not existence — is polled.
+#[allow(dead_code)]
+pub fn wait_for_file_trimmed_eq(
+    path: &Path,
+    expected: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_for_file_matching(path, timeout, |contents| contents.trim() == expected)
+}
+
+/// Bounded poll until `path`'s contents contain `needle`. The bounded,
+/// non-panicking sibling of [`wait_for_file_contains`] (which is pinned to the
+/// harness-wide [`WAIT_TIMEOUT`]); see [`wait_for_file_matching`] for why
+/// content — not existence — is polled.
+#[allow(dead_code)]
+pub fn wait_for_file_containing(
+    path: &Path,
+    needle: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_for_file_matching(path, timeout, |contents| contents.contains(needle))
+}
+
+/// Bounded poll until `path` holds at least `want` COMPLETE — i.e.
+/// newline-terminated — lines. For PATH recorder shims that append one line per
+/// exec (`printf '…\n' >> "$RECORD"`), which is how the launch-shape tests
+/// observe what was actually launched.
+///
+/// Counts newline terminators rather than [`str::lines`] deliberately:
+/// `lines()` also counts a half-written trailing line, so a reader using it can
+/// return the instant the shell has created the file and still read an
+/// incomplete record. That is the same race [`wait_for_file_matching`]
+/// documents, one level up.
+#[allow(dead_code)]
+pub fn wait_for_file_lines(path: &Path, want: usize, timeout: Duration) -> Result<(), String> {
+    wait_for_file_matching(path, timeout, |contents| {
+        contents.matches('\n').count() >= want
+    })
 }
 
 /// Blocking `read_exact` bounded by a wall-clock `deadline`, tolerating the
