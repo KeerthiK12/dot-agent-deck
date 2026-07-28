@@ -3626,23 +3626,158 @@ pub enum Action {
     ScheduleDelete(String),
 }
 
+/// Kitty/xterm modifier parameter for a CSI sequence: `1 + bitmask`, where
+/// shift=1, alt=2, ctrl=4. So Shift → 2, Alt → 3, Ctrl → 5, Ctrl+Shift → 6.
+fn csi_modifier_param(mods: KeyModifiers) -> u8 {
+    let mut bits = 0u8;
+    if mods.contains(KeyModifiers::SHIFT) {
+        bits |= 1;
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        bits |= 2;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        bits |= 4;
+    }
+    1 + bits
+}
+
+/// PRD #227: the C0 control byte a `Ctrl+<char>` keypress must forward to an
+/// embedded pane, or `None` when the character has no control-byte meaning (the
+/// caller then forwards the literal character, which is right for `Ctrl+1`,
+/// `Ctrl+,`, …).
+///
+/// This table exists because M2 moves the Ctrl translation out of the *terminal*
+/// and into *us*. In legacy mode the terminal collapsed the chord to its control
+/// byte before crossterm ever saw it (`Ctrl+[` arrived as `KeyCode::Esc`,
+/// `Ctrl+4` as `Char('4') + CONTROL` because crossterm re-derives that from the
+/// `0x1c` byte). With `DISAMBIGUATE_ESCAPE_CODES` active the terminal instead
+/// reports the *key* plus the modifier (`CSI 91;5u` → `Char('[') + CONTROL`), so
+/// producing the byte is now our job. Anything missing here does not merely fail
+/// to improve — it REGRESSES from the legacy behavior to a literal character.
+/// That is how the `Ctrl+[` bug came back as `Ctrl+3`/`Ctrl+8`: the fix
+/// enumerated aliases one at a time.
+///
+/// So this is written as RULES, not as an alias list:
+///
+/// * `@ A–Z [ \ ] ^ _` and Space — the ASCII caret rule, `byte = ch & 0x1f`.
+///   Space (0x20) masks to 0x00 by the same arithmetic, which is exactly why
+///   `Ctrl+Space` and `Ctrl+@` agree on NUL.
+/// * `a–z` — the same rule after upcasing, giving 0x01..=0x1a.
+/// * `2`–`8` — xterm's digit aliases: NUL, ESC, FS, GS, RS, US, DEL. `4`–`7` are
+///   also the *only* form crossterm's legacy parser produces for `0x1c..=0x1f`
+///   (`crossterm-0.28.1/src/event/sys/unix/parse.rs:110-113`), so they matter in
+///   legacy mode too, not just under M2.
+/// * `?` → DEL and `/` → US — xterm's two punctuation aliases that the caret
+///   rule cannot produce (`?` masks to 0x1f, `/` to 0x0f).
+///
+/// Deliberately NOT mapped: `` Ctrl+` ``. Its ASCII value (0x60) is outside
+/// xterm's Ctrl-translation range and no supported terminal collapses it to NUL,
+/// so there is no legacy byte to preserve — mapping it would invent behavior
+/// rather than restore it.
+///
+/// # The decoder half — RE-VERIFY ON A CROSSTERM UPGRADE
+///
+/// This table is only correct if crossterm decodes the way it is described
+/// above. Two things hold that down:
+///
+/// 1. `keyevent_ctrl_c0_matches_crossterm_decoder` round-trips every byte below
+///    through the REAL decoder — it puts a PTY on fd 0 so crossterm's
+///    `pub(crate)` `parse_event` runs on genuine terminal input — and so fails
+///    the moment the encoder stops being the decoder's inverse. It needs the
+///    process to itself (crossterm 0.28's raw-mode flag and its lazily-built
+///    event reader are PROCESS-global), so it runs under `cargo test-fast` /
+///    `cargo nextest` and skips under a plain `cargo test`.
+/// 2. `Cargo.toml` pins the direct dependency to `=0.28.1`, so the decoder
+///    cannot change without a deliberate edit to that line.
+///
+/// The hand-read decoder tables stay recorded here because they are the *why*
+/// behind the rules above, and because (1) proves agreement without explaining
+/// it. Read out of `crossterm-0.28.1/src/event/sys/unix/parse.rs`; legacy single
+/// bytes, in `parse_event`'s match order (earlier arms shadow later ones):
+///
+/// * `:35-91` — `0x1b` opens an escape sequence; alone, with no further input
+///   pending, it is `KeyCode::Esc`.
+/// * `:92-94` — `0x0d` is `Enter`.
+/// * `:95-101` — `0x0a` is `Enter` ONLY when raw mode is OFF (upstream issue
+///   #371). In raw mode — which is the only mode the deck forwards keys in — it
+///   falls through to the arm below and arrives as `Char('j') + CONTROL`.
+/// * `:102` — `0x09` is `Tab`, with NO `CONTROL` modifier.
+/// * `:103-105` — `0x7f` is `Backspace`, with NO `CONTROL` modifier.
+/// * `:106-109` — `0x01..=0x1a` is `Char(b - 0x01 + b'a') + CONTROL`.
+/// * `:110-113` — `0x1c..=0x1f` is `Char(b - 0x1c + b'4') + CONTROL`. There is
+///   no other legacy form for these four, which is why `4`–`7` are aliases.
+/// * `:114-117` — `0x00` is `Char(' ') + CONTROL`.
+///
+/// CSI-u (`parse_csi_u_encoded_key_code`, `:497`): the codepoint becomes
+/// `KeyCode::Char` verbatim (`:540-566`, with the same `Esc` / `Enter` / `Tab` /
+/// `Backspace` special cases as the legacy path), and the `;<n>` parameter goes
+/// through `parse_modifiers` (`:303`), which is `n.saturating_sub(1)` read as a
+/// bitmask — 1 SHIFT, 2 ALT, 4 CONTROL. So `CSI 91;5u` is `Char('[') + CONTROL`:
+/// under M2 every alias above arrives as its literal character plus `CONTROL`,
+/// which is the whole reason this function has to exist.
+///
+/// `keyevent_ctrl_c0_controls` and
+/// `ctrl_c0_byte_maps_exactly_the_documented_alias_set` pin the ENCODER against
+/// that reading, exhaustively over all 128 ASCII characters, with no PTY needed;
+/// `keyevent_ctrl_c0_matches_crossterm_decoder` pins the reading itself against
+/// the shipped decoder. What none of them can do is keep the LINE REFERENCES
+/// above accurate: relaxing the `=0.28.1` pin in `Cargo.toml` means re-checking
+/// every one of them by hand, even when the round-trip test stays green.
+fn ctrl_c0_byte(c: char) -> Option<u8> {
+    match c {
+        // `a`–`z` / `A`–`Z` → 0x01..=0x1a via the caret rule on the upcased char.
+        'a'..='z' | 'A'..='Z' => Some(c.to_ascii_uppercase() as u8 & 0x1f),
+        // The caret rule proper: `@`→NUL, `[`→ESC, `\`→FS, `]`→GS, `^`→RS,
+        // `_`→US, and Space→NUL.
+        '@' | '[' | '\\' | ']' | '^' | '_' | ' ' => Some(c as u8 & 0x1f),
+        // xterm's digit aliases. `3`..`7` are contiguous with ESC..US.
+        '2' => Some(0x00),
+        '3'..='7' => Some(c as u8 - b'3' + 0x1b),
+        '8' | '?' => Some(0x7f),
+        '/' => Some(0x1f),
+        _ => None,
+    }
+}
+
 /// Convert a crossterm `KeyEvent` into the byte sequence expected by a terminal PTY.
 fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     // Alt modifier: wrap the base key bytes with an ESC prefix.
     let has_alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Ctrl+letter → control codes 0x01–0x1a (Alt adds ESC prefix)
+    // Ctrl+<key> → the C0 control byte (Alt adds ESC prefix). See
+    // [`ctrl_c0_byte`] for why the whole alias table lives behind one rule-based
+    // function instead of a list of match arms here.
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && let KeyCode::Char(c) = key.code
+        && let Some(b) = ctrl_c0_byte(c)
     {
-        let c = c.to_ascii_lowercase();
-        if c.is_ascii_lowercase() {
-            let ctrl = vec![c as u8 - b'a' + 1];
-            return Some(if has_alt {
-                [vec![0x1b], ctrl].concat()
-            } else {
-                ctrl
-            });
+        return Some(if has_alt { vec![0x1b, b] } else { vec![b] });
+    }
+
+    // PRD #227: modifier-aware encoding for keys whose legacy byte form cannot
+    // carry a modifier at all — the deck used to forward Shift+Enter as a bare
+    // `\r`, i.e. literally the same bytes as a plain Enter, so the agent
+    // submitted instead of inserting a newline.
+    //
+    // Only SHIFT/CONTROL open this path. ALT on its own keeps its historical
+    // ESC-prefix form (Alt+Enter → `ESC\r`), because a genuine Alt+Enter is
+    // meaningful to some agents; when ALT accompanies SHIFT/CONTROL it is folded
+    // into the modifier bitmask rather than dropped.
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        let m = csi_modifier_param(key.modifiers);
+        match key.code {
+            // CSI-u: `ESC[13;2u` is the only newline encoding verified to work
+            // across all supported agents (pi, claude, opencode, codex). It also
+            // carries no `\r`, so the submit-debounce correctly ignores it.
+            KeyCode::Enter => return Some(format!("\x1b[13;{m}u").into_bytes()),
+            // Legacy CSI-with-modifier form for arrows (Shift+Up → `ESC[1;2A`).
+            KeyCode::Up => return Some(format!("\x1b[1;{m}A").into_bytes()),
+            KeyCode::Down => return Some(format!("\x1b[1;{m}B").into_bytes()),
+            KeyCode::Right => return Some(format!("\x1b[1;{m}C").into_bytes()),
+            KeyCode::Left => return Some(format!("\x1b[1;{m}D").into_bytes()),
+            _ => {}
         }
     }
 
@@ -7442,6 +7577,110 @@ fn resolve_orchestration_for_restore(
     Ok((orch, snap.start_role_index))
 }
 
+/// PRD #227 M2: whether this process pushed `KeyboardEnhancementFlags`.
+///
+/// The push is *gated* (see [`push_keyboard_enhancement`]), so it does not
+/// always happen — and an unmatched pop is not harmless: it tells the terminal
+/// to discard the top of a stack this process never contributed to, which
+/// inside a multiplexer can be a flag set some other program owns. Both
+/// teardown paths (normal exit and the panic hook) consult this flag.
+static KEYBOARD_ENHANCEMENT_PUSHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// PRD #227 M2: ask the terminal for the enhanced (kitty) keyboard protocol so
+/// modifier-bearing keypresses reach the deck at all. Without it a
+/// kitty-capable terminal stays in legacy mode, where Shift+Enter has no
+/// distinct encoding and arrives as a bare `\r` — the modifier is gone before
+/// any deck code runs, so the modifier-aware encoder (M1/M3) never sees it.
+///
+/// Gated on `supports_keyboard_enhancement()`, which returns `false` inside
+/// tmux: there the outer terminal cannot deliver the encoding anyway, so the
+/// feature self-disables and the deck degrades to its previous behavior rather
+/// than pushing a mode nothing honors.
+///
+/// `DISAMBIGUATE_ESCAPE_CODES` **only** — deliberately not
+/// `REPORT_ALL_KEYS_AS_ESCAPE_CODES`, which would re-encode ordinary
+/// text-producing keys as CSI-u and change how every existing dashboard
+/// binding arrives.
+fn push_keyboard_enhancement() {
+    if !matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    ) {
+        return;
+    }
+    if crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        ),
+    )
+    .is_ok()
+    {
+        KEYBOARD_ENHANCEMENT_PUSHED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// PRD #227 M2: undo [`push_keyboard_enhancement`]. Called from *both* teardown
+/// paths — normal exit and the panic hook — because a leaked push outlives the
+/// process and leaves the shell the user drops back into in the enhanced mode.
+///
+/// No-op unless this process actually pushed; the `swap` also makes a second
+/// call safe, so the two paths cannot double-pop.
+fn pop_keyboard_enhancement() {
+    if KEYBOARD_ENHANCEMENT_PUSHED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags,
+        );
+    }
+}
+
+/// PRD #227 M2: RAII pairing for [`push_keyboard_enhancement`], so the pop
+/// happens on *every* way out of [`run_tui`] rather than only the one that
+/// reaches the explicit teardown.
+///
+/// The teardown at the end of `run_tui` still pops explicitly, because the
+/// ORDER of the escape sequences there is deliberate — the pop must precede
+/// `ratatui::restore()`. But the event loop between the push and that teardown
+/// propagates I/O errors with `?`: a failed `terminal.draw`, `event::read`, or
+/// `event::poll` returns early and skips every line below it, teardown
+/// included. A leaked push is not cosmetic like a leaked mouse-capture — it
+/// outlives the process and corrupts key delivery in the shell the user is
+/// dropped back into. This guard's `Drop` covers the normal return, the
+/// `?`-error returns, and an unwinding panic, which is what makes the
+/// changelog's unconditional "popped on exit, so it cannot leak" wording true.
+///
+/// It is also the backstop for the one path the panic hook deliberately skips:
+/// the hook returns early while `in_guarded_parser_feed()` (it must not tear
+/// down a terminal the render loop is still using), so if such a panic ever
+/// escapes `catch_unwind` instead of being swallowed, this `Drop` is what pops.
+/// That pairing is what makes the hook's early return safe — and it holds only
+/// under `panic = "unwind"`, which is why the hook gates that return on
+/// `cfg(panic = "unwind")` and does the teardown itself in an abort build, where
+/// no `Drop` runs at all (PRD #227 audit item C).
+///
+/// Idempotent by construction: [`pop_keyboard_enhancement`] is a test-and-clear
+/// on [`KEYBOARD_ENHANCEMENT_PUSHED`], so the explicit teardown pop, this
+/// `Drop`, and the panic hook can all fire in any combination without a second
+/// pop ever discarding a flag set that another program on the terminal's stack
+/// owns.
+struct KeyboardEnhancementGuard;
+
+impl KeyboardEnhancementGuard {
+    /// Perform the (gated) push and return the guard that will undo it.
+    fn push() -> Self {
+        push_keyboard_enhancement();
+        Self
+    }
+}
+
+impl Drop for KeyboardEnhancementGuard {
+    fn drop(&mut self) {
+        pop_keyboard_enhancement();
+    }
+}
+
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
@@ -7456,9 +7695,31 @@ pub fn run_tui(
         // screen out from under the render loop and exit the TUI, exactly the
         // crash this guard exists to prevent. Leave the terminal untouched and
         // let `catch_unwind` swallow it (the caller logs and drops the chunk).
+        //
+        // PRD #227 audit item C: gated on `panic = "unwind"`, which is every
+        // official build (`Cargo.toml` defines no `panic = "abort"` profile).
+        // The early return is only correct BECAUSE the panic is recoverable:
+        // under `panic = "abort"` nothing can catch it, `catch_unwind` never
+        // runs, `KeyboardEnhancementGuard::drop` never runs, and the process
+        // dies moments later — so returning here would leak the enhanced
+        // keyboard mode into the user's shell, the single failure mode this
+        // milestone exists to prevent. In an abort build the whole `if` is
+        // compiled out and the guarded case falls through to the full teardown
+        // below, which is the right trade when the deck is dying anyway.
+        //
+        // NOT solvable by simply moving the pop above this return: under unwind
+        // that would pop on every RECOVERED guarded-parser panic and silently
+        // disable Shift+Enter (and every other modifier-bearing key) for the
+        // rest of a session that keeps running perfectly well.
+        #[cfg(panic = "unwind")]
         if crate::embedded_pane::in_guarded_parser_feed() {
             return;
         }
+        // PRD #227 M2: pop the keyboard-enhancement flag on the crash path too.
+        // Unlike mouse capture, a leaked push is not merely cosmetic — it
+        // survives the process and corrupts key delivery in the shell the user
+        // is dropped back into.
+        pop_keyboard_enhancement();
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableMouseCapture,
@@ -7476,6 +7737,21 @@ pub fn run_tui(
     )?;
 
     let mut terminal = ratatui::init();
+
+    // PRD #227 M2: raw mode and the alternate screen are up, so negotiate the
+    // enhanced keyboard protocol now — before the event loop starts polling,
+    // since the support probe reads the terminal's reply off stdin itself.
+    //
+    // Held as an RAII guard, NOT a bare call: the event loop below returns early
+    // via `?` on any terminal I/O error, which would skip the explicit
+    // `pop_keyboard_enhancement()` in the teardown and leak the enhanced mode
+    // into the user's shell. The guard's `Drop` pops on that path (and on an
+    // unwind); the explicit teardown pop stays because it must run BEFORE
+    // `ratatui::restore()`, and the pop is idempotent so the two never conflict.
+    // Bound to a NAMED binding — `let _ = …` would drop it immediately and pop
+    // the flag before the event loop ever runs.
+    let _keyboard_enhancement = KeyboardEnhancementGuard::push();
+
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
     // PRD #196: restore the persisted global last-command so the new-pane form
@@ -9878,6 +10154,9 @@ pub fn run_tui(
     // EOF, and the agents survive — same property the round-7 loop
     // already guarded for the external-daemon case.
 
+    // PRD #227 M2: undo the enhanced-keyboard push (no-op if it never happened)
+    // alongside the mouse-capture / bracketed-paste restores.
+    pop_keyboard_enhancement();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
@@ -19893,6 +20172,110 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // PRD #227 M2 — keyboard-enhancement push/pop lifecycle
+    // ---------------------------------------------------------------------------
+
+    // These two drive `KEYBOARD_ENHANCEMENT_PUSHED` (a process-global) directly
+    // rather than through `push_keyboard_enhancement()`, which self-disables
+    // under a test harness because `supports_keyboard_enhancement()` finds no
+    // kitty-capable terminal. Storing `true` is the stand-in for "the gated push
+    // succeeded". Safe to share the static across them because nextest runs each
+    // test in its own process; the pop they trigger writes 5 bytes of escape
+    // sequence to the captured test stdout and touches nothing else.
+    //
+    // The `?`-error return inside `run_tui`'s event loop that motivates the guard
+    // is NOT reachable in-process (it needs a real terminal whose `draw` /
+    // `read` / `poll` fails), so these cover the guard MECHANISM — that `Drop`
+    // pops at all, and that it cannot double-pop — rather than that specific
+    // call site. The end-to-end pop-on-exit evidence is the L2
+    // `embed/key-forwarding/002` assertion on the deck's real output stream.
+
+    /// Pin the exact bytes crossterm writes for the push and the pop.
+    ///
+    /// The L2 `embed/key-forwarding/002` test asserts on these literal sequences
+    /// in the deck's real output stream, which is the only direct evidence M2
+    /// ran at all. That assertion would silently stop proving anything if a
+    /// crossterm upgrade changed the encoding, so pin it here where the failure
+    /// is a compile-fast unit test naming the new form rather than a puzzling
+    /// PTY-test timeout. Note the pop is `CSI < 1 u`, NOT the `>` form.
+    #[test]
+    fn keyboard_enhancement_wire_bytes_are_the_ones_the_e2e_asserts() {
+        use crossterm::Command;
+
+        let mut push = String::new();
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        )
+        .write_ansi(&mut push)
+        .expect("format push command");
+        assert_eq!(
+            push, "\x1b[>1u",
+            "crossterm's PushKeyboardEnhancementFlags encoding changed; update the \
+             PUSH_ENHANCEMENT constant in tests/e2e_pane_shift_enter.rs to match"
+        );
+
+        let mut pop = String::new();
+        crossterm::event::PopKeyboardEnhancementFlags
+            .write_ansi(&mut pop)
+            .expect("format pop command");
+        assert_eq!(
+            pop, "\x1b[<1u",
+            "crossterm's PopKeyboardEnhancementFlags encoding changed; update the \
+             POP_ENHANCEMENT constant in tests/e2e_pane_shift_enter.rs to match"
+        );
+    }
+
+    /// The guard pops when it leaves scope — the property that covers every
+    /// `run_tui` exit path the explicit teardown misses.
+    #[test]
+    fn keyboard_enhancement_guard_pops_on_scope_exit() {
+        KEYBOARD_ENHANCEMENT_PUSHED.store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let _guard = KeyboardEnhancementGuard;
+            assert!(
+                KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst),
+                "the flag must stay set while the guard is alive — popping early \
+                 would disable the enhanced protocol for the whole session"
+            );
+        }
+        assert!(
+            !KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst),
+            "the guard's Drop must pop the keyboard-enhancement flag; without it a \
+             `?`-error return from run_tui's event loop leaks the enhanced mode \
+             into the shell the user is dropped back into"
+        );
+    }
+
+    /// The explicit teardown pop and the guard's `Drop` both firing must pop
+    /// exactly once, so neither can discard a flag set another program on the
+    /// terminal's stack owns.
+    #[test]
+    fn keyboard_enhancement_pop_is_idempotent() {
+        KEYBOARD_ENHANCEMENT_PUSHED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let guard = KeyboardEnhancementGuard;
+
+        // Stands in for the explicit pop in run_tui's normal teardown.
+        pop_keyboard_enhancement();
+        assert!(
+            !KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst),
+            "the first pop must clear the flag"
+        );
+
+        // The guard now drops on top of that. The test-and-clear means it finds
+        // the flag already false and emits nothing.
+        drop(guard);
+        assert!(
+            !KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst),
+            "a second pop must remain a no-op"
+        );
+
+        // A pop with no push at all is likewise inert (the tmux case, where the
+        // support probe returns false and nothing is ever pushed).
+        pop_keyboard_enhancement();
+        assert!(!KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // ---------------------------------------------------------------------------
     // keyevent_to_bytes tests
     // ---------------------------------------------------------------------------
 
@@ -19910,6 +20293,18 @@ mod tests {
         assert_eq!(
             keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(vec![b'\r'])
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            Some(b"\x1b[13;5u".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            Some(vec![0x1b, b'\r'])
         );
         assert_eq!(
             keyevent_to_bytes(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
@@ -19937,6 +20332,467 @@ mod tests {
         assert_eq!(keyevent_to_bytes(&key), Some(vec![0x1a]));
     }
 
+    /// Every NON-LETTER `Ctrl+<char>` alias, enumerated one at a time.
+    ///
+    /// Deliberately a hand-written list rather than a restatement of
+    /// [`ctrl_c0_byte`]'s rules: the rules are the implementation, this is the
+    /// intent, and the exhaustive sweep in
+    /// [`ctrl_c0_byte_maps_exactly_the_documented_alias_set`] fails if a rule ever
+    /// grows wider (or narrower) than the list.
+    const CTRL_C0_SYMBOL_ALIASES: &[(char, u8)] = &[
+        // NUL
+        ('@', 0x00),
+        (' ', 0x00),
+        ('2', 0x00),
+        // ESC — `Ctrl+[` is how vim leaves insert mode inside an embedded pane.
+        ('[', 0x1b),
+        ('3', 0x1b),
+        // FS
+        ('\\', 0x1c),
+        ('4', 0x1c),
+        // GS
+        (']', 0x1d),
+        ('5', 0x1d),
+        // RS
+        ('^', 0x1e),
+        ('6', 0x1e),
+        // US — `Ctrl+_` / `Ctrl+/` is readline's undo.
+        ('_', 0x1f),
+        ('7', 0x1f),
+        ('/', 0x1f),
+        // DEL
+        ('?', 0x7f),
+        ('8', 0x7f),
+    ];
+
+    /// Lowercase and uppercase `Ctrl+letter`, expressed as an ORDINAL (the nth
+    /// letter → byte n) rather than as the `& 0x1f` mask [`ctrl_c0_byte`] uses,
+    /// so the two formulations have to agree.
+    fn ctrl_c0_letter_aliases() -> Vec<(char, u8)> {
+        ('a'..='z')
+            .chain('A'..='Z')
+            .enumerate()
+            .map(|(i, c)| (c, (i % 26) as u8 + 1))
+            .collect()
+    }
+
+    /// PRD #227: the C0 controls that are NOT Ctrl+letter. With the enhanced
+    /// (kitty) protocol active (M2) the terminal disambiguates these into
+    /// `CSI <code>;5u`, which crossterm reports as `Char(c) + CONTROL` — so
+    /// Ctrl+[ arrives as `Char('[') + CONTROL`, not as the legacy
+    /// `KeyCode::Esc`. Each must still reach the pane as its single C0 byte.
+    ///
+    /// The DIGIT aliases are here for two independent reasons: they are xterm's
+    /// unshifted way to reach the same seven bytes (and under M2 the *only* way,
+    /// since `@ ^ _ ?` are shifted symbols the protocol reports as their
+    /// unshifted key), and `0x1c..=0x1f` decoded by crossterm's LEGACY parser
+    /// arrives as `Char('4'..='7') + CONTROL` too.
+    #[test]
+    fn keyevent_ctrl_c0_controls() {
+        for (ch, want) in CTRL_C0_SYMBOL_ALIASES
+            .iter()
+            .copied()
+            .chain(ctrl_c0_letter_aliases())
+        {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+            assert_eq!(
+                keyevent_to_bytes(&key),
+                Some(vec![want]),
+                "Ctrl+{ch:?} must forward the C0 byte {want:#04x}, not the literal character"
+            );
+            // Alt+Ctrl+<char> keeps the ESC prefix in front of the same byte.
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL | KeyModifiers::ALT);
+            assert_eq!(
+                keyevent_to_bytes(&key),
+                Some(vec![0x1b, want]),
+                "Alt+Ctrl+{ch:?} must forward ESC followed by {want:#04x}"
+            );
+        }
+    }
+
+    /// The alias table is a closed set: exhaustive over all 128 ASCII characters
+    /// plus a couple of non-ASCII ones, so neither a too-wide rule (`'0'..='9'`
+    /// swallowing Ctrl+0/Ctrl+1/Ctrl+9, which have no control byte) nor a
+    /// too-narrow one can pass.
+    #[test]
+    fn ctrl_c0_byte_maps_exactly_the_documented_alias_set() {
+        let letters = ctrl_c0_letter_aliases();
+        for byte in 0u8..=127 {
+            let c = byte as char;
+            let expected = letters
+                .iter()
+                .chain(CTRL_C0_SYMBOL_ALIASES)
+                .find(|(alias, _)| *alias == c)
+                .map(|(_, want)| *want);
+            assert_eq!(
+                ctrl_c0_byte(c),
+                expected,
+                "Ctrl+{c:?} ({byte:#04x}): the alias table and the documented set disagree"
+            );
+        }
+        // Non-ASCII must never be masked into a control byte (`c as u8` would
+        // truncate the codepoint).
+        for c in ['é', 'λ', '€', '🙂'] {
+            assert_eq!(ctrl_c0_byte(c), None, "Ctrl+{c:?} is not a C0 alias");
+        }
+    }
+
+    /// PRD #227 review item A: run OUR encoder against THEIR decoder.
+    ///
+    /// crossterm's `parse_event` is `pub(crate)`, so the only way to reach the
+    /// real decoder is to give crossterm a terminal to read from: `tty_fd()`
+    /// returns stdin when stdin is a tty, so this installs a PTY slave on fd 0
+    /// and writes keypresses into the master. Bytes then travel the exact
+    /// production path — PTY line discipline, `Parser::advance`, `parse_event` —
+    /// instead of a hand-transcribed copy of crossterm's tables that could
+    /// silently drift from them on an upgrade.
+    ///
+    /// # Only sound when the test owns the process
+    ///
+    /// Every piece of state this probe touches is PROCESS-global, not per-test:
+    /// fd 0, crossterm 0.28's raw-mode flag, and crossterm's lazily-built event
+    /// reader (cached in a process-wide `Mutex<Option<...>>`). A concurrent
+    /// stdin/event user in the same process could consume the queued event
+    /// between this probe's `poll` and its `read`, at which point `event::read`
+    /// blocks and the 5 s deadline in [`Self::decode`] never gets a chance to
+    /// fire — a hang, not a failure. The cached reader also outlives `Drop`,
+    /// still holding a registration for the PTY the probe just closed.
+    ///
+    /// [`keyevent_ctrl_c0_matches_crossterm_decoder`] therefore refuses to run
+    /// unless it owns the process (its `NEXTEST_EXECUTION_MODE=process-per-test`
+    /// guard). Under process-per-test there is no competing consumer, so the
+    /// deadline really does bound `decode`, and the stale cached reader is
+    /// harmless because the process exits moments later. That same guard is what
+    /// makes the panic safety of [`Self::new`] acceptable — read its note before
+    /// reusing this type anywhere else.
+    #[cfg(unix)]
+    struct CrosstermInputProbe {
+        master: std::fs::File,
+        /// Kept alive only so the slave end stays open for the probe's lifetime;
+        /// fd 0 is a `dup` of it and is what crossterm actually reads.
+        _slave: std::fs::File,
+        /// `dup` of the original fd 0, put back by `Drop`; `-1` if that `dup`
+        /// failed. `-1` does NOT prove fd 0 was closed — `dup` also fails with
+        /// `EMFILE`/`EINTR` on a perfectly valid stdin — so `Drop` reads it only
+        /// as "nothing to put back" and never closes fd 0 on its strength.
+        saved_stdin: libc::c_int,
+    }
+
+    #[cfg(unix)]
+    impl CrosstermInputProbe {
+        /// # Panic safety: none, deliberately
+        ///
+        /// The two `openpty` descriptors stay bare `c_int`s until the last few
+        /// lines, so any failing assertion below leaks them, and one that fires
+        /// after the `dup2` also leaves fd 0 pointing at the probe PTY with
+        /// crossterm's raw-mode flag set. No `Drop` runs, because `Self` does not
+        /// exist yet.
+        ///
+        /// That is acceptable for exactly one reason: the only caller refuses to
+        /// run unless it owns the process, so a panic here means a dedicated,
+        /// already-failed process that is about to exit and take the leaked
+        /// descriptors and the redirected fd 0 with it. There is no sibling test
+        /// left to corrupt, and no production code in this process at all.
+        /// Loosen that guard — or call this from anywhere else — and this needs
+        /// real `OwnedFd` plumbing first.
+        fn new() -> Self {
+            let mut master: libc::c_int = -1;
+            let mut slave: libc::c_int = -1;
+            // SAFETY: `openpty` writes the two fds through the out-pointers; the
+            // trailing name/termios/winsize arguments are documented as optional
+            // and passed as NULL.
+            //
+            // All three NULLs are `null_mut`, not `null`, because macOS and glibc
+            // disagree on the constness of the last two: Apple declares them
+            // `*mut termios` / `*mut winsize` while glibc declares them `*const`.
+            // `null_mut` satisfies both — exactly on macOS, and by the standard
+            // `*mut T` -> `*const T` coercion on Linux, which also pins the
+            // otherwise-free `T` from each parameter's expected type. `null()`
+            // builds on Linux and breaks the macOS build (rustc E0308), so do not
+            // "simplify" these back.
+            let rc = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(
+                rc,
+                0,
+                "openpty failed ({}). This test needs a PTY to hand crossterm's own \
+                 decoder real input.",
+                std::io::Error::last_os_error()
+            );
+
+            // SAFETY: termios/fcntl calls on the fd `openpty` just handed us,
+            // which is open and unshared for the whole block. On an assertion
+            // failure the two fds leak — see the panic-safety note above for why
+            // that is tolerable here.
+            //
+            // RAW, because a canonical-mode slave withholds bytes until a newline
+            // and `cfmakeraw` also clears ISIG/IXON — so 0x03/0x1a/0x11 arrive as
+            // DATA instead of signalling or flow-controlling the test process.
+            // This is also the state the deck's own terminal is in.
+            //
+            // NON-BLOCKING, because crossterm reads only after `poll` reports
+            // POLLIN but loops and reads again while an escape sequence is
+            // incomplete; on a blocking fd that second read would hang the whole
+            // process, whereas `EWOULDBLOCK` sends it back to `poll` and lets the
+            // per-keypress deadline in `decode` fail cleanly instead.
+            unsafe {
+                let mut tio: libc::termios = std::mem::zeroed();
+                assert_eq!(
+                    libc::tcgetattr(slave, &mut tio),
+                    0,
+                    "tcgetattr on the probe pty slave ({})",
+                    std::io::Error::last_os_error()
+                );
+                libc::cfmakeraw(&mut tio);
+                assert_eq!(
+                    libc::tcsetattr(slave, libc::TCSANOW, &tio),
+                    0,
+                    "tcsetattr on the probe pty slave ({})",
+                    std::io::Error::last_os_error()
+                );
+                let flags = libc::fcntl(slave, libc::F_GETFL);
+                assert_ne!(
+                    flags,
+                    -1,
+                    "F_GETFL on the probe pty slave ({})",
+                    std::io::Error::last_os_error()
+                );
+                assert_ne!(
+                    libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK),
+                    -1,
+                    "F_SETFL O_NONBLOCK on the probe pty slave ({})",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            // SAFETY: `dup`/`dup2` on fd 0 with an fd we own. The `dup` result is
+            // stashed unchecked ON PURPOSE: a failure only costs us the ability to
+            // restore fd 0 in `Drop`, which in this process nobody observes, and
+            // `-1` is explicitly NOT read as "fd 0 was closed" (see the field's
+            // doc). The `dup2` itself is asserted, because without it crossterm
+            // would read the developer's real terminal rather than the probe.
+            let saved_stdin = unsafe { libc::dup(libc::STDIN_FILENO) };
+            let rc = unsafe { libc::dup2(slave, libc::STDIN_FILENO) };
+            assert_ne!(
+                rc,
+                -1,
+                "dup2 of the probe pty onto stdin failed ({})",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(
+                unsafe { libc::isatty(libc::STDIN_FILENO) },
+                1,
+                "stdin must be the probe pty, otherwise crossterm would fall back \
+                 to /dev/tty and read the developer's real terminal"
+            );
+
+            // crossterm's decoder branches on its OWN raw-mode flag for `0x0a`
+            // (upstream issue #371: in raw mode `\n` is Ctrl+J, in cooked mode it
+            // is Enter), so the probe has to match the deck: raw. `tty_fd()`
+            // resolves to the fd-0 pty installed above, so this cannot touch the
+            // developer's terminal.
+            crossterm::terminal::enable_raw_mode().expect("enable raw mode on the probe pty");
+            assert!(
+                crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
+                "crossterm must report raw mode, otherwise 0x0a decodes as Enter and \
+                 re-encodes as 0x0d"
+            );
+
+            // SAFETY: both fds came from our own `openpty` and have not been
+            // handed to anything that closes them, so wrapping them in `File`
+            // moves sole ownership to `Self` and they close on `Drop`. (fd 0 is a
+            // separate descriptor — the `dup2` above — and is dealt with there.)
+            // This is the first point at which anything is owned; every assertion
+            // before it leaks.
+            let (master, slave) = unsafe {
+                use std::os::unix::io::FromRawFd;
+                (
+                    std::fs::File::from_raw_fd(master),
+                    std::fs::File::from_raw_fd(slave),
+                )
+            };
+            Self {
+                master,
+                _slave: slave,
+                saved_stdin,
+            }
+        }
+
+        /// Feed `bytes` as if the terminal had sent them, and return the single
+        /// `KeyEvent` crossterm decodes from them.
+        ///
+        /// The deadline is a real bound only because the caller owns the process:
+        /// with no other event consumer, a `poll` that reports POLLIN is followed
+        /// by a `read` that cannot be beaten to the queued event, so `read`
+        /// returns rather than blocking past the deadline.
+        fn decode(&self, bytes: &[u8]) -> KeyEvent {
+            use std::io::Write;
+            (&self.master)
+                .write_all(bytes)
+                .expect("write the keypress into the probe pty");
+            (&self.master).flush().expect("flush the probe pty");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "crossterm decoded no key event from {bytes:02x?} within 5s"
+                );
+                if !crossterm::event::poll(std::time::Duration::from_millis(50))
+                    .expect("poll the probe pty")
+                {
+                    continue;
+                }
+                match crossterm::event::read().expect("read from the probe pty") {
+                    crossterm::event::Event::Key(key) => return key,
+                    // A stray resize/focus event is not what we asked about.
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CrosstermInputProbe {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            // SAFETY: put back the fd 0 we replaced, using a descriptor this
+            // struct owns. If the `dup` in `new` failed there is nothing to put
+            // back, and fd 0 is left as the (soon to be closed) probe pty rather
+            // than closed outright — closing it would be acting on an inference
+            // `dup` failure does not support. Harmless: the caller owns the
+            // process and it is about to exit.
+            unsafe {
+                if self.saved_stdin >= 0 {
+                    libc::dup2(self.saved_stdin, libc::STDIN_FILENO);
+                    libc::close(self.saved_stdin);
+                }
+            }
+        }
+    }
+
+    /// PRD #227 review item A: the encoder must be the exact INVERSE of
+    /// crossterm's decoder over the whole control range, in BOTH wire forms.
+    ///
+    /// This is the property test that the one-alias-at-a-time fixes kept missing.
+    /// `Ctrl+[` regressed under M2, was fixed by naming `[`, and then `Ctrl+3`
+    /// and `Ctrl+8` regressed the same way — because nothing asserted the
+    /// mapping was *complete*. Feeding every control byte through crossterm and
+    /// back out through [`keyevent_to_bytes`] catches all of them at once, and
+    /// catches the next one for free.
+    ///
+    /// Every byte in `0x00..=0x1f` plus `0x7f` round-trips; there is no
+    /// documented exception. `0x0a` is the one that DEPENDS on terminal state:
+    /// crossterm reports it as `Ctrl+J` in raw mode (which re-encodes to `0x0a`)
+    /// but as `Enter` in cooked mode (which would re-encode to `0x0d`), so the
+    /// probe asserts raw mode is active — matching the deck, which never runs
+    /// the pane-input path outside raw mode.
+    ///
+    /// Runs only under a process-per-test runner — `cargo nextest`, i.e.
+    /// `cargo test-fast`, the fast-tier gate — because [`CrosstermInputProbe`]
+    /// is sound only with the process to itself; see the guard at the top of the
+    /// body.
+    #[cfg(unix)]
+    #[test]
+    fn keyevent_ctrl_c0_matches_crossterm_decoder() {
+        // Decision 26-style runtime skip. The precondition
+        // [`CrosstermInputProbe`] documents is PROCESS ISOLATION, so the guard
+        // asserts that property directly instead of a proxy for it: nextest
+        // publishes its isolation model in `NEXTEST_EXECUTION_MODE`, and only the
+        // value `process-per-test` means "this process is yours". Every other
+        // reading skips — variable absent (a plain `cargo test` puts every unit
+        // test of the crate in ONE process), empty, renamed, or some future
+        // shared-process mode — because the guard has to fail safe: a sibling
+        // stdin/event consumer turns `decode`'s bounded wait into an unbounded one
+        // (a hang, not a failure), and a sibling toggling crossterm's
+        // process-global raw-mode flag makes phase 1's `0x0a` expectation WRONG
+        // rather than merely slow. A shared-process runner that still advertised
+        // itself as nextest would walk straight into both. `cargo test-fast` is
+        // nextest in process-per-test mode, so the official fast-tier gate
+        // (CLAUDE.md rule 5) runs this test.
+        let process_per_test = matches!(
+            std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+            Ok("process-per-test")
+        );
+        if !process_per_test {
+            eprintln!(
+                "SKIP: keyevent_ctrl_c0_matches_crossterm_decoder needs \
+                 NEXTEST_EXECUTION_MODE=process-per-test, i.e. PROCESS ISOLATION (it \
+                 installs a PTY on fd 0 and drives crossterm's process-global raw-mode \
+                 flag and cached event reader). Run it under `cargo test-fast` / \
+                 `cargo nextest run`, which is process-per-test; plain `cargo test` shares \
+                 one process across the whole crate, and any other execution mode is \
+                 skipped the same way."
+            );
+            return;
+        }
+
+        let probe = CrosstermInputProbe::new();
+
+        // --- Phase 1: the LEGACY wire form. Every control byte a legacy
+        // terminal can deliver must survive decode → encode unchanged. ---
+        for byte in (0x00u8..=0x1f).chain(std::iter::once(0x7f)) {
+            let key = probe.decode(&[byte]);
+            assert_eq!(
+                keyevent_to_bytes(&key).as_deref(),
+                Some(&[byte][..]),
+                "control byte {byte:#04x} decoded by crossterm as {key:?} did not re-encode \
+                 to itself — the deck would forward something else to the agent's PTY"
+            );
+        }
+
+        // --- Phase 2: the M2 wire form. `DISAMBIGUATE_ESCAPE_CODES` makes the
+        // terminal send `CSI <codepoint>;5u` instead of the collapsed byte, so
+        // crossterm reports `Char(c) + CONTROL` and producing the byte becomes
+        // the deck's job. This is the form that regressed twice. ---
+        for (ch, want) in CTRL_C0_SYMBOL_ALIASES
+            .iter()
+            .copied()
+            .chain(ctrl_c0_letter_aliases())
+        {
+            // `1 + ctrl(4)` = 5 — the kitty modifier parameter for Ctrl alone.
+            let wire = format!("\x1b[{};5u", ch as u32);
+            let key = probe.decode(wire.as_bytes());
+            assert_eq!(
+                keyevent_to_bytes(&key).as_deref(),
+                Some(&[want][..]),
+                "{wire:?} (Ctrl+{ch:?}) decoded by crossterm as {key:?} must forward \
+                 {want:#04x}; forwarding the literal character instead is the Ctrl+[ / \
+                 Ctrl+3 regression"
+            );
+        }
+
+        // --- Phase 3: the modifier-bearing keys M1/M3 added, checked against
+        // the real decoder rather than a hand-made `KeyEvent`. Each of these is
+        // its own inverse: what a kitty terminal sends is exactly what the deck
+        // forwards. ---
+        for (wire, want) in [
+            // The headline of PRD #227.
+            ("\x1b[13;2u", "\x1b[13;2u"), // Shift+Enter
+            ("\x1b[13;5u", "\x1b[13;5u"), // Ctrl+Enter
+            ("\x1b[1;2A", "\x1b[1;2A"),   // Shift+Up
+            ("\x1b[1;2B", "\x1b[1;2B"),   // Shift+Down
+            ("\x1b[1;5C", "\x1b[1;5C"),   // Ctrl+Right
+            ("\x1b[1;5D", "\x1b[1;5D"),   // Ctrl+Left
+        ] {
+            let key = probe.decode(wire.as_bytes());
+            assert_eq!(
+                keyevent_to_bytes(&key).as_deref(),
+                Some(want.as_bytes()),
+                "{wire:?} decoded by crossterm as {key:?} must be forwarded verbatim as \
+                 {want:?}; collapsing it to the unmodified legacy byte is the bug PRD #227 \
+                 fixes"
+            );
+        }
+    }
+
     #[test]
     fn keyevent_alt_prefix() {
         let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
@@ -19948,6 +20804,14 @@ mod tests {
         assert_eq!(
             keyevent_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL)),
+            Some(b"\x1b[1;5A".to_vec())
         );
         assert_eq!(
             keyevent_to_bytes(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
