@@ -14,9 +14,25 @@ use std::time::{Duration, Instant};
 use dot_agent_deck::event::AgentEvent;
 use spec::spec;
 
+/// A hook endpoint nothing can ever be listening on.
+///
+/// `wrap` resolves `DOT_AGENT_DECK_SOCKET` at *emit* time and tags each event
+/// with the ambient `DOT_AGENT_DECK_PANE_ID`, so a wrapper subprocess that
+/// inherits both writes `<pane>-session` status straight into whichever real
+/// pane is running the suite — a developer running these tests inside the deck
+/// watches their own card flip through session_start/thinking/idle. Every site
+/// below that does not care about emitted events points here instead and drops
+/// the inherited ids; `hook::send_to_socket` treats an unreachable endpoint as a
+/// no-op. `codex_wrap_005` is the deliberate exception: it binds a real socket
+/// because the events are what it asserts on.
+const UNREACHABLE_HOOK_SOCKET: &str = "/nonexistent/dot-agent-deck-wrap-tests.sock";
+
 fn run_wrap(script: &str, stdin: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args(["wrap", "--agent", "codex", "--", "/bin/sh", "-c", script])
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -88,6 +104,9 @@ fn run_with_stderr_redirected() -> (bool, Vec<u8>, Vec<u8>) {
             "-c",
             "printf 'mixed-stderr-marker\\n' >&2",
         ])
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::from(
             slave.try_clone().expect("clone PTY slave for stdin"),
         ))
@@ -117,6 +136,9 @@ fn run_with_stdout_redirected() -> (bool, Vec<u8>) {
              if [ -t 2 ]; then error=tty; else error=pipe; fi; \
              printf 'stdin=%s stderr=%s\\n' \"$input\" \"$error\"",
         ])
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::from(
             slave.try_clone().expect("clone PTY slave for stdin"),
         ))
@@ -182,6 +204,9 @@ fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
             "-c",
             "printf 'pipe-out\\n'; printf 'pipe-err\\n' >&2",
         ])
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(pipe_stderr))
@@ -202,6 +227,9 @@ fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
             "-c",
             "cat > \"$WRAP_STDIN_RECORD\"",
         ])
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .env("WRAP_STDIN_RECORD", &binary_record)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -344,7 +372,10 @@ fn run_signal_case(
             "-c",
             "printf '%s\\n' \"$$\" > \"$WRAP_CHILD_PID_FILE\"; exec /bin/sleep 60",
         ])
-        .env("WRAP_CHILD_PID_FILE", &pid_path);
+        .env("WRAP_CHILD_PID_FILE", &pid_path)
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID");
 
     let _master = if interactive {
         let (master, slave) = open_pty();

@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -53,6 +54,23 @@ pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 /// [`crate::hook`] all reference the same symbol so two string
 /// literals can't drift apart.
 pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
+
+/// Hook-ingestion endpoint override read by [`crate::config::socket_path`].
+///
+/// The daemon injects its OWN bound hook-socket path into every agent it
+/// spawns ([`AgentPtyRegistry::spawn_agent`]) so a child never has to
+/// re-resolve the endpoint from ambient environment. Everything downstream of
+/// a spawn that emits events — `dot-agent-deck wrap`, the `hook` /
+/// `agent-event` verbs, an agent's installed hook script — resolves this var
+/// at *emit* time, so without the injection a child inherits whatever
+/// `XDG_RUNTIME_DIR` its grandparent happened to carry. That is exactly how a
+/// test-spawned agent's events used to land in the developer's *live* daemon
+/// and surface as phantom dashboard cards: the test overrode
+/// [`DOT_AGENT_DECK_PANE_ID`] but not the socket, so the events arrived at the
+/// real deck tagged with a pane id it had never heard of.
+///
+/// A caller-supplied value always wins — the injection only fills the gap.
+pub const DOT_AGENT_DECK_SOCKET: &str = "DOT_AGENT_DECK_SOCKET";
 
 /// Test-only safety watchdog: when set truthy (`1`/`true`/`yes`/`on`), a
 /// `daemon serve` captures its parent pid at startup and gracefully exits once
@@ -1531,6 +1549,11 @@ pub struct AgentPtyRegistry {
     /// fingerprint is a CONFLICT (never a false replay). Bounded by LRU eviction —
     /// see [`MAX_DELIVERY_RESULTS`].
     delivery_ledger: Mutex<DeliveryLedger>,
+    /// The hook-ingestion socket this registry's daemon is bound to, injected
+    /// into spawned children as [`DOT_AGENT_DECK_SOCKET`]. `None` for a
+    /// registry with no owning daemon (in-process unit tests), in which case
+    /// no injection happens and children resolve the endpoint the old way.
+    hook_socket: Mutex<Option<PathBuf>>,
 }
 
 struct RegistryInner {
@@ -1569,7 +1592,19 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             user_input_at: Mutex::new(HashMap::new()),
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
+            hook_socket: Mutex::new(None),
         }
+    }
+
+    /// Record the hook-ingestion socket the owning daemon bound, so
+    /// [`spawn_agent`](Self::spawn_agent) can inject it into every child as
+    /// [`DOT_AGENT_DECK_SOCKET`]. Called once from
+    /// [`crate::daemon::run_daemon_with`] right after the bind succeeds.
+    ///
+    /// Idempotent and last-writer-wins: a daemon binds exactly one hook
+    /// socket for its lifetime, so a second call would carry the same path.
+    pub fn set_hook_socket(&self, path: PathBuf) {
+        *self.hook_socket.lock().unwrap() = Some(path);
     }
 
     /// PRD #127 M2.2: record that a user keystroke just reached the pane with
@@ -1706,6 +1741,19 @@ impl AgentPtyRegistry {
                     None
                 }
             });
+
+        // Point the child at THIS daemon's hook socket rather than letting it
+        // re-resolve the endpoint from inherited environment at emit time.
+        // A caller-supplied value wins (tests pin their own socket, and
+        // `respawn_agent_for_pane` replays a `spawn_env` that already carries
+        // ours), so this only fills the gap.
+        if !opts.env.iter().any(|(k, _)| k == DOT_AGENT_DECK_SOCKET)
+            && let Some(sock) = self.hook_socket.lock().unwrap().clone()
+            && let Some(sock) = sock.to_str()
+        {
+            opts.env
+                .push((DOT_AGENT_DECK_SOCKET.to_string(), sock.to_string()));
+        }
 
         // M2.11: capture display_name and cwd into the registry so renamed
         // panes survive a reconnect. Both go through the same validation
@@ -4933,6 +4981,81 @@ mod spawn_tests {
             status.exit_code(),
             42,
             "opts.env PANE_ID was clobbered — scrub must run before opts.env is applied"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Hook-socket injection + pane provenance. Together these stop a child
+    // from re-resolving the hook endpoint out of inherited environment: a
+    // test-spawned agent whose events resolved the developer's real socket
+    // used to surface as a phantom card in whatever deck the test ran inside.
+    // ---------------------------------------------------------------------
+
+    /// Read back what the child actually saw for `DOT_AGENT_DECK_SOCKET` by
+    /// having it write the value to a file, so the assertion covers the real
+    /// child environment rather than the registry's bookkeeping.
+    fn child_observed_socket(
+        registry: &AgentPtyRegistry,
+        pane_id: &str,
+        extra_env: Vec<(String, String)>,
+    ) -> String {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let out = dir.path().join("socket.txt");
+        let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())];
+        env.extend(extra_env);
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&format!(
+                    "sh -c 'printf \"%s\" \"${{DOT_AGENT_DECK_SOCKET:-<unset>}}\" > {}'",
+                    out.display()
+                )),
+                env,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        // The child writes and exits promptly; poll rather than sleep a fixed
+        // span so a fast machine doesn't wait and a loaded one doesn't flake.
+        for _ in 0..200 {
+            if let Ok(v) = std::fs::read_to_string(&out)
+                && !v.is_empty()
+            {
+                return v;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("child never reported its DOT_AGENT_DECK_SOCKET");
+    }
+
+    #[test]
+    fn spawn_agent_injects_the_daemons_hook_socket_into_the_child() {
+        let registry = AgentPtyRegistry::new();
+        registry.set_hook_socket(PathBuf::from("/tmp/dad-test-daemon.sock"));
+        let observed = child_observed_socket(&registry, "pane-inject", vec![]);
+        registry.shutdown_all();
+        assert_eq!(
+            observed, "/tmp/dad-test-daemon.sock",
+            "the child must be handed the daemon's own hook socket, not left to \
+             re-resolve one from inherited environment at emit time"
+        );
+    }
+
+    #[test]
+    fn spawn_agent_lets_a_caller_supplied_hook_socket_win() {
+        let registry = AgentPtyRegistry::new();
+        registry.set_hook_socket(PathBuf::from("/tmp/dad-test-daemon.sock"));
+        let observed = child_observed_socket(
+            &registry,
+            "pane-explicit",
+            vec![(
+                DOT_AGENT_DECK_SOCKET.to_string(),
+                "/tmp/dad-test-caller.sock".to_string(),
+            )],
+        );
+        registry.shutdown_all();
+        assert_eq!(
+            observed, "/tmp/dad-test-caller.sock",
+            "injection must only fill a gap — an explicit socket (tests pinning \
+             their own, or a respawn replaying spawn_env) has to win"
         );
     }
 
