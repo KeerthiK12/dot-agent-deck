@@ -695,7 +695,57 @@ pub struct AgentPty {
 /// 3 s matches the F1 graceful-shutdown grace, which is the natural
 /// sibling. Hardcoded as a constant for now (one symbol to find) rather
 /// than lifted to `DashboardConfig` until a real user need surfaces.
-pub(crate) const AGENT_TERMINATE_GRACE: Duration = Duration::from_secs(3);
+/// `pub` so the wrapper-escalation test can assert against the real deadline
+/// instead of duplicating the number — a change here must keep that test honest.
+pub const AGENT_TERMINATE_GRACE: Duration = Duration::from_secs(3);
+
+/// Divisor giving the wrapper's grace from the deck's. See
+/// [`WRAP_TERMINATE_GRACE`] for why this is a fraction and not a thin
+/// subtraction.
+pub(crate) const WRAP_GRACE_DIVISOR: u32 = 2;
+
+/// The wrapper's own SIGTERM→SIGKILL grace, deliberately SHORTER than
+/// [`AGENT_TERMINATE_GRACE`].
+///
+/// A wrapped agent sits two levels below the deck, in a process group the deck
+/// cannot signal: portable-pty `setsid`s the wrapper, then the wrapper
+/// `setsid`s the agent again so it can own the inner PTY as its controlling
+/// terminal ([`crate::wrap`]). So `killpg(wrapper_pgid, …)` reaches the wrapper
+/// ONLY — the agent is reachable exclusively via the wrapper forwarding to its
+/// own child group.
+///
+/// Both graces used to be `AGENT_TERMINATE_GRACE`, which made teardown a race
+/// the wrapper could not win: the deck SIGTERMs the wrapper at T0 and SIGKILLs
+/// it at T0+grace, while the wrapper forwarded SIGTERM at ~T0 and armed its own
+/// escalation for ~T0+grace. Both deadlines fell together and the wrapper's is
+/// only checked on a reap-loop tick, so the deck killed the wrapper first and an
+/// agent that had not exited on SIGTERM — a wedged agent, or any interactive
+/// shell, which ignores SIGTERM — was orphaned to init.
+///
+/// Halving makes the wrapper always escalate first, so the agent is dead before
+/// the deck's SIGKILL removes the only process that can signal it.
+///
+/// A fraction, not a thin subtraction: the wrapper's chain is observe-signal →
+/// forward → wait out its grace → `SIGKILL` → reap, and the *observe* step
+/// depends on where the reap loop sits in its 50 ms cadence and how loaded the
+/// host is. A host running dozens of agents can stretch that tick, and any
+/// overrun puts the agent back to being orphaned — so the headroom should not be
+/// a couple of scheduler quanta. Half the budget cannot be eaten that way.
+/// Measured through `close_agent`, the wrapper escalates 1.503 s after observing
+/// SIGTERM, against the deck's 3.0 s.
+///
+/// The cost is deliberate: a slow-but-honest agent gets half as long to exit on
+/// SIGTERM before the wrapper escalates. Orphaning a live agent process is the
+/// worse outcome, and the deck's own grace is unchanged as the outer bound.
+pub(crate) const WRAP_TERMINATE_GRACE: Duration =
+    Duration::from_millis(AGENT_TERMINATE_GRACE.as_millis() as u64 / WRAP_GRACE_DIVISOR as u64);
+
+// The ordering above is load-bearing, not stylistic: if these ever became equal
+// (or inverted) the orphan bug returns silently, so pin it at compile time.
+const _: () = assert!(
+    WRAP_TERMINATE_GRACE.as_millis() < AGENT_TERMINATE_GRACE.as_millis(),
+    "the wrapper must escalate to SIGKILL strictly before the deck kills the wrapper"
+);
 
 // PRD #42 M1: the process-group teardown helpers (`pid_to_pgid`,
 // `signal_child_pgroup_or_fallback`, `force_kill_child_and_wait`,

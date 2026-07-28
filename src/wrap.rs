@@ -729,7 +729,11 @@ impl SignalForwarder {
     fn terminate_with(&mut self, signal: libc::c_int) {
         if self.escalate_deadline.is_none() {
             kill_pid_group(self.pid, signal);
-            self.escalate_deadline = Some(Instant::now() + crate::agent_pty::AGENT_TERMINATE_GRACE);
+            // Strictly shorter than the deck's own grace against THIS wrapper —
+            // we are the only process that can signal the agent's group, so we
+            // have to finish before the deck kills us. See
+            // `WRAP_TERMINATE_GRACE`.
+            self.escalate_deadline = Some(Instant::now() + crate::agent_pty::WRAP_TERMINATE_GRACE);
         }
     }
 }
