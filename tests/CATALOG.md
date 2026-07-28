@@ -1874,6 +1874,34 @@ without depending on the config struct API.
 - **Does not assert:** the work-done leg (logged as a soft observation; hard-covered by `codex/worker/001`); the launch-shape half of PRD #225 (`codex/spawn/007` for the hook-learned badge, `codex/spawn/008` for the respawn wrap decision); the hookless-wrapper guard (`orchestration/delegate/008`).
 - **Platform coverage:** mac+linux (unix-only — writes an executable role script).
 
+##### orchestration/delegate/010 — An observed replacement `SessionStart` starts, but does not bypass, the delegate readiness buffer (PRD #249 M1).
+- **Layer:** fast synthetic PTY integration (real `handle_delegate` + `clear = true` respawn + in-process daemon hook socket; no LLM and no `e2e` feature gate).
+- **Agent:** synthetic hook-emitting worker backed by `cat`.
+- **Asserts:** with `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=1000`, the task pointer is absent 350 ms after the replacement agent's matching `SessionStart` and appears after the configured buffer elapses.
+- **Does not assert:** real-agent startup timing or timeout-fallback behavior (covered by `orchestration/delegate/011` and `/012`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/011 — The timeout fallback waits the delegate readiness buffer even when no `SessionStart` arrives (PRD #249 M1).
+- **Layer:** fast synthetic PTY integration (real `handle_delegate` + `clear = true` respawn + daemon broadcast, with Tokio's clock paused to cross the production timeout instantly; no socket, LLM, or `e2e` feature gate).
+- **Agent:** hookless `cat` stand-in that never emits `SessionStart`.
+- **Asserts:** after the 30-second fallback expires in virtual time, the pointer remains absent while the additional 1000 ms readiness buffer is still running and is delivered afterward.
+- **Does not assert:** the observed-`SessionStart` branch or whether a real hookless agent is interactive at fallback time.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/012 — A slow-readiness toggle proves the delegate buffer prevents lost payload and submit bytes (PRD #249 M4).
+- **Layer:** fast synthetic real-binary-subprocess integration (real `handle_delegate`, respawn, hook socket, managed PTY, and Python raw-mode readiness stub; no LLM and no `e2e` feature gate).
+- **Agent:** deterministic slow-readiness stand-in that discards PTY input for 650 ms after `SessionStart`, then echoes accepted bytes in raw mode.
+- **Asserts:** changing only `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` loses the pointer at `0`, while `1000` delivers the pointer and its trailing submit CR after the measured input-readiness window.
+- **Does not assert:** a real Claude or OpenCode timing distribution; the deterministic stub pins the race that real-agent timing cannot reproduce reliably.
+- **Platform coverage:** mac+linux (unix-only — Python `termios` raw-mode stub).
+
+##### orchestration/delegate/013 — A worker that receives a delegate and then emits no event produces a visible orchestrator notice (PRD #249 M3).
+- **Layer:** fast synthetic PTY integration (real `handle_delegate`, managed worker and orchestrator PTYs, and shortened worker-response window; no LLM and no `e2e` feature gate).
+- **Agent:** silent `cat` worker plus a raw no-echo orchestrator observer.
+- **Asserts:** the worker first receives the task pointer, then its lack of any agent event produces an LF-terminated notice in the orchestrator pane naming the delegated `coder` role and the missing event; LF distinguishes `write_to_pane_notice` from a submitted LLM prompt.
+- **Does not assert:** tracing output from the companion `warn!`, an actual agent response, or recovery after the notice.
+- **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
