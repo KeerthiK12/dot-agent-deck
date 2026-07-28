@@ -1491,6 +1491,37 @@ async fn deliver_payload_and_submit(
     PayloadDelivery::Applied
 }
 
+/// PRD #249 M3: the [`SubmitMode::Notice`] counterpart of
+/// [`deliver_payload_and_submit`] — payload, then a single `\n`, with no
+/// `SUBMIT_DELAY` and no CR. Shares the partial-write classification for the same
+/// reason: a notice whose payload landed but whose LF did not leaves the target
+/// holding un-terminated bytes, which a blind retry would duplicate into the
+/// pane.
+///
+/// No submit delay because there is nothing to keep the terminator from fusing
+/// to: LF is not an Enter for the agents this project drives, so the pause that
+/// `SUBMIT_DELAY` exists to create has no meaning here (matching
+/// [`AgentPtyRegistry::write_to_pane_notice`]'s unguarded path).
+async fn deliver_payload_as_notice(
+    w: &mut (dyn std::io::Write + Send),
+    payload: &[u8],
+) -> PayloadDelivery {
+    match write_all_tracked(w, payload) {
+        WriteProgress::Complete => {}
+        WriteProgress::Partial => return PayloadDelivery::Ambiguous,
+        WriteProgress::NothingWritten(e) => return PayloadDelivery::CleanFailure(e),
+    }
+    let _ = w.flush();
+    match write_all_tracked(w, b"\n") {
+        WriteProgress::Complete => {}
+        WriteProgress::Partial | WriteProgress::NothingWritten(_) => {
+            return PayloadDelivery::Ambiguous;
+        }
+    }
+    let _ = w.flush();
+    PayloadDelivery::Applied
+}
+
 /// One agent owned by the registry: child + master + shared writer + bus.
 /// Field names are stable — tests and tooling that peek into the registry
 /// (e.g. for `process_id()`) rely on `child` existing here.
@@ -2927,6 +2958,66 @@ impl AgentPtyRegistry {
     where
         Fut: std::future::Future<Output = bool>,
     {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Submit,
+            expected_agent_id,
+            revalidate,
+        )
+        .await
+    }
+
+    /// PRD #249 M3: [`Self::write_to_pane_notice`] under
+    /// [`Self::write_and_submit_guarded`]'s identity gate — the LF-terminated
+    /// visibility path, but bound to an EXACT target identity.
+    ///
+    /// A pane id is just a string: an orchestrator that exited (or was closed)
+    /// frees its `pane_id_env` for the next spawn, and an unguarded notice would
+    /// then write one orchestration's diagnostics into a stranger's pane —
+    /// `scheduler/idle-worker/008` and `/014` pin exactly that. The bytes are
+    /// unsubmitted, so the stranger is not made to *act* on them, but they are
+    /// still someone else's context and someone else's scrollback.
+    ///
+    /// Failure and refusal are reported through the same [`GuardedSend`] vocabulary
+    /// so callers classify a refused notice the way they classify a refused prompt.
+    pub async fn write_notice_guarded<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: Option<&str>,
+        revalidate: impl FnOnce() -> Fut,
+    ) -> Result<GuardedSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Notice,
+            expected_agent_id,
+            revalidate,
+        )
+        .await
+    }
+
+    /// The shared body of [`Self::write_and_submit_guarded`] (payload +
+    /// `SUBMIT_DELAY` + CR) and [`Self::write_notice_guarded`] (payload + LF).
+    /// Only the delivery tail differs; every identity, liveness and rebind check
+    /// — and the writer-held re-validation barrier that closes the TOCTOU — is
+    /// common, so the two entrypoints cannot drift apart on the parts that make
+    /// the send safe.
+    async fn write_guarded<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        mode: SubmitMode,
+        expected_agent_id: Option<&str>,
+        revalidate: impl FnOnce() -> Fut,
+    ) -> Result<GuardedSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
         let is_paneless = pane_id == "<no-pane>";
         let target = if is_paneless {
             // Resolve BY agent identity; no identity → nothing to route to.
@@ -2983,7 +3074,11 @@ impl AgentPtyRegistry {
         // failure before any byte reached the PTY is a clean, retryable transport
         // error; a partial write (payload started, or the submit CR failed after
         // the payload landed) is AMBIGUOUS and must not be blind-retried.
-        match deliver_payload_and_submit(&mut **w, &payload).await {
+        let delivery = match mode {
+            SubmitMode::Submit => deliver_payload_and_submit(&mut **w, &payload).await,
+            SubmitMode::Notice => deliver_payload_as_notice(&mut **w, &payload).await,
+        };
+        match delivery {
             PayloadDelivery::Applied => Ok(GuardedSend::Applied),
             PayloadDelivery::Ambiguous => Ok(GuardedSend::Ambiguous),
             PayloadDelivery::CleanFailure(e) => Err(AgentPtyError::Writer(e)),

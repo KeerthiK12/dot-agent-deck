@@ -1,6 +1,6 @@
 # PRD #249: Delegate prompt lost or unsubmitted on `clear=true` respawn
 
-**Status**: Not started
+**Status**: In progress — M1, M3 and M4's fast tier landed; M2, M4's real-agent e2e, M5 and M6 outstanding
 **Priority**: High
 **Created**: 2026-07-28
 **GitHub Issue**: [#249](https://github.com/vfarcic/dot-agent-deck/issues/249)
@@ -174,10 +174,10 @@ The maintainer cannot reproduce the severe variant, so the reporters are the ins
 
 ## Milestones
 
-- [ ] **M1**: Readiness gate applied before the legacy injection on both branches, env-overridable
+- [x] **M1**: Readiness gate applied before the legacy injection on both branches, env-overridable
 - [ ] **M2**: OpenCode `clear = true` exposure established empirically and covered
-- [ ] **M3**: Undelivered-prompt failure surfaced rather than silent
-- [ ] **M4**: Slow-readiness toggle test (fails at 0, passes at chosen buffer) plus fast-tier assertions and a real-agent e2e
+- [x] **M3**: Undelivered-prompt failure surfaced rather than silent
+- [x] **M4**: Slow-readiness toggle test (fails at 0, passes at chosen buffer) plus fast-tier assertions — real-agent e2e still outstanding
 - [ ] **M5**: Docs describe `clear`'s delivery semantics; changelog fragment; rule 12 answer recorded
 - [ ] **M6**: #199 closed with the fix referenced, reporters asked to confirm; retirement dependency filed against #243
 
@@ -194,11 +194,15 @@ The maintainer cannot reproduce the severe variant, so the reporters are the ins
 
 ## Open Questions
 
-1. **What is the real readiness window on a respawned agent?** 500 ms (spawn path) and 1000 ms (@bustapipes' proposal) are both guesses. The M4 harness can measure it.
-2. **Should the gate live in `dispatch_one_owned` or inside `write_to_pane_and_submit`?** Pushing it down covers every caller, not just delegate — broader protection, but it would also delay writes that are not post-respawn and don't need it.
-3. **Do agents need different windows?** If Claude and OpenCode differ materially, the buffer belongs in the agent registry (`src/agent_registry.rs`) rather than as one constant.
-4. **Should the CR get its own readiness re-check?** The maintainer's variant is specifically a lost CR *after* a landed payload, which a single pre-write gate may not fully close if the agent becomes input-ready but not submit-aware mid-write. A second short gate before the terminator, or a verify-and-retry, may be needed.
-5. **Is `SUBMIT_DELAY` = 150 ms adequate on a cold agent?** It was chosen for warm panes. The cold-start case may want a larger value, which would be a narrower fix than the pre-write gate and might address the maintainer's variant on its own.
+1. **What is the real readiness window on a respawned agent?** ~~500 ms (spawn path) and 1000 ms (@bustapipes' proposal) are both guesses.~~ **Answered — measured.** `orchestration/delegate/012` reports the slow-readiness stub's real post-`SessionStart` input-readiness window at **656 ms** (654 ms under full fast-tier load, 657 ms when the test runs alone). The buffer therefore ships at **1000 ms** with ~1.5x margin — measurement-backed rather than symmetric with the spawn path's warm-pane 500 ms. The number is recorded in `DELEGATE_READINESS_BUFFER`'s doc comment and in the changelog fragment so the next timing drift is diagnosable against it.
+2. **Should the gate live in `dispatch_one_owned` or inside `write_to_pane_and_submit`?** **Answered: `dispatch_one_owned`.** Pushing it down would delay every caller — including the many writes that were never post-respawn and need no gate. The gate belongs to the respawn, so it lives in the respawn's arm.
+3. **Do agents need different windows?** **Answered for now: one constant.** No evidence yet that OpenCode's window differs materially from Claude's; revisit only if M2 shows it does, at which point the value moves into `src/agent_registry.rs`.
+4. **Should the CR get its own readiness re-check?** **Answered: no.** `orchestration/delegate/012` asserts both the payload *and* its trailing submit CR land after the pre-write gate against a stub that discards input for 656 ms — i.e. the single pre-write gate closes the "landed but unsubmitted" variant too, with no second gate and no verify-and-retry.
+5. **Is `SUBMIT_DELAY` = 150 ms adequate on a cold agent?** **Answered: yes, unchanged.** Same evidence as question 4 — the CR is honored after the gate at the existing 150 ms.
+
+### New: the readiness gate sleeps one timer tick less than the configured buffer
+
+Tokio rounds every `sleep` deadline UP to the next whole millisecond (`TimeSource::deadline_to_tick` adds 999_999 ns), so `sleep(buffer)` resolves in `buffer..=buffer + 1 ms`. The gate therefore sleeps `buffer - 1 ms`, which makes the configured value the wait's upper bound instead of its lower bound (release window `[buffer - 1 ms, buffer]`). At 1000 ms against a 656 ms measured window a millisecond is noise; what it buys is that the gate stays observable on a **paused virtual clock**, so `orchestration/delegate/011` can advance exactly the configured buffer and see the release instead of missing it by one rounded-up tick. Without it that test cannot cover the fallback branch at all without burning 30 real seconds.
 
 ## Verification Notes (from triage)
 
@@ -216,3 +220,11 @@ Recorded so the implementer does not re-derive them:
 - `CHANGELOG.md:168` — the single-line delegate change that reduced this symptom's frequency without removing its cause.
 - PR #237 (Codex wrapper fix) merged 2026-07-28T18:35Z; wrapper-specific, does not cover Claude's NativeHooks path.
 - `clear = false` confirmed working by @xclydes and @tomikonio on different Claude versions.
+
+## Implementation Notes (M1 + M3, as built)
+
+- **Gate**: `src/state.rs::dispatch_one_owned`, at the end of the respawn's `Ok(new_agent_id)` arm — after the `if !observed` fallback log, so it covers the observed AND timeout-fallback branches by construction, and before the legacy PTY injection. `DELEGATE_READINESS_BUFFER` = 1000 ms, resolved per dispatch by `delegate_readiness_buffer()`; `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` overrides it (`0` = no gate, capped at `MAX_DELEGATE_READINESS_BUFFER` = 30 s, garbage → default with a `warn!`). Pi's native seed path still `return`s before the gate, so it is untouched.
+- **Note on `DOT_AGENT_DECK_SESSION_START_WAIT_MS`**: the Verification Notes above attribute its resolution to `src/state.rs:58-62`. That is wrong — the override is resolved only in `src/spawn.rs::session_start_wait_timeout` (the scheduler mirror); the delegate path uses the bare `SESSION_START_WAIT_TIMEOUT` constant. The new variable mirrors that override's *pattern* without hanging off a shared resolver, and wiring `SESSION_START_WAIT_MS` into the delegate path was deliberately left out of scope.
+- **Visibility (M3)**: `arm_delegate_silence_watch` (`src/state.rs`) subscribes to the hook broadcast *before* the pointer write, then reports a worker that emits no event proving a real turn (`worker_event_proves_delivery` — `SessionStart`/`SessionEnd` don't count; a `clear = true` respawn emits one by definition) within `delegate_no_event_window` = `min(worker_response_timeout, 30 s)`. Reuses PRD #126's knob deliberately: an operator who disabled the idle detector (`0`) gets no silent-worker report either. Output is a `warn!` plus an LF-terminated notice in the orchestrator pane (`compose_delegate_silence_notice`, role name framed by `quote_untrusted_role`).
+- **New registry primitive**: `AgentPtyRegistry::write_notice_guarded` — `write_to_pane_notice`'s LF tail under `write_and_submit_guarded`'s identity gate, sharing one `write_guarded` body so the two entrypoints can't drift on the checks that make a send safe. Required: an unguarded notice violated `scheduler/idle-worker/008` and `/014` (a dead orchestration's diagnostics reached a successor agent that inherited the pane id). The orchestrator's registry identity is captured in `handle_delegate`'s synchronous fan-out, not on the dispatch task's first poll, which can land after the pane changed hands.
+- **Rule 12**: no `PROTOCOL_VERSION` bump and no `.breaking.md`. The change is daemon-internal timing before an existing PTY write plus one additional daemon→pane notice write; no wire shape, field, or field meaning moved. The previous-release-daemon manual check still owed at PR time.
