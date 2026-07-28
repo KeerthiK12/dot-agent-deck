@@ -65,7 +65,7 @@ watch = false
 pattern = "git (log|status|show|diff)"
 watch = false
 
-# Dogfood: mixed agents — orchestrator/auditor=pi (Opus, high thinking), reviewer=opencode (gpt-5.6-pro), tester=codex (gpt-5.6-sol, high reasoning), coder/release=claude. Flip any role back via the commented all-claude command under it.
+# Dogfood: mixed agents — orchestrator=pi (Opus, high thinking), reviewer/auditor=opencode (gpt-5.6-pro), tester=codex (gpt-5.6-sol, high reasoning), coder/release=claude. Flip any role back via the commented all-claude command under it.
 [[orchestrations]]
 name = "dot-agent-deck"
 
@@ -139,7 +139,7 @@ prompt_template = "Review the change. Report findings only — do not modify cod
 
 [[orchestrations.roles]]
 name = "auditor"
-command = "devbox run pi-big"
+command = "devbox run oc-big"
 # command = "devbox run agent-auditor"   # all-claude default
 description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = "Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
