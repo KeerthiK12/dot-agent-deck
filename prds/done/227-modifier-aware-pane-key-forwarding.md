@@ -1,6 +1,6 @@
 # PRD #227: Modifier-aware key forwarding to embedded agent panes (Shift+Enter = newline)
 
-**Status**: Implemented (2026-07-28) — M1–M6 landed on `prd-227-modifier-aware-key-forwarding-to-embedded-agent-pa`; review + audit resolved; pre-PR e2e gate green (2167 tests, 0 failures). Awaiting PR, CI, and merge.
+**Status**: Complete (2026-07-28) — [PR #238](https://github.com/vfarcic/dot-agent-deck/pull/238) squash-merged as `3cc8aa4`, issue #227 closed. M1–M6 all landed; review + audit resolved; pre-PR e2e gate green (2168 tests, 0 failures); CI green on all four platforms. Follow-ups filed: [#242](https://github.com/vfarcic/dot-agent-deck/issues/242) (unify the crossterm dependency), [#247](https://github.com/vfarcic/dot-agent-deck/issues/247) (wall-clock deadline flakes in `spawn_005` / `codex_hooks_003`), [#248](https://github.com/vfarcic/dot-agent-deck/issues/248) (local macOS type-check for the libc surface). No `graduate-` follow-up — shipped visible, no feature flag.
 **Priority**: High
 **Created**: 2026-07-26
 **GitHub Issue**: [#227](https://github.com/vfarcic/dot-agent-deck/issues/227)
