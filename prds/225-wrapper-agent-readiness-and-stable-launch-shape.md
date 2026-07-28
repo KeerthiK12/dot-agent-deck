@@ -4,6 +4,7 @@
 **Priority**: High
 **Created**: 2026-07-26
 **GitHub Issue**: [#225](https://github.com/vfarcic/dot-agent-deck/issues/225)
+**Related**: [PRD #234](234-screen-state-observation-hookless-agents.md) (screen-state observation — the truth source for the hookless-agent readiness case this PRD defers; see Open Question 2 and Risks)
 **Feature flag**: None — this is a defect fix on a shipped surface (the delegate path), not a new user-visible surface. Rule 9 does not apply.
 
 ## Problem Statement
@@ -113,7 +114,7 @@ The second is probably cleaner but touches every reader of `RunningAgent.agent_t
 
 ## Risks
 
-- **Over-fitting to Codex.** The readiness contract has to hold for the next wrapper agent too, or PRD #211 inherits this bug. Mitigated by making the discriminator a registry property, not a Codex special case, and by documenting the contract in M7.
+- **Over-fitting to Codex.** The readiness contract has to hold for the next wrapper agent too, or PRD #211 inherits this bug. Mitigated by making the discriminator a registry property, not a Codex special case, and by documenting the contract in M7. Note this is only *partially* mitigated: a hookless wrapper agent has no real `SessionStart` to wait for, so it keeps today's behaviour (or eats the full timeout) no matter how the discriminator is expressed. That residual gap is [PRD #234](234-screen-state-observation-hookless-agents.md)'s to close, and is a conscious hand-off rather than an oversight — but it means "PRD #211 does not inherit this bug" is not true until #234 lands.
 - **The timeout fallback is load-bearing and untested.** If Codex's native hooks are not installed or not trusted, the gate falls through to the timeout. That path must still deliver a usable prompt, which is why M4 revisits the duration.
 - **Cross-version behavior behind a stable wire.** The marker is additive, but an old wrapper against a new daemon reverts to today's racy behavior. That is acceptable (no worse than current), but it must be a conscious, documented outcome rather than a surprise.
 
@@ -121,6 +122,8 @@ The second is probably cleaner but touches every reader of `RunningAgent.agent_t
 
 1. **Should Codex be wrapped at all when launched via a script?** It is a hybrid whose events come from native hooks, and unwrapped Codex panes work today. If the answer is "no", Defect 2's fix largely subsumes Defect 1 for Codex — but Defect 1 still has to be fixed for `command = "codex"` and for Gemini. Worth settling before M3.
 2. **Is `hook_install.is_some()` the right discriminator** for "this agent will emit a real `SessionStart`", or does that need to be an explicit field on `AgentSpec`? An explicit field is more honest about intent and survives an agent that installs hooks for other reasons.
+
+   **Choose this with [PRD #234](234-screen-state-observation-hookless-agents.md) in mind.** This PRD's fix is *provenance*-based — ignore the synthetic event, wait for the real one — which structurally requires a real one to exist, hence the conditional skip and the hookless hole below. #234 supplies the missing truth source for exactly that case (readiness observed from the screen: the agent has painted its input box, which a launcher script cannot fake). The discriminator chosen here should therefore express "**where does this agent's readiness signal come from**" rather than "does it install hooks", so #234's observed-readiness source can be added as a third answer without re-migrating every call site. An explicit `AgentSpec` field is the shape that survives that; `hook_install.is_some()` is the shape that does not.
 3. **Does the scheduler path want the same semantics?** A scheduled card's prompt has the same delivery problem, but the failure mode and acceptable latency may differ from an interactive delegate.
 
 ## Work Log
