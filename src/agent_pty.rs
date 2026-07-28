@@ -503,7 +503,8 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
 
 /// Returns `true` if `value` is acceptable as an orchestration's
 /// identity cwd: non-empty, ≤ [`CWD_MAX_LEN`] bytes, free of ASCII
-/// control characters, AND an absolute path (starts with `/`).
+/// control characters, AND an absolute path for this platform
+/// ([`is_absolute_project_path`]).
 ///
 /// Round-12 auditor #2: the orchestration_cwd field is treated as
 /// the project root, so being absolute is part of the contract — a
@@ -512,7 +513,71 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
 /// orchestrations whose own resolved cwd happens to match. Reject up
 /// front instead.
 pub fn is_valid_orchestration_cwd(value: &str) -> bool {
-    is_valid_cwd(value) && value.starts_with('/')
+    is_valid_cwd(value) && is_absolute_project_path(value)
+}
+
+/// Whether `value` is an absolute project-root path **on this platform** — the
+/// only platform-dependent half of [`is_valid_orchestration_cwd`] and
+/// [`validate_orchestration_surface`], kept as one `cfg` seam so the
+/// classification rules themselves ([`is_posix_absolute_path`],
+/// [`is_windows_absolute_path`]) stay pure data and are unit-tested on every
+/// platform.
+///
+/// PRD #163 review: the rule used to be a bare `starts_with('/')` everywhere,
+/// which is correct on Unix and rejects *every* legitimate Windows working
+/// directory — a Windows daemon's own `current_dir()` is a drive-letter path
+/// (`C:\proj`) and a network project root is a UNC path (`\\server\share\proj`).
+/// The failure was silent in the worst way: an orchestration pane's
+/// `TabMembership` was dropped to `None` and a live `OrchestrationSurface` was
+/// discarded outright, so orchestration tabs simply never rehydrated on Windows.
+///
+/// - **Unix** keeps the historical rule byte-for-byte: a leading `/`, nothing
+///   else.
+/// - **Windows** accepts that *plus* its two native absolute forms. The POSIX
+///   form stays valid there on purpose rather than as laziness: a Windows TUI
+///   attached to a remote Unix daemon (`remotes.toml`) receives POSIX project
+///   roots, and this same validator runs on that receive path.
+fn is_absolute_project_path(value: &str) -> bool {
+    #[cfg(unix)]
+    {
+        is_posix_absolute_path(value)
+    }
+    #[cfg(windows)]
+    {
+        is_posix_absolute_path(value) || is_windows_absolute_path(value)
+    }
+}
+
+/// A POSIX absolute path: a leading `/`. The historical rule, and on Unix still
+/// the only accepted form.
+pub fn is_posix_absolute_path(value: &str) -> bool {
+    value.starts_with('/')
+}
+
+/// A Windows absolute path, in the two rooted forms Win32 resolves without
+/// consulting any per-process current directory:
+///
+/// - **UNC / device** — two leading separators: `\\server\share\proj`,
+///   `//server/share/proj`, `\\?\C:\proj`. Either separator is accepted because
+///   Win32 treats `/` and `\` interchangeably in paths.
+/// - **Drive-letter rooted** — `C:\proj` or `C:/proj`.
+///
+/// Deliberately *not* accepted, because neither is absolute:
+///
+/// - `C:proj` — drive-*relative*: it resolves against that drive's own current
+///   directory, so two orchestrations could resolve it to different real roots
+///   (exactly the collision the absolute-path contract exists to prevent).
+/// - `\proj` — rooted on the *current* drive, so it is likewise not a stable
+///   project identity.
+pub fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let is_sep = |b: u8| b == b'\\' || b == b'/';
+    // `\\server\share`, `//server/share`, `\\?\C:\…`
+    if bytes.len() >= 2 && is_sep(bytes[0]) && is_sep(bytes[1]) {
+        return true;
+    }
+    // `C:\proj` / `C:/proj` — the separator is required (see the doc comment).
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && is_sep(bytes[2])
 }
 
 /// PRD #120 (H1/M1/L2): wire-boundary validation for the live
@@ -686,6 +751,14 @@ pub struct AgentPty {
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub writer: Box<dyn std::io::Write + Send>,
     pub reader: Box<dyn std::io::Read + Send>,
+    /// PRD #163 M3 — the OS grouping that makes "tear down the agent *and*
+    /// everything it spawned" possible, established at spawn and handed to every
+    /// teardown helper. Zero-sized on Unix (the child is already its own process
+    /// group thanks to `portable-pty`'s `setsid`, which `killpg` addresses by
+    /// pid); on Windows it owns the agent's Job Object handle, whose membership is
+    /// only inherited forward — so it must be created here, at spawn, and live as
+    /// long as the agent. See [`crate::platform::proc::AgentProcessGroup`].
+    pub process_group: crate::platform::proc::AgentProcessGroup,
 }
 
 /// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
@@ -755,7 +828,7 @@ const _: () = assert!(
 // `crate::platform::proc::*`.
 
 fn force_kill_and_wait(pty: &mut AgentPty) {
-    crate::platform::proc::force_kill_child_and_wait(&mut pty.child);
+    crate::platform::proc::force_kill_child_and_wait(&mut pty.child, &pty.process_group);
 }
 
 /// RAII guard that owns a freshly-spawned child between the `spawn_command`
@@ -764,24 +837,46 @@ fn force_kill_and_wait(pty: &mut AgentPty) {
 /// later step in [`spawn`] like `take_writer` or `try_clone_reader` returned
 /// an error, or a panic unwound through the spawn path), the child is
 /// force-killed and reaped so no orphan process is left behind.
+///
+/// It carries the child's [`crate::platform::proc::AgentProcessGroup`] alongside
+/// it (PRD #163 M3) so this early-failure teardown reaps the whole descendant
+/// tree, exactly like the registry's later teardown paths — otherwise a spawn
+/// that failed *after* the child had already forked would leak its descendants
+/// on Windows.
 struct ChildGuard {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    process_group: crate::platform::proc::AgentProcessGroup,
 }
 
 impl ChildGuard {
-    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
-        Self { child: Some(child) }
+    fn new(
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        process_group: crate::platform::proc::AgentProcessGroup,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            process_group,
+        }
     }
 
-    fn take(mut self) -> Box<dyn portable_pty::Child + Send + Sync> {
-        self.child.take().expect("ChildGuard already taken")
+    fn take(
+        mut self,
+    ) -> (
+        Box<dyn portable_pty::Child + Send + Sync>,
+        crate::platform::proc::AgentProcessGroup,
+    ) {
+        let child = self.child.take().expect("ChildGuard already taken");
+        // `self` still drops after this (it owns the group), and its `Drop` is a
+        // no-op once the child is gone, so hand the real group out and leave the
+        // guard with the empty `Default` one.
+        (child, std::mem::take(&mut self.process_group))
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            crate::platform::proc::force_kill_child_and_wait(&mut child);
+            crate::platform::proc::force_kill_child_and_wait(&mut child, &self.process_group);
         }
     }
 }
@@ -940,11 +1035,21 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         .spawn_command(cmd)
         .map_err(|e| AgentPtyError::Spawn(e.to_string()))?;
 
+    // PRD #163 M3: adopt the child into the OS grouping its teardown will use, as
+    // early as possible. This is a no-op on Unix (`portable-pty` already `setsid`'d
+    // the child into its own process group, which `killpg` addresses by pid) and
+    // creates + populates the agent's Job Object on Windows. It has to happen here
+    // rather than at teardown because job membership is inherited forward only: a
+    // job joined later would not contain the descendants the child had already
+    // spawned. Infallible by contract — a Windows job quirk degrades teardown to a
+    // single-process kill (logged) instead of failing an otherwise-healthy spawn.
+    let process_group = crate::platform::proc::AgentProcessGroup::adopt(child.process_id());
+
     // Wrap the freshly-spawned child in an RAII guard *before* any fallible
     // step below: a failure in `take_writer` / `try_clone_reader` (or a
     // panic between them) would otherwise orphan the child. The guard is
     // taken on the success path and its child moved into the AgentPty.
-    let child_guard = ChildGuard::new(child);
+    let child_guard = ChildGuard::new(child, process_group);
 
     // Drop the slave — we interact through the master side only.
     drop(pair.slave);
@@ -959,11 +1064,13 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         .try_clone_reader()
         .map_err(|e| AgentPtyError::Reader(e.to_string()))?;
 
+    let (child, process_group) = child_guard.take();
     Ok(AgentPty {
-        child: child_guard.take(),
+        child,
         master: pair.master,
         writer,
         reader,
+        process_group,
     })
 }
 
@@ -1353,6 +1460,13 @@ async fn deliver_payload_and_submit(
 /// (e.g. for `process_id()`) rely on `child` existing here.
 pub struct RunningAgent {
     pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// PRD #163 M3 — the agent's descendant-tree grouping, moved here from
+    /// [`AgentPty::process_group`] at insert time and handed to every teardown
+    /// path (`close_agent`, `respawn_agent_for_pane`, `shutdown_all`,
+    /// `shutdown_all_graceful`). Zero-sized on Unix; the agent's Job Object
+    /// handle on Windows, which must stay alive for as long as the agent does or
+    /// `TerminateJobObject` would have nothing to terminate.
+    pub process_group: crate::platform::proc::AgentProcessGroup,
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub writer: Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>,
     pub bus: Arc<AgentBus>,
@@ -2017,6 +2131,7 @@ impl AgentPtyRegistry {
             master,
             writer,
             reader,
+            process_group,
         } = pty;
 
         let bus = Arc::new(AgentBus::new());
@@ -2034,6 +2149,7 @@ impl AgentPtyRegistry {
 
         let agent = RunningAgent {
             child,
+            process_group,
             master,
             writer: Arc::new(AsyncMutex::new(writer)),
             bus,
@@ -2558,6 +2674,7 @@ impl AgentPtyRegistry {
         crate::platform::proc::terminate_child_with_grace_and_wait(
             &mut agent.child,
             AGENT_TERMINATE_GRACE,
+            &agent.process_group,
         );
         // Notify the idle monitor so it observes the registry shrink
         // immediately. The pump_reader thread will *also* signal once it
@@ -2646,6 +2763,7 @@ impl AgentPtyRegistry {
 
         let RunningAgent {
             child,
+            process_group,
             master,
             writer,
             bus: _,
@@ -2689,10 +2807,14 @@ impl AgentPtyRegistry {
         // the same worker. Same shape `daemon_protocol.rs` uses for
         // `close_agent`.
         let mut child = child;
+        // The process group moves onto the blocking task too — it is what the
+        // teardown's force phase reaps the descendant tree through (PRD #163 M3),
+        // and it is dropped there once the old child is gone.
         let join = tokio::task::spawn_blocking(move || {
             crate::platform::proc::terminate_child_with_grace_and_wait(
                 &mut child,
                 AGENT_TERMINATE_GRACE,
+                &process_group,
             );
         })
         .await;
@@ -3118,7 +3240,10 @@ impl AgentPtyRegistry {
             inner.agents.drain().map(|(_, a)| a).collect()
         };
         for mut agent in agents {
-            crate::platform::proc::force_kill_child_and_wait(&mut agent.child);
+            crate::platform::proc::force_kill_child_and_wait(
+                &mut agent.child,
+                &agent.process_group,
+            );
         }
         // Wake the idle monitor if it's parked on `change_notify` — the
         // registry just emptied, so the next gate check should see
@@ -3190,9 +3315,14 @@ impl AgentPtyRegistry {
         // Phase 3: SIGKILL any survivor and reap. `force_kill_child_and_wait`
         // is no-op-safe on an already-exited child (ESRCH is logged-but-
         // ignored and `wait` returns the cached status), so this loop is
-        // safe to run unconditionally.
+        // safe to run unconditionally. On Windows this is where the
+        // `TerminateJobObject` backstop for each agent's descendant tree runs
+        // (PRD #163 M3) — phase 1's `CTRL_BREAK_EVENT` is best-effort only.
         for mut agent in agents {
-            crate::platform::proc::force_kill_child_and_wait(&mut agent.child);
+            crate::platform::proc::force_kill_child_and_wait(
+                &mut agent.child,
+                &agent.process_group,
+            );
         }
 
         self.change_notify.notify_one();
@@ -3349,6 +3479,70 @@ mod tests {
             orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_some());
+    }
+
+    // PRD #163 review: the orchestration-cwd absoluteness rule used to be a bare
+    // `starts_with('/')`, which rejects every legitimate Windows working
+    // directory. These pin the two pure classifiers on EVERY platform (they are
+    // plain byte inspection, so Linux CI covers the Windows rule too) plus the
+    // platform composition in `is_absolute_project_path`.
+
+    #[test]
+    fn posix_absolute_path_classification() {
+        assert!(is_posix_absolute_path("/home/user/project-a"));
+        assert!(is_posix_absolute_path("/"));
+        assert!(!is_posix_absolute_path("relative/proj"));
+        assert!(!is_posix_absolute_path(""));
+        // A Windows path is NOT posix-absolute — that is the whole reason the
+        // second classifier exists.
+        assert!(!is_posix_absolute_path(r"C:\proj"));
+    }
+
+    #[test]
+    fn windows_absolute_path_accepts_drive_letter_and_unc() {
+        // Drive-letter rooted, both separators.
+        assert!(is_windows_absolute_path(r"C:\Users\dev\project-a"));
+        assert!(is_windows_absolute_path("C:/Users/dev/project-a"));
+        assert!(is_windows_absolute_path(r"z:\p"));
+        // UNC and the extended-length / device prefixes.
+        assert!(is_windows_absolute_path(r"\\server\share\project-a"));
+        assert!(is_windows_absolute_path("//server/share/project-a"));
+        assert!(is_windows_absolute_path(r"\\?\C:\project-a"));
+    }
+
+    #[test]
+    fn windows_absolute_path_rejects_relative_and_drive_relative() {
+        assert!(!is_windows_absolute_path("relative/proj"));
+        assert!(!is_windows_absolute_path(""));
+        // Drive-RELATIVE: resolves against that drive's own cwd, so it is not a
+        // stable project identity.
+        assert!(!is_windows_absolute_path("C:proj"));
+        assert!(!is_windows_absolute_path("C:"));
+        // Rooted on the *current* drive — same objection.
+        assert!(!is_windows_absolute_path(r"\proj"));
+        // Not a drive letter.
+        assert!(!is_windows_absolute_path("1:/proj"));
+    }
+
+    /// The platform composition: Unix stays byte-for-byte on the historical
+    /// POSIX-only rule, Windows accepts both families (its own daemon reports
+    /// `C:\…`, and a remote Unix daemon reports `/…`).
+    #[test]
+    fn orchestration_cwd_absoluteness_follows_the_platform() {
+        assert!(is_valid_orchestration_cwd("/home/user/project-a"));
+        assert!(!is_valid_orchestration_cwd("relative/proj"));
+
+        let windows_paths = [r"C:\Users\dev\project-a", r"\\server\share\project-a"];
+        for path in windows_paths {
+            assert_eq!(
+                is_valid_orchestration_cwd(path),
+                cfg!(windows),
+                "{path} must be accepted only where it is genuinely absolute"
+            );
+        }
+        // Control bytes are still refused regardless of the path family.
+        assert!(!is_valid_orchestration_cwd("C:\\proj\\\x1b[31m"));
+        assert!(!is_valid_orchestration_cwd("C:\\proj\\\0evil"));
     }
 
     // PRD #111 auditor BLOCKER: a hostile / buggy daemon sending an
@@ -4876,7 +5070,11 @@ mod spawn_tests {
         drop(pair.slave);
         let pid = child.process_id().expect("child should expose a pid");
 
-        let guard = ChildGuard::new(child);
+        // Same adoption the real `spawn()` does, so the guard's teardown reaps
+        // the tree rather than just the direct child (PRD #163 M3; a no-op on
+        // Unix, where `killpg` addresses the group by pid).
+        let process_group = crate::platform::proc::AgentProcessGroup::adopt(Some(pid));
+        let guard = ChildGuard::new(child, process_group);
         // Drop the master *before* the guard so any PTY I/O the child is
         // blocked on unblocks before SIGKILL — matching the production
         // shutdown order.

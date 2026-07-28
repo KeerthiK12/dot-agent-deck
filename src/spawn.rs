@@ -436,10 +436,18 @@ fn spawn_one(
 /// (the command needs shell-wrapping). `agent_pty::spawn` consumes the SHELL
 /// override to pick the `-c` shell and does NOT export it into the child env
 /// (PRD #127 C2), so a single-word command carries no SHELL at all.
+///
+/// PRD #163 M1: the pinned shell comes from
+/// [`crate::platform::shell::fixed_command_shell`] — still `/bin/sh` on Unix,
+/// but `%COMSPEC%` on Windows, where pinning a POSIX path would hand
+/// `agent_pty::spawn` a shell that does not exist.
 fn pane_env(pane_id: &str, pin_sh: bool) -> Vec<(String, String)> {
     let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())];
     if pin_sh {
-        env.push(("SHELL".to_string(), "/bin/sh".to_string()));
+        env.push((
+            "SHELL".to_string(),
+            crate::platform::shell::fixed_command_shell("/bin/sh"),
+        ));
     }
     env
 }
@@ -1142,9 +1150,29 @@ mod tests {
         assert_eq!(env[0].0, DOT_AGENT_DECK_PANE_ID);
         assert!(!env.iter().any(|(k, _)| k == "SHELL"));
 
-        // multi-word (pin_sh=true) → pane-id + the SHELL wrapper override.
+        // multi-word (pin_sh=true) → pane-id + the SHELL wrapper override. The
+        // *value* is platform-specific (`fixed_command_shell`): Unix pins the
+        // deterministic POSIX `/bin/sh`, Windows has no such shell to pin and
+        // resolves `%COMSPEC%` (else `cmd.exe`) instead. Asserting the real value
+        // on each platform rather than skipping the Windows half — the expectation
+        // is restated here independently, not read back out of the seam.
         let env = pane_env("sched-x-1", true);
-        assert!(env.iter().any(|(k, v)| k == "SHELL" && v == "/bin/sh"));
+        assert_eq!(env.len(), 2);
+        let shell = env
+            .iter()
+            .find(|(k, _)| k == "SHELL")
+            .map(|(_, v)| v.as_str())
+            .expect("a wrapped command must carry the SHELL override");
+        #[cfg(unix)]
+        assert_eq!(shell, "/bin/sh");
+        #[cfg(windows)]
+        {
+            let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+            assert_eq!(
+                shell, comspec,
+                "on Windows the pinned shell is %COMSPEC% (else cmd.exe), never a POSIX path"
+            );
+        }
     }
 
     // finding #2 — the synthetic SessionStart surfaced to attached TUIs is a
