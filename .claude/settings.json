@@ -4,18 +4,5 @@
       "Bash(.claude/skills/demo-reel-adapter/build.sh)",
       "Bash(.claude/skills/demo-reel-adapter/build.sh *)"
     ]
-  },
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "command": "dot-ai skills generate --agent claude-code",
-            "type": "command"
-          }
-        ],
-        "matcher": "startup"
-      }
-    ]
   }
 }
