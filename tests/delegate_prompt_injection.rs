@@ -790,7 +790,7 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
     );
 }
 
-/// Scenario: Delegate with `clear = true` to a worker that never emits `SessionStart`, advance a paused Tokio clock across the fallback timeout, and force a 1000 ms readiness buffer. Delivery must remain absent after the timeout itself and arrive only after the additional buffer.
+/// Scenario: Delegate with `clear = true` to a worker that never emits `SessionStart`, advance a paused Tokio clock across the fallback timeout, and force a 1000 ms readiness buffer. Delivery must remain absent just short of the buffer and arrive after advancing one millisecond beyond it to tolerate Tokio's deadline rounding.
 #[spec("orchestration/delegate/011")]
 #[test]
 #[cfg(unix)]
@@ -853,7 +853,17 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
         String::from_utf8_lossy(&after_timeout)
     );
 
-    tokio::time::advance(Duration::from_millis(DELEGATE_READINESS_BUFFER_MS)).await;
+    tokio::time::advance(Duration::from_millis(DELEGATE_READINESS_BUFFER_MS - 2)).await;
+    tokio::task::yield_now().await;
+    std::thread::sleep(Duration::from_millis(100));
+    let just_before_buffer = registry.snapshot(&new_agent_id).unwrap_or_default();
+    assert!(
+        !snapshot_contains(&just_before_buffer, POINTER),
+        "timeout fallback released delegate delivery just short of the configured 1000 ms readiness buffer; snapshot = {:?}",
+        String::from_utf8_lossy(&just_before_buffer)
+    );
+
+    tokio::time::advance(Duration::from_millis(3)).await;
     tokio::task::yield_now().await;
     std::thread::sleep(Duration::from_millis(100));
     let delivered = registry.snapshot(&new_agent_id).unwrap_or_default();

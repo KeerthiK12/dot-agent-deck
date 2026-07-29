@@ -2341,53 +2341,56 @@ fn write_credential_file_atomic_0o600(dst: &Path, bytes: &[u8]) -> std::io::Resu
     Ok(())
 }
 
-/// Copy the host user's OpenCode credentials into the per-test
-/// tempdir HOME. Mirrors [`import_claude_credentials`] — copies the
-/// auth state but NOT any `plugin/` directory (the deck installs its
-/// own OpenCode plugin pointing at the per-test paths). M3.1
-/// auditor S2 + S3: atomic 0o600 creation for `auth.json`, and
-/// source-path symlinks are refused with a redacted error.
-///
-/// This helper is currently dead code (no `chain-smoke/opencode/*`
-/// test calls it — see PRD § Discovered Issues `di-001`). Kept so
-/// the OpenCode chain-smoke test can be added without harness
-/// changes once the deck install-path bug is fixed.
+/// Copy only the host user's OpenCode `auth.json` credentials into the per-test
+/// HOME, plus the user-editable config when present. The OpenCode data roots can
+/// also contain databases, tool-output history, installed binaries and
+/// `node_modules` symlinks; none are authentication state, and importing them
+/// would both violate fixture isolation and make a valid installation fail the
+/// harness's no-symlink rule. The deck installs its own plugin into the isolated
+/// HOME. M3.1 auditor S2 + S3 still apply: each credential is created atomically
+/// with mode 0o600 and a source symlink is refused with a redacted error.
 fn import_opencode_credentials(test_home: &Path) -> std::io::Result<()> {
-    let mut imported_any = false;
-
-    let source_roots = [
-        host_home().join(".local").join("share").join("opencode"),
-        host_home().join(".opencode"),
+    let mut imported_auth = false;
+    let credentials = [
+        (
+            host_home()
+                .join(".local")
+                .join("share")
+                .join("opencode")
+                .join("auth.json"),
+            test_home
+                .join(".local")
+                .join("share")
+                .join("opencode")
+                .join("auth.json"),
+            "~/.local/share/opencode/auth.json",
+        ),
+        (
+            host_home().join(".opencode").join("auth.json"),
+            test_home.join(".opencode").join("auth.json"),
+            "~/.opencode/auth.json",
+        ),
+        (
+            host_home()
+                .join(".config")
+                .join("opencode")
+                .join("auth.json"),
+            test_home.join(".config").join("opencode").join("auth.json"),
+            "~/.config/opencode/auth.json",
+        ),
     ];
-    let redacted_roots = ["~/.local/share/opencode", "~/.opencode"];
-    for (src, redacted) in source_roots.iter().zip(redacted_roots.iter()) {
-        // Stat with symlink_metadata so a symlinked root is refused
-        // rather than silently followed.
-        let Ok(meta) = std::fs::symlink_metadata(src) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::other(format!(
-                "refusing to import {redacted}: expected a regular directory, found a symlink"
-            )));
-        }
-        if !meta.file_type().is_dir() {
+    for (src, dst, redacted) in credentials {
+        if !src.exists() {
             continue;
         }
-        let rel = src
-            .strip_prefix(host_home())
-            .expect("HOME-relative source path");
-        let dst = test_home.join(rel);
-        copy_dir_excluding_plugin_subdir(src, &dst)?;
-        // Re-stamp auth.json with the strict mode atomically — the
-        // dir-copy walks regular files via fs::copy which inherits
-        // host mode bits.
-        let dst_auth = dst.join("auth.json");
-        if dst_auth.is_file() {
-            let bytes = std::fs::read(&dst_auth)?;
-            write_credential_file_atomic_0o600(&dst_auth, &bytes)?;
-        }
-        imported_any = true;
+        let bytes = read_credential_file_no_symlink(
+            &src,
+            &format!("OpenCode credentials not found at {redacted}"),
+            redacted,
+        )?;
+        std::fs::create_dir_all(dst.parent().expect("OpenCode auth path has a parent"))?;
+        write_credential_file_atomic_0o600(&dst, &bytes)?;
+        imported_auth = true;
     }
 
     // ~/.config/opencode/opencode.jsonc is the user-editable config.
@@ -2400,13 +2403,13 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<()> {
         let dst_cfg_dir = test_home.join(".config").join("opencode");
         std::fs::create_dir_all(&dst_cfg_dir)?;
         std::fs::copy(&src_cfg, dst_cfg_dir.join("opencode.jsonc"))?;
-        imported_any = true;
     }
 
-    if !imported_any {
+    if !imported_auth {
         return Err(std::io::Error::other(
-            "OpenCode credentials not found under ~/.local/share/opencode or ~/.opencode — \
-             log in with `opencode auth login`"
+            "OpenCode credentials not found at ~/.local/share/opencode/auth.json, \
+             ~/.opencode/auth.json, or ~/.config/opencode/auth.json — log in with \
+             `opencode auth login`"
                 .to_string(),
         ));
     }
@@ -2437,34 +2440,6 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
         })?)
     );
     write_credential_file_atomic_0o600(&dst.join("config.toml"), config.as_bytes())
-}
-
-/// Like `copy_dir_recursively` but skips any top-level `plugin/`
-/// child — the deck auto-installs its own OpenCode plugin into the
-/// tempdir HOME and we do NOT want the host's plugin firing too.
-fn copy_dir_excluding_plugin_subdir(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if ty.is_dir() {
-            if entry.file_name() == "plugin" {
-                continue;
-            }
-            copy_dir_recursively(&from, &to)?;
-        } else if ty.is_file() {
-            std::fs::copy(&from, &to)?;
-        } else {
-            return Err(std::io::Error::other(format!(
-                "OpenCode credential entry {} is not a regular file or directory \
-                 (symlinks/sockets/FIFOs are not supported)",
-                from.display()
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Write a minimal `session.toml` containing exactly one pane that

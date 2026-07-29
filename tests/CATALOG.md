@@ -1884,7 +1884,7 @@ without depending on the config struct API.
 ##### orchestration/delegate/011 — The timeout fallback waits the delegate readiness buffer even when no `SessionStart` arrives (PRD #249 M1).
 - **Layer:** fast synthetic PTY integration (real `handle_delegate` + `clear = true` respawn + daemon broadcast, with Tokio's clock paused to cross the production timeout instantly; no socket, LLM, or `e2e` feature gate).
 - **Agent:** hookless `cat` stand-in that never emits `SessionStart`.
-- **Asserts:** after the 30-second fallback expires in virtual time, the pointer remains absent while the additional 1000 ms readiness buffer is still running and is delivered afterward.
+- **Asserts:** after the 30-second fallback expires in virtual time, the pointer remains absent both immediately and 998 ms into the additional 1000 ms readiness buffer, then is delivered after the clock advances to 1001 ms; the one-millisecond overshoot tolerates Tokio rounding sleep deadlines up without weakening the near-boundary lower-bound proof.
 - **Does not assert:** the observed-`SessionStart` branch or whether a real hookless agent is interactive at fallback time.
 - **Platform coverage:** mac+linux.
 
@@ -1901,6 +1901,22 @@ without depending on the config struct API.
 - **Asserts:** the worker first receives the task pointer, then its lack of any agent event produces an LF-terminated notice in the orchestrator pane naming the delegated `coder` role and the missing event; LF distinguishes `write_to_pane_notice` from a submitted LLM prompt.
 - **Does not assert:** tracing output from the companion `warn!`, an actual agent response, or recovery after the notice.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
+
+##### orchestration/delegate/014 — A `clear = true` delegate reaches a REAL interactive Claude worker and the worker visibly acts on it (PRD #249 M4 real-agent happy path).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness; flaky-tolerant pre-PR e2e tier, runtime-skipped when the Claude CLI or credentials are unavailable). Imported Claude credentials plus project trust clear onboarding without a keystroke, and the production delegate CLI drives the daemon through its real socket.
+- **Agent:** REAL interactive Claude Code pinned to Haiku (`claude-haiku-4-5-20251001`, `--allowedTools Bash Read`, no `-p`) as the `clear = true` `coder` role; the deterministic orchestrator role only invokes the same `dot-agent-deck delegate` CLI a real orchestrator uses.
+- **Asserts:** the worker's real prompt editor is visibly ready before delegation; after the delegate respawns it, the role card visibly traverses Thinking → Working with Bash, its native `UserPromptSubmit` hook carries the injected `worker-task-coder.md` pointer (submission rather than PTY echo), and it creates `prd249-claude-respawn-4d37c1.txt` with exact known contents. This proves the happy path against a current real agent; the deterministic `/012` stand-in pins the race itself.
+- **Does not assert:** the exact agent response, the measured readiness threshold (covered by `/012`), the timeout-fallback branch (covered by `/011`), or work-done delivery.
+- **Platform coverage:** mac+linux (unix-only PTY/UDS; local real-agent tier).
+- **Cost note:** one short Haiku worker turn.
+
+##### orchestration/delegate/015 — A `clear = true` delegate reaches a REAL interactive OpenCode worker and the worker visibly acts on it, establishing M2 by observation.
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness; flaky-tolerant pre-PR e2e tier, runtime-skipped when the OpenCode CLI or credentials are unavailable). Imported OpenCode credentials and `--auto` prevent a permission prompt from blocking the pane; a test-only forwarding env can set the production readiness buffer to zero for the explicit pre-fix observation run.
+- **Agent:** REAL interactive OpenCode pinned to the cheap mini model `openrouter/openai/gpt-4o-mini` (no `opencode run`, no stand-in) as the `clear = true` `coder` role; the deterministic orchestrator role invokes the genuine delegate CLI.
+- **Asserts:** the OpenCode TUI is visibly ready before delegation; after the delegate respawns it, the role card visibly traverses Thinking → Working with its shell tool, the OpenCode plugin's native `session.prompt` event carries the injected `worker-task-coder.md` pointer, and it creates `prd249-opencode-respawn-8a62f4.txt` with exact known contents.
+- **Does not assert:** exact model phrasing, a universal OpenCode startup-time distribution from one host, the deterministic race (covered by `/012`), or work-done delivery.
+- **Platform coverage:** mac+linux (unix-only PTY/UDS; local real-agent tier).
+- **Cost note:** one short GPT-4o-mini worker turn per observation.
 
 #### orchestration/identity
 
