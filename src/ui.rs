@@ -19776,6 +19776,42 @@ mod tests {
         assert_eq!(f.focused, FormField::Command);
     }
 
+    // --- PRD #220: dispatcher mode constants and builder ---
+
+    #[test]
+    fn dispatcher_mode_name_and_seed_constants() {
+        assert_eq!(DISPATCHER_MODE_NAME, "dispatcher");
+        assert!(
+            DISPATCHER_SEED_PROMPT.contains("dispatch"),
+            "seed must contain 'dispatch'"
+        );
+        assert!(
+            DISPATCHER_SEED_PROMPT.contains("worktree"),
+            "seed must contain 'worktree'"
+        );
+    }
+
+    #[test]
+    fn build_dispatcher_mode_produces_correct_config() {
+        let mode = build_dispatcher_mode(std::path::Path::new("/tmp/test-repo"));
+        assert_eq!(mode.name, DISPATCHER_MODE_NAME);
+        let seed = mode
+            .seed_prompt
+            .expect("dispatcher mode must have a seed prompt");
+        assert!(
+            seed.starts_with(DISPATCHER_SEED_PROMPT),
+            "seed must start with the constant prompt, got:\n{seed}"
+        );
+        assert!(
+            seed.contains("working_dir: /tmp/test-repo"),
+            "seed must contain the working_dir, got:\n{seed}"
+        );
+        assert!(
+            seed.contains(".worktrees/"),
+            "seed must mention the worktrees directory, got:\n{seed}"
+        );
+    }
+
     // --- PRD #127 M3.3: "Scheduled Tasks" manager dialog pure-data helpers ---
 
     fn make_scheduled_task(name: &str, enabled: bool) -> config::ScheduledTask {

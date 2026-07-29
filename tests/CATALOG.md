@@ -816,6 +816,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** launch wrapping (covered by `codex/spawn/*` and `codex/live/001`) or custom command arguments.
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/016 — Selecting the experimental "dispatcher" authoring option in the new-pane form opens a live dispatcher mode tab with a real Claude agent receiving the dispatcher seed prompt, and the tab surfaces live on the attached TUI's tab strip with the agent transitioning through Working status (PRD #220). [reel]
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness with imported Claude credentials — records a `full-stream.cast`).
+- **Agent:** Claude Code (interactive `claude` with Haiku, real Anthropic API — the agent receives the dispatcher seed prompt via gated delivery, genuinely starts, and transitions through Working status).
+- **Asserts:** the dispatcher tab labelled "dispatcher" surfaces LIVE on the tab strip within 60s of form submission; the agent genuinely starts (Working status observed, soft signal).
+- **Does not assert:** the dispatched-unit tab (relying on the agent to call `dot-agent-deck dispatch` would be LLM-dependent); exact prompt delivery content; agent lifetime beyond the Working transition.
+- **Platform coverage:** mac+linux.
+
 ### Focus / navigation
 
 #### focus/dashboard
