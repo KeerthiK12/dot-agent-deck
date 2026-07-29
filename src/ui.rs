@@ -533,7 +533,6 @@ fn build_dispatcher_mode(working_dir: &std::path::Path) -> ModeConfig {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // "Scheduled Tasks" management dialog (PRD #127 M3.3)
 // ---------------------------------------------------------------------------
@@ -968,8 +967,7 @@ impl NewPaneFormState {
     /// PRD #220: cycler index of the dispatcher option — appended after
     /// `schedule: issues`. Only meaningful when `show_dispatcher` is true.
     fn dispatcher_index(&self) -> usize {
-        self.issue_dispatch_index()
-            + if self.show_issue_dispatch { 1 } else { 0 }
+        self.issue_dispatch_index() + if self.show_issue_dispatch { 1 } else { 0 }
     }
 
     /// Whether the built-in "schedule" authoring option is currently selected.
@@ -991,7 +989,9 @@ impl NewPaneFormState {
     /// (plain `schedule` OR `schedule: issues` OR `dispatcher`). Drives the shared
     /// "↳ authoring (one-off)" hint + its reserved render row.
     fn is_authoring_selected(&self) -> bool {
-        self.is_schedule_selected() || self.is_issue_dispatch_selected() || self.is_dispatcher_selected()
+        self.is_schedule_selected()
+            || self.is_issue_dispatch_selected()
+            || self.is_dispatcher_selected()
     }
 
     fn mode_option_count(&self) -> usize {

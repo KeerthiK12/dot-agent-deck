@@ -566,7 +566,15 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     });
 
-    let result = run_hook_loop(listener, state, event_tx, pty_registry.clone(), shutdown, worktree_registry.clone()).await;
+    let result = run_hook_loop(
+        listener,
+        state,
+        event_tx,
+        pty_registry.clone(),
+        shutdown,
+        worktree_registry.clone(),
+    )
+    .await;
 
     if let Some(h) = attach_handle {
         h.abort();
@@ -890,15 +898,21 @@ async fn run_hook_loop(
                                         "Received dispatch signal"
                                     );
                                     use crate::dispatch::{self, DispatchContext};
-                                    
+
                                     use std::path::PathBuf;
 
-                                    // Phase 1: read cwd under a short-lived read lock.
+                                    // Phase 1: resolve caller cwd from the PTY registry's
+                                    // AgentRecord.cwd, not AppState::pane_cwd_map.
+                                    // pane_cwd_map is only populated for orchestration
+                                    // panes; mode panes (including the dispatcher mode)
+                                    // never get an entry there, which would make every
+                                    // dispatch from a mode pane a silent no-op.
                                     let cwd = {
-                                        let st = state.read().await;
-                                        st.pane_cwd_map
-                                            .get(&signal.pane_id)
-                                            .cloned()
+                                        let records = pty_registry.agent_records();
+                                        records
+                                            .iter()
+                                            .find(|r| r.pane_id_env.as_deref() == Some(&signal.pane_id))
+                                            .and_then(|r| r.cwd.clone())
                                     };
                                     let cwd = match cwd {
                                         Some(c) => c,

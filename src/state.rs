@@ -8,8 +8,8 @@ use tracing::warn;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
-    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal,
-    EventType, LiveTarget, OrchestrationSurface, WorkDoneSignal, Writable,
+    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
+    LiveTarget, OrchestrationSurface, WorkDoneSignal, Writable,
 };
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 

@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
-use crate::issue_dispatch_run::{create_worktree, remove_worktree, WorktreeCreation};
+use crate::issue_dispatch_run::{WorktreeCreation, create_worktree, remove_worktree};
 use crate::scheduler::StderrNotifier;
-use crate::spawn::{spawn, SpawnRequest};
+use crate::spawn::{SpawnRequest, spawn};
 
 fn sanitize_name(name: &str) -> String {
     let sanitized = name
@@ -16,7 +16,13 @@ fn sanitize_name(name: &str) -> String {
         .replace('\0', "");
     let slug_chars: String = sanitized
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     if slug_chars.is_empty() || slug_chars.chars().all(|c| c == '-') {
         "dispatch".to_string()
@@ -92,9 +98,7 @@ pub async fn handle_dispatch(
 
     let prompt = match task {
         Some(t) => t.to_string(),
-        None => format!(
-            "Isolated worktree for task: {name}. Read your environment and proceed."
-        ),
+        None => format!("Isolated worktree for task: {name}. Read your environment and proceed."),
     };
 
     let req = SpawnRequest {
