@@ -1,6 +1,6 @@
 # PRD #241: Safe pane closing — scope Ctrl+W to command mode, confirm destructive close, unwedge NotFound
 
-**Status**: Implementation complete — PR pending (M1–M5 done; M6 partial)
+**Status**: Complete (2026-07-29) — [PR #258](https://github.com/vfarcic/dot-agent-deck/pull/258) squash-merged as `a005907`, issues #241, #88, #192, #218 closed. M1–M6 all landed; Greptile review settled (Confidence 3/5, no unresolved findings); pre-PR e2e gate green (2153 passed, 0 skipped, 1 pre-existing unrelated failure); CI green on all platforms.
 **Priority**: High
 **Created**: 2026-07-28
 **GitHub Issue**: [#241](https://github.com/vfarcic/dot-agent-deck/issues/241)
@@ -167,11 +167,11 @@ Touches the daemon RPC path, so the question is owed explicitly. Expected answer
 - [x] **M3**: Confirmation dialog on the close action (keybinding and `[Close]` button), defaulting to Cancel
 - [x] **M4**: Command-mode exit discoverable — mode-aware hints bar and help overlay; `close` not advertised where unavailable
 - [x] **M5**: L1 coverage plus PTY-attached L2 (real shell word-delete, real-agent no-teardown) green in the pre-PR e2e tier
-- [ ] **M6**: Docs updated, changelog fragment added, rule 12 cross-version answer recorded; #88, #192, #218 closed with the fix referenced
+- [x] **M6**: Docs updated, changelog fragment added, rule 12 cross-version answer recorded; #88, #192, #218 closed with the fix referenced
   - [x] Docs updated (`docs/keyboard-shortcuts.md` plus four cross-references)
   - [x] Rule 12 cross-version answer recorded and **verified** — see Implementation Notes
-  - [ ] Changelog fragment — written by the release step during `/prd-done`'s first push
-  - [ ] #88, #192, #218 closed with the fix referenced — happens at merge
+  - [x] Changelog fragment — landed as `changelog.d/241.bugfix.md`
+  - [x] #88, #192, #218 closed with the fix referenced — closed at merge, each with a comment linking [PR #258](https://github.com/vfarcic/dot-agent-deck/pull/258)
 
 ## Implementation Notes
 
