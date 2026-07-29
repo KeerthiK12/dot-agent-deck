@@ -203,8 +203,8 @@ fn snapshot_has_silence_notice(snapshot: &[u8]) -> bool {
         .split_inclusive('\n')
         .filter(|line| line.ends_with('\n'))
         .any(|line| {
-            let line = line.to_ascii_lowercase();
-            line.contains("delegat") && line.contains("event")
+            line.contains("delegate possibly not delivered (dot-agent-deck daemon report)")
+                && line.contains("emitted no agent event")
         })
 }
 
@@ -1267,6 +1267,56 @@ impl SilenceHarness {
         );
     }
 
+    async fn redelegate_and_wait_for_another_pointer(&self) {
+        let before = self
+            .registry
+            .snapshot(&self.worker_agent_id)
+            .unwrap_or_default();
+        let previous_count = before
+            .windows(POINTER.len())
+            .filter(|w| *w == POINTER)
+            .count();
+        assert!(
+            previous_count > 0,
+            "re-delegation precondition failed: first pointer was absent; snapshot = {:?}",
+            String::from_utf8_lossy(&before)
+        );
+
+        self.state
+            .handle_delegate(
+                DelegateSignal {
+                    pane_id: ORCH_PANE.to_string(),
+                    task: "Perform the newer delegated silence-watch task.".to_string(),
+                    to: vec![WORKER_ROLE.to_string()],
+                    timestamp: chrono::Utc::now(),
+                },
+                &self.registry,
+                &self.event_tx,
+            )
+            .await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = self
+                .registry
+                .snapshot(&self.worker_agent_id)
+                .unwrap_or_default();
+            let current_count = snapshot
+                .windows(POINTER.len())
+                .filter(|w| *w == POINTER)
+                .count();
+            if current_count > previous_count {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "second delegation never produced another observable task pointer; previous_count={previous_count}, current_count={current_count}, snapshot={:?}",
+                String::from_utf8_lossy(&snapshot)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     fn orchestrator_snapshot(&self) -> Vec<u8> {
         self.registry
             .snapshot(&self.orchestrator_agent_id)
@@ -1451,11 +1501,12 @@ fn delegate_silence_notice_does_not_reach_successor_orchestrator() {
 }
 
 /// Scenario: Complete a hookless delegated task through the real `work-done`
-/// handler before the no-event window expires. The completion is positive proof
-/// of delivery, so no later silence notice may appear.
+/// handler and prove its silence watch is cancelled. Then delegate twice to one
+/// worker and report only the older task done; the newer silent task must still
+/// produce its own no-event notice.
 #[test]
 #[cfg(unix)]
-fn delegate_work_done_before_window_cancels_silence_notice() {
+fn delegate_work_done_cancels_only_matching_silence_watch() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
@@ -1469,26 +1520,56 @@ fn delegate_work_done_before_window_cancels_silence_notice() {
         .build()
         .expect("build work-done cancellation runtime")
         .block_on(async {
+            {
+                let harness = SilenceHarness::new(64).await;
+                harness.delegate_and_wait_for_pointer().await;
+                harness
+                    .state
+                    .handle_work_done(
+                        WorkDoneSignal {
+                            pane_id: WORKER_PANE.to_string(),
+                            task: "Completed without hook activity.".to_string(),
+                            done: false,
+                            timestamp: chrono::Utc::now(),
+                        },
+                        &harness.registry,
+                    )
+                    .await;
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                let snapshot = harness.orchestrator_snapshot();
+                assert!(
+                    !snapshot_has_silence_notice(&snapshot),
+                    "timely work-done failed to cancel its no-event watch: {:?}",
+                    String::from_utf8_lossy(&snapshot)
+                );
+            }
+
             let harness = SilenceHarness::new(64).await;
             harness.delegate_and_wait_for_pointer().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            harness.redelegate_and_wait_for_another_pointer().await;
             harness
                 .state
                 .handle_work_done(
                     WorkDoneSignal {
                         pane_id: WORKER_PANE.to_string(),
-                        task: "Completed without hook events.".to_string(),
+                        task: "The superseded task completed late.".to_string(),
                         done: false,
                         timestamp: chrono::Utc::now(),
                     },
                     &harness.registry,
                 )
                 .await;
-            tokio::time::sleep(Duration::from_millis(900)).await;
-            let snapshot = harness.orchestrator_snapshot();
+            let notice = wait_for_silence_notice(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                Duration::from_secs(2),
+            )
+            .await;
             assert!(
-                !snapshot_has_silence_notice(&snapshot),
-                "work-done failed to cancel the no-event watch: {:?}",
-                String::from_utf8_lossy(&snapshot)
+                snapshot_has_silence_notice(&notice),
+                "stale work-done cancelled the newer delegation's no-event watch: {:?}",
+                String::from_utf8_lossy(&notice)
             );
         });
 }
