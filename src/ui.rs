@@ -519,7 +519,7 @@ You are a parallel-work dispatcher. Your job is to decompose a task into indepen
 /// that teaches the agent to decompose work and call `dispatch` per unit.
 fn build_dispatcher_mode(working_dir: &std::path::Path) -> ModeConfig {
     let seed = format!(
-        "{seed}\n\nworking_dir: {dir}\n\nThe repo at this path is where worktrees will be created under .worktrees/.",
+        "{seed}\n\nworking_dir: {dir}\n\nThe repo at this path is the main worktree. Dispatched worktrees are created as sibling directories at ../<repo>-dispatch-<name>.",
         seed = DISPATCHER_SEED_PROMPT,
         dir = working_dir.display(),
     );
@@ -19807,8 +19807,8 @@ mod tests {
             "seed must contain the working_dir, got:\n{seed}"
         );
         assert!(
-            seed.contains(".worktrees/"),
-            "seed must mention the worktrees directory, got:\n{seed}"
+            seed.contains("sibling directories"),
+            "seed must mention sibling worktree layout, got:\n{seed}"
         );
     }
 
