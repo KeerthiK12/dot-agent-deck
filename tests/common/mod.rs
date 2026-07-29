@@ -541,6 +541,18 @@ impl TuiDeck {
             // within 300s instead of leaking to PID 1 for hours/days. Idle
             // shutdown stays disabled (above) for determinism.
             ("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "300"),
+            // PRD #249 M3: the daemon reports a delegated worker that emits no
+            // event within a window (30s by default) as "possibly not
+            // delivered", writing a notice into the ORCHESTRATOR's pane. Most
+            // e2e delegate tests drive stand-in workers (`cat`, recorder
+            // scripts) that legitimately emit nothing, so the report would fire
+            // on every one of them and dirty panes that tests assert stay clean
+            // (`orchestration/delegate/001`). Pinned off here rather than via
+            // `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS=0`, which would also
+            // disable PRD #126's idle-worker detection that other tests
+            // exercise. A test that wants the report overrides it via
+            // `with_env`.
+            ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0"),
         ];
         // PATH is required for the deck to spawn its own daemon
         // subcommand (it shells out via `current_exe`, but lookups like
@@ -2791,6 +2803,14 @@ pub fn spawn_daemon_serve_with_env(
     // 5000ms stays comfortably above spawn/005's 2s "not yet delivered" window
     // and below every 10s delivery window. A test may override via `extra_env`.
     env.push(("DOT_AGENT_DECK_SESSION_START_WAIT_MS".into(), "5000".into()));
+    // PRD #249 M3: same pin as the TuiDeck harness above — the silent-worker
+    // report would fire on every stand-in worker that emits no events and write
+    // a notice into an orchestrator pane. Off by default here; a test that wants
+    // the report sets it in `extra_env`, which is layered after this.
+    env.push((
+        "DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS".into(),
+        "0".into(),
+    ));
     for (k, v) in extra_env {
         env.push(((*k).to_string(), (*v).to_string()));
     }

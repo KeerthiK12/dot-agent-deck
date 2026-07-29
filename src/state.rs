@@ -115,24 +115,6 @@ pub const DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS: &str =
 /// nearest sane behavior instead of silently breaking delivery.
 const MAX_DELEGATE_READINESS_BUFFER: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Tokio's timer granularity. Every deadline handed to `tokio::time::sleep` is
-/// rounded UP to the next whole-millisecond tick
-/// (`runtime::time::TimeSource::deadline_to_tick` adds 999_999 ns), so
-/// `sleep(d)` actually resolves somewhere in `d..=d + 1 ms` — the wait is always
-/// a little longer than asked for and never shorter.
-///
-/// The readiness gate therefore sleeps one tick less than the configured buffer,
-/// which makes the configured value the wait's upper bound instead of its lower
-/// bound: the gate releases within `[buffer - 1 ms, buffer]`. At the 1000 ms
-/// default — roughly 1.5x the 656 ms readiness window measured by
-/// `orchestration/delegate/012` — a millisecond either way is noise. What it buys
-/// is that the gate stays observable on a PAUSED virtual clock: a test that
-/// advances exactly `buffer` sees the gate release, instead of missing it by the
-/// one rounded-up tick. That is how the fallback branch is regression-pinned
-/// (`orchestration/delegate/011`), which cannot burn 30 real seconds to reach the
-/// timeout.
-const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(1);
-
 /// PRD #249 M1: resolve the post-readiness buffer for one delegate dispatch.
 ///
 /// A non-numeric value falls back to the default with a `warn!`; an out-of-range
@@ -920,18 +902,73 @@ fn arm_idle_worker_watch(
 /// the `0`-means-disabled contract.
 const MAX_DELEGATE_NO_EVENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// PRD #249 M3: how long after delivery a delegated worker may emit **nothing at
-/// all** before the daemon surfaces it, or `None` when the detector is disabled.
+/// PRD #249 M3 seam: overrides the delegate no-event window with an integer
+/// number of **milliseconds**, `0` meaning "never report a silent worker".
+/// Read at use time, never cached; mirrors
+/// [`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`]'s naming and parsing.
 ///
-/// Deliberately shares [`worker_response_timeout`]'s resolution (env seam →
-/// orchestration config → worker config → default) rather than adding a second
-/// knob: an operator who turned the idle-worker detector off (`0`) asked not to
-/// be told about quiet workers, and that answer should hold for both reports.
-/// Capped by [`MAX_DELEGATE_NO_EVENT_WINDOW`].
+/// This exists because the window's *default* is derived from
+/// [`worker_response_timeout`], and without an override of its own the only way
+/// to silence this diagnostic would be
+/// [`DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS`]`=0`, which also disables genuine
+/// idle-worker detection (PRD #126) as collateral. A diagnostic must be
+/// switchable without taking a real feature down with it — the e2e harness in
+/// particular pins this to `0` so a stand-in worker that emits no events and
+/// outlives the window cannot write a notice into an orchestrator pane a test is
+/// asserting stays clean.
+pub const DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS: &str =
+    "DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS";
+
+/// PRD #249 M3: how long after delivery a delegated worker may emit **nothing at
+/// all** before the daemon surfaces it, or `None` when the report is disabled.
+///
+/// Precedence:
+///
+/// 1. [`DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS`] — `0` disables the report,
+///    a non-numeric value falls through with a `warn!`;
+/// 2. the default: [`worker_response_timeout`]'s resolution (env seam →
+///    orchestration config → worker config → default), capped by
+///    [`MAX_DELEGATE_NO_EVENT_WINDOW`], and `None` when the idle detector itself
+///    is off — an operator who asked not to be told about quiet workers should
+///    not be told about silent ones either.
+///
+/// Values from either source are clamped to [`MAX_DELEGATE_NO_EVENT_WINDOW`]:
+/// past that horizon the diagnosis is useless (see the constant), and the
+/// long-horizon question — "this worker owes me an answer" — already has its own
+/// detector in PRD #126. So this knob shortens or silences; it does not extend.
 fn delegate_no_event_window(
     orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
 ) -> Option<std::time::Duration> {
+    if let Ok(raw) = std::env::var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS) {
+        match raw.trim().parse::<u64>() {
+            Ok(0) => {
+                tracing::debug!(
+                    "delegate silent-worker report disabled by \
+                     {DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS}=0"
+                );
+                return None;
+            }
+            Ok(ms) => {
+                let requested = std::time::Duration::from_millis(ms);
+                let clamped = requested.min(MAX_DELEGATE_NO_EVENT_WINDOW);
+                if clamped != requested {
+                    warn!(
+                        requested_ms = requested.as_millis(),
+                        clamped_ms = clamped.as_millis(),
+                        max_ms = MAX_DELEGATE_NO_EVENT_WINDOW.as_millis(),
+                        "{DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS} is out of range; clamped"
+                    );
+                }
+                return Some(clamped);
+            }
+            Err(_) => warn!(
+                value = %raw,
+                "{DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS} is not a non-negative integer \
+                 number of milliseconds; using the derived default window"
+            ),
+        }
+    }
     worker_response_timeout(orchestration_cwd, worker_cwd)
         .map(|timeout| timeout.min(MAX_DELEGATE_NO_EVENT_WINDOW))
 }
@@ -1042,8 +1079,9 @@ struct SilenceReportTarget {
 /// inside the spawned dispatch task — for the same two reasons PRD #126 resolves
 /// the idle watch there:
 ///
-/// * a **disabled** detector (`0` from either source) yields `None` here, so no
-///   broadcast subscription and no task are created at all;
+/// * a **disabled** report (`0` from any of [`delegate_no_event_window`]'s
+///   sources) yields `None` here, so no broadcast subscription and no task are
+///   created at all;
 /// * the orchestrator's registry identity is captured while the delegate is still
 ///   live. Capturing it inside the dispatch task instead is racy in exactly the
 ///   direction that matters: the task's first poll can land after the
@@ -1608,7 +1646,16 @@ async fn dispatch_one_owned(
                         "delegate: readiness signal handled; holding the task \
                          prompt for the post-respawn readiness buffer"
                     );
-                    tokio::time::sleep(buffer.saturating_sub(TIMER_TICK)).await;
+                    // A plain `sleep(buffer)`: the configured value is a LOWER
+                    // bound on the wait, never an upper one. Tokio rounds a
+                    // sleep deadline up to the next whole-millisecond tick, so
+                    // this resolves in `buffer..=buffer + 1 ms` — shaving that
+                    // tick off to make the release land exactly on `buffer`
+                    // would turn a tunable minimum into a maximum, and would
+                    // make a deliberate `…_BUFFER_MS=1` sleep zero. Tests that
+                    // need to observe the release on a paused clock straddle
+                    // the boundary themselves (`orchestration/delegate/011`).
+                    tokio::time::sleep(buffer).await;
                 }
             }
             Err(e) => {
@@ -3264,11 +3311,20 @@ mod tests {
         }
     }
 
-    /// PRD #249 M3: the no-event window follows the idle detector's knob — `0`
-    /// still means "report nothing" — but is capped, because "this worker has
-    /// emitted nothing at all" is a diagnosis that is useless two hours late.
+    /// Serializes the two tests that read [`DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS`]:
+    /// one sets it, the other asserts it is unset, and under plain `cargo test`
+    /// (threads in one process, unlike nextest) they would otherwise race.
+    static NO_EVENT_WINDOW_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// PRD #249 M3: with no override set, the no-event window still follows the
+    /// idle detector's knob — `0` means "report nothing" — but is capped, because
+    /// "this worker has emitted nothing at all" is a diagnosis that is useless two
+    /// hours late.
     #[test]
     fn delegate_no_event_window_is_capped_and_respects_disabled() {
+        let _g = NO_EVENT_WINDOW_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         fn config_dir(value: &str) -> tempfile::TempDir {
             let dir = tempfile::tempdir().expect("tempdir");
             std::fs::write(
@@ -3281,6 +3337,10 @@ mod tests {
         assert!(
             std::env::var(DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS).is_err(),
             "the ms seam must be unset for the file path to be observable"
+        );
+        assert!(
+            std::env::var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS).is_err(),
+            "the M3 override must be unset for the derived default to be observable"
         );
 
         let disabled = config_dir("0");
@@ -3296,6 +3356,61 @@ mod tests {
             delegate_no_event_window(long.path().to_str(), None),
             Some(MAX_DELEGATE_NO_EVENT_WINDOW),
         );
+    }
+
+    /// PRD #249 M3: the silent-worker report is a diagnostic, so it must be
+    /// switchable on its own. Turning it off used to require
+    /// `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS=0`, which took real idle-worker
+    /// detection down with it — the e2e harness needs the first without the
+    /// second.
+    #[test]
+    fn delegate_no_event_window_override_is_independent_of_the_idle_detector() {
+        let _g = NO_EVENT_WINDOW_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS).ok();
+
+        // A live idle detector, so a `None` below can only come from this knob.
+        let cwd = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            cwd.path().join(".dot-agent-deck.toml"),
+            "worker_response_timeout_minutes = 2\n",
+        )
+        .expect("write project config");
+        let cwd = cwd.path().to_str();
+        assert_eq!(
+            worker_response_timeout(cwd, None),
+            Some(std::time::Duration::from_secs(120)),
+            "the idle detector must stay armed across every case below"
+        );
+
+        for (raw, expected) in [
+            // The e2e harness's pin: report off, idle detector untouched.
+            ("0", None),
+            ("250", Some(std::time::Duration::from_millis(250))),
+            // Beyond the useful horizon of "has said nothing at all"; PRD #126's
+            // detector owns the long-horizon question.
+            ("600000", Some(MAX_DELEGATE_NO_EVENT_WINDOW)),
+            // Garbage → the derived default, no panic.
+            ("never", Some(MAX_DELEGATE_NO_EVENT_WINDOW)),
+            ("", Some(MAX_DELEGATE_NO_EVENT_WINDOW)),
+        ] {
+            // SAFETY: lock held for the duration; restored below.
+            unsafe { std::env::set_var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS, raw) };
+            assert_eq!(
+                delegate_no_event_window(cwd, None),
+                expected,
+                "{DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS}={raw:?} must resolve to {expected:?}"
+            );
+        }
+
+        // SAFETY: lock held for the duration.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS),
+            }
+        }
     }
 
     /// PRD #249 M3: `SessionStart` is what a `clear = true` respawn produces by
