@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -108,6 +108,15 @@ struct StreamBackend {
     /// handle is aborted instead, which closes the attach socket and the
     /// daemon sees EOF — implicit detach (M1.3 survival property).
     io_task: Option<tokio::task::JoinHandle<()>>,
+    /// PRD #241 F3b: what the per-pane I/O task is doing right now — one of
+    /// [`IO_ATTACHED`], [`IO_REATTACHING`], [`IO_FINISHED`].
+    ///
+    /// `close_pane` reads it to decide how long to keep asking the daemon
+    /// whether a *replacement* agent has taken over this pane's slot before it
+    /// accepts an "agent not found" as proof the pane is gone. See
+    /// [`resolve_pane_slot_after_not_found`] for how each state maps to a
+    /// settle window.
+    io_state: Arc<AtomicU8>,
     /// Tokio handle so the (blocking) `close_pane` path can issue
     /// `stop-agent` over a fresh short-lived connection. Also used by the
     /// M2.5 detach path to await the writer briefly while the explicit
@@ -260,6 +269,14 @@ pub struct EmbeddedPaneController {
     /// honest feedback + leaves PaneInput — closing the server/UI race where the
     /// UI's pre-forward liveness snapshot was stale.
     stream_rejections: Arc<Mutex<Vec<(String, String)>>>,
+    /// PRD #241 F3b (review finding G2): warnings from closes that COMPLETED
+    /// without being able to confirm the daemon side (see
+    /// [`StopOutcome::DoneUnverified`]). `close_pane` returns `Ok(())` on that
+    /// path — the card is gone and the caller has nothing to retry — so the
+    /// message cannot ride the `Result`. The render loop drains this each frame
+    /// (exactly like [`Self::stream_rejections`]) into `ui.status_message`, the
+    /// same status line every other close outcome already reports through.
+    close_warnings: Arc<Mutex<Vec<String>>>,
 }
 
 impl EmbeddedPaneController {
@@ -274,6 +291,7 @@ impl EmbeddedPaneController {
             client: DaemonClient::new(socket_path),
             runtime,
             stream_rejections: Arc::new(Mutex::new(Vec::new())),
+            close_warnings: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -283,6 +301,15 @@ impl EmbeddedPaneController {
     /// feedback and leave PaneInput.
     pub fn take_stream_rejections(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *self.stream_rejections.lock().unwrap())
+    }
+
+    /// PRD #241 F3b (review finding G2): drain and return the warnings queued by
+    /// closes that completed WITHOUT being able to confirm the daemon side. The
+    /// render loop consumes these each frame and shows them on the status line —
+    /// a possibly-orphaned agent must never be a silent outcome. Empty on every
+    /// ordinary close, successful or failed.
+    pub fn take_close_warnings(&self) -> Vec<String> {
+        std::mem::take(&mut *self.close_warnings.lock().unwrap())
     }
 
     /// Test-only constructor for code paths that need a `PaneController`
@@ -690,23 +717,42 @@ impl EmbeddedPaneController {
         let pane_id_for_task = pane_id.clone();
         let rejections_for_task = Arc::clone(&self.stream_rejections);
 
-        let io_task = runtime.spawn(run_pane_io_task(
-            pane_id_for_task,
-            client_for_task,
-            conn,
-            agent_id_for_task,
-            input_rx,
-            parser_for_task,
-            mouse_mode_for_task,
-            hyperlinks_for_task,
-            rejections_for_task,
-        ));
+        // PRD #241 F3b: published state for the I/O task. Seeded here rather
+        // than inside `run_pane_io_task` so it already reads `IO_ATTACHED`
+        // before the task is first polled — a `close_pane` racing the spawn
+        // must never see a not-yet-started `IO_FINISHED`.
+        let io_state = Arc::new(AtomicU8::new(IO_ATTACHED));
+        let io_state_for_task = Arc::clone(&io_state);
+        let io_state_for_exit = Arc::clone(&io_state);
+
+        let io_task = runtime.spawn(async move {
+            run_pane_io_task(
+                pane_id_for_task,
+                client_for_task,
+                conn,
+                agent_id_for_task,
+                input_rx,
+                parser_for_task,
+                mouse_mode_for_task,
+                hyperlinks_for_task,
+                rejections_for_task,
+                io_state_for_task,
+            )
+            .await;
+            // The task gave up: no respawned agent will be adopted for this
+            // pane any more, so a later "agent not found" needs no settle wait.
+            // An `abort()` skips this store, leaving the last in-flight state —
+            // the conservative direction, and only reachable from
+            // `StreamBackend::drop`, i.e. after any close has already finished.
+            io_state_for_exit.store(IO_FINISHED, Ordering::SeqCst);
+        });
 
         let pane = Pane {
             backend: StreamBackend {
                 agent_id: shared_agent_id,
                 input_tx,
                 io_task: Some(io_task),
+                io_state,
                 runtime,
                 daemon_path,
                 resize_tx,
@@ -1195,6 +1241,504 @@ const CREATE_PANE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// gets the "stop-agent timed out" error message with a retry hint.
 const CTRL_W_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// PRD #241 M2: is this `stop-agent` failure the daemon telling us that
+/// **this exact agent id** is already gone?
+///
+/// The daemon's only agent-scoped not-found condition is
+/// [`AgentPtyError::NotFound`](crate::agent_pty::AgentPtyError), whose `Display`
+/// is `"Agent {id} not found"`. `handle_request`'s `StopAgent` arm passes that
+/// string through verbatim into `AttachResponse::err`, and `stop_agent` wraps it
+/// verbatim into `ClientError::Server` — so the whole message, for the id we
+/// actually sent, is what this predicate matches.
+///
+/// It is deliberately an EXACT match on that rendering rather than a
+/// `contains("not found")` substring test (PRD #241 review F3a). The loose form
+/// also swallowed unrelated server errors — `"Pane 3 not found"`,
+/// `"session not found"`, a wrapped `"file not found"` from anything the stop
+/// path might grow — and classifying one of those as "already stopped" silently
+/// discards a **live** pane. Binding the match to the requested id also means a
+/// not-found reported for some *other* agent can never authorize dropping this
+/// one.
+///
+/// Kept as the ONE place the string is sniffed. A typed protocol error would be
+/// better still, but it does not remove the string match: a newer TUI must keep
+/// understanding an older daemon's message, so the sniff would survive as the
+/// compatibility path while the typed variant moved the wire shape and forced a
+/// `PROTOCOL_VERSION` bump this PRD deliberately does not take. Narrowing the
+/// predicate buys the safety; the wire change would only add surface.
+fn is_agent_not_found(err: &crate::daemon_client::ClientError, agent_id: &str) -> bool {
+    match err {
+        crate::daemon_client::ClientError::Server(msg) => msg
+            .trim()
+            .eq_ignore_ascii_case(&format!("Agent {agent_id} not found")),
+        _ => false,
+    }
+}
+
+/// PRD #241 F3b: the per-pane I/O task is streaming from a live attach session.
+const IO_ATTACHED: u8 = 0;
+/// PRD #241 F3b: the attach session ended and the task is inside
+/// [`resolve_and_reattach`], hunting for the agent that replaced this pane's
+/// (typically respawned) one.
+const IO_REATTACHING: u8 = 1;
+/// PRD #241 F3b: the task has exited — it will never adopt another agent for
+/// this pane.
+const IO_FINISHED: u8 = 2;
+
+/// PRD #241 F3b: worst-case wall clock for one F9 `clear = true` respawn to hand
+/// the pane slot over to its replacement — the old child's SIGTERM-to-exit (up to
+/// [`AGENT_TERMINATE_GRACE`](crate::agent_pty::AGENT_TERMINATE_GRACE) = 3 s, and
+/// the longer pathological case where SIGTERM is trapped) plus the replacement
+/// process's startup. Observed at up to ~5 s for Claude Code under devbox; see
+/// [`REATTACH_LOOKUP_TOTAL_BUDGET`], which was already sized against this same
+/// measurement.
+///
+/// **Both windows that guard this one race derive from this constant** —
+/// [`CLOSE_SLOT_SETTLE_BUDGET`] (how long a close waits for the replacement to
+/// show up before declaring the slot empty) and [`REATTACH_LOOKUP_TOTAL_BUDGET`]
+/// (how long the pane's I/O task hunts for that same replacement). Review finding
+/// G1: they used to be independent magic numbers — 3.5 s here against a
+/// documented ~5 s worst case there — so a slow respawn could outlive the close's
+/// window, get declared "slot empty", and keep running with its card gone. Two
+/// constants guarding one race must not contradict each other, so the ordering is
+/// pinned at compile time below.
+const RESPAWN_SLOT_HANDOVER_WORST_CASE: Duration = Duration::from_secs(5);
+
+/// PRD #241 F3b: margin added on top of [`RESPAWN_SLOT_HANDOVER_WORST_CASE`] for
+/// [`CLOSE_SLOT_SETTLE_BUDGET`], covering the `list-agents` round-trip that
+/// observes the replacement plus one [`CLOSE_SLOT_POLL_INTERVAL`] of poll
+/// granularity. Being generous costs a slightly longer wait on a rare path;
+/// being stingy orphans an agent.
+const CLOSE_SLOT_SETTLE_MARGIN_MS: u64 = 500;
+
+/// PRD #241 F3b: how long [`EmbeddedPaneController::close_pane`] keeps asking
+/// the daemon "who owns this pane slot now?" after both `stop-agent` attempts
+/// answered *agent not found* and the pane's I/O task is mid-reattach.
+///
+/// The window exists because `respawn_agent_for_pane` (the F9 `clear = true`
+/// delegate flow) removes the old agent from the registry and drops its PTY
+/// master — which is what ends the attach stream and puts the I/O task into
+/// [`IO_REATTACHING`] — then SIGTERMs the child with up to
+/// `AGENT_TERMINATE_GRACE` (3 s) of grace *before* spawning the replacement.
+/// For that whole stretch the daemon truthfully reports both "the id you asked
+/// about does not exist" and "no agent occupies this pane", so a single
+/// snapshot is not evidence the slot is empty: declaring the close complete
+/// there drops the card while the replacement comes up behind it and keeps
+/// running unattended.
+///
+/// Sized as [`RESPAWN_SLOT_HANDOVER_WORST_CASE`] plus
+/// [`CLOSE_SLOT_SETTLE_MARGIN_MS`] rather than as its own number, so it can never
+/// again fall short of the respawn the reattach loop is simultaneously waiting
+/// out.
+const CLOSE_SLOT_SETTLE_BUDGET: Duration = Duration::from_millis(
+    RESPAWN_SLOT_HANDOVER_WORST_CASE.as_millis() as u64 + CLOSE_SLOT_SETTLE_MARGIN_MS,
+);
+
+/// PRD #241 F3b: the much shorter settle window used while the I/O task still
+/// reports [`IO_ATTACHED`].
+///
+/// A respawn ends the attach stream at its very start, so an attached task
+/// means no respawn is in flight — except for the propagation gap between the
+/// daemon dropping the PTY master and our reader observing the end, which is
+/// local-socket latency. Two `stop-agent` round-trips and a `list-agents` have
+/// already elapsed by the time we get here; 300 ms of re-checking is several
+/// more round-trips of margin, without making the ordinary ghost-card close
+/// (agent long gone, attach socket still nominally open) pay the full respawn
+/// budget.
+const CLOSE_SLOT_ATTACHED_GRACE: Duration = Duration::from_millis(300);
+
+/// PRD #241 F3b: gap between slot-occupancy polls inside
+/// [`CLOSE_SLOT_SETTLE_BUDGET`].
+const CLOSE_SLOT_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+/// PRD #241 F3b: bound on the single `list_agents` round-trip used to resolve
+/// the pane slot's current occupant. Same reasoning as
+/// [`HYDRATE_LIST_TIMEOUT`], but much tighter: `close_pane` runs on the render
+/// thread via `block_on`, and the daemon has just answered two `stop-agent`
+/// RPCs, so it is demonstrably alive.
+const CLOSE_SLOT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// PRD #241 F3b (review finding G3): worst-case wall clock for one *resolution
+/// round* — the `list-agents` that names the pane slot's current occupant plus
+/// the `stop-agent` sent to that occupant.
+const CLOSE_SLOT_RESOLVE_ROUND_WORST_CASE: Duration = Duration::from_millis(
+    CLOSE_SLOT_LOOKUP_TIMEOUT.as_millis() as u64 + CTRL_W_STOP_TIMEOUT.as_millis() as u64,
+);
+
+/// PRD #241 F3b (review finding G3): hard cap on how many *replacement* agents
+/// one close will chase before it stops guessing and says so.
+///
+/// One round is the pre-G3 behaviour (find the replacement, stop it); the extra
+/// rounds cover a respawn chain where each replacement is itself replaced before
+/// our `stop-agent` lands. Past that the slot is changing owners faster than a
+/// client can follow it, and chasing further only trades a longer render-thread
+/// block for the same uncertainty — so the close completes and is *announced*
+/// instead (see [`slot_churn_outcome`]).
+const CLOSE_SLOT_RESOLVE_MAX_ROUNDS: u32 = 3;
+
+/// PRD #241 F3b (review finding G3): total wall-clock budget for resolving who
+/// owns the pane slot, covering **all** rounds together — the iteration cap
+/// alone would not bound the work, because each round can spend a
+/// `list-agents` timeout plus a `stop-agent` timeout.
+///
+/// Sized as the longest path a close could already take before G3 existed: a
+/// full [`CLOSE_SLOT_SETTLE_BUDGET`] of polling, one more
+/// [`CLOSE_SLOT_POLL_INTERVAL`] of granularity, then one
+/// [`CLOSE_SLOT_RESOLVE_ROUND_WORST_CASE`] to find and stop the single
+/// replacement that appears at the very end of the window (the
+/// `lifecycle/stop/009` shape). So the unchurned case always fits and is never
+/// cut short into a false "unverified" — the bound only ever bites on genuine
+/// churn, and the worst-case block on this path is unchanged by G3; it is
+/// merely named and enforced now instead of being an emergent sum.
+const CLOSE_SLOT_RESOLVE_TOTAL_BUDGET: Duration = Duration::from_millis(
+    CLOSE_SLOT_SETTLE_BUDGET.as_millis() as u64
+        + CLOSE_SLOT_POLL_INTERVAL.as_millis() as u64
+        + CLOSE_SLOT_RESOLVE_ROUND_WORST_CASE.as_millis() as u64,
+);
+
+/// PRD #241 F3b: what the close path decided to do about the daemon-side agent.
+/// Replaces the previous `Result<Result<(), ClientError>, Elapsed>` pair, which
+/// could no longer express the extra outcomes the slot check produces (a
+/// *replacement* agent was stopped instead; the slot was proven empty).
+enum StopOutcome {
+    /// The daemon-side agent for this pane is gone — either `stop-agent`
+    /// succeeded, or the daemon proved nothing occupies the pane slot. Teardown
+    /// may complete.
+    Done,
+    /// PRD #241 F3b (review finding G2): teardown completes, but nothing *proved*
+    /// the pane slot empty — `list-agents` was unusable during the respawn window,
+    /// or (finding G3) the slot kept changing owners until the bounded resolution
+    /// loop ran out of budget (see [`resolve_pane_slot_after_not_found`] for why
+    /// retaining the pane here would be worse). Complete the close AND surface
+    /// the carried message: a close that could not determine whether an agent is
+    /// still running must never be silent, which is the same reason
+    /// [`Self::Failed`] retains the pane rather than degrading to a detach.
+    DoneUnverified(String),
+    /// A genuine failure: the agent may still be alive. Retain the pane and
+    /// surface this message.
+    Failed(String),
+    /// The stop RPC never answered.
+    TimedOut,
+}
+
+/// PRD #241 F3: what one `stop-agent` attempt means. Split out from
+/// [`StopOutcome`] because `NotFound` is not (yet) an outcome — it is the
+/// signal to keep looking.
+enum StopClass {
+    /// The daemon acknowledged the stop.
+    Stopped,
+    /// The daemon reports THIS id does not exist (see [`is_agent_not_found`]).
+    NotFound,
+    /// Any other server/transport error.
+    Failed(String),
+    /// The RPC did not answer within [`CTRL_W_STOP_TIMEOUT`].
+    TimedOut,
+}
+
+impl StopClass {
+    /// Collapse to the caller-visible outcome, or `None` when the daemon says
+    /// this id does not exist.
+    ///
+    /// PRD #241 F3b (review finding G3): `NotFound` deliberately has **no**
+    /// outcome. It used to collapse to [`StopOutcome::Done`], which is what let
+    /// a stop that lost a race to yet another respawn report the close as
+    /// complete while the successor kept running — the same silent-orphan bug
+    /// as G1/G2, one level deeper. Returning `None` makes "the id I asked about
+    /// is gone" un-representable as a finished close: every call site must
+    /// either keep resolving the slot or announce that it could not.
+    fn resolved(self) -> Option<StopOutcome> {
+        match self {
+            StopClass::Stopped => Some(StopOutcome::Done),
+            StopClass::NotFound => None,
+            StopClass::Failed(msg) => Some(StopOutcome::Failed(msg)),
+            StopClass::TimedOut => Some(StopOutcome::TimedOut),
+        }
+    }
+}
+
+/// PRD #241 F3: classify one bounded `stop_agent` attempt against the id it was
+/// sent for. The id matters — [`is_agent_not_found`] only accepts the daemon's
+/// agent-scoped not-found for exactly this agent.
+fn classify_stop(
+    result: Result<Result<(), crate::daemon_client::ClientError>, tokio::time::error::Elapsed>,
+    agent_id: &str,
+) -> StopClass {
+    match result {
+        Ok(Ok(())) => StopClass::Stopped,
+        Ok(Err(e)) if is_agent_not_found(&e, agent_id) => StopClass::NotFound,
+        Ok(Err(e)) => StopClass::Failed(e.to_string()),
+        Err(_) => StopClass::TimedOut,
+    }
+}
+
+/// PRD #241 F3b (review finding G2): the user-visible text for a close that
+/// COMPLETED without being able to verify the daemon side.
+///
+/// Says three things, in the order a user needs them: the pane *is* closed (so
+/// the vanished card is not itself a bug), why we could not check, and what may
+/// still be running plus what to do about it. Restarting the deck re-hydrates
+/// every daemon-side agent into a card (`hydrate_from_daemon`), so a survivor
+/// becomes visible and closable again; stopping the daemon is the blunt option.
+///
+/// Kept in one place so every arm that cannot verify a close words it
+/// identically and a test can pin the behaviour rather than N copies of a
+/// format string. `reason` is the middle clause — what stopped us from
+/// verifying — and reads directly after "Closed pane N but".
+fn unverified_close_warning(pane_id_env: &str, reason: &str) -> String {
+    format!(
+        "Closed pane {pane_id_env} but {reason} — an agent may still be running unattended; \
+         restart the deck to reattach it, or stop the daemon"
+    )
+}
+
+/// PRD #241 F3b (review finding G3): the close ran out of budget while chasing
+/// a pane slot that kept changing owners.
+///
+/// The daemon answered every question we asked — this is not the G2
+/// "cannot query the daemon" case — but the answer kept changing under us:
+/// each agent we were told owns the slot had already been replaced by the time
+/// our `stop-agent` arrived. Teardown still completes (retaining the pane would
+/// re-wedge issue #218's ghost card), so the user is told instead, exactly as on
+/// the G2 paths.
+fn slot_churn_warning(pane_id_env: &str) -> String {
+    unverified_close_warning(
+        pane_id_env,
+        "the pane slot kept changing owners, so the close could not be verified (each replacement \
+         was itself replaced before the close could stop it)",
+    )
+}
+
+/// PRD #241 F3b (review finding G3): log the exhausted bound with enough detail
+/// to tell the two bounds apart in a trace, and return the one announced
+/// outcome the user sees for either.
+fn slot_churn_outcome(pane_id_env: &str, replacement_stops: u32, elapsed: Duration) -> StopOutcome {
+    tracing::warn!(
+        pane_id = %pane_id_env,
+        replacement_stops,
+        elapsed_ms = elapsed.as_millis() as u64,
+        max_rounds = CLOSE_SLOT_RESOLVE_MAX_ROUNDS,
+        budget_ms = CLOSE_SLOT_RESOLVE_TOTAL_BUDGET.as_millis() as u64,
+        "close_pane: the pane slot kept changing owners — completing the close without confirming \
+         the slot is empty"
+    );
+    StopOutcome::DoneUnverified(slot_churn_warning(pane_id_env))
+}
+
+/// PRD #241 F3b: both `stop-agent` attempts said the agent does not exist —
+/// decide whether the pane is genuinely agent-less or whether a *replacement*
+/// has taken over its slot.
+///
+/// The daemon is authoritative about which agent (if any) currently carries
+/// this `pane_id_env`, so ask it:
+///
+/// * **an occupant we have not already stopped** → that is the replacement the
+///   F9 respawn produced. Stop *it*; its result is the close's result. This is
+///   the orphan the old code created by returning `Ok(())` and dropping the
+///   pane out from under a live agent. Review finding G3: unless that stop
+///   *also* comes back id-scoped not-found, which means the replacement was
+///   itself replaced between our `list-agents` and our `stop-agent` — so the
+///   answer is to resolve the slot **again**, not to call the close done.
+/// * **an occupant we already stopped** → the daemon contradicts itself
+///   (`stop` says gone, `list` says present). Nothing further to kill; treat
+///   the stop as done.
+/// * **no occupant** → the slot is empty; how long we keep re-checking before
+///   believing it depends on what the pane's I/O task is doing.
+///   [`IO_FINISHED`] is immediate (it can no longer adopt anything, so nothing
+///   can be orphaned), [`IO_REATTACHING`] gets the full
+///   [`CLOSE_SLOT_SETTLE_BUDGET`] (a respawn inside its SIGTERM grace shows an
+///   empty slot for up to `AGENT_TERMINATE_GRACE`), and [`IO_ATTACHED`] gets
+///   only [`CLOSE_SLOT_ATTACHED_GRACE`]. The window is recomputed every pass,
+///   so a task that transitions attached → reattaching mid-poll extends it, and
+///   it is measured from the last handover we witnessed rather than from the
+///   start of the close — "the slot has looked empty for a whole handover" is
+///   the claim, and a stop that loses to a further respawn restarts it.
+/// * **`list_agents` unusable** → no positive evidence of a replacement exists.
+///   Fall back to the plain already-stopped reading, which is exactly the
+///   behaviour without this check; the alternative — retaining the pane — would
+///   re-wedge the ghost card that issue #218 reported, in exchange for guarding
+///   a replacement we have no reason to believe exists. Review finding G2: the
+///   close still completes, but it returns [`StopOutcome::DoneUnverified`] so the
+///   user is *told* it completed blind — a replacement that starts after the
+///   failed lookup would otherwise run unattended with no signal at all, the very
+///   silence the pane-retaining failure path exists to prevent.
+///
+/// Review finding G3: because the third bullet feeds back into the first, this
+/// is a **bounded re-resolution loop** rather than a fixed number of steps —
+/// TOCTOU against a remote daemon has no depth limit a client can assume, so
+/// nesting depth is handled by one code path instead of by special-casing each
+/// newly-noticed level. Two explicit bounds keep the *total* work finite:
+/// [`CLOSE_SLOT_RESOLVE_MAX_ROUNDS`] replacement stops, and
+/// [`CLOSE_SLOT_RESOLVE_TOTAL_BUDGET`] of wall clock across all rounds
+/// (enforced both by the checks in the loop and, structurally, by the timeout
+/// wrapped around it here). Exhausting either completes the teardown and
+/// returns [`slot_churn_outcome`] — never a silent `Done`.
+async fn resolve_pane_slot_after_not_found(
+    client: &DaemonClient,
+    pane_id_env: &str,
+    already_stopped: [String; 2],
+    io_state: &AtomicU8,
+) -> (String, StopOutcome) {
+    // Owned out here so the id survives the hard-deadline arm below, which
+    // cancels the loop mid-round and therefore cannot return it.
+    let mut last_tried = already_stopped[1].clone();
+    let chased = tokio::time::timeout(
+        CLOSE_SLOT_RESOLVE_TOTAL_BUDGET,
+        chase_pane_slot_owner(
+            client,
+            pane_id_env,
+            already_stopped,
+            io_state,
+            &mut last_tried,
+        ),
+    )
+    .await;
+    match chased {
+        Ok(outcome) => (last_tried, outcome),
+        // Reachable only once a churn round has re-armed the settle window past
+        // the budget: a replacement discovered near the deadline can start a
+        // `stop-agent` that would run beyond it. Cancelling that stop mid-flight
+        // is the point — the budget is a ceiling on how long Ctrl+W blocks the
+        // render thread — and the announced outcome is the honest one, because
+        // we no longer know whether the stop landed. Keeping the bound here
+        // rather than only in the loop's arithmetic also means a later edit to
+        // any single arm cannot quietly unbound the whole path.
+        Err(_) => {
+            tracing::warn!(
+                pane_id = %pane_id_env,
+                budget_ms = CLOSE_SLOT_RESOLVE_TOTAL_BUDGET.as_millis() as u64,
+                "close_pane: pane-slot resolution hit its total budget mid-round — completing the \
+                 close without confirming the slot is empty"
+            );
+            (
+                last_tried,
+                StopOutcome::DoneUnverified(slot_churn_warning(pane_id_env)),
+            )
+        }
+    }
+}
+
+/// PRD #241 F3b: the re-resolution loop behind
+/// [`resolve_pane_slot_after_not_found`], which owns its bounds and its docs.
+///
+/// Writes the last id it sent a `stop-agent` to into `last_tried` as it goes,
+/// so the caller can still name it after cancelling this future at the deadline.
+async fn chase_pane_slot_owner(
+    client: &DaemonClient,
+    pane_id_env: &str,
+    already_stopped: [String; 2],
+    io_state: &AtomicU8,
+    last_tried: &mut String,
+) -> StopOutcome {
+    let mut already_stopped: Vec<String> = already_stopped.into();
+    let started = tokio::time::Instant::now();
+    // The settle window asks "has the slot looked empty for a whole respawn
+    // handover?", so it is measured from the last handover we witnessed — not
+    // from the start of the close. A stop that loses to a further respawn is
+    // fresh evidence that a handover is in flight, so it re-arms this.
+    let mut handover_at = started;
+    let mut replacement_stops: u32 = 0;
+    loop {
+        let listed = tokio::time::timeout(CLOSE_SLOT_LOOKUP_TIMEOUT, client.list_agents()).await;
+        let occupant = match listed {
+            Ok(Ok(records)) => records
+                .into_iter()
+                .find(|r| r.pane_id_env.as_deref() == Some(pane_id_env))
+                .map(|r| r.id),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    pane_id = %pane_id_env,
+                    error = %e,
+                    "close_pane: cannot confirm the pane slot is empty (list-agents failed); \
+                     accepting the daemon's 'agent not found' as an already-stopped close"
+                );
+                return StopOutcome::DoneUnverified(unverified_close_warning(
+                    pane_id_env,
+                    &format!("could not query the daemon (list-agents: {e})"),
+                ));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    pane_id = %pane_id_env,
+                    timeout_ms = CLOSE_SLOT_LOOKUP_TIMEOUT.as_millis() as u64,
+                    "close_pane: cannot confirm the pane slot is empty (list-agents timed out); \
+                     accepting the daemon's 'agent not found' as an already-stopped close"
+                );
+                return StopOutcome::DoneUnverified(unverified_close_warning(
+                    pane_id_env,
+                    &format!(
+                        "could not query the daemon (list-agents timed out after {}s)",
+                        CLOSE_SLOT_LOOKUP_TIMEOUT.as_secs()
+                    ),
+                ));
+            }
+        };
+
+        match occupant {
+            Some(id) if !already_stopped.contains(&id) => {
+                replacement_stops += 1;
+                tracing::info!(
+                    pane_id = %pane_id_env,
+                    replacement_agent_id = %id,
+                    replacement_stops,
+                    "close_pane: a replacement agent now owns this pane slot — stopping it \
+                     instead of orphaning it"
+                );
+                let stop = tokio::time::timeout(CTRL_W_STOP_TIMEOUT, client.stop_agent(&id)).await;
+                let class = classify_stop(stop, &id);
+                last_tried.clone_from(&id);
+                if let Some(outcome) = class.resolved() {
+                    return outcome;
+                }
+                // PRD #241 F3b (review finding G3): id-scoped not-found for the
+                // *replacement* — a further respawn took the slot between the
+                // `list-agents` above and this stop. That is not a finished
+                // close, it is the same question one level down, so ask it
+                // again with this id added to the set we have already tried.
+                // The handover clock re-arms because a fresh handover is
+                // demonstrably in flight.
+                already_stopped.push(id);
+                handover_at = tokio::time::Instant::now();
+                if replacement_stops >= CLOSE_SLOT_RESOLVE_MAX_ROUNDS
+                    || started.elapsed() + CLOSE_SLOT_RESOLVE_ROUND_WORST_CASE
+                        > CLOSE_SLOT_RESOLVE_TOTAL_BUDGET
+                {
+                    return slot_churn_outcome(pane_id_env, replacement_stops, started.elapsed());
+                }
+            }
+            Some(_) => return StopOutcome::Done,
+            None => {
+                let settle = match io_state.load(Ordering::SeqCst) {
+                    // No respawned agent will ever be adopted for this pane, so
+                    // an empty slot is final.
+                    IO_FINISHED => Duration::ZERO,
+                    IO_REATTACHING => CLOSE_SLOT_SETTLE_BUDGET,
+                    _ => CLOSE_SLOT_ATTACHED_GRACE,
+                };
+                if handover_at.elapsed() >= settle {
+                    tracing::debug!(
+                        pane_id = %pane_id_env,
+                        settle_ms = settle.as_millis() as u64,
+                        replacement_stops,
+                        "close_pane: pane slot stayed empty for the whole settle window — \
+                         treating the close as complete"
+                    );
+                    return StopOutcome::Done;
+                }
+                // Only reachable once a churn round has re-armed the settle
+                // window past the total budget: with `replacement_stops == 0`
+                // the check above returns first, because the budget is a full
+                // settle window plus a whole round (pinned below).
+                if started.elapsed() + CLOSE_SLOT_POLL_INTERVAL + CLOSE_SLOT_LOOKUP_TIMEOUT
+                    > CLOSE_SLOT_RESOLVE_TOTAL_BUDGET
+                {
+                    return slot_churn_outcome(pane_id_env, replacement_stops, started.elapsed());
+                }
+                tokio::time::sleep(CLOSE_SLOT_POLL_INTERVAL).await;
+            }
+        }
+    }
+}
+
 /// PRD #92 F12: initial wait between `list_agents` lookups when the
 /// per-pane attach stream has ended and we're trying to find the
 /// freshly-respawned agent for `pane_id_env`. The F9 clear=true delegate
@@ -1222,7 +1766,47 @@ const REATTACH_LOOKUP_MAX_DELAY: Duration = Duration::from_millis(1000);
 /// slow ones get caught within the budget. On give-up the io_task
 /// exits cleanly; the pane keeps its last-rendered screen and the user
 /// can close it manually.
-const REATTACH_LOOKUP_TOTAL_BUDGET: Duration = Duration::from_secs(10);
+///
+/// PRD #241 F3b (review finding G1): expressed as twice
+/// [`RESPAWN_SLOT_HANDOVER_WORST_CASE`] — the same worst case
+/// [`CLOSE_SLOT_SETTLE_BUDGET`] is derived from, doubled for retry margin. The
+/// value is unchanged (10 s); what changed is that the close path's window and
+/// this one now move together, because they wait out the *same* respawn.
+const REATTACH_LOOKUP_TOTAL_BUDGET: Duration =
+    Duration::from_millis(2 * RESPAWN_SLOT_HANDOVER_WORST_CASE.as_millis() as u64);
+
+// PRD #241 F3b (review finding G1): the ordering of these three windows is
+// load-bearing, not stylistic — pin it at compile time so a future edit to any
+// one of them cannot silently re-open the orphaned-replacement race.
+const _: () = assert!(
+    CLOSE_SLOT_SETTLE_BUDGET.as_millis() >= RESPAWN_SLOT_HANDOVER_WORST_CASE.as_millis(),
+    "close_pane must keep polling the pane slot for at least as long as a respawn can take to \
+     hand it over, or a replacement appearing later is orphaned with its card gone"
+);
+const _: () = assert!(
+    REATTACH_LOOKUP_TOTAL_BUDGET.as_millis() >= CLOSE_SLOT_SETTLE_BUDGET.as_millis(),
+    "the pane I/O task must still be willing to adopt a replacement for at least as long as \
+     close_pane waits for one, or the close outlasts the only task that could attach to it"
+);
+
+// PRD #241 F3b (review finding G3): the re-resolution loop's bounds. Both are
+// pinned so shrinking the budget can never turn the ordinary single-respawn
+// close into a false "could not verify", and so the loop always gets at least
+// the one round that was the pre-G3 behaviour.
+const _: () = assert!(
+    CLOSE_SLOT_RESOLVE_TOTAL_BUDGET.as_millis()
+        >= CLOSE_SLOT_SETTLE_BUDGET.as_millis()
+            + CLOSE_SLOT_POLL_INTERVAL.as_millis()
+            + CLOSE_SLOT_RESOLVE_ROUND_WORST_CASE.as_millis(),
+    "pane-slot resolution must be able to wait out a whole respawn handover AND still afford one \
+     worst-case stop of the replacement it finds, or a close that verified fine before would now \
+     report itself unverified"
+);
+const _: () = assert!(
+    CLOSE_SLOT_RESOLVE_MAX_ROUNDS >= 1,
+    "a close must be allowed to stop at least one replacement agent, or the replacement-aware \
+     close path is disabled and every respawn during a close orphans its agent"
+);
 
 /// PRD #92 F12: bounds NEW agents that produce zero NEW bytes after the
 /// initial snapshot replay before terminating. Reader-side any
@@ -1266,6 +1850,7 @@ async fn run_pane_io_task(
     mouse_mode: Arc<AtomicBool>,
     hyperlinks: Arc<Mutex<HyperlinkMap>>,
     stream_rejections: Arc<Mutex<Vec<(String, String)>>>,
+    io_state: Arc<AtomicU8>,
 ) {
     let mut conn_opt: Option<AttachConnection> = Some(initial_conn);
     let mut consecutive_empty_sessions: u32 = 0;
@@ -1402,6 +1987,11 @@ async fn run_pane_io_task(
             }
         }
 
+        // PRD #241 F3b: publish "a replacement may be coming" for the whole
+        // lookup. A concurrent `close_pane` that gets `agent not found` for the
+        // id it holds must wait out this window instead of dropping the pane
+        // on top of the agent the daemon is about to hand us.
+        io_state.store(IO_REATTACHING, Ordering::SeqCst);
         match resolve_and_reattach(&client, &pane_id).await {
             Some((new_agent_id, new_conn)) => {
                 tracing::debug!(
@@ -1411,6 +2001,7 @@ async fn run_pane_io_task(
                 );
                 *agent_id.lock().unwrap() = new_agent_id;
                 conn_opt = Some(new_conn);
+                io_state.store(IO_ATTACHED, Ordering::SeqCst);
             }
             None => {
                 tracing::debug!(
@@ -1847,6 +2438,12 @@ impl PaneController for EmbeddedPaneController {
         // re-read the id after a mid-reattach swap.
         let shared_agent_id = Arc::clone(&s.agent_id);
         let initial_agent_id = shared_agent_id.lock().unwrap().clone();
+        // PRD #241 F3b: the pane slot's identity (`pane_id` IS the
+        // `DOT_AGENT_DECK_PANE_ID` the daemon records as `pane_id_env`) plus the
+        // I/O task's liveness, so the not-found path below can ask the daemon
+        // who owns the slot NOW rather than trusting a possibly-stale id.
+        let pane_id_env = pane_id.to_string();
+        let io_state = Arc::clone(&s.io_state);
         // CodeRabbit Fix E: bound the stop-agent RPC. Without this
         // timeout a wedged daemon would pin the TUI renderer
         // indefinitely (Ctrl+W happens on the render thread via
@@ -1866,39 +2463,84 @@ impl PaneController for EmbeddedPaneController {
         // (just-killed) agent — the daemon answers stop-agent with an
         // "Agent <id> not found" error. Re-read the shared agent id once
         // and retry: the io_task may have already swapped in the NEW id
-        // from the F9 respawn. If the retry also fails we fall through
-        // to the existing log+restore path; we don't loop further.
-        let (agent_id, stop_result) = s.runtime.block_on(async move {
-            use crate::daemon_client::ClientError;
+        // from the F9 respawn.
+        //
+        // PRD #241 F3b: if BOTH attempts come back agent-not-found, that used
+        // to end the story — `Ok(())`, pane dropped. It no longer does, because
+        // "the id I hold is gone" and "this pane has no agent" are different
+        // claims during a respawn. `resolve_pane_slot_after_not_found` asks the
+        // daemon which agent owns the pane slot now and stops THAT one, so a
+        // replacement can never be left running with its card gone.
+        let (agent_id, stop_outcome) = s.runtime.block_on(async move {
+            // Attempt 1: the id this pane was bound to when the close started.
             let first = tokio::time::timeout(
                 CTRL_W_STOP_TIMEOUT,
                 client.stop_agent(&initial_agent_id),
             )
             .await;
-            match first {
-                Ok(Err(ClientError::Server(ref msg)))
-                    if msg.to_lowercase().contains("not found") =>
-                {
-                    let retry_id = shared_agent_id.lock().unwrap().clone();
-                    tracing::debug!(
-                        first_agent_id = %initial_agent_id,
-                        retry_agent_id = %retry_id,
-                        "close_pane: stop-agent returned 'not found'; retrying once with currently-bound agent id"
-                    );
-                    let second =
-                        tokio::time::timeout(CTRL_W_STOP_TIMEOUT, client.stop_agent(&retry_id))
-                            .await;
-                    (retry_id, second)
-                }
-                other => (initial_agent_id, other),
+            if let Some(outcome) = classify_stop(first, &initial_agent_id).resolved() {
+                return (initial_agent_id, outcome);
             }
+
+            // Attempt 2 (PRD #92 F12): re-read the shared id — the io_task may
+            // already have swapped in the respawned agent — and try that.
+            // Unconditional even when the id is unchanged: for a ghost card
+            // this second identical answer is what proves the id is dead
+            // rather than merely stale.
+            let retry_id = shared_agent_id.lock().unwrap().clone();
+            tracing::debug!(
+                first_agent_id = %initial_agent_id,
+                retry_agent_id = %retry_id,
+                "close_pane: stop-agent returned 'not found'; retrying once with currently-bound agent id"
+            );
+            let second =
+                tokio::time::timeout(CTRL_W_STOP_TIMEOUT, client.stop_agent(&retry_id)).await;
+            if let Some(outcome) = classify_stop(second, &retry_id).resolved() {
+                return (retry_id, outcome);
+            }
+
+            // PRD #241 F3b: both ids are gone as far as the daemon is
+            // concerned. That is NOT yet proof this pane has no agent: the F9
+            // `clear = true` respawn removes the old agent and spawns a
+            // replacement under the SAME `pane_id_env`, and until the io_task
+            // adopts it the shared id we just asked about is the dead one. If
+            // we returned success here, the card would vanish while the
+            // replacement kept running on the daemon with nothing attached to
+            // it. Ask the daemon who owns the slot instead.
+            resolve_pane_slot_after_not_found(
+                &client,
+                &pane_id_env,
+                [initial_agent_id, retry_id],
+                &io_state,
+            )
+            .await
         });
-        match stop_result {
-            Ok(Ok(())) => {
+        match stop_outcome {
+            StopOutcome::Done => {
                 // Drop `s` → io_task aborts. No explicit abort needed.
                 Ok(())
             }
-            Ok(Err(e)) => {
+            StopOutcome::DoneUnverified(warning) => {
+                // PRD #241 F3b (review finding G2): the close completes for the
+                // reason documented on `resolve_pane_slot_after_not_found` —
+                // with `list-agents` unusable there is no evidence a replacement
+                // exists, and retaining the pane would re-wedge #218's ghost
+                // card. But "completed without being able to check" is exactly
+                // the silent degradation the `Failed` arm below refuses to allow:
+                // an agent could still be alive on the daemon with its card gone.
+                // So finish the teardown (drop `s` → io_task aborts, same as
+                // `Done`) and queue the warning for the render loop's per-frame
+                // drain, which puts it on the status line.
+                tracing::warn!(
+                    pane_id = %pane_id,
+                    agent_id = %agent_id,
+                    "close completed without confirming the daemon side — surfacing a \
+                     possibly-unattended-agent warning"
+                );
+                self.close_warnings.lock().unwrap().push(warning);
+                Ok(())
+            }
+            StopOutcome::Failed(e) => {
                 // Don't silently degrade to detach: a swallowed
                 // stop-agent error would close the socket, the daemon
                 // would treat the close as implicit detach, and the
@@ -1929,7 +2571,7 @@ impl PaneController for EmbeddedPaneController {
                     "stop-agent failed for pane {pane_id}: {e}"
                 )))
             }
-            Err(_) => {
+            StopOutcome::TimedOut => {
                 // Timeout: daemon never answered. Same restore path as
                 // the RPC-error branch — the io_task is still alive
                 // (`s` not dropped), the daemon-side agent likely still

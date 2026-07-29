@@ -167,8 +167,15 @@ pub(crate) fn clamp_scroll_offset(
 // UI state types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum UiMode {
+/// Which input layer currently owns the keyboard. PRD #241 made this public:
+/// key resolution is no longer mode-independent (`ClosePane` resolves only in
+/// command mode), so the L1 seams that prove the gating —
+/// [`key_action_for_mode`] and [`render_hints_bar_for_mode_to_buffer`] — take
+/// the mode as an argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiMode {
+    /// Command mode: the dashboard/tab keyboard owns the keys. This is the
+    /// ONLY mode in which the destructive `ClosePane` chord resolves.
     Normal,
     Filter,
     Help,
@@ -192,6 +199,12 @@ enum UiMode {
     /// next-fire) with add/edit (seeded authoring agent), delete-with-confirm
     /// (definition only), and run-now actions.
     ScheduledTasks,
+    /// PRD #241 M3: the close confirmation dialog. Armed by
+    /// [`Action::CloseSelected`] (from the `Ctrl+W` chord *or* the `[Close]`
+    /// button) whenever there is something to close; only an explicit Close
+    /// selection emits [`Action::ConfirmCloseSelected`] and performs the
+    /// teardown. The selection index lives in `UiState::close_confirm`.
+    CloseConfirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1607,6 +1620,24 @@ struct UiState {
     /// PRD #92 F1 widened this from 2 to 3 options; Detach remains the
     /// default so the existing muscle memory does not become destructive.
     quit_confirm_selected: usize,
+    /// PRD #241 M3: selected option in the close-confirmation modal
+    /// (0=Cancel, 1=Close). Only meaningful when `mode == CloseConfirm`; it is
+    /// re-seeded to the Cancel default every time the dialog is armed.
+    close_confirm: CloseConfirmState,
+    /// PRD #241 review F1: the stable identity the open confirmation is bound
+    /// to, captured when the dialog was armed. `Action::ConfirmCloseSelected`
+    /// closes THIS and only this — never whatever happens to be selected by the
+    /// time the user answers. Cleared on every exit from the dialog.
+    close_confirm_target: Option<CloseTarget>,
+    /// PRD #241 review F5: has the armed close confirmation been drawn yet?
+    ///
+    /// The run loop drains a whole input burst before re-rendering, so without
+    /// this the keystroke queued behind the `Ctrl+W` (or behind the `[Close]` /
+    /// tab-strip `×` click) that armed the dialog would be delivered to a modal
+    /// the user has never seen. While it is `false`, `run_tui` discards pending
+    /// input and re-renders instead of reading; `render_overlays` sets it the
+    /// first time the dialog actually reaches the screen.
+    close_confirm_displayed: bool,
     /// PRD #92 F1: selected option in the secondary Stop-confirmation
     /// dialog (0=No, 1=Yes). Defaults to No — the safer default for the
     /// destructive choice. Only meaningful when `mode == StopConfirm`.
@@ -1801,6 +1832,9 @@ impl UiState {
             config_gen_target: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
+            close_confirm: CloseConfirmState::default(),
+            close_confirm_target: None,
+            close_confirm_displayed: false,
             stop_confirm_selected: 0,
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
@@ -3439,7 +3473,18 @@ pub enum Action {
     NewPane,
     /// PRD #80: close the selected pane — or the entire mode/orchestration tab
     /// it belongs to (Ctrl+W).
+    ///
+    /// PRD #241 M3: this is now a *request*, not the teardown itself. Both
+    /// doors that produce it — the `close_pane` chord and the `[Close]` button
+    /// — arm the confirmation dialog (see [`close_confirmation_for_action`]);
+    /// only [`Action::ConfirmCloseSelected`] destroys anything. Putting the
+    /// modal on the action rather than the key is what keeps the two doors
+    /// from drifting apart.
     CloseSelected,
+    /// PRD #241 M3: the user explicitly picked **Close** in the confirmation
+    /// dialog. This is the only action that performs the destructive
+    /// close-pane / close-tab teardown.
+    ConfirmCloseSelected,
     /// PRD #80: toggle the embedded-pane layout between stacked and tiled
     /// (Ctrl+T).
     ToggleLayout,
@@ -4026,6 +4071,314 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
     }
 }
 
+/// PRD #241 M3: the close-confirmation dialog's whole state — which option is
+/// highlighted, and how much the confirmed close would destroy. Index 0 is
+/// **Cancel** and it is the [`Default`], following the same reasoning as the
+/// quit dialog's Detach default: `Ctrl+W` is already in people's fingers, so the
+/// muscle memory must not become destructive.
+///
+/// Deliberately holds no *identity* of what is being closed: that lives in
+/// [`UiState::close_confirm_target`] as a [`CloseTarget`]. See its docs for why
+/// the two are separate. `scope` is not identity — it is the one bit of the
+/// resolved close the dialog has to be able to say out loud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CloseConfirmState {
+    /// 0 = Cancel (default), 1 = Close.
+    pub selected: usize,
+    /// What the confirmed close will actually tear down, decided by
+    /// [`resolve_close_plan`] — the same function the confirmed close itself
+    /// branches on. Defaults to [`CloseScope::Pane`], the narrower claim.
+    pub scope: CloseScope,
+}
+
+/// PRD #241 fact-check follow-up: how much a confirmed close destroys, and
+/// therefore which words the dialog is allowed to use.
+///
+/// The dialog used to read `Close selected pane?` for every target, which is a
+/// lie on a Mode or Orchestration tab: that close takes the whole tab and every
+/// pane in it. Crucially the lie was NOT fixable by branching on
+/// [`CloseTarget`], because `CloseTarget::Session` does not mean "one card" —
+/// the confirmed close resolves the armed session, discovers its pane belongs to
+/// a Mode/Orchestration tab, and closes that entire tab. Only a plain dashboard
+/// pane reaches the one-pane branch. So the wording is derived from
+/// [`resolve_close_plan`], the single function the teardown itself branches on,
+/// and the two cannot disagree without the close changing shape.
+///
+/// Deliberately carries no pane COUNT. A number here would have to be recomputed
+/// against a moving world (reactive pools grow and shrink, roles die into dead
+/// slots), and a confidently wrong "3 panes" is worse than no number at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseScope {
+    /// Exactly one plain dashboard pane and its card.
+    #[default]
+    Pane,
+    /// A whole Mode / Orchestration tab: every pane it owns.
+    Tab,
+}
+
+/// PRD #241 review F1: the STABLE identity of whatever a close confirmation was
+/// armed against.
+///
+/// The first cut of the dialog stored only the dashboard's selection index and
+/// re-derived the victim at confirm time. That inverts the PRD's whole thesis:
+/// `Ctrl+PgUp` / `Ctrl+PgDn`, a mouse click, or any reactive re-index still
+/// landed while the modal was up, so the user could read "Close selected pane?",
+/// say yes, and lose a *different* tab or card. Capturing identity at ARM time —
+/// the same stable-selection discipline `Tab::Dashboard::selected_session_id`
+/// already uses — means the answer applies to the thing the user pointed at, and
+/// to nothing else.
+///
+/// If the captured target has disappeared by the time the user confirms, the
+/// close does nothing and says so. There is deliberately no fallback to "the
+/// current selection": a confirmation that retargets is worse than no
+/// confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseTarget {
+    /// A Mode / Orchestration tab, keyed by its [`TabId`] (stable across
+    /// tab-strip reordering and index shifts, unlike the position).
+    Tab(TabId),
+    /// A dashboard card, keyed by its session id (stable across filtering,
+    /// sorting, and list churn, unlike `selected_index`).
+    Session(String),
+}
+
+/// PRD #241 review F1: resolve a [`TabId`] back to its current position, or
+/// `None` if that tab is gone.
+fn tab_index_for_id(tab_manager: &TabManager, id: TabId) -> Option<usize> {
+    tab_manager
+        .tabs()
+        .iter()
+        .position(|t| tab_id_of(t) == Some(id))
+}
+
+/// The stable id of a closable tab. `Tab::Dashboard` has none — it is never
+/// closable, which is exactly the invariant `dashboard/pane/003` pins.
+fn tab_id_of(tab: &Tab) -> Option<TabId> {
+    match tab {
+        Tab::Mode { id, .. } | Tab::Orchestration { id, .. } => Some(*id),
+        Tab::Dashboard { .. } => None,
+    }
+}
+
+/// The dialog's options, in render/selection order. Index 0 is the
+/// non-destructive default. Only the confirm option's description changes with
+/// the scope — Cancel means the same thing either way.
+fn close_confirm_options(scope: CloseScope) -> [(&'static str, &'static str); 2] {
+    match scope {
+        CloseScope::Pane => [
+            ("Cancel", "keep it open"),
+            ("Close", "stop the agent and remove it"),
+        ],
+        CloseScope::Tab => [
+            ("Cancel", "keep it open"),
+            ("Close", "stop all agents and remove the tab"),
+        ],
+    }
+}
+
+/// The dialog's question, phrased for what the close will actually take.
+fn close_confirm_header(scope: CloseScope) -> &'static str {
+    match scope {
+        CloseScope::Pane => "  Close selected pane?",
+        CloseScope::Tab => "  Close this tab and all its panes?",
+    }
+}
+
+/// How many options the dialog offers — the same for every scope, so the key
+/// handler does not need to know which one is on screen.
+const CLOSE_CONFIRM_OPTION_COUNT: usize = 2;
+
+/// PRD #241 M3: decide whether a dispatched action needs the close
+/// confirmation, and seed the dialog when it does.
+///
+/// The gate lives on the ACTION rather than on the key because
+/// [`Action::CloseSelected`] has two doors — the `close_pane` chord and the
+/// persistent `[Close]` button — and both must confirm. `has_target` is the
+/// caller's answer to "is anything actually armed?": an active
+/// Mode/Orchestration tab, or a selected dashboard card with a live pane. With
+/// nothing armed the close stays the pre-existing no-op and no modal opens, so
+/// an unarmed dashboard can never be talked into closing card 0.
+pub fn close_confirmation_for_action(
+    action: &Action,
+    has_target: bool,
+) -> Option<CloseConfirmState> {
+    match action {
+        Action::CloseSelected if has_target => Some(CloseConfirmState::default()),
+        _ => None,
+    }
+}
+
+/// PRD #241 M3 + review F1/F4: raise the close confirmation, bound to `target`.
+///
+/// The ONE place the modal is armed, so every door into a destructive close —
+/// the `close_pane` chord, the `[Close]` button, and the tab strip's `×` —
+/// enters through the identical transition: Cancel selected, the target's
+/// stable identity recorded, and the "not drawn yet" flag reset so no
+/// already-queued keystroke can answer a dialog the user has not seen (F5).
+/// `scope` comes from [`resolve_close_plan`] against `target` — the SAME
+/// function `Action::ConfirmCloseSelected` branches on — so the sentence the
+/// user reads and the teardown they authorise are decided once. It is frozen
+/// here with the target for the same reason the target itself is frozen: the
+/// dialog describes what was armed, never what happens to be selected later.
+fn arm_close_confirmation(
+    ui: &mut UiState,
+    prompt: CloseConfirmState,
+    target: CloseTarget,
+    scope: CloseScope,
+) {
+    ui.close_confirm = CloseConfirmState { scope, ..prompt };
+    ui.close_confirm_target = Some(target);
+    ui.close_confirm_displayed = false;
+    ui.mode = UiMode::CloseConfirm;
+}
+
+/// PRD #241: **the** decision of what a confirmed close will destroy.
+///
+/// One function, two consumers that must never disagree: the confirmation
+/// dialog's wording (via [`CloseScope`], captured at arm time) and the confirmed
+/// teardown in `Action::ConfirmCloseSelected`, which matches directly on the
+/// returned plan. Before this existed the dialog inferred its copy from the
+/// [`CloseTarget`] variant, which is not the same question — a
+/// `CloseTarget::Session` whose pane belongs to a Mode/Orchestration tab closes
+/// that whole tab, so "Session" never implied "one pane".
+///
+/// `None` means a confirmed close would do nothing: the armed tab or session is
+/// gone. The caller says so rather than retargeting.
+fn resolve_close_plan(
+    target: &CloseTarget,
+    tab_manager: &TabManager,
+    snapshot: &AppState,
+) -> Option<ClosePlan> {
+    match target {
+        // PR #151 (e2e layout_002 regression): a Mode/Orchestration TAB is a
+        // close target in its own right, independent of the dashboard selection
+        // (which is `None` while such a tab is active). PRD #241 review F1:
+        // resolve the ARMED tab's id back to its current index rather than
+        // closing `active_index()`, so switching tabs under the open dialog
+        // cannot redirect the teardown. (selection_016)
+        CloseTarget::Tab(id) => {
+            tab_index_for_id(tab_manager, *id).map(|index| ClosePlan::Tab { index })
+        }
+        // PRD #113 finding 2: on the Dashboard the destructive close needs a
+        // session that still exists AND still owns a pane. Nothing armed means
+        // no card-0 fallback (that fallback is reserved for Enter/Focus), so an
+        // unarmed dashboard can never silently close card 0.
+        CloseTarget::Session(sid) => {
+            let pane_id = snapshot.sessions.get(sid)?.pane_id.clone()?;
+            // The armed card may be the face of a pane that lives inside a
+            // Mode/Orchestration tab. Closing it closes the tab — every pane in
+            // it — which is exactly why the dialog cannot read the target
+            // variant and call it a day.
+            match tab_manager
+                .tab_index_for_agent_pane(&pane_id)
+                .or_else(|| tab_manager.tab_index_for_pane(&pane_id))
+            {
+                Some(index) => Some(ClosePlan::Tab { index }),
+                None => Some(ClosePlan::Pane {
+                    session_id: sid.clone(),
+                    pane_id,
+                }),
+            }
+        }
+    }
+}
+
+/// PRD #241: the resolved shape of a confirmed close — see
+/// [`resolve_close_plan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClosePlan {
+    /// Tear down the Mode/Orchestration tab at this index and every pane it
+    /// owns.
+    Tab { index: usize },
+    /// Tear down exactly one plain dashboard pane and drop its card.
+    Pane { session_id: String, pane_id: String },
+}
+
+impl ClosePlan {
+    /// How much this plan destroys, in the terms the dialog speaks.
+    fn scope(&self) -> CloseScope {
+        match self {
+            ClosePlan::Tab { .. } => CloseScope::Tab,
+            ClosePlan::Pane { .. } => CloseScope::Pane,
+        }
+    }
+}
+
+/// PRD #241 M3: what would a close act on right now — and nothing, if nothing?
+///
+/// Mirrors — deliberately, arm for arm — the branch structure of the confirmed
+/// close in `dispatch_action`, so the dialog can never be raised for a close
+/// that would then turn out to be a no-op:
+///
+/// * an active Mode/Orchestration tab is closable regardless of the dashboard
+///   selection (PR #151 / `dashboard/selection/016`), and
+/// * otherwise the dashboard needs a REAL active selection whose session owns a
+///   pane (PRD #113 finding 2 / `dashboard/selection/012` — no card-0
+///   fallback).
+///
+/// PRD #241 review F1: it returns the target's stable identity rather than a
+/// bare "yes", so the confirmation can be *bound* to it. See [`CloseTarget`].
+fn resolve_close_target(
+    ui: &UiState,
+    tab_manager: &TabManager,
+    snapshot: &AppState,
+    filtered: &[(&String, &SessionState)],
+) -> Option<CloseTarget> {
+    if let Some(id) = tab_id_of(tab_manager.active_tab()) {
+        return Some(CloseTarget::Tab(id));
+    }
+    ui.selected_index
+        .and_then(|i| filtered.get(i))
+        .filter(|(id, _)| {
+            snapshot
+                .sessions
+                .get(*id)
+                .is_some_and(|session| session.pane_id.is_some())
+        })
+        .map(|(id, _)| CloseTarget::Session((*id).clone()))
+}
+
+/// PRD #241 M3: key handling for the close confirmation, modelled on
+/// [`handle_quit_confirm_key`]. Up/Down (or k/j) move the highlight, Enter
+/// commits the highlighted option, and Esc cancels. Only an explicit **Close**
+/// selection returns [`Action::ConfirmCloseSelected`]; everything else that
+/// leaves the dialog returns [`Action::DismissModal`], which is a pure
+/// return-to-Normal.
+///
+/// PRD #241 review F5: there is deliberately **no `y` shortcut**. An earlier
+/// cut had one, and a single keypress that destroys a pane is exactly the input
+/// most likely to already be sitting in the event queue when the dialog opens —
+/// the run loop drains a whole input burst without re-rendering, so a `y` typed
+/// before the prompt existed could answer it. `y` was this implementation's own
+/// addition, not a PRD requirement (the PRD's risk row only asks that confirm be
+/// a single keypress, which Enter is). With Cancel as the default selection, the
+/// worst a stray queued keystroke can now do is *dismiss* the dialog. The
+/// arm-time input drain in `run_tui` closes the same hole from the other side;
+/// this is the half that holds even if that one is bypassed.
+pub fn handle_close_confirm_key(state: &mut CloseConfirmState, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.selected = state.selected.saturating_sub(1);
+            Action::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if state.selected + 1 < CLOSE_CONFIRM_OPTION_COUNT {
+                state.selected += 1;
+            }
+            Action::Continue
+        }
+        KeyCode::Enter => {
+            if state.selected == 1 {
+                Action::ConfirmCloseSelected
+            } else {
+                Action::DismissModal
+            }
+        }
+        KeyCode::Esc => Action::DismissModal,
+        _ => Action::Continue,
+    }
+}
+
 fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState, managed_agents_count: usize) -> Action {
     // PRD #93 Phase 2 / M4.2: dialog was Detach/Cancel — every pane is
     // daemon-backed so quitting the TUI was always a detach, never a kill.
@@ -4570,6 +4923,66 @@ fn dashboard_focus_target(ui: &UiState, total: usize) -> Option<usize> {
         Some(idx) => idx.min(total - 1),
         None => ui.last_active_selection.unwrap_or(0).min(total - 1),
     })
+}
+
+/// PRD #241 M4 (review F2b): which pane does `Ctrl+D` go *back* to from command
+/// mode?
+///
+/// Answers the return leg of the toggle, per active tab, using the same targets
+/// each tab's own Enter/focus action already uses — so the chord lands exactly
+/// where the user would have landed the long way round:
+///
+/// * **Mode tab** — the remembered focused pane, else the agent pane
+///   (`Action::ModeTabFocus`).
+/// * **Orchestration tab** — the remembered focused role pane, else the start
+///   (orchestrator) role (`Action::OrchestrationFocus`).
+/// * **Dashboard** — the selected card's pane, but only when the session can
+///   take live input; a history-only or view-only card has nothing to type into,
+///   so `Action::Focus`'s gate applies here too.
+///
+/// `None` = nothing to return to; the caller stays in command mode and says so
+/// rather than pretending the chord did something.
+fn resume_pane_input_target(
+    ui: &UiState,
+    pane: &dyn PaneController,
+    tab_manager: &TabManager,
+    snapshot: &AppState,
+    filtered: &[(&String, &SessionState)],
+) -> Option<String> {
+    match tab_manager.active_tab() {
+        Tab::Mode {
+            focused_pane_id,
+            agent_pane_id,
+            ..
+        } => Some(
+            focused_pane_id
+                .clone()
+                .unwrap_or_else(|| agent_pane_id.clone()),
+        ),
+        Tab::Orchestration {
+            focused_role_pane_id,
+            role_pane_ids,
+            start_role_index,
+            ..
+        } => focused_role_pane_id
+            .clone()
+            .or_else(|| role_pane_ids.get(*start_role_index).cloned()),
+        Tab::Dashboard { .. } => {
+            // Prefer whatever the controller already has focused — returning to
+            // the pane you just left beats re-deriving from the card list — and
+            // fall back to the selected card.
+            let focused = pane
+                .as_any()
+                .downcast_ref::<EmbeddedPaneController>()
+                .and_then(|embedded| embedded.focused_pane_id());
+            let selected = dashboard_focus_target(ui, filtered.len())
+                .and_then(|i| filtered.get(i))
+                .and_then(|(id, _)| snapshot.sessions.get(*id))
+                .filter(|session| non_live_input_feedback(session.writable()).is_none())
+                .and_then(|session| session.pane_id.clone());
+            selected.or(focused)
+        }
+    }
 }
 
 /// PRD #113 M2/M4 — reconcile the dashboard's *active* selection highlight with
@@ -5539,16 +5952,22 @@ enum Flow {
 }
 
 /// PRD #80: map a Ctrl-modified `KeyEvent` to the global command [`Action`] it
-/// triggers (works from any UI mode). Returns `None` for any key this layer
-/// does not own, so it falls through to the per-mode handlers. This is part of
-/// the thin `KeyEvent -> Option<Action>` mapper that pairs with
-/// [`dispatch_action`]; the M2 button bar produces the SAME variants from a
-/// click, so key and click cannot drift.
+/// triggers. Returns `None` for any key this layer does not own, so it falls
+/// through to the per-mode handlers. This is part of the thin
+/// `KeyEvent -> Option<Action>` mapper that pairs with [`dispatch_action`]; the
+/// M2 button bar produces the SAME variants from a click, so key and click
+/// cannot drift.
+///
+/// This is the MODE-INDEPENDENT mapping: "which global command is this chord
+/// bound to?". It is deliberately unchanged by PRD #241 — the mouse-dispatch
+/// mapper wants exactly this question answered, and so does the button bar.
+/// Key dispatch must go through [`global_action_for_mode`] instead, which
+/// applies the one mode restriction the PRD adds.
 pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     // PRD #40: the four configurable global commands resolve from the active
-    // keybinding config (any chord, any mode), defaulting to Ctrl+d/t/n/w. The
-    // caller excludes Ctrl+C before calling this, so a binding to Ctrl+C can't
-    // win here.
+    // keybinding config (any chord), defaulting to Ctrl+d/t/n/w. The caller
+    // excludes Ctrl+C before calling this, so a binding to Ctrl+C can't win
+    // here.
     if kb.matches(KbAction::Dashboard, key) {
         return Some(Action::DetachToNormal);
     }
@@ -5568,6 +5987,63 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
             KeyCode::PageUp => return Some(Action::GlobalPrevTab),
             _ => {}
         }
+    }
+    None
+}
+
+/// PRD #241 M1: the mode-aware wrapper around [`global_action`] used by the
+/// live key dispatch.
+///
+/// `Ctrl+W` is delete-previous-word in every shell, readline app, and editor
+/// the user runs *inside* a pane, yet it used to resolve the destructive
+/// `close_pane` command from any mode — so typing it in an embedded shell tore
+/// the pane down instead of deleting a word, and the word-delete behaviour was
+/// unobtainable. `ClosePane` is therefore scoped to command mode; in every
+/// other mode the chord is not claimed here, which lets `PaneInput` fall
+/// through to `handle_pane_input_key` → `keyevent_to_bytes` → `0x17` on the
+/// PTY.
+///
+/// This generalizes the `is_ctrl_c` carve-out (a mode-dependent global chord)
+/// instead of adding a second hardcoded special case. `Dashboard`, `NewPane`,
+/// and `ToggleLayout` keep resolving from EVERY mode — none of them is
+/// destructive, and two of them are the way *out* of a pane.
+///
+/// PRD #241 review F1: `UiMode::CloseConfirm` claims **nothing** here. The
+/// `blocking_overlay` / `modal_active` guards that make the dialog topmost are
+/// mouse-only, and this resolution runs *before* the per-mode key handler — so
+/// `Ctrl+PgUp` / `Ctrl+PgDn` (and `Ctrl+D`/`Ctrl+N`/`Ctrl+T`) still landed while
+/// the modal was up, moving the ground under an open confirmation. The armed
+/// target is now identity-bound so that could no longer redirect the teardown,
+/// but a dialog you can navigate out from under is still a lie about what is
+/// about to happen. The modal owns the keyboard until it is answered; `Ctrl+C`
+/// keeps its own carve-out to the quit flow.
+fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
+    if mode == UiMode::CloseConfirm {
+        return None;
+    }
+    match global_action(kb, key) {
+        Some(Action::CloseSelected) if mode != UiMode::Normal => None,
+        other => other,
+    }
+}
+
+/// PRD #241 M1 (L1 `keybindings/safety/003`, `/004`, `keybindings/remap/003`):
+/// resolve a key the way the live loop does for a given mode.
+///
+/// Composes the exact two production seams the dispatch loop uses, in the same
+/// order: [`global_action_for_mode`] first, then — in `PaneInput` — the
+/// PTY-forwarding fall-through (`handle_pane_input_key`). Returning `None`
+/// means "no global command and nothing to forward", i.e. the key belongs to
+/// that mode's own handler.
+pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
+    if let Some(action) = global_action_for_mode(kb, mode, key) {
+        return Some(action);
+    }
+    if mode == UiMode::PaneInput {
+        return match handle_pane_input_key(*key) {
+            Action::Continue => None,
+            forwarded => Some(forwarded),
+        };
     }
     None
 }
@@ -5759,12 +6235,16 @@ fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usi
         .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(*idx))
 }
 
-/// PRD #80 M3: close the tab at `idx` and reconcile shared state, reusing the
-/// same teardown the Ctrl+W tab-close path performs — unregister every
-/// successfully-closed pane, drop the matching sessions (keeping any that
-/// failed to close so the user can retry), clean their metadata, and resweep
-/// the dashboard layout. Used by [`Action::CloseTab`] (a `[×]` click); the
-/// Ctrl+W card path keeps its own inline message that names the specific pane.
+/// PRD #80 M3: close the tab at `idx` and reconcile shared state — unregister
+/// every successfully-closed pane, drop the matching sessions (keeping any that
+/// failed to close so the user can retry), clean their metadata, and resweep the
+/// dashboard layout.
+///
+/// PRD #241: the ONE tab teardown. Every door that destroys a tab — the `Ctrl+W`
+/// chord on an active Mode/Orchestration tab, a `[×]` click on the tab strip,
+/// and a confirmed close on a dashboard card whose pane lives inside such a tab
+/// — resolves to [`ClosePlan::Tab`] and lands here, so they cannot drift apart
+/// in what they remove or what they report.
 fn close_tab_by_index(
     idx: usize,
     ui: &mut UiState,
@@ -5793,8 +6273,6 @@ fn close_tab_by_index(
             if outcome.is_clean() {
                 ui.status_message = Some(("Closed tab".to_string(), std::time::Instant::now()));
             } else {
-                let failed_ids: Vec<&str> =
-                    outcome.failed.iter().map(|(id, _)| id.as_str()).collect();
                 let first_err = outcome
                     .failed
                     .first()
@@ -5804,13 +6282,23 @@ fn close_tab_by_index(
                     tracing::warn!(
                         pane_id = %id,
                         error = %e,
-                        "M3: close_pane failed during [×] tab teardown — card preserved"
+                        "M3: close_pane failed during tab teardown — pane and tab preserved"
                     );
                 }
+                // PRD #241: the tab is still here — `close_tab` keeps it when
+                // any pane refuses to stop, holding exactly the panes that did
+                // not close. Say that, because the previous wording ("Close
+                // partially failed …") was reported next to a tab that had
+                // already vanished, leaving the advice to retry with nothing to
+                // retry on. Closing is not transactional, so name both halves:
+                // what went, and what stayed.
+                let failed = outcome.failed.len();
+                let closed = outcome.closed.len();
                 ui.status_message = Some((
                     format!(
-                        "Close partially failed for {} pane(s) — first error: {first_err}",
-                        failed_ids.len()
+                        "Closed {closed} pane(s); {failed} could not be stopped, so the tab is \
+                         kept with them — press {} to retry. First error: {first_err}",
+                        display_notation(&ui.keybindings, KbAction::ClosePane)
                     ),
                     std::time::Instant::now(),
                 ));
@@ -6004,7 +6492,43 @@ fn dispatch_action(
             // split on the next frame (it reads `pane_layout`).
             ui.status_message = Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
         }
-        // Ctrl+d: enter Normal (command) mode, stay on current tab.
+        // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
+        // the current tab.
+        //
+        // PRD #241 M4 (review F2b): this used to be one-way — every mode
+        // collapsed to `Normal`, so from command mode the chord did nothing
+        // visible. That is the whole of issue #88 ("I honestly don't know how to
+        // get out of command mode"), and M4's `Ctrl+d: back to pane` hint would
+        // have been a lie without this half. From command mode the chord now
+        // re-enters the pane the current tab is focused on; with no pane to
+        // return to it stays put and says so, rather than silently doing
+        // nothing.
+        Action::DetachToNormal if ui.mode == UiMode::Normal => {
+            match resume_pane_input_target(ui, pane, tab_manager, snapshot, filtered) {
+                Some(target_pane_id) if pane.focus_pane(&target_pane_id).is_ok() => {
+                    ui.mode = UiMode::PaneInput;
+                    // Reset dismissed flags so art reappears when the user
+                    // returns to the dashboard (mirrors `Action::Focus`).
+                    for entry in ui.idle_art_cache.values_mut() {
+                        entry.dismissed = false;
+                    }
+                    ui.status_message = Some((
+                        format!(
+                            "PaneInput mode — type to interact, {} for dashboard",
+                            display_notation(&ui.keybindings, KbAction::Dashboard)
+                        ),
+                        std::time::Instant::now(),
+                    ));
+                }
+                _ => {
+                    ui.status_message = Some((
+                        "No pane to return to — press Enter on a card to open one".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
+            }
+        }
+        // Ctrl+d from anywhere else: leave for command mode.
         Action::DetachToNormal => {
             // Re-suppress the prompt in reactive panes when leaving PaneInput
             // so automated output stays clean.
@@ -6031,142 +6555,121 @@ fn dispatch_action(
                 UiMode::Help
             };
         }
-        // Ctrl+w: close selected pane (or entire mode tab if it's the agent pane).
+        // PRD #241 M3: Ctrl+w / the `[Close]` button REQUEST a close. Nothing
+        // is destroyed here — if anything is armed we raise the confirmation
+        // dialog (seeded to Cancel, bound to the armed target) and wait for an
+        // explicit `ConfirmCloseSelected`. Both doors land on this one arm,
+        // which is why the modal lives on the action rather than on the key
+        // handler; the tab strip's `×` is the third door and arms the identical
+        // transition from `Action::CloseTab`.
+        Action::CloseSelected => {
+            let target = resolve_close_target(ui, tab_manager, snapshot, filtered);
+            // `close_confirmation_for_action` stays the seam that decides whether
+            // this action confirms at all and seeds the dialog
+            // (`prompt/close-confirm/003`); the identity of what it confirms
+            // rides alongside it in `close_confirm_target`.
+            if let Some(prompt) =
+                close_confirmation_for_action(&Action::CloseSelected, target.is_some())
+                && let Some(target) = target
+            {
+                // PRD #241: the dialog's wording comes from the SAME resolution
+                // `ConfirmCloseSelected` runs below, so it can never promise a
+                // pane and take a tab.
+                let scope = resolve_close_plan(&target, tab_manager, snapshot)
+                    .map_or(CloseScope::Pane, |plan| plan.scope());
+                arm_close_confirmation(ui, prompt, target, scope);
+            }
+            // No target (PRD #113 finding 2: an inactive dashboard selection
+            // means nothing is armed) — stay exactly as silent as before, and
+            // in particular do NOT arm a modal that would let the user close
+            // card 0 by reflex.
+        }
+        // The confirmed close: tear down whatever the confirmation was ARMED
+        // against — never whatever is selected now (PRD #241 review F1).
         //
         // PRD #92 F4: inspect each close result and preserve the card / session
         // on failure so the user can see the error and retry.
-        Action::CloseSelected => {
-            // PR #151 (e2e layout_002 regression): branch on the ACTIVE tab.
-            // Ctrl+W routes here for BOTH "close the selected dashboard card" and
-            // "close the active Mode/Orchestration tab". The dashboard-card close
-            // below no-ops on an inactive selection (finding 2 / selection_012),
-            // but on a Mode/Orchestration tab the dashboard selection is `None`,
-            // so that gate wrongly suppressed the tab-close. When the active tab
-            // IS a closable tab, close it directly — regardless of
-            // `ui.selected_index` — mirroring the mouse [×] path
-            // (`close_tab_by_index`) so the keyboard closes the same tab the same
-            // way. (selection_016)
-            let active_is_closable_tab = matches!(
-                tab_manager.active_tab(),
-                Tab::Mode { .. } | Tab::Orchestration { .. }
-            );
-            if active_is_closable_tab {
-                close_tab_by_index(tab_manager.active_index(), ui, state, tab_manager);
-            }
-            // PRD #113 finding 2: on the Dashboard the destructive close requires
-            // a REAL active selection. When the selection is inactive (`None`)
-            // this is a no-op — no card-0 fallback (that fallback is reserved for
-            // Enter/Focus) — so an unarmed dashboard can never silently close
-            // card 0.
-            else if let Some(sid) = ui
-                .selected_index
-                .and_then(|i| filtered.get(i))
-                .map(|(id, _)| (*id).clone())
-                && let Some(session) = snapshot.sessions.get(&sid)
-                && let Some(ref pane_id) = session.pane_id
-            {
-                let closed_pane_id = pane_id.clone();
-                // Check if this pane belongs to a mode or orchestration tab.
-                let mode_tab_idx = tab_manager
-                    .tab_index_for_agent_pane(pane_id)
-                    .or_else(|| tab_manager.tab_index_for_pane(pane_id));
-                if let Some(tab_idx) = mode_tab_idx {
-                    // Close the entire tab (agent + side panes, or all role panes).
-                    match tab_manager.close_tab(tab_idx) {
-                        Ok(outcome) => {
-                            let mut st = state.blocking_write();
-                            for id in &outcome.closed {
-                                st.unregister_pane(id);
-                            }
-                            // Remove sessions whose pane_id is in the closed set ONLY.
-                            let closed_set: std::collections::HashSet<&str> =
-                                outcome.closed.iter().map(String::as_str).collect();
-                            st.sessions.retain(|_, s| {
-                                s.pane_id
-                                    .as_ref()
-                                    .is_none_or(|pid| !closed_set.contains(pid.as_str()))
-                            });
-                            drop(st);
-                            // Clean pane_metadata only for the successfully-closed panes.
-                            for id in &outcome.closed {
-                                ui.pane_metadata.remove(id);
-                            }
-                            if outcome.is_clean() {
-                                ui.status_message = Some((
-                                    format!("Closed tab containing pane {closed_pane_id}"),
-                                    std::time::Instant::now(),
-                                ));
-                            } else {
-                                let failed_ids: Vec<&str> =
-                                    outcome.failed.iter().map(|(id, _)| id.as_str()).collect();
-                                let first_err = outcome
-                                    .failed
-                                    .first()
-                                    .map(|(_, e)| e.as_str())
-                                    .unwrap_or("");
-                                for (id, e) in &outcome.failed {
-                                    tracing::warn!(
-                                        pane_id = %id,
-                                        error = %e,
-                                        "F4: close_pane failed during tab teardown — card preserved"
-                                    );
-                                }
-                                ui.status_message = Some((
-                                    format!(
-                                        "Close partially failed for {} pane(s) — first error: {first_err}",
-                                        failed_ids.len()
-                                    ),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                            // PRD #84 M4: remaining panes are sized by the
-                            // pre-draw `resize_panes_to_layout` next frame.
-                        }
-                        Err(e) => {
-                            ui.status_message = Some((
-                                format!("Failed to close tab: {e}"),
-                                std::time::Instant::now(),
-                            ));
-                        }
+        Action::ConfirmCloseSelected => {
+            // Leaving the modal is unconditional — whether the teardown
+            // succeeds or is preserved for retry, the dialog is done. Taking
+            // the target also disarms it, so a second confirmation cannot
+            // replay against a stale identity.
+            ui.mode = UiMode::Normal;
+            ui.close_confirm_displayed = false;
+            let target = ui.close_confirm_target.take();
+            // PRD #241: re-resolve the ARMED target through the same function
+            // that decided the dialog's wording. Whatever it says here is what
+            // the user was shown, because the two share this call.
+            let plan = target
+                .as_ref()
+                .and_then(|target| resolve_close_plan(target, tab_manager, snapshot));
+            match plan {
+                // PRD #241 review F1: something WAS armed and it no longer
+                // resolves — its tab or its session went away while the dialog
+                // was open. Close NOTHING and say so; the one thing a
+                // confirmation must never do is retarget onto whatever is
+                // selected now.
+                None => {
+                    if target.is_some() {
+                        ui.status_message = Some((
+                            "Nothing closed — what this confirmation was armed against is gone"
+                                .to_string(),
+                            std::time::Instant::now(),
+                        ));
                     }
-                } else {
-                    // Plain dashboard pane — close just this one and inspect the result.
-                    match pane.close_pane(pane_id) {
+                }
+                // A whole Mode/Orchestration tab: the agent pane plus every side
+                // or role pane. Reached both from a tab that was active when the
+                // chord landed AND from a dashboard card whose pane turns out to
+                // live in such a tab — which is why the dialog said "this tab
+                // and all its panes" either way.
+                Some(ClosePlan::Tab { index }) => {
+                    close_tab_by_index(index, ui, state, tab_manager);
+                }
+                // Plain dashboard pane — close just this one and inspect the
+                // result. PRD #92 F4: preserve the card / session on failure so
+                // the user can see the error and retry.
+                Some(ClosePlan::Pane {
+                    session_id,
+                    pane_id,
+                }) => {
+                    match pane.close_pane(&pane_id) {
                         Ok(()) => {
                             let mut st = state.blocking_write();
-                            st.sessions.remove(&sid);
-                            st.unregister_pane(&closed_pane_id);
+                            st.sessions.remove(&session_id);
+                            st.unregister_pane(&pane_id);
                             drop(st);
-                            ui.pane_metadata.remove(&closed_pane_id);
-                            ui.status_message = Some((
-                                format!("Closed pane {closed_pane_id}"),
-                                std::time::Instant::now(),
-                            ));
+                            ui.pane_metadata.remove(&pane_id);
+                            ui.status_message =
+                                Some((format!("Closed pane {pane_id}"), std::time::Instant::now()));
                         }
                         Err(e) => {
                             tracing::warn!(
-                                pane_id = %closed_pane_id,
+                                pane_id = %pane_id,
                                 error = %e,
                                 "F4: close_pane failed — card preserved for retry"
                             );
                             ui.status_message = Some((
                                 format!(
-                                    "Failed to close pane {closed_pane_id}: {e} — press {} to retry",
+                                    "Failed to close pane {pane_id}: {e} — press {} to retry",
                                     display_notation(&ui.keybindings, KbAction::ClosePane)
                                 ),
                                 std::time::Instant::now(),
                             ));
                         }
                     }
-                }
-                if ui.mode == UiMode::PaneInput {
-                    ui.mode = UiMode::Normal;
-                }
-                // Clamp selected_index so it doesn't point past the now-shorter list.
-                if let Some(idx) = ui.selected_index
-                    && idx > 0
-                {
-                    ui.selected_index = Some(idx - 1);
+                    // (PRD #241 M3: the "leave PaneInput after a close" reset
+                    // that used to live here is now unconditional at the top of
+                    // this arm — a confirmed close always arrives from the
+                    // modal.)
+                    // Clamp selected_index so it doesn't point past the
+                    // now-shorter list. The tab branch above does the same
+                    // inside `close_tab_by_index`.
+                    if let Some(idx) = ui.selected_index
+                        && idx > 0
+                    {
+                        ui.selected_index = Some(idx - 1);
+                    }
                 }
             }
             // PRD #89 M1.3 — Ctrl+W close-pane is a detach path; flush a fresh
@@ -6223,8 +6726,24 @@ fn dispatch_action(
         }
         // PRD #80 M3: click a tab's [×] → close that tab, reusing Ctrl+W's
         // tab-teardown semantics for the clicked tab.
+        //
+        // PRD #241 review F4: this was the third door into an irreversible
+        // teardown and the only one that stayed one-click. The PRD put the modal
+        // on the ACTION rather than the key precisely so every door inherits it,
+        // so arm the same confirmation here — bound to the CLICKED tab's stable
+        // id, which is what makes it safe for the dialog to outlive a tab-strip
+        // reorder. The Dashboard tab has no id and is never closable
+        // (`dashboard/pane/003`), so a stray `×` hit on it stays a no-op.
         Action::CloseTab(idx) => {
-            close_tab_by_index(idx, ui, state, tab_manager);
+            if let Some(id) = tab_manager.tabs().get(idx).and_then(tab_id_of) {
+                // A tab-strip `×` always takes the whole tab, so the dialog says
+                // so — through the same `resolve_close_plan` seam as every other
+                // door rather than a second hand-written answer.
+                let target = CloseTarget::Tab(id);
+                let scope = resolve_close_plan(&target, tab_manager, snapshot)
+                    .map_or(CloseScope::Pane, |plan| plan.scope());
+                arm_close_confirmation(ui, CloseConfirmState::default(), target, scope);
+            }
         }
         // PRD #80 M4 / PRD #83: single-click a card → select exactly that card
         // (PRD #68). Under #83 the Dashboard's selection is keyed by session id
@@ -7120,6 +7639,11 @@ fn dispatch_action(
         }
         // quit-confirm [Cancel]: return to the dashboard.
         Action::DismissModal => {
+            // PRD #241 review F1: disarm the close confirmation on the way out
+            // so a later `ConfirmCloseSelected` can never replay a target the
+            // user already declined. Harmless for every other modal.
+            ui.close_confirm_target = None;
+            ui.close_confirm_displayed = false;
             ui.mode = UiMode::Normal;
         }
         // config-gen [Yes]: send the prompt to the pending target pane.
@@ -9166,6 +9690,19 @@ pub fn run_tui(
                     );
                 }
             }
+            // PRD #241 F3b (review finding G2): a close that COMPLETED without
+            // being able to query the daemon may have left an agent running
+            // unattended. `close_pane` returns `Ok(())` there (nothing to retry —
+            // the card is already gone), so the warning arrives on this queue
+            // instead of the `Result`. Show it on the same status line the close
+            // path uses for its other outcomes; queued after the handler's
+            // "Closed pane N", so the warning is what the user is left reading.
+            // A single status line holds one message, so if several blind closes
+            // land in the same frame the last one is displayed — every one of them
+            // is also logged at WARN by `close_pane`.
+            for warning in embedded.take_close_warnings() {
+                ui.status_message = Some((warning, std::time::Instant::now()));
+            }
         }
 
         // Drain all pending events before re-rendering. This avoids a full
@@ -9177,6 +9714,24 @@ pub fn run_tui(
 
         // Process events in a tight loop until the queue is empty.
         loop {
+            // PRD #241 review F5: never let input that PREDATES the close
+            // confirmation answer it. This drain loop deliberately processes a
+            // whole input burst without re-rendering, so the keystroke queued
+            // behind the `Ctrl+W` / `[Close]` click / tab-strip `×` that armed
+            // the dialog would otherwise be delivered to a modal that has not
+            // been drawn — confirming a destructive close the user never saw.
+            // Discard whatever is still buffered and break out to render first;
+            // `render_overlays` sets the flag once the dialog is actually on
+            // screen. (The dialog also has no `y` shortcut, so even if this
+            // were bypassed a single stray keystroke could at worst hit the
+            // default Cancel.)
+            if ui.mode == UiMode::CloseConfirm && !ui.close_confirm_displayed {
+                while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                    let _ = event::read()?;
+                }
+                break;
+            }
+
             let ev = event::read()?;
 
             // PRD #84 M4 (invariant 4): a terminal resize is now just a
@@ -9246,6 +9801,10 @@ pub fn run_tui(
                     ui.mode,
                     UiMode::QuitConfirm
                         | UiMode::StopConfirm
+                        // PRD #241 M3: the close confirmation is a topmost
+                        // modal too — scrolling behind it must not reach a pane
+                        // the user may be about to destroy.
+                        | UiMode::CloseConfirm
                         | UiMode::ConfigGenPrompt
                         | UiMode::StarPrompt
                         | UiMode::Help
@@ -9402,6 +9961,10 @@ pub fn run_tui(
                     ui.mode,
                     UiMode::QuitConfirm
                         | UiMode::StopConfirm
+                        // PRD #241 M3: its [Cancel]/[Close] buttons live in
+                        // `modal_button_rects`; any miss is consumed here
+                        // rather than falling through to the pane behind it.
+                        | UiMode::CloseConfirm
                         | UiMode::ConfigGenPrompt
                         | UiMode::StarPrompt
                         | UiMode::Help
@@ -10014,11 +10577,14 @@ pub fn run_tui(
                 }
             }
 
-            // Global configurable shortcuts (work from any mode). PRD #40:
-            // resolved from config (any chord, not just Ctrl+key); `is_ctrl_c`
-            // excluded so it can't be hijacked away from the quit flow.
+            // Global configurable shortcuts. PRD #40: resolved from config (any
+            // chord, not just Ctrl+key); `is_ctrl_c` excluded so it can't be
+            // hijacked away from the quit flow. PRD #241 M1: all of them still
+            // resolve from any mode EXCEPT the destructive `close_pane`, which
+            // is command-mode only so `Ctrl+W` reaches the PTY as word-delete
+            // while the user is typing in a pane.
             if action.is_none() && !is_ctrl_c {
-                action = global_action(&kb, &key);
+                action = global_action_for_mode(&kb, ui.mode, &key);
             }
 
             // Tab cycling in Normal mode: move_left/move_right (defaults h/l)
@@ -10113,6 +10679,20 @@ pub fn run_tui(
                         handle_quit_confirm_key(key, &mut ui, managed_agents_count)
                     }
                     UiMode::StopConfirm => handle_stop_confirm_key(key, &mut ui),
+                    // PRD #241 M3: the close confirmation owns the keyboard
+                    // while it is up; only Enter-on-Close escapes as
+                    // `ConfirmCloseSelected`. Ctrl+C keeps its PRD #40 safety
+                    // net — every other modal handler routes it to the quit
+                    // flow, and this one must not be the exception that traps
+                    // the user.
+                    UiMode::CloseConfirm if is_ctrl_c => {
+                        ui.close_confirm_target = None;
+                        ui.close_confirm_displayed = false;
+                        ui.quit_confirm_selected = 0;
+                        ui.mode = UiMode::QuitConfirm;
+                        Action::Continue
+                    }
+                    UiMode::CloseConfirm => handle_close_confirm_key(&mut ui.close_confirm, key),
                     UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, &mut ui),
                 });
             }
@@ -11088,6 +11668,14 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
     if ui.mode == UiMode::QuitConfirm {
         ui.modal_button_rects = render_quit_confirm(frame, ui.quit_confirm_selected);
     }
+    if ui.mode == UiMode::CloseConfirm {
+        ui.modal_button_rects = render_close_confirm(frame, &ui.close_confirm);
+        // PRD #241 review F5: the dialog has now reached the screen, so input
+        // arriving from here on is a genuine answer to it. Until this flip, the
+        // run loop refuses to feed it anything (see the drain at the top of the
+        // event loop).
+        ui.close_confirm_displayed = true;
+    }
     if ui.mode == UiMode::StopConfirm {
         // M5 adds no buttons to the secondary Stop-confirm dialog (not in the
         // contract); its keystrokes (y/n/Enter/Esc) remain the only path.
@@ -11519,8 +12107,68 @@ fn button_shortcut_label(keybindings: &KeybindingConfig, action: KbAction) -> St
     s
 }
 
-fn global_bar_buttons(keybindings: &KeybindingConfig, has_pane_control: bool) -> Vec<Button> {
+/// PRD #241 M4 (review F2a): the ONE mode-aware answer to "which global
+/// commands does this mode actually offer, and which way does the dashboard
+/// chord travel from here?"
+///
+/// Both user-visible surfaces read it, which is what makes the mode-awareness
+/// real rather than test-only: the LIVE bottom bar ([`global_bar_buttons`], via
+/// `render_bottom_bar`) and the hints string ([`dashboard_hints_string`], via
+/// the `render_hints_bar_*_to_buffer` seams). The first cut fixed only the
+/// string — which nothing in the running app rendered — so the tests passed over
+/// a seam the app never called while the live bar kept offering `[Close Ctrl+W]`
+/// in modes where the chord no longer closes, and never named the way back to
+/// the pane at all.
+struct ModeGlobals {
+    /// Does the `close_pane` chord resolve in this mode? (PRD #241 M1 scoped it
+    /// to command mode.) Drives both the hint and the `[Close]` button's
+    /// enabled state, so the bar can't offer a command the keyboard refuses.
+    close_available: bool,
+    /// Lowercase hint label for the dashboard chord, naming the trip it makes
+    /// FROM this mode.
+    dashboard_hint: &'static str,
+    /// Title-cased button label for the same chord.
+    dashboard_button: &'static str,
+}
+
+impl ModeGlobals {
+    fn for_mode(mode: UiMode) -> Self {
+        if mode == UiMode::Normal {
+            // Already in command mode: the chord's only remaining trip is back
+            // to the pane, and that is the one issue #88's reporter could not
+            // find on screen.
+            Self {
+                close_available: true,
+                dashboard_hint: "back to pane",
+                dashboard_button: "Back to Pane",
+            }
+        } else {
+            Self {
+                close_available: false,
+                dashboard_hint: "dashboard",
+                dashboard_button: "Command Mode",
+            }
+        }
+    }
+}
+
+fn global_bar_buttons(
+    keybindings: &KeybindingConfig,
+    mode: UiMode,
+    has_pane_control: bool,
+) -> Vec<Button> {
+    let g = ModeGlobals::for_mode(mode);
     vec![
+        // PRD #241 M4: the way out, named for the direction it travels. In
+        // command mode this is the only on-screen answer to "how do I get back
+        // to my pane?" — the gap issue #88 reported. `Action::DetachToNormal` is
+        // a toggle, so one button serves both trips.
+        Button::new(
+            g.dashboard_button,
+            button_shortcut_label(keybindings, KbAction::Dashboard),
+            Action::DetachToNormal,
+            true,
+        ),
         // PRD #80 review FIX 3: New Pane is ALWAYS enabled — you can always
         // create the first pane, even with no panes / controller yet.
         Button::new(
@@ -11529,11 +12177,14 @@ fn global_bar_buttons(keybindings: &KeybindingConfig, has_pane_control: bool) ->
             Action::NewPane,
             true,
         ),
+        // PRD #241 M1/M4: dimmed and inert outside command mode, where the
+        // chord no longer resolves — a disabled button records no rect, so the
+        // click is the same silent no-op the key now is.
         Button::new(
             "Close",
             button_shortcut_label(keybindings, KbAction::ClosePane),
             Action::CloseSelected,
-            has_pane_control,
+            has_pane_control && g.close_available,
         ),
         Button::new(
             "Toggle Layout",
@@ -11651,13 +12302,14 @@ fn layout_button_bar(label_widths: &[u16], width: u16) -> (Vec<Rect>, u16) {
 fn render_button_bar(
     frame: &mut Frame,
     keybindings: &KeybindingConfig,
+    mode: UiMode,
     area: Rect,
     has_pane_control: bool,
     extra_buttons: &[Button],
 ) -> Vec<(Action, Rect)> {
     // Global commands first, then any context-specific buttons (e.g. the
     // dashboard's Filter / Rename / Generate). One funnel, one bar.
-    let mut buttons = global_bar_buttons(keybindings, has_pane_control);
+    let mut buttons = global_bar_buttons(keybindings, mode, has_pane_control);
     buttons.extend(extra_buttons.iter().cloned());
 
     let widths: Vec<u16> = buttons
@@ -11710,7 +12362,7 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16, tab_view: &Activ
         UiMode::Filter | UiMode::Rename | UiMode::PaneInput => 1,
         _ if ui.status_message.is_some() => 1,
         _ => {
-            let mut buttons = global_bar_buttons(&ui.keybindings, true);
+            let mut buttons = global_bar_buttons(&ui.keybindings, ui.mode, true);
             if !matches!(tab_view, ActiveTabView::Mode { .. }) {
                 buttons.extend(dashboard_context_buttons(&ui.keybindings, true));
             }
@@ -11787,10 +12439,11 @@ fn render_bottom_bar(
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
             }
-            let command_mode_label = button_shortcut_label(&ui.keybindings, KbAction::Dashboard);
+            // PRD #241 M4: same mode-aware seam the wide bar uses, so the two
+            // surfaces can never disagree about which way `Ctrl+D` travels.
             let buttons = [Button::new(
-                "Command Mode",
-                command_mode_label,
+                ModeGlobals::for_mode(ui.mode).dashboard_button,
+                button_shortcut_label(&ui.keybindings, KbAction::Dashboard),
                 Action::DetachToNormal,
                 true,
             )];
@@ -11810,6 +12463,7 @@ fn render_bottom_bar(
                 let rects = render_button_bar(
                     frame,
                     &ui.keybindings,
+                    ui.mode,
                     area,
                     has_pane_control,
                     extra_buttons,
@@ -12021,6 +12675,79 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect)
         Button::new("Detach", "", Action::DetachAndQuit, true),
         Button::new("Stop", "", Action::RequestStop, true),
         Button::new("Cancel", "", Action::DismissModal, true),
+    ];
+    let btn_row = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + popup_area.height.saturating_sub(3),
+        width: popup_area.width.saturating_sub(2),
+        height: 1,
+    };
+    render_modal_button_row(frame, &buttons, btn_row, 1)
+}
+
+/// PRD #241 M3: the close confirmation dialog. Same shape as
+/// [`render_quit_confirm`] — a centered popup with an option list, a keyboard
+/// hint row, and clickable buttons — with Cancel first and highlighted by
+/// default so the reflexive Enter is the harmless one.
+fn render_close_confirm(frame: &mut Frame, state: &CloseConfirmState) -> Vec<(Action, Rect)> {
+    let selected = state.selected;
+    let area = frame.area();
+    let popup_width = 64u16.min(area.width.saturating_sub(4));
+    let popup_height = 9u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let mut text = vec![
+        Line::from(""),
+        Line::styled(
+            close_confirm_header(state.scope),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+    ];
+
+    for (i, (label, desc)) in close_confirm_options(state.scope).iter().enumerate() {
+        let cursor = if i == selected { ">" } else { " " };
+        let style = if i == selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            text_primary()
+        };
+        text.push(Line::styled(
+            format!("  {cursor} {label:<7} \u{2014} {desc}"),
+            style,
+        ));
+    }
+
+    text.push(Line::from(""));
+    text.push(Line::styled(
+        "  Up/Down: navigate  Enter: confirm  Esc: cancel",
+        text_primary(),
+    ));
+
+    let block = Block::default()
+        .title(" Close ")
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    frame.render_widget(Paragraph::new(text).block(block), popup_area);
+
+    // Clickable equivalents of the two options, on the blank row above the
+    // keyboard hint (same placement as the quit dialog's button row).
+    let buttons = [
+        Button::new("Cancel", "", Action::DismissModal, true),
+        Button::new("Close", "", Action::ConfirmCloseSelected, true),
     ];
     let btn_row = Rect {
         x: popup_area.x + 1,
@@ -12281,20 +13008,40 @@ fn jump_range_notation(keybindings: &KeybindingConfig) -> String {
 }
 
 /// PRD #40: build the dashboard hints-bar text from the active keybinding
-/// config. With the default config this reproduces the previous hardcoded
-/// string byte-for-byte (`Ctrl+n: new  …  Ctrl+c: quit`); a remapped action
-/// shows the user's key (e.g. `Alt+Shift+l: layout`), and an unbound action
-/// shows `(unbound)` rather than a bare `: new`. Single source of truth for
-/// both the live hints bar (`render_bottom_bar`) and the standalone
-/// [`render_hints_bar_to_buffer`] snapshot entrypoint.
-fn dashboard_hints_string(keybindings: &KeybindingConfig) -> String {
+/// config. A remapped action shows the user's key (e.g. `Alt+Shift+l: layout`),
+/// and an unbound action shows `(unbound)` rather than a bare `: new`. Single
+/// source of truth for the [`render_hints_bar_to_buffer`] /
+/// [`render_hints_bar_for_mode_to_buffer`] entrypoints.
+///
+/// PRD #241 M4 made it mode-aware, fixing two ways the old fixed string lied:
+///
+/// * it advertised `close` unconditionally, but after M1 the chord only closes
+///   in command mode — promising a key that no longer does anything is worse
+///   than saying nothing; and
+/// * it read `Ctrl+d: dashboard` *while the user was standing in the
+///   dashboard*, naming the destination they had already reached and never
+///   revealing that the same chord is the way back to the pane. (Issue #88: "I
+///   honestly don't know how to get out of command mode.") In command mode the
+///   hint now names the trip the user actually needs.
+fn dashboard_hints_string(keybindings: &KeybindingConfig, mode: UiMode) -> String {
+    let g = ModeGlobals::for_mode(mode);
+    // Only advertise close where close works.
+    let close = if g.close_available {
+        format!(
+            "{}: close  ",
+            display_notation(keybindings, KbAction::ClosePane)
+        )
+    } else {
+        String::new()
+    };
+    // Name the direction the chord travels FROM here.
+    let dashboard_label = g.dashboard_hint;
     // `Ctrl+c: quit` is hardcoded: quit is not a remappable action — Ctrl+C is
     // the non-overridable modal trigger (Detach/Stop/Cancel), so the hint is a
     // fixed string rather than a config-derived notation.
     format!(
-        "{}: new  {}: close  {}: layout  {}: dashboard ({} {} {})  Ctrl+c: quit",
+        "{}: new  {close}{}: layout  {}: {dashboard_label} ({} {} {})  Ctrl+c: quit",
         display_notation(keybindings, KbAction::NewPane),
-        display_notation(keybindings, KbAction::ClosePane),
         display_notation(keybindings, KbAction::ToggleLayout),
         display_notation(keybindings, KbAction::Dashboard),
         jump_range_notation(keybindings),
@@ -12333,9 +13080,23 @@ pub fn render_help_overlay_with_bindings_to_buffer(
 /// PRD #40 (L1 `keybindings/hints/001`): render the dashboard hints bar
 /// against an arbitrary [`KeybindingConfig`] into a standalone `Buffer` for
 /// snapshot testing. Uses the shared [`dashboard_hints_string`] builder so the
-/// snapshot matches the live bar's content.
+/// snapshot matches the live bar's content. Renders the command-mode bar; use
+/// [`render_hints_bar_for_mode_to_buffer`] to see another mode's.
 pub fn render_hints_bar_to_buffer(
     keybindings: &KeybindingConfig,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    render_hints_bar_for_mode_to_buffer(keybindings, UiMode::Normal, width, height)
+}
+
+/// PRD #241 M4 (L1 `keybindings/hints/003`): the mode-aware hints bar. The
+/// close hint appears only where the chord actually closes, and the
+/// dashboard/pane chord is labelled with the direction it travels FROM the
+/// given mode.
+pub fn render_hints_bar_for_mode_to_buffer(
+    keybindings: &KeybindingConfig,
+    mode: UiMode,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -12344,7 +13105,7 @@ pub fn render_hints_bar_to_buffer(
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
-    let hints = dashboard_hints_string(keybindings);
+    let hints = dashboard_hints_string(keybindings, mode);
     terminal
         .draw(|frame| {
             let area = Rect {
@@ -12380,9 +13141,16 @@ fn render_help_overlay(
     let left: Vec<Line> = vec![
         Line::styled("  Global (works from any pane)", cyan),
         Line::from(""),
-        help_key_line(&n(KbAction::Dashboard), "Command mode (dashboard)"),
+        // PRD #241 M4: the old "Command mode (dashboard)" named only the
+        // outbound trip, so a user already in command mode read it as dead
+        // text and could not find the way back to their pane (issue #88).
+        help_key_line(&n(KbAction::Dashboard), "Toggle command / pane"),
         help_key_line(&n(KbAction::NewPane), "Create new pane"),
-        help_key_line(&n(KbAction::ClosePane), "Close selected pane"),
+        // PRD #241 review F6: `close_pane` is NOT global any more — M1 scoped it
+        // to command mode so the chord reaches the PTY as word-delete while you
+        // are typing in a pane. It is listed under "Dashboard (command mode)"
+        // below; leaving it here would document a key that does nothing where
+        // the heading promises it works.
         help_key_line(&n(KbAction::ToggleLayout), "Toggle layout (stacked/tiled)"),
         // Quit is not a remappable action: Ctrl+C (non-overridable) opens the
         // Detach/Stop/Cancel modal, so the help row is a fixed string.
@@ -12413,6 +13181,8 @@ fn render_help_overlay(
         ),
         help_key_line(&jump_range_notation(keybindings), "Jump to pane N"),
         help_key_line(&n(KbAction::FocusPane), "Focus selected pane"),
+        // PRD #241: command-mode only, and it asks before it destroys anything.
+        help_key_line(&n(KbAction::ClosePane), "Close selected pane (confirms)"),
         help_key_line(&n(KbAction::Filter), "Filter sessions"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
         help_key_line(&n(KbAction::Rename), "Rename session"),
@@ -14120,6 +14890,26 @@ pub fn render_quit_confirm_to_buffer(
     })
 }
 
+/// PRD #241 M3 (L1 `prompt/close-confirm/001`): render the close confirmation
+/// into a standalone Buffer through the SAME `render_close_confirm` the live
+/// modal draws, so the snapshot and the running dialog cannot drift.
+///
+/// `state.scope` selects the target-aware copy exactly as it does live: a
+/// `CloseConfirmState` with the default [`CloseScope::Pane`] renders the
+/// single-pane wording, and one carrying [`CloseScope::Tab`] renders the
+/// whole-tab wording. Production never picks the scope by hand — see
+/// [`resolve_close_plan`] — so a test that wants the tab copy should set the
+/// field, not assume it.
+pub fn render_close_confirm_to_buffer(
+    state: &CloseConfirmState,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        render_close_confirm(frame, state);
+    })
+}
+
 /// L1 test seam: render `render_stop_confirm` into a standalone Buffer.
 /// See `render_stats_bar_to_buffer` for the rationale.
 #[doc(hidden)]
@@ -14323,6 +15113,49 @@ pub fn render_button_bar_with_bindings_to_buffer(
     // Scheduled Tasks button) so every remappable label is exercised.
     let ctx_buttons = dashboard_context_buttons(keybindings, true);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            render_bottom_bar(frame, &mut ui, area, true, &ctx_buttons);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #241 M4 (review F2a / T2) L1 seam: render the bottom bar **as the running
+/// app draws it in `mode`**.
+///
+/// This is [`render_bottom_bar`] itself — the function `render_frame` calls on
+/// every frame — with nothing but `UiState::mode` varied, so an assertion made
+/// here is an assertion about what the user actually sees. That distinction is
+/// the point of the seam: `render_hints_bar_for_mode_to_buffer` renders a string
+/// the live UI never draws, so a mode-awareness test written against it can pass
+/// while the running bar still offers `[Close Ctrl+W]` in a mode where the chord
+/// does nothing.
+///
+/// In command mode expect `[Back to Pane Ctrl+D]` and an enabled `[Close
+/// Ctrl+W]`; in `PaneInput` expect the single `[Command Mode Ctrl+D]`
+/// affordance; in any other mode the wide bar renders with `[Close Ctrl+W]`
+/// dimmed and inert.
+pub fn render_button_bar_for_mode_to_buffer(
+    keybindings: &KeybindingConfig,
+    mode: UiMode,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
+    ui.mode = mode;
     terminal
         .draw(|frame| {
             let area = Rect {
@@ -19316,9 +20149,9 @@ mod tests {
     /// Scenario: PRD #113 review finding 2 — an INACTIVE dashboard selection
     /// means nothing is armed, so the close-pane action must be a NO-OP. With
     /// three cards and `selected_index = None`, dispatching `Action::CloseSelected`
-    /// must NOT fall back to closing card 0: no `close_pane` call is issued and
-    /// no session is removed (matching the `dashboard/pane/003` "never close
-    /// without a real selection" invariant).
+    /// must NOT fall back to closing card 0: it opens no confirmation, issues no
+    /// `close_pane` call, and removes no session (matching the
+    /// `dashboard/pane/003` "never close without a real selection" invariant).
     #[spec("dashboard/selection/012")]
     #[test]
     fn selection_012_inactive_close_is_noop() {
@@ -19348,6 +20181,14 @@ mod tests {
             area,
         );
 
+        // PRD #241 M3: nothing armed ⇒ nothing to confirm. The close request
+        // must stay as silent as it was before the modal existed — arming a
+        // dialog here would give the reflexive Enter a card to destroy.
+        assert_eq!(
+            ui.mode,
+            UiMode::Normal,
+            "an inactive selection must not open the close confirmation"
+        );
         assert!(
             pc.closed.lock().unwrap().is_empty(),
             "an inactive selection must not close any card (no fallback to card 0)"
@@ -19363,11 +20204,11 @@ mod tests {
     /// inactive-selection close no-op (selection_012) must NOT suppress closing a
     /// Mode/Orchestration TAB via Ctrl+W. With a Mode tab active and
     /// `selected_index == None` (the real condition on a Mode tab — nothing armed
-    /// on the dashboard), dispatching `Action::CloseSelected` must close that tab;
-    /// likewise for an active Orchestration tab. Today this FAILS: the close
-    /// routes through the dashboard-selection gate that short-circuits on `None`,
-    /// so the tab persists (the keyboard Ctrl+W tab-close regressed while the
-    /// mouse click-to-close path, which bypasses the gate, still works).
+    /// on the dashboard), `Action::CloseSelected` must arm the PRD #241
+    /// confirmation and the follow-up `Action::ConfirmCloseSelected` must close
+    /// that tab; likewise for an active Orchestration tab. Bounds
+    /// `dashboard/selection/012`: an unarmed dashboard CARD stays a no-op, but an
+    /// active tab remains a valid confirmation target.
     #[spec("dashboard/selection/016")]
     #[test]
     fn selection_016_inactive_selection_does_not_block_tab_close() {
@@ -19408,6 +20249,29 @@ mod tests {
             None,
             area,
         );
+        // PRD #241 M3: an active tab IS a target, so the request confirms
+        // rather than no-ops — but nothing is torn down until the user says so.
+        assert_eq!(
+            ui.mode,
+            UiMode::CloseConfirm,
+            "an active Mode tab must arm the close confirmation"
+        );
+        assert_eq!(
+            tab_manager.tab_count(),
+            2,
+            "opening the confirmation must not close anything yet"
+        );
+        dispatch_action(
+            Action::ConfirmCloseSelected,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            area,
+        );
         assert_eq!(
             tab_manager.tab_count(),
             1,
@@ -19427,6 +20291,22 @@ mod tests {
         ui.selected_index = None;
         dispatch_action(
             Action::CloseSelected,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            area,
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::CloseConfirm,
+            "an active Orchestration tab must arm the close confirmation"
+        );
+        dispatch_action(
+            Action::ConfirmCloseSelected,
             &mut ui,
             &*pc,
             &state,
