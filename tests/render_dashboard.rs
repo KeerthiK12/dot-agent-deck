@@ -1135,8 +1135,8 @@ fn pane_005_highlight_follows_selected_session_id() {
     let mut tab = Tab::Dashboard {
         selected_session_id: Some("sess-beta".to_string()),
     };
-    let selected_index =
-        sync_and_derive_selection(&mut tab, None, &filtered).expect("dashboard derives an index");
+    let selected_index = sync_and_derive_selection(&mut tab, None, &filtered, None)
+        .expect("dashboard derives an index");
     assert_eq!(
         selected_index, 1,
         "selection must follow the stable session id to the 2nd card"

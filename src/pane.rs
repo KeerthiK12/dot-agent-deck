@@ -237,6 +237,26 @@ pub trait PaneController: Send + Sync {
     fn focused_pane_id(&self) -> Option<String> {
         None
     }
+    /// Attach a daemon-side pane to this controller on demand, returning
+    /// whether the pane is wired afterwards.
+    ///
+    /// A card can be backed by a LIVE daemon agent and still have no local
+    /// pane — a `SessionStart` surfaced over the broadcast that never went
+    /// through startup hydration. `focus_pane` reports those as
+    /// `CommandFailed`, which the focus call sites otherwise read as "stale
+    /// card, delete it". They call this first and retry, so the delete path is
+    /// reached only by genuinely dead cards.
+    ///
+    /// Exists as a trait method rather than a
+    /// `downcast_ref::<EmbeddedPaneController>()` at each call site so the
+    /// behaviour is reachable from a mock: a downcast silently no-ops for every
+    /// controller except the concrete production one, which made the retry
+    /// impossible to cover in a fast-tier test. The default returns `false`
+    /// ("nothing to attach"), preserving the old behaviour for render-only
+    /// fixtures and local-PTY mocks.
+    fn try_hydrate_pane(&self, _pane_id: &str) -> bool {
+        false
+    }
     /// PRD #76 M2.15 fixup pass 2 G1 — legacy single-call entry point.
     /// The default impl routes through `create_pane_with_options` with
     /// `AgentSpawnOptions::default()`, which opens the PTY at the

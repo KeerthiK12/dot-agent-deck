@@ -1733,6 +1733,14 @@ fn process_agent_output_chunk(
 }
 
 impl PaneController for EmbeddedPaneController {
+    /// The production implementation of the on-demand attach: resolve
+    /// `pane_id` through `list_agents` and wire the daemon's pane. Delegates to
+    /// the inherent [`EmbeddedPaneController::hydrate_pane`], which is a no-op
+    /// returning `true` when the pane is already wired.
+    fn try_hydrate_pane(&self, pane_id: &str) -> bool {
+        self.hydrate_pane(pane_id)
+    }
+
     fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
         let mut panes = self.panes.lock().unwrap();
         if !panes.contains_key(pane_id) {

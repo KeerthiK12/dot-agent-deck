@@ -4350,11 +4350,12 @@ fn focus_deck(
             // retry before the delete arm below treats it as stale. Post-PRD #93
             // the daemon-backed `EmbeddedPaneController` is the only production
             // `PaneController` (the old in-process `LocalDeck` is gone), so the
-            // downcast below always succeeds and the guard always operates on it.
+            // attach below always operates on it. Routed through the trait's
+            // `try_hydrate_pane` rather than a downcast so a mock can exercise
+            // this path — see the trait method's docs.
             let mut focus_result = pane.focus_pane(pane_id);
             if let Err(PaneError::CommandFailed(_)) = focus_result
-                && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                && embedded.hydrate_pane(pane_id)
+                && pane.try_hydrate_pane(pane_id)
             {
                 focus_result = pane.focus_pane(pane_id);
             }
@@ -4462,10 +4463,21 @@ fn dispatch_normal_mode_key(
 /// The caller passes the active tab, so a pane focused while another tab
 /// is active can never rewrite a different tab's selection — the gating
 /// the PRD calls for.
+///
+/// `current_index` is the highlight as it stands this frame. It only matters
+/// when several visible cards share one pane id: the Orchestration arm keys on
+/// pane id, and `position` returns the FIRST match, so re-deriving every frame
+/// pinned the highlight to the first of the group and made the rest impossible
+/// to select. Preferring the current index when it names the same pane keeps
+/// the cursor where the user put it. Duplicates are a bug in their own right
+/// (see the retire block in `state::AppState::apply_event`), but the deck
+/// should degrade to "reachable" rather than "silently unreachable" when one
+/// slips through.
 pub fn sync_and_derive_selection(
     tab: &mut Tab,
     focused_pane_id: Option<&str>,
     filtered: &[(&str, Option<&str>)],
+    current_index: Option<usize>,
 ) -> Option<usize> {
     match tab {
         Tab::Dashboard {
@@ -4499,10 +4511,13 @@ pub fn sync_and_derive_selection(
             {
                 *focused_role_pane_id = Some(fid.to_string());
             }
-            match focused_role_pane_id
-                .as_deref()
-                .and_then(|pid| filtered.iter().position(|(_, p)| *p == Some(pid)))
-            {
+            match focused_role_pane_id.as_deref().and_then(|pid| {
+                // Hold position within a same-pane group instead of snapping to
+                // its first member (see the `current_index` note above).
+                current_index
+                    .filter(|&i| filtered.get(i).is_some_and(|(_, p)| *p == Some(pid)))
+                    .or_else(|| filtered.iter().position(|(_, p)| *p == Some(pid)))
+            }) {
                 Some(idx) => Some(idx),
                 None => {
                     if focused_role_pane_id.is_some() {
@@ -4609,7 +4624,8 @@ fn reconcile_dashboard_selection(
             return;
         }
     }
-    if let Some(idx) = sync_and_derive_selection(tab, focused_pane_id, filtered) {
+    if let Some(idx) = sync_and_derive_selection(tab, focused_pane_id, filtered, ui.selected_index)
+    {
         ui.selected_index = Some(idx);
     }
 }
@@ -6450,7 +6466,27 @@ fn dispatch_action(
                         // PRD #84 M4: the destination tab's panes are sized by
                         // the pre-draw `resize_panes_to_layout` next frame.
                     }
-                    match pane.focus_pane(pane_id) {
+                    // Same on-demand hydrate-and-retry `focus_deck` performs
+                    // (PRD #127 finding #2). A card can be backed by a LIVE
+                    // daemon agent and still have no local pane — a
+                    // broadcast-surfaced `SessionStart` that never went through
+                    // startup hydration, which is exactly how a daemon-spawned
+                    // or foreign-pane card arrives. `focus_pane` reports those
+                    // as `CommandFailed`, and the arm below reads that as
+                    // "stale" and DELETES the session.
+                    //
+                    // Only the digit-jump path got this guard when #127 added
+                    // it; Enter — the way a card is normally opened — kept the
+                    // bare delete, so pressing Enter on a live-but-unwired card
+                    // destroyed it. Attach the daemon's pane first and retry, so
+                    // the delete arm is reached only by genuinely dead cards.
+                    let mut focus_result = pane.focus_pane(pane_id);
+                    if let Err(PaneError::CommandFailed(_)) = focus_result
+                        && pane.try_hydrate_pane(pane_id)
+                    {
+                        focus_result = pane.focus_pane(pane_id);
+                    }
+                    match focus_result {
                         Ok(()) => {
                             ui.mode = UiMode::PaneInput;
                             // Reset dismissed flags so art reappears when
@@ -18606,6 +18642,158 @@ mod tests {
             snapshot.sessions.insert(format!("s{i}"), sess);
         }
         snapshot
+    }
+
+    /// A controller whose pane is NOT wired locally: `focus_pane` fails until
+    /// the pane is attached on demand. Models the real case a live card hits —
+    /// a `SessionStart` surfaced over the broadcast that never went through
+    /// startup hydration.
+    struct UnwiredPC {
+        /// Whether the daemon actually has a pane to attach (`false` = the
+        /// card really is dead).
+        hydratable: bool,
+        wired: std::sync::Mutex<bool>,
+        hydrate_calls: std::sync::Mutex<usize>,
+    }
+    impl UnwiredPC {
+        fn new(hydratable: bool) -> Self {
+            Self {
+                hydratable,
+                wired: std::sync::Mutex::new(false),
+                hydrate_calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+    impl crate::pane::PaneController for UnwiredPC {
+        fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            if *self.wired.lock().unwrap() {
+                Ok(())
+            } else {
+                Err(crate::pane::PaneError::CommandFailed(
+                    "Pane p0 not found".to_string(),
+                ))
+            }
+        }
+        fn try_hydrate_pane(&self, _id: &str) -> bool {
+            *self.hydrate_calls.lock().unwrap() += 1;
+            if self.hydratable {
+                *self.wired.lock().unwrap() = true;
+            }
+            self.hydratable
+        }
+        fn create_pane_with_options(
+            &self,
+            _c: Option<&str>,
+            _d: Option<&str>,
+            _o: crate::pane::AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), crate::pane::PaneError> {
+            Ok(("p0".to_string(), "a0".to_string()))
+        }
+        fn write_to_pane(&self, _i: &str, _t: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _i: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn rename_pane(
+            &self,
+            _i: &str,
+            _n: &str,
+        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+            Ok(crate::pane::RenameOutcome::Applied(_n.to_string()))
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+            Ok(vec![])
+        }
+        fn resize_pane(
+            &self,
+            _i: &str,
+            _d: crate::pane::PaneDirection,
+            _a: u16,
+        ) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "unwired-mock"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Drive `Action::Focus` (Enter) against a card whose pane is not wired
+    /// locally. Returns `(session_survived, hydrate_attempts, entered_pane_input)`.
+    fn enter_on_unwired_card(hydratable: bool) -> (bool, usize, bool) {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(UnwiredPC::new(hydratable));
+        let mut tab_manager = TabManager::new(pc.clone());
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        let mut ui = default_ui();
+        ui.selected_index = Some(0);
+
+        dispatch_action(
+            Action::Focus,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            Some("s0"),
+            Rect::new(0, 0, 80, 24),
+        );
+
+        let survived = state.blocking_read().sessions.contains_key("s0");
+        let calls = *pc.hydrate_calls.lock().unwrap();
+        (survived, calls, matches!(ui.mode, UiMode::PaneInput))
+    }
+
+    /// Scenario: Press Enter on a dashboard card that is backed by a LIVE
+    /// daemon agent but has no local pane yet (the broadcast-surfaced case).
+    /// The deck must attach the pane on demand and open it, NOT treat the
+    /// failed focus as a stale card and delete it — which is what destroyed
+    /// live cards before, since only the digit-jump path had this guard.
+    #[spec("dashboard/selection/020")]
+    #[test]
+    fn selection_020_enter_hydrates_a_live_card_instead_of_deleting_it() {
+        let (survived, calls, entered) = enter_on_unwired_card(true);
+        assert_eq!(
+            calls, 1,
+            "Enter must attempt an on-demand attach exactly once"
+        );
+        assert!(
+            survived,
+            "Enter deleted a LIVE card whose pane merely wasn't wired yet"
+        );
+        assert!(
+            entered,
+            "after a successful attach, Enter must open the pane"
+        );
+    }
+
+    /// Scenario: Press Enter on a card whose pane the daemon genuinely does
+    /// not have. The on-demand attach fails, so the card really is stale and
+    /// the existing cleanup must still remove it — the fix must not turn a
+    /// dead card into an undeletable one.
+    #[spec("dashboard/selection/021")]
+    #[test]
+    fn selection_021_enter_still_removes_a_genuinely_stale_card() {
+        let (survived, calls, entered) = enter_on_unwired_card(false);
+        assert_eq!(calls, 1, "the attach must still be attempted");
+        assert!(
+            !survived,
+            "a card with no backing daemon pane must still be cleaned up"
+        );
+        assert!(!entered, "a failed attach must not enter PaneInput mode");
     }
 
     /// Scenario: Open a second (Mode) tab so a tab switch is possible, arm the

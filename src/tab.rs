@@ -1324,11 +1324,11 @@ mod tests {
             selected_session_id: Some("s2".to_string()),
         };
         // No focused pane: index derives purely from the remembered id.
-        let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered);
+        let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered, None);
         assert_eq!(idx, Some(1));
 
         // A focused pane that maps to a visible card adopts that card.
-        let idx = crate::ui::sync_and_derive_selection(&mut dash, Some("p3"), filtered);
+        let idx = crate::ui::sync_and_derive_selection(&mut dash, Some("p3"), filtered, None);
         assert_eq!(idx, Some(2));
         assert!(matches!(
             &dash,
@@ -1347,7 +1347,7 @@ mod tests {
             cwd: "/work".to_string(),
             focused_pane_id: None,
         };
-        let idx = crate::ui::sync_and_derive_selection(&mut mode, Some("p1"), filtered);
+        let idx = crate::ui::sync_and_derive_selection(&mut mode, Some("p1"), filtered, None);
         assert_eq!(idx, None);
         assert!(matches!(
             &dash,
@@ -1370,7 +1370,7 @@ mod tests {
         let mut dash = Tab::Dashboard {
             selected_session_id: Some("gone".to_string()),
         };
-        let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered);
+        let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered, None);
         assert_eq!(idx, Some(0));
         assert!(matches!(
             &dash,
@@ -1395,7 +1395,7 @@ mod tests {
             config: orch_config("orch"),
             status: OrchestrationStatus::WaitingForOrchestrator,
         };
-        let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered);
+        let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
         assert!(matches!(
             &orch,
@@ -1404,6 +1404,41 @@ mod tests {
                 ..
             }
         ));
+
+        // Two visible cards on ONE role pane: the highlight must be able to
+        // rest on either. The Orchestration arm keys on pane id, and
+        // `position` returns the FIRST match, so re-deriving every frame used
+        // to pin the highlight to index 0 and make the second card impossible
+        // to select — the observable symptom of a duplicated Pi card sitting
+        // at deck indices 3 and 4 with only the first selectable.
+        let dup: &[(&str, Option<&str>)] = &[("s-a", Some("p1")), ("s-b", Some("p1"))];
+        let mut dup_tab = Tab::Orchestration {
+            id: 3,
+            name: "orch".to_string(),
+            role_pane_ids: vec!["p1".to_string()],
+            role_statuses: vec![OrchestrationRoleStatus::Working],
+            cwd: "/work".to_string(),
+            focused_role_pane_id: Some("p1".to_string()),
+            start_role_index: 0,
+            orchestrator_prompt: None,
+            config: orch_config("orch"),
+            status: OrchestrationStatus::WaitingForOrchestrator,
+        };
+        assert_eq!(
+            crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),
+            Some(1),
+            "the highlight must hold on the second card of a same-pane group, not snap to the first"
+        );
+        // With no current highlight, the first member is still the right answer.
+        assert_eq!(
+            crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, None),
+            Some(0)
+        );
+        // An out-of-range or mismatched current index must not be trusted.
+        assert_eq!(
+            crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(9)),
+            Some(0)
+        );
 
         // Reactive remap — ACTIVE tab: the focused side pane was
         // recreated, so follow it to the successor and re-focus that id.
