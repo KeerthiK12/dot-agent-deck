@@ -88,6 +88,20 @@ fn plugin_template(binary_path: &str) -> String {
     format!(
         r#"import {{ execFileSync }} from "child_process";
 
+// Duplicate-load guard. The installer fans out to EVERY candidate config root
+// that exists (`$XDG_CONFIG_HOME/opencode` and `~/.opencode`) because it cannot
+// know which one OpenCode reads. When both exist OpenCode loads both copies into
+// one process, and every hook fired twice — observed in production as doubled
+// `Received event` lines in the daemon log, i.e. two events per real action.
+//
+// Fixed here rather than by narrowing the install, because the fan-out is what
+// guarantees we land in the root OpenCode actually uses; suppressing the second
+// copy keeps that guarantee and costs one flag. First copy loaded wins; any
+// later copy exports inert no-op hooks.
+const DAD_GUARD = "__dotAgentDeckPluginLoaded";
+const DAD_ALREADY_LOADED = globalThis[DAD_GUARD] === true;
+globalThis[DAD_GUARD] = true;
+
 const BINARY_PATH = {binary_path_json};
 const knownSessions = new Map();
 const messageRoles = new Map();
@@ -301,6 +315,12 @@ const handleMessagePartUpdated = (event, directory) => {{
 }};
 
 export const DotAgentDeckPlugin = async (ctx) => {{
+  // A second copy of this plugin in the same OpenCode process returns inert
+  // hooks, so one real action produces one event. See DAD_GUARD above.
+  if (DAD_ALREADY_LOADED) {{
+    return {{ event: async () => {{}} }};
+  }}
+
   const directory = ctx?.directory ?? process.cwd();
 
   return {{
@@ -549,6 +569,40 @@ mod tests {
         assert!(content.contains("eventType === \"message.updated\""));
         assert!(content.contains("const permissionPayload"));
         assert!(content.contains("\"permission.asked\""));
+    }
+
+    /// The installer intentionally fans out to every existing OpenCode config
+    /// root, so when both `$XDG_CONFIG_HOME/opencode` and `~/.opencode` exist
+    /// OpenCode loads two copies of the plugin into one process and every hook
+    /// fires twice (observed as doubled `Received event` lines in the daemon
+    /// log). The template must therefore carry a process-wide duplicate-load
+    /// guard whose second copy returns inert hooks.
+    #[test]
+    fn plugin_template_suppresses_a_duplicate_load() {
+        let content = plugin_template("/usr/local/bin/dot-agent-deck");
+        // The flag is read BEFORE it is set, so the first copy loaded wins.
+        let read_at = content
+            .find("const DAD_ALREADY_LOADED = globalThis[DAD_GUARD] === true;")
+            .expect("guard must snapshot the flag");
+        let set_at = content
+            .find("globalThis[DAD_GUARD] = true;")
+            .expect("guard must claim the flag");
+        assert!(
+            read_at < set_at,
+            "the flag must be READ before being SET, or the first copy would \
+             see its own claim and disable itself"
+        );
+        // A duplicate returns hooks that do nothing.
+        assert!(
+            content.contains("if (DAD_ALREADY_LOADED) {"),
+            "the plugin factory must short-circuit on a duplicate load"
+        );
+        // The guard must sit on globalThis: two copies are separate ES modules,
+        // so module-local state would not be shared between them.
+        assert!(
+            content.contains(r#"const DAD_GUARD = "__dotAgentDeckPluginLoaded";"#),
+            "the guard must be keyed on globalThis, not module scope"
+        );
     }
 
     /// The plugin must be a FLAT `.js` file directly under `plugin/` — that is the
