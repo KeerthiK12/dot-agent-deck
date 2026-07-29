@@ -931,10 +931,9 @@ async fn run_hook_loop(
                                         event_tx: event_tx.clone(),
                                         worktrees: worktree_registry.clone(),
                                     };
-                                    let task = signal.task.as_deref();
+                                    let task = signal.task.as_deref().unwrap_or_default();
                                     let result = dispatch::handle_dispatch(
                                         &ctx,
-                                        &signal.pane_id,
                                         &signal.name,
                                         task,
                                     )

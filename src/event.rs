@@ -701,8 +701,6 @@ pub struct DispatchSignal {
     pub name: String,
     #[serde(default)]
     pub task: Option<String>,
-    #[serde(default)]
-    pub to_orchestration: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 

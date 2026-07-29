@@ -875,9 +875,9 @@ impl NewPaneFormState {
             // all observe one consistent value.
             show_issue_dispatch: crate::features::show_issue_dispatch_authoring(),
             dispatcher_authoring,
-            // PRD #220: gated behind the same experimental flag as issue-dispatch
-            // for now; can be promoted to permanent when the feature stabilizes.
-            show_dispatcher: crate::features::show_issue_dispatch_authoring(),
+            // PRD #220: gated behind the dedicated dispatcher experimental flag
+            // (CLAUDE.md #9); can be promoted to permanent when the feature stabilizes.
+            show_dispatcher: crate::features::show_dispatcher(),
             selection_index: 0,
             agent_selection: None,
             has_mode_field,

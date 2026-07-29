@@ -131,9 +131,6 @@ enum Commands {
         /// Mutually exclusive with --task.
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
-        /// Target orchestration name for return-edge routing (PRD #220 M2.0).
-        #[arg(long = "to")]
-        to: Option<String>,
     },
     /// Signal task completion back to the orchestrator
     WorkDone {
@@ -681,7 +678,6 @@ fn main() -> ExitCode {
             name,
             task,
             task_file,
-            to,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -704,7 +700,6 @@ fn main() -> ExitCode {
                 pane_id,
                 name,
                 task: Some(task_text),
-                to_orchestration: to,
                 timestamp: chrono::Utc::now(),
             };
             let msg = dot_agent_deck::event::DaemonMessage::Dispatch(signal);
