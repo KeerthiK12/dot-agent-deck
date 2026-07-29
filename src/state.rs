@@ -284,10 +284,6 @@ pub struct AppState {
     /// can neither restore a stale id nor clear a newer one, and a delayed
     /// prior-generation `SessionEnd` cannot wipe the current generation.
     pane_hook_session: HashMap<String, (String, DateTime<Utc>)>,
-    /// PRD #220 M2.0: dispatch-id → caller pane_id for return-edge routing.
-    /// When a dispatch-spawned orchestration emits `work-done`, the daemon
-    /// resolves the caller pane from this map and routes the result there.
-    pub dispatch_callbacks: HashMap<String, String>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -1007,8 +1003,6 @@ impl AppState {
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
         self.pane_orchestration_map.remove(pane_id);
-        // PRD #220: clean up dispatch callbacks keyed by this pane.
-        self.dispatch_callbacks.retain(|_, v| v != pane_id);
     }
 
     /// Handle an orchestrator's delegate signal: validate the sender, look
@@ -1140,7 +1134,7 @@ impl AppState {
     /// `done: true` from the orchestrator pane itself signals the whole
     /// orchestration is complete; we log and exit without writing back a
     /// "completed" prompt to the orchestrator (it just issued it).
-    pub async fn handle_work_done(&mut self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
+    pub async fn handle_work_done(&self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
         let role_name = match self.pane_role_map.get(&signal.pane_id) {
             Some(name) => name.clone(),
             None => {
@@ -1172,36 +1166,7 @@ impl AppState {
             }
         }
 
-        // PRD #220 M2.1: if this work-done is from a dispatch-spawned
-        // orchestration, route the result to the CALLER pane (the pane
-        // that issued `dispatch`), not the dispatch-orchestration's own
-        // orchestrator. The dispatch_id → caller_pane mapping was
-        // registered at dispatch time.
-        let orchestration = self.pane_orchestration_map.get(&signal.pane_id);
-        if let Some((orch_name, _orch_cwd)) = orchestration {
-            if orch_name.starts_with("dispatch-") {
-                if let Some(caller_pane_id) = self.dispatch_callbacks.get(orch_name) {
-                    let feedback = format!(
-                        "[dispatch: {orch_name}] worker '{safe_name}' completed: {summary}",
-                        summary = signal.task.chars().take(200).collect::<String>(),
-                    );
-                    if let Err(e) = registry
-                        .write_to_pane_and_submit(caller_pane_id, &feedback)
-                        .await
-                    {
-                        warn!(
-                            pane_id = %caller_pane_id,
-                            dispatch = %orch_name,
-                            error = %e,
-                            "dispatch: failed to route work-done to caller pane"
-                        );
-                    }
-                    // Consume the callback so we don't double-deliver.
-                    self.dispatch_callbacks.remove(orch_name);
-                    return; // routed to caller — skip normal orchestrator delivery
-                }
-            }
-        }
+        let orchestration = self.pane_orchestration_map.get(&signal.pane_id).cloned();
 
         // Find the orchestrator pane in the same orchestration as the
         // worker. We scope by `pane_orchestration_map` so a parallel
@@ -1210,7 +1175,7 @@ impl AppState {
         let orchestrator_pane_id = self
             .orchestrator_pane_ids
             .iter()
-            .find(|p| self.pane_orchestration_map.get(p.as_str()) == orchestration)
+            .find(|p| self.pane_orchestration_map.get(p.as_str()) == orchestration.as_ref())
             .cloned();
 
         let Some(orch_pane_id) = orchestrator_pane_id else {
@@ -1244,13 +1209,6 @@ impl AppState {
                 "work-done: failed to write feedback into orchestrator pane"
             );
         }
-    }
-
-    /// PRD #220: record a dispatch callback so that when the dispatched
-    /// orchestration emits work-done, the result is routed back to the caller.
-    pub fn register_dispatch_callback(&mut self, dispatch_id: &str, caller_pane_id: &str) {
-        self.dispatch_callbacks
-            .insert(dispatch_id.to_string(), caller_pane_id.to_string());
     }
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {

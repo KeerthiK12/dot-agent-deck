@@ -9,12 +9,9 @@ use crate::scheduler::StderrNotifier;
 use crate::spawn::{SpawnRequest, spawn};
 
 fn sanitize_name(name: &str) -> String {
-    let sanitized = name
-        .replace('/', "-")
-        .replace('\\', "-")
+    let slug_chars: String = name
         .replace("..", "_")
-        .replace('\0', "");
-    let slug_chars: String = sanitized
+        .replace('\0', "")
         .chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '-' || c == '_' {
@@ -58,7 +55,6 @@ pub struct DispatchContext {
     pub registry: Arc<AgentPtyRegistry>,
     pub event_tx: tokio::sync::broadcast::Sender<BroadcastMsg>,
     pub worktrees: Arc<std::sync::Mutex<HashMap<PathBuf, PathBuf>>>,
-    pub callbacks: std::collections::HashMap<String, String>,
 }
 
 pub async fn handle_dispatch(

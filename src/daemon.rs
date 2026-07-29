@@ -930,7 +930,6 @@ async fn run_hook_loop(
                                         registry: pty_registry.clone(),
                                         event_tx: event_tx.clone(),
                                         worktrees: worktree_registry.clone(),
-                                        callbacks: std::collections::HashMap::new(),
                                     };
                                     let task = signal.task.as_deref();
                                     let result = dispatch::handle_dispatch(
@@ -940,16 +939,6 @@ async fn run_hook_loop(
                                         task,
                                     )
                                     .await;
-
-                                    // Phase 3: under a short write lock, record the
-                                    // callback only (the slow work is already done).
-                                    if result.success {
-                                        let dispatch_id = format!("dispatch-{}", signal.name);
-                                        state.write().await.register_dispatch_callback(
-                                            &dispatch_id,
-                                            &signal.pane_id,
-                                        );
-                                    }
 
                                     // Deliver result to the caller pane (doesn't need
                                     // any AppState lock — uses the PTY registry).
@@ -970,7 +959,7 @@ async fn run_hook_loop(
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
-                                    state.write().await.handle_work_done(signal, &pty_registry).await;
+                                    state.read().await.handle_work_done(signal, &pty_registry).await;
                                 }
                                 DaemonMessage::GetSeed(req) => {
                                     // PRD #201 native prompt delivery: hand the
