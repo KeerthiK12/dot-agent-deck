@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
-use crate::issue_dispatch_run::{WorktreeCreation, create_worktree, remove_worktree};
+use crate::issue_dispatch_run::{
+    WorktreeCreation, create_worktree, record_worktree, remove_worktree,
+};
 use crate::scheduler::StderrNotifier;
 use crate::spawn::{SpawnRequest, spawn};
 
@@ -36,7 +38,11 @@ struct DispatchPaths {
 fn derive_dispatch_paths(working_dir: &Path, name: &str) -> DispatchPaths {
     let clean_name = sanitize_name(name);
     let slug = format!("dispatch-{clean_name}");
-    let worktree_dir = working_dir.join(".worktrees").join(&slug);
+    let worktree_dir = working_dir.parent().unwrap_or(working_dir).join(format!(
+        "{}-{}",
+        working_dir.file_name().unwrap().to_string_lossy(),
+        slug
+    ));
     let branch = format!("agent/{slug}");
     DispatchPaths {
         worktree_dir,
@@ -66,7 +72,7 @@ pub async fn handle_dispatch(
     let paths = derive_dispatch_paths(&ctx.working_dir, name);
     let clone_dir = ctx.working_dir.clone();
 
-    match create_worktree(&clone_dir, &paths.worktree_dir, &paths.branch).await {
+    match create_worktree(&clone_dir, &paths.worktree_dir, &paths.branch, false).await {
         Ok(WorktreeCreation::Created) => {}
         Ok(WorktreeCreation::AlreadyClaimed) => {
             return DispatchResult {
@@ -87,10 +93,7 @@ pub async fn handle_dispatch(
         }
     }
 
-    {
-        let mut wts = ctx.worktrees.lock().unwrap_or_else(|e| e.into_inner());
-        wts.insert(paths.worktree_dir.clone(), clone_dir.clone());
-    }
+    record_worktree(&ctx.worktrees, &paths.worktree_dir, &clone_dir);
 
     let prompt = match task {
         Some(t) => t.to_string(),

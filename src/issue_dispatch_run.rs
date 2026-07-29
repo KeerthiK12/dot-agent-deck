@@ -127,10 +127,33 @@ pub fn worktree_still_in_use(records: &[AgentRecord], worktree_dir: &Path) -> bo
 }
 
 /// Remove a dispatched worktree from its clone (`git -C <clone> worktree remove
-/// <worktree> --force`), PRESERVING the clone. Best-effort: a non-zero exit
-/// (already removed, locked) or a spawn error is logged, not fatal — the tab is
-/// already gone.
+/// <worktree>`), PRESERVING the clone. Before removing, check the worktree's
+/// `git status --porcelain`: if it has uncommitted changes, log a warning and
+/// leave the worktree in place so the user can recover their work. Best-effort:
+/// a non-zero exit (already removed, locked) or a spawn error is logged, not
+/// fatal — the tab is already gone.
 pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path) {
+    let worktree = worktree_dir.to_string_lossy();
+    let status = run_capture_args("git", &["-C", &worktree, "status", "--porcelain"]).await;
+    match status {
+        Ok(output) if !output.trim().is_empty() => {
+            tracing::warn!(
+                worktree = %worktree_dir.display(),
+                "dispatch: worktree has uncommitted changes; leaving in place"
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                worktree = %worktree_dir.display(),
+                error = %e,
+                "dispatch: could not check worktree status; leaving in place"
+            );
+            return;
+        }
+    }
+
     let res = run_status(
         "git",
         &[
@@ -138,8 +161,7 @@ pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path) {
             &clone_dir.to_string_lossy(),
             "worktree",
             "remove",
-            &worktree_dir.to_string_lossy(),
-            "--force",
+            &worktree,
         ],
     )
     .await;
@@ -314,7 +336,7 @@ async fn dispatch_one_issue(
     // fire can claim it in the TOCTOU window after the idempotency check above
     // (see `create_worktree`); that benign race is a skip, not a failure —
     // mirroring the `dispatch_decision` worktree-presence skip.
-    match create_worktree(clone_dir, &paths.worktree_dir, &paths.branch).await? {
+    match create_worktree(clone_dir, &paths.worktree_dir, &paths.branch, true).await? {
         WorktreeCreation::Created => {}
         WorktreeCreation::AlreadyClaimed => {
             notifier.notify(NotifyEvent::IssueDispatchSkipped {
@@ -592,9 +614,11 @@ pub enum WorktreeCreation {
 /// dispatched, had its tab closed without a PR, and is still open leaves
 /// `agent/issue-<n>` behind. A naive `worktree add -b <branch>` would then fail
 /// ("a branch named … already exists") on EVERY later fire, permanently wedging
-/// the reuse-the-vacated-slot model. So probe for the branch first: attach the
-/// existing branch (no `-b`) when it is already there, and only create it (`-b`)
-/// when it is not.
+/// the reuse-the-vacated-slot model. So probe for the branch first: when
+/// `reuse_existing_branch` is true, attach the existing branch (no `-b`) when it is
+/// already there, and only create it (`-b`) when it is not. When
+/// `reuse_existing_branch` is false, an existing branch is treated as
+/// [`WorktreeCreation::AlreadyClaimed`] so the caller can refuse the dispatch.
 ///
 /// TOCTOU: the caller only reaches here after [`dispatch_decision`] saw the
 /// worktree dir ABSENT, but a concurrent fire of the same task can create it in
@@ -608,6 +632,7 @@ pub async fn create_worktree(
     clone_dir: &Path,
     worktree_dir: &Path,
     branch: &str,
+    reuse_existing_branch: bool,
 ) -> Result<WorktreeCreation, String> {
     if let Some(parent) = worktree_dir.parent() {
         std::fs::create_dir_all(parent)
@@ -629,6 +654,9 @@ pub async fn create_worktree(
     )
     .await
     .is_ok();
+    if branch_exists && !reuse_existing_branch {
+        return Ok(WorktreeCreation::AlreadyClaimed);
+    }
     let add = if branch_exists {
         run_status("git", &["-C", &clone, "worktree", "add", &wt, branch]).await
     } else {
@@ -916,7 +944,7 @@ mod tests {
         // Simulate the concurrent fire having already created the worktree dir.
         std::fs::create_dir_all(&worktree_dir).unwrap();
 
-        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-7").await;
+        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-7", false).await;
         assert_eq!(
             outcome,
             Ok(WorktreeCreation::AlreadyClaimed),
@@ -934,7 +962,7 @@ mod tests {
         std::fs::create_dir_all(&clone_dir).unwrap();
         let worktree_dir = clone_dir.join(".worktrees").join("issue-9"); // absent
 
-        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-9").await;
+        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-9", false).await;
         assert!(
             outcome.is_err(),
             "a real add failure with no worktree on disk must propagate as Err, got {outcome:?}"
