@@ -1279,9 +1279,10 @@ struct SilenceWatch {
 /// to, so the report stays in the log rather than being routed by string.
 /// PRD #249 M3 review (finding B4/S4): the watch is CANCELLABLE, and three
 /// outcomes cancel it — a `work-done` from the worker
-/// ([`AgentPtyRegistry::cancel_silence_watch`], called from
-/// [`AppState::handle_work_done`]), a close of either pane, and a superseding
-/// delegate to the same worker. Without that, the detached task ran to its
+/// ([`AgentPtyRegistry::retire_silence_watch`], called from
+/// [`AppState::handle_work_done`], which credits the completion to the oldest
+/// unaccounted-for delegation so a stale one cannot disarm a newer watch), a
+/// close of either pane, and a superseding delegate to the same worker. Without that, the detached task ran to its
 /// deadline regardless: `work-done` is a CLI signal rather than an `AgentEvent`,
 /// so a hookless worker could receive the pointer, report completion, and still
 /// be accused of never having got it. A diagnostic that fires after positive
@@ -1871,16 +1872,51 @@ async fn dispatch_one_owned(
                         "delegate: readiness signal handled; holding the task \
                          prompt for the post-respawn readiness buffer"
                     );
-                    // A plain `sleep(buffer)`: the configured value is a LOWER
-                    // bound on the wait, never an upper one. Tokio rounds a
-                    // sleep deadline up to the next whole-millisecond tick, so
-                    // this resolves in `buffer..=buffer + 1 ms` — shaving that
-                    // tick off to make the release land exactly on `buffer`
-                    // would turn a tunable minimum into a maximum, and would
-                    // make a deliberate `…_BUFFER_MS=1` sleep zero. Tests that
-                    // need to observe the release on a paused clock straddle
-                    // the boundary themselves (`orchestration/delegate/011`).
-                    tokio::time::sleep(buffer).await;
+                    // PRD #249 round-6 review (Greptile): the wait is
+                    // CANCELLABLE. It used to be an unconditional sleep, so a
+                    // pane closed mid-wait kept this task alive for the whole
+                    // remainder — negligible at the 1000 ms default, up to 30 s
+                    // at the clamp — before the guarded write below discovered
+                    // the target was gone. The outcome was already correct
+                    // (nothing is written, and nothing can land on a successor);
+                    // this is purely the lingering task. Same shape as
+                    // `arm_delegate_silence_watch`: one `oneshot`, `biased` so a
+                    // close landing in the same instant as the release always
+                    // wins.
+                    let closing = registry.pane_close_signal(&pane_id);
+                    // The sleep arm is a plain `sleep(buffer)`: the configured
+                    // value is a LOWER bound on the wait, never an upper one.
+                    // Tokio rounds a sleep deadline up to the next
+                    // whole-millisecond tick, so it resolves in
+                    // `buffer..=buffer + 1 ms` — shaving that tick off to make
+                    // the release land exactly on `buffer` would turn a tunable
+                    // minimum into a maximum, and would make a deliberate
+                    // `…_BUFFER_MS=1` sleep zero. Tests that need to observe the
+                    // release on a paused clock straddle the boundary themselves
+                    // (`orchestration/delegate/011`).
+                    tokio::select! {
+                        biased;
+                        _ = closing => {
+                            // Abandon rather than fall through to the write:
+                            // `begin_pane_close` has already swept every record
+                            // touching this pane and deliberately does not
+                            // restore them even if the close then fails, so a
+                            // delegate caught inside that window is abandoned
+                            // too. Falling through would also mean writing
+                            // BEFORE the readiness buffer elapsed, which is the
+                            // very defect this gate exists to prevent.
+                            warn!(
+                                role = %target_role,
+                                pane_id = %pane_id,
+                                buffer_ms = buffer.as_millis(),
+                                "delegate: worker pane began closing during the \
+                                 readiness buffer; abandoning the dispatch \
+                                 without writing the task pointer"
+                            );
+                            return;
+                        }
+                        _ = tokio::time::sleep(buffer) => {}
+                    }
                 }
                 // PRD #249 review (finding B1): the identity the pointer is now
                 // bound to. Captured from the respawn rather than re-read after
@@ -2641,13 +2677,34 @@ impl AppState {
         // signal, not an `AgentEvent`, so the watch's event wait can never see
         // it: a hookless worker that received its pointer and reported
         // completion would otherwise still be accused, minutes later, of
-        // possibly never having got it. Cancelled first, above every early
-        // return, for the same reason as the retire above.
-        if registry.cancel_silence_watch(&signal.pane_id) {
-            tracing::debug!(
-                pane_id = %signal.pane_id,
-                "work-done: cancelled the delegate silent-worker watch (delivery is proven)"
-            );
+        // possibly never having got it. Retired first, above every early
+        // return, for the same reason as the retire below.
+        //
+        // PRD #249 round-6 review (Greptile): this retires ONE watch,
+        // oldest-first — it used to be an unconditional cancel, which let a
+        // stale completion from delegation N disarm delegation N+1's watch and
+        // silently switch the undelivered-prompt detector off for exactly the
+        // case it exists to surface. See
+        // [`AgentPtyRegistry::retire_silence_watch`] for why the accounting
+        // cannot simply borrow the idle detector's generation.
+        match registry.retire_silence_watch(&signal.pane_id) {
+            crate::agent_pty::SilenceWatchRetirement::Nothing => {}
+            crate::agent_pty::SilenceWatchRetirement::Cancelled { seq } => {
+                tracing::debug!(
+                    pane_id = %signal.pane_id,
+                    armed_seq = seq,
+                    "work-done: cancelled the delegate silent-worker watch (delivery is proven)"
+                );
+            }
+            crate::agent_pty::SilenceWatchRetirement::KeptNewer { seq, remaining } => {
+                tracing::debug!(
+                    pane_id = %signal.pane_id,
+                    armed_seq = seq,
+                    remaining_superseded = remaining,
+                    "work-done: credited to a superseded delegation; the newest \
+                     silent-worker watch stays armed"
+                );
+            }
         }
         match registry.retire_outstanding_delegation(&signal.pane_id) {
             crate::agent_pty::DelegationRetirement::Nothing => {}
