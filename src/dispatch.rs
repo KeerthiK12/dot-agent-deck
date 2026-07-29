@@ -57,12 +57,7 @@ pub struct DispatchContext {
     pub worktrees: Arc<std::sync::Mutex<HashMap<PathBuf, PathBuf>>>,
 }
 
-pub async fn handle_dispatch(
-    ctx: &DispatchContext,
-    _caller_pane_id: &str,
-    name: &str,
-    task: Option<&str>,
-) -> DispatchResult {
+pub async fn handle_dispatch(ctx: &DispatchContext, name: &str, task: &str) -> DispatchResult {
     let paths = derive_dispatch_paths(&ctx.working_dir, name);
     let clone_dir = ctx.working_dir.clone();
 
@@ -92,10 +87,7 @@ pub async fn handle_dispatch(
         wts.insert(paths.worktree_dir.clone(), clone_dir.clone());
     }
 
-    let prompt = match task {
-        Some(t) => t.to_string(),
-        None => format!("Isolated worktree for task: {name}. Read your environment and proceed."),
-    };
+    let prompt = task.to_string();
 
     let req = SpawnRequest {
         task_name: format!("dispatch-{name}"),
