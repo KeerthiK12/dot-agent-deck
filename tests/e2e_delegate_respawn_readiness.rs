@@ -228,6 +228,7 @@ fn delegate_014_real_claude_worker_acts_on_clear_true_delegate() {
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
         .with_env("PATH", path_with_binary_dir())
+        .with_env(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, "1000")
         .with_imported_claude_credentials()
         .with_claude_trust_workdir()
         .launch_with_fixture("minimal");
@@ -256,6 +257,7 @@ fn delegate_015_real_opencode_worker_acts_on_clear_true_delegate() {
     let builder = TuiDeck::builder()
         .with_pty_size(180, 45)
         .with_env("PATH", path_with_binary_dir())
+        .with_env(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, "1000")
         .with_imported_opencode_credentials();
     let deck = maybe_forward_readiness_override(builder).launch_with_fixture("minimal");
 

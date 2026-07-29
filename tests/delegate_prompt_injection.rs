@@ -27,8 +27,12 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 
-use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
-use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType};
+use dot_agent_deck::agent_pty::{
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions, TabMembership,
+};
+use dot_agent_deck::event::{
+    AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType, WorkDoneSignal,
+};
 use dot_agent_deck::state::{AppState, OrchestrationIdentity};
 #[cfg(unix)]
 use spec::spec;
@@ -42,6 +46,7 @@ const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task
 const SESSION_START_ORIGIN_METADATA_KEY: &str = "session_start_origin";
 const WRAPPER_FORK_SESSION_START_ORIGIN: &str = "wrapper_fork";
 const DELEGATE_READINESS_BUFFER_ENV: &str = "DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS";
+const DELEGATE_NO_EVENT_WINDOW_ENV: &str = "DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS";
 const SESSION_START_WAIT_ENV: &str = "DOT_AGENT_DECK_SESSION_START_WAIT_MS";
 const WORKER_RESPONSE_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS";
 const DELEGATE_READINESS_BUFFER_MS: u64 = 1000;
@@ -199,7 +204,7 @@ fn snapshot_has_silence_notice(snapshot: &[u8]) -> bool {
         .filter(|line| line.ends_with('\n'))
         .any(|line| {
             let line = line.to_ascii_lowercase();
-            line.contains("delegat") && line.contains("coder") && line.contains("event")
+            line.contains("delegat") && line.contains("event")
         })
 }
 
@@ -533,6 +538,7 @@ fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent() {
         ),
         (SESSION_START_WAIT_ENV, "5000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
     ]);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -637,6 +643,7 @@ fn delegate_008_hookless_wrapper_fork_start_still_releases_prompt() {
         ),
         (SESSION_START_WAIT_ENV, "5000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
     ]);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -713,6 +720,7 @@ fn delegate_010_observed_session_start_waits_for_readiness_buffer() {
         ),
         (SESSION_START_WAIT_ENV, "2000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
     ]);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -790,25 +798,34 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
     );
 }
 
-/// Scenario: Delegate with `clear = true` to a worker that never emits `SessionStart`, advance a paused Tokio clock across the fallback timeout, and force a 1000 ms readiness buffer. Delivery must remain absent just short of the buffer and arrive after advancing one millisecond beyond it to tolerate Tokio's deadline rounding.
+/// Scenario: Delegate with `clear = true` to workers that never emit `SessionStart` and advance a paused Tokio clock across the fallback timeout. A 1000 ms buffer must hold through its boundary, and a separate 1 ms case must still wait rather than collapsing to `sleep(0)`.
 #[spec("orchestration/delegate/011")]
 #[test]
 #[cfg(unix)]
 fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let _env = EnvGuard::set(&[
+    let env = EnvGuard::set(&[
         (
             DELEGATE_READINESS_BUFFER_ENV,
             &DELEGATE_READINESS_BUFFER_MS.to_string(),
         ),
         (SESSION_START_WAIT_ENV, "30000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
     ]);
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build timeout-fallback readiness runtime")
-        .block_on(delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner());
+        .block_on(async {
+            delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner().await;
+            env.repoint(DELEGATE_READINESS_BUFFER_ENV, "1");
+            delegate_011_one_millisecond_buffer_is_a_real_wait_inner().await;
+            env.repoint(DELEGATE_READINESS_BUFFER_ENV, " 1 \t");
+            delegate_011_one_millisecond_buffer_is_a_real_wait_inner().await;
+            env.repoint(DELEGATE_READINESS_BUFFER_ENV, "18446744073709551616");
+            delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner().await;
+        });
 }
 
 #[cfg(unix)]
@@ -875,6 +892,132 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
     registry.shutdown_all();
 }
 
+#[cfg(unix)]
+async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
+    let cwd = common::race_safe_tempdir();
+    std::fs::write(
+        cwd.path().join(".dot-agent-deck.toml"),
+        clear_true_config("cat"),
+    )
+    .expect("write one-millisecond orchestration config");
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let old_agent_id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd_str),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn initial one-millisecond worker");
+    let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
+    let mut state = AppState::default();
+    register_orchestration(&mut state, &cwd_str);
+    state
+        .handle_delegate(
+            DelegateSignal {
+                pane_id: ORCH_PANE.to_string(),
+                task: "List the files in the current directory.".to_string(),
+                to: vec![WORKER_ROLE.to_string()],
+                timestamp: chrono::Utc::now(),
+            },
+            &registry,
+            &event_tx,
+        )
+        .await;
+    let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
+
+    tokio::time::advance(Duration::from_secs(30)).await;
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let at_fallback = registry.snapshot(&new_agent_id).unwrap_or_default();
+    assert!(
+        !snapshot_contains(&at_fallback, POINTER),
+        "BUFFER_MS=1 collapsed to a zero wait at the timeout fallback; snapshot = {:?}",
+        String::from_utf8_lossy(&at_fallback)
+    );
+
+    tokio::time::advance(Duration::from_millis(2)).await;
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let delivered = registry.snapshot(&new_agent_id).unwrap_or_default();
+    assert!(
+        snapshot_contains(&delivered, POINTER),
+        "the one-millisecond readiness buffer never released after virtual time crossed its rounded deadline; snapshot = {:?}",
+        String::from_utf8_lossy(&delivered)
+    );
+    registry.shutdown_all();
+}
+
+#[cfg(unix)]
+async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
+    let cwd = common::race_safe_tempdir();
+    std::fs::write(
+        cwd.path().join(".dot-agent-deck.toml"),
+        clear_true_config("cat"),
+    )
+    .expect("write overflow-buffer orchestration config");
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let old_agent_id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd_str),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn initial overflow-buffer worker");
+    let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
+    let mut state = AppState::default();
+    register_orchestration(&mut state, &cwd_str);
+    state
+        .handle_delegate(
+            DelegateSignal {
+                pane_id: ORCH_PANE.to_string(),
+                task: "List the files in the current directory.".to_string(),
+                to: vec![WORKER_ROLE.to_string()],
+                timestamp: chrono::Utc::now(),
+            },
+            &registry,
+            &event_tx,
+        )
+        .await;
+    let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
+
+    tokio::time::advance(Duration::from_secs(30)).await;
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_millis(1001)).await;
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let after_default = registry.snapshot(&new_agent_id).unwrap_or_default();
+    assert!(
+        !snapshot_contains(&after_default, POINTER),
+        "an above-u64 readiness value fell back to the 1000 ms default instead of clamping to 30 s; snapshot = {:?}",
+        String::from_utf8_lossy(&after_default)
+    );
+
+    tokio::time::advance(Duration::from_millis(29_001)).await;
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let delivered = registry.snapshot(&new_agent_id).unwrap_or_default();
+    assert!(
+        snapshot_contains(&delivered, POINTER),
+        "the clamped 30-second readiness buffer never released after its rounded deadline; snapshot = {:?}",
+        String::from_utf8_lossy(&delivered)
+    );
+    registry.shutdown_all();
+}
+
 /// Scenario: Toggle only the delegate readiness buffer around a slow raw-mode worker that emits `SessionStart` 650 ms before accepting input. A zero buffer must lose the pointer, while 1000 ms must deliver the pointer and its submit CR after the stub becomes ready.
 #[spec("orchestration/delegate/012")]
 #[test]
@@ -885,6 +1028,7 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
         (SESSION_START_WAIT_ENV, "2000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
     ]);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -932,7 +1076,7 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
         });
 }
 
-/// Scenario: Delegate to a worker that receives the pointer but emits no agent event before the short response window expires. The orchestrator pane must gain an LF-terminated visible notice naming the delegate role and missing event, without submitting that notice as an LLM prompt.
+/// Scenario: Delegate to a worker that receives the pointer but is neither hooked nor finished before the short no-event window expires. The orchestrator pane must gain an LF-terminated fixed daemon-authored notice with no role-name interpolation.
 #[spec("orchestration/delegate/013")]
 #[test]
 #[cfg(unix)]
@@ -941,7 +1085,8 @@ fn delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane() {
     let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
         (SESSION_START_WAIT_ENV, "2000"),
-        (WORKER_RESPONSE_TIMEOUT_ENV, "600"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "600"),
     ]);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1016,8 +1161,581 @@ async fn delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane_inner()
         wait_for_silence_notice(&registry, &orchestrator_agent_id, Duration::from_secs(3)).await;
     assert!(
         snapshot_has_silence_notice(&notice),
-        "a worker that received its delegate pointer and emitted no agent event produced no LF-terminated visible notice naming role 'coder' in the orchestrator pane; snapshot = {:?}",
+        "a worker that received its delegate pointer and emitted no agent event produced no LF-terminated fixed daemon notice in the orchestrator pane; snapshot = {:?}",
+        String::from_utf8_lossy(&notice)
+    );
+    assert!(
+        !String::from_utf8_lossy(&notice).contains(WORKER_ROLE),
+        "the fixed pane notice must not interpolate the untrusted delegate role; snapshot = {:?}",
         String::from_utf8_lossy(&notice)
     );
     registry.shutdown_all();
+}
+
+#[cfg(unix)]
+struct SilenceHarness {
+    _cwd: tempfile::TempDir,
+    cwd_str: String,
+    registry: Arc<AgentPtyRegistry>,
+    state: AppState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    orchestrator_agent_id: String,
+    worker_agent_id: String,
+}
+
+#[cfg(unix)]
+impl SilenceHarness {
+    async fn new(channel_capacity: usize) -> Self {
+        common::init_test_env();
+        let cwd = common::race_safe_tempdir();
+        let observer = cwd.path().join("silence-test-orchestrator");
+        write_executable(
+            &observer,
+            "#!/bin/sh\nstty raw -echo\nprintf SILENCE-ORCHESTRATOR-READY\nexec cat -u\n",
+        );
+        let cwd_str = cwd.path().to_string_lossy().into_owned();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let orchestrator_agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&observer.to_string_lossy()),
+                cwd: Some(&cwd_str),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn silence-test orchestrator");
+        let ready = wait_for_snapshot_needle(
+            &registry,
+            &orchestrator_agent_id,
+            b"SILENCE-ORCHESTRATOR-READY",
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            snapshot_contains(&ready, b"SILENCE-ORCHESTRATOR-READY"),
+            "silence-test orchestrator never became observable; snapshot = {:?}",
+            String::from_utf8_lossy(&ready)
+        );
+        let worker_agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(&cwd_str),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn silence-test worker");
+        let mut state = AppState::default();
+        register_orchestration(&mut state, &cwd_str);
+        state
+            .pane_cwd_map
+            .insert(ORCH_PANE.to_string(), cwd_str.clone());
+        let (event_tx, _rx) = broadcast::channel(channel_capacity);
+        Self {
+            _cwd: cwd,
+            cwd_str,
+            registry,
+            state,
+            event_tx,
+            orchestrator_agent_id,
+            worker_agent_id,
+        }
+    }
+
+    async fn delegate_and_wait_for_pointer(&self) {
+        self.state
+            .handle_delegate(
+                DelegateSignal {
+                    pane_id: ORCH_PANE.to_string(),
+                    task: "Perform the delegated silence-watch task.".to_string(),
+                    to: vec![WORKER_ROLE.to_string()],
+                    timestamp: chrono::Utc::now(),
+                },
+                &self.registry,
+                &self.event_tx,
+            )
+            .await;
+        let delivered = wait_for_snapshot_needle(
+            &self.registry,
+            &self.worker_agent_id,
+            POINTER,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            snapshot_contains(&delivered, POINTER),
+            "silence-watch precondition failed: worker never received pointer; snapshot = {:?}",
+            String::from_utf8_lossy(&delivered)
+        );
+    }
+
+    fn orchestrator_snapshot(&self) -> Vec<u8> {
+        self.registry
+            .snapshot(&self.orchestrator_agent_id)
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SilenceHarness {
+    fn drop(&mut self) {
+        self.registry.shutdown_all();
+    }
+}
+
+#[cfg(unix)]
+fn turn_event(pane_id: &str, agent_id: &str, event_type: EventType) -> AgentEvent {
+    let mut event = session_start_event(AgentType::None, pane_id, agent_id, false);
+    event.event_type = event_type;
+    event
+}
+
+/// Scenario: Attempt direct guarded notice writes with a wrong expected agent,
+/// a pane re-homed into another orchestration, and a pane mid-close. Each attempt
+/// must be refused and none of its marker bytes may enter the observable PTY.
+#[test]
+#[cfg(unix)]
+fn delegate_notice_guard_rejects_wrong_agent_rehome_and_closing() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build guarded-notice runtime")
+        .block_on(async {
+            let cwd = common::race_safe_tempdir();
+            let observer = cwd.path().join("guarded-notice-observer");
+            write_executable(
+                &observer,
+                "#!/bin/sh\nstty raw -echo\nprintf GUARDED-NOTICE-READY\nexec cat -u\n",
+            );
+            let cwd_str = cwd.path().to_string_lossy().into_owned();
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let agent_id = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(&observer.to_string_lossy()),
+                    cwd: Some(&cwd_str),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
+                    tab_membership: Some(TabMembership::Orchestration {
+                        name: "successor-orchestration".to_string(),
+                        role_index: 0,
+                        role_name: "orchestrator".to_string(),
+                        is_start_role: true,
+                        orchestration_cwd: Some(cwd_str.clone()),
+                        display_title: None,
+                        orchestration_id: Some("successor-instance".to_string()),
+                    }),
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn guarded-notice observer");
+            let ready = wait_for_snapshot_needle(
+                &registry,
+                &agent_id,
+                b"GUARDED-NOTICE-READY",
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(snapshot_contains(&ready, b"GUARDED-NOTICE-READY"));
+
+            let wrong_agent = registry
+                .write_notice_guarded(
+                    ORCH_PANE,
+                    "WRONG-AGENT-NOTICE",
+                    Some("stale-agent-id"),
+                    || async { true },
+                )
+                .await
+                .expect("wrong-agent guarded notice result");
+            assert_eq!(wrong_agent, GuardedSend::WrongSession);
+
+            let rehome_registry = Arc::clone(&registry);
+            let rehomed = registry
+                .write_notice_guarded(
+                    ORCH_PANE,
+                    "REHOMED-NOTICE",
+                    Some(&agent_id),
+                    || async move {
+                        rehome_registry
+                            .pane_orchestration(ORCH_PANE)
+                            .is_some_and(|membership| membership.name == "original-orchestration")
+                    },
+                )
+                .await
+                .expect("re-homed guarded notice result");
+            assert_eq!(rehomed, GuardedSend::Stale);
+
+            registry.begin_pane_close(ORCH_PANE);
+            let closing_registry = Arc::clone(&registry);
+            let closing = registry
+                .write_notice_guarded(
+                    ORCH_PANE,
+                    "CLOSING-NOTICE",
+                    Some(&agent_id),
+                    || async move { !closing_registry.is_pane_closing(ORCH_PANE) },
+                )
+                .await
+                .expect("closing guarded notice result");
+            assert_eq!(closing, GuardedSend::Stale);
+            registry.finish_pane_close(ORCH_PANE, false);
+
+            std::thread::sleep(Duration::from_millis(100));
+            let snapshot = registry.snapshot(&agent_id).unwrap_or_default();
+            for marker in [
+                b"WRONG-AGENT-NOTICE".as_slice(),
+                b"REHOMED-NOTICE".as_slice(),
+                b"CLOSING-NOTICE".as_slice(),
+            ] {
+                assert!(
+                    !snapshot_contains(&snapshot, marker),
+                    "refused notice bytes reached the pane: marker={:?}, snapshot={:?}",
+                    String::from_utf8_lossy(marker),
+                    String::from_utf8_lossy(&snapshot)
+                );
+            }
+            registry.shutdown_all();
+        });
+}
+
+/// Scenario: Arm a timed silence notice, let the original orchestrator exit, and
+/// place an unrelated successor on the same pane id before the deadline. The
+/// dead orchestration's notice must not enter the successor's PTY.
+#[test]
+#[cfg(unix)]
+fn delegate_silence_notice_does_not_reach_successor_orchestrator() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "700"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build successor-notice runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(64).await;
+            harness.delegate_and_wait_for_pointer().await;
+            harness
+                .registry
+                .close_agent(&harness.orchestrator_agent_id)
+                .expect("let original orchestrator exit");
+
+            let successor_script = harness._cwd.path().join("successor-orchestrator");
+            write_executable(
+                &successor_script,
+                "#!/bin/sh\nstty raw -echo\nprintf SUCCESSOR-ORCHESTRATOR-READY\nexec cat -u\n",
+            );
+            let successor = harness
+                .registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(&successor_script.to_string_lossy()),
+                    cwd: Some(&harness.cwd_str),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn successor orchestrator");
+            let ready = wait_for_snapshot_needle(
+                &harness.registry,
+                &successor,
+                b"SUCCESSOR-ORCHESTRATOR-READY",
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(snapshot_contains(&ready, b"SUCCESSOR-ORCHESTRATOR-READY"));
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            let snapshot = harness.registry.snapshot(&successor).unwrap_or_default();
+            assert!(
+                !snapshot_has_silence_notice(&snapshot),
+                "a timed notice entered a successor orchestrator pane: {:?}",
+                String::from_utf8_lossy(&snapshot)
+            );
+        });
+}
+
+/// Scenario: Complete a hookless delegated task through the real `work-done`
+/// handler before the no-event window expires. The completion is positive proof
+/// of delivery, so no later silence notice may appear.
+#[test]
+#[cfg(unix)]
+fn delegate_work_done_before_window_cancels_silence_notice() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "600"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build work-done cancellation runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(64).await;
+            harness.delegate_and_wait_for_pointer().await;
+            harness
+                .state
+                .handle_work_done(
+                    WorkDoneSignal {
+                        pane_id: WORKER_PANE.to_string(),
+                        task: "Completed without hook events.".to_string(),
+                        done: false,
+                        timestamp: chrono::Utc::now(),
+                    },
+                    &harness.registry,
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let snapshot = harness.orchestrator_snapshot();
+            assert!(
+                !snapshot_has_silence_notice(&snapshot),
+                "work-done failed to cancel the no-event watch: {:?}",
+                String::from_utf8_lossy(&snapshot)
+            );
+        });
+}
+
+/// Scenario: Overflow the silence watch's tiny broadcast receiver after pointer
+/// delivery. Because a proof event may have been dropped, the daemon must stay
+/// conservative and emit no unprovable silence notice.
+#[test]
+#[cfg(unix)]
+fn delegate_lagged_event_bus_suppresses_unprovable_silence_notice() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "400"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build lagged-channel runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(4).await;
+            harness.delegate_and_wait_for_pointer().await;
+            for index in 0..32 {
+                let event =
+                    turn_event("unrelated-pane", &format!("agent-{index}"), EventType::Idle);
+                harness
+                    .event_tx
+                    .send(BroadcastMsg::Event(event))
+                    .expect("silence watch is subscribed before pointer delivery");
+            }
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let snapshot = harness.orchestrator_snapshot();
+            assert!(
+                !snapshot_has_silence_notice(&snapshot),
+                "a lagged receiver was treated as proof of silence: {:?}",
+                String::from_utf8_lossy(&snapshot)
+            );
+        });
+}
+
+/// Scenario: Send a turn-shaped event for the correct worker pane but an old
+/// agent generation. The stale event must not suppress the current worker's
+/// silence notice.
+#[test]
+#[cfg(unix)]
+fn delegate_wrong_generation_event_does_not_suppress_silence_notice() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "400"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wrong-generation runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(64).await;
+            harness.delegate_and_wait_for_pointer().await;
+            harness
+                .event_tx
+                .send(BroadcastMsg::Event(turn_event(
+                    WORKER_PANE,
+                    "stale-worker-generation",
+                    EventType::Thinking,
+                )))
+                .expect("silence watch receiver");
+            let notice = wait_for_silence_notice(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_has_silence_notice(&notice),
+                "a stale generation event suppressed the current worker's notice: {:?}",
+                String::from_utf8_lossy(&notice)
+            );
+        });
+}
+
+/// Scenario: Replace a delegated worker with a successor on the same pane and
+/// send a turn event from that successor. Pane-id reuse must not let the rebound
+/// agent answer the original generation's silence watch.
+#[test]
+#[cfg(unix)]
+fn delegate_rebound_worker_event_does_not_suppress_original_watch() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "1200"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build rebound-worker runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(64).await;
+            harness.delegate_and_wait_for_pointer().await;
+            harness
+                .registry
+                .close_agent(&harness.worker_agent_id)
+                .expect("close original worker without a pane-close sweep");
+            let successor = harness
+                .registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    cwd: Some(&harness.cwd_str),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn rebound worker");
+            harness
+                .event_tx
+                .send(BroadcastMsg::Event(turn_event(
+                    WORKER_PANE,
+                    &successor,
+                    EventType::Thinking,
+                )))
+                .expect("silence watch receiver");
+            let notice = wait_for_silence_notice(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                Duration::from_secs(3),
+            )
+            .await;
+            assert!(
+                snapshot_has_silence_notice(&notice),
+                "a rebound successor event suppressed the original generation's notice: {:?}",
+                String::from_utf8_lossy(&notice)
+            );
+        });
+}
+
+/// Scenario: Emit only a matching startup `Idle` event after delegate delivery.
+/// Startup status is not proof that a turn consumed the pointer, so the silence
+/// notice must still appear.
+#[test]
+#[cfg(unix)]
+fn delegate_startup_idle_does_not_suppress_silence_notice() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "400"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build startup-idle runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(64).await;
+            harness.delegate_and_wait_for_pointer().await;
+            harness
+                .event_tx
+                .send(BroadcastMsg::Event(turn_event(
+                    WORKER_PANE,
+                    &harness.worker_agent_id,
+                    EventType::Idle,
+                )))
+                .expect("silence watch receiver");
+            let notice = wait_for_silence_notice(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_has_silence_notice(&notice),
+                "a startup Idle event incorrectly proved task delivery: {:?}",
+                String::from_utf8_lossy(&notice)
+            );
+        });
+}
+
+/// Scenario: Resolve the no-event knob behaviorally at `1`, whitespace-padded
+/// `1`, and an integer above `u64::MAX` while the idle detector is disabled. The
+/// short values must report, and the overflow value must report only at its 30 s
+/// cap rather than falling through to disabled.
+#[test]
+#[cfg(unix)]
+fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "1"),
+    ]);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build no-event parser runtime")
+        .block_on(async {
+            for raw in ["1", " 1 \t"] {
+                env.repoint(DELEGATE_NO_EVENT_WINDOW_ENV, raw);
+                let harness = SilenceHarness::new(64).await;
+                harness.delegate_and_wait_for_pointer().await;
+                let notice = wait_for_silence_notice(
+                    &harness.registry,
+                    &harness.orchestrator_agent_id,
+                    Duration::from_secs(1),
+                )
+                .await;
+                assert!(
+                    snapshot_has_silence_notice(&notice),
+                    "no-event override {raw:?} did not resolve to an enabled one-millisecond window: {:?}",
+                    String::from_utf8_lossy(&notice)
+                );
+            }
+
+            env.repoint(DELEGATE_NO_EVENT_WINDOW_ENV, "18446744073709551616");
+            let harness = SilenceHarness::new(64).await;
+            harness.delegate_and_wait_for_pointer().await;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            let early = harness.orchestrator_snapshot();
+            assert!(
+                !snapshot_has_silence_notice(&early),
+                "overflow no-event value reported before the 30-second cap: {:?}",
+                String::from_utf8_lossy(&early)
+            );
+
+            tokio::time::advance(Duration::from_millis(30_001)).await;
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            let capped = harness.orchestrator_snapshot();
+            assert!(
+                snapshot_has_silence_notice(&capped),
+                "above-u64 no-event value fell through to disabled instead of the 30-second cap: {:?}",
+                String::from_utf8_lossy(&capped)
+            );
+        });
 }
