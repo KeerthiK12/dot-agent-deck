@@ -112,7 +112,7 @@ Whitelist (safe to mirror): read-only inspection — `status`, `log`, `diff`, `s
 
 6. Write the approved config to `{dir}/.dot-agent-deck.toml`. If an orchestration was kept, include `[[orchestrations]]` alongside `[[modes]]` in the same file.
 
-7. **After writing the file, tell the user the next steps:** "Config created! To use it, press Ctrl+w to close this pane, then Ctrl+n to create a new one. Select the same directory and choose your mode from the Mode field."
+7. **After writing the file, tell the user the next steps:** "Config created! To use it, press Ctrl+d to leave this pane, then Ctrl+w and choose **Close** to close it, then Ctrl+n to create a new one. Select the same directory and choose your mode from the Mode field." (`Ctrl+w` only closes from command mode — while you are typing in the pane it is the ordinary delete-previous-word.)
 
 ## Orchestrations
 

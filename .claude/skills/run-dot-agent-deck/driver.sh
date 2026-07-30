@@ -69,15 +69,19 @@ tui_smoke() {
   tmux new-session -d -s "$SESSION" -x 120 -y 40 "$BIN"
 
   # Wait up to 8 s for the dashboard to render. The marker is the
-  # bottom-row hotkey hint, which only appears once the TUI has drawn.
+  # bottom-row quit button, which only appears once the TUI has drawn.
+  # It used to be the old status-bar legend's "Ctrl+c: quit"; the
+  # persistent button bar replaced that text with "[Quit Ctrl+C]", so
+  # the probe matched nothing and every run reported a false
+  # "did not render within 8s" while the dashboard was in fact up.
   for i in 1 2 3 4 5 6 7 8; do
-    if tmux capture-pane -t "$SESSION" -p 2>/dev/null | grep -q "Ctrl+c: quit"; then
+    if tmux capture-pane -t "$SESSION" -p 2>/dev/null | grep -q "\[Quit Ctrl+C\]"; then
       break
     fi
     sleep 1
   done
 
-  if ! tmux capture-pane -t "$SESSION" -p 2>/dev/null | grep -q "Ctrl+c: quit"; then
+  if ! tmux capture-pane -t "$SESSION" -p 2>/dev/null | grep -q "\[Quit Ctrl+C\]"; then
     echo "TUI did not render within 8s" >&2
     tmux capture-pane -t "$SESSION" -p >&2 || true
     return 1

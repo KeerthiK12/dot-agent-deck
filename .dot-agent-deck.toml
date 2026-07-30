@@ -11,7 +11,10 @@
 # kick in on the COLD path — when the daemon is empty (fresh machine / crash) —
 # so for those, STOP THE DAEMON (not just the TUI) before relaunching.
 #
-# UI keys: New pane Ctrl+N · Close/detach pane Ctrl+W / Ctrl+D · Quit Ctrl+C · Help ?
+# UI keys: New pane Ctrl+N · Command mode / back to pane Ctrl+D · Quit Ctrl+C · Help ?
+#          Close pane Ctrl+W — COMMAND MODE ONLY, and it asks to confirm (default
+#          Cancel). While you are typing inside a pane, Ctrl+W is that program's
+#          ordinary delete-previous-word and closes nothing.
 # -----------------------------------------------------------------------------
 # 1) AUTO-RESTORE IS THE DEFAULT (no flag)
 #    - dot-agent-deck                 -> empty dashboard on a fresh snapshot path
