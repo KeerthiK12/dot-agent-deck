@@ -29,6 +29,7 @@ const PANE: &str = "cursor-report-pane";
 /// What a terminal is asked: DSR, "report the cursor position".
 const QUERY: &[u8] = b"\x1b[6n";
 /// What we answer: CPR for row 1, column 1, as the raw bytes we write.
+#[cfg(unix)]
 const REPORT_RAW: &[u8] = b"\x1b[1;1R";
 /// The same answer as a Unix tty renders it back.
 ///
@@ -38,15 +39,37 @@ const REPORT_RAW: &[u8] = b"\x1b[1;1R";
 /// byte 0x1b, so the echo arrives in caret notation. (The `cat` stub cannot be
 /// used as the witness instead: canonical mode holds our reply in the input
 /// buffer until a newline arrives, and a CPR sequence must not carry one.)
+#[cfg(unix)]
 const REPORT_ECHOED: &[u8] = b"^[[1;1R";
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// True once the cursor-position report is visible in either encoding.
+/// True once the answer is evidenced in the pane's output.
+///
+/// The observable proof differs by platform, so the witness does too — both
+/// directions fail if the answer is never written, which is what makes each one
+/// load-bearing rather than decorative.
+///
+/// On Unix the tty echoes our reply straight back (raw, or in caret notation
+/// under `ECHOCTL`), so the report itself is the witness. "Output arrived after
+/// the query" would NOT work here: the `cat` stub echoes the query regardless of
+/// whether we answered.
+#[cfg(unix)]
 fn answered(snap: &[u8]) -> bool {
     contains(snap, REPORT_RAW) || contains(snap, REPORT_ECHOED)
+}
+
+/// On Windows there is no line discipline echoing input back, and `cat` holds
+/// our reply because a CPR carries no newline — so the reply is not directly
+/// observable. What IS observable is the effect: ConPTY withholds everything
+/// until answered, so any output *past* the query proves the answer landed.
+/// Unanswered, the snapshot stays exactly `ESC[6n` — the signature this fix was
+/// diagnosed from.
+#[cfg(windows)]
+fn answered(snap: &[u8]) -> bool {
+    contains(snap, QUERY) && snap.len() > QUERY.len()
 }
 
 /// Poll the agent's PTY snapshot until the report appears or `timeout` elapses,

@@ -1341,22 +1341,32 @@ fn retain_partial_dsr(carry: &mut Vec<u8>, haystack: &[u8]) {
 
 /// Write a CPR answer back to the agent's PTY.
 ///
-/// Uses `try_lock` rather than `blocking_lock`: the input path
-/// (`write_to_pane_and_submit`) holds this same mutex across `await` points, and
-/// a hard block here would stall the reader thread — and with it the pane's
-/// entire output pump. The query arrives at session start, before any input can
-/// be in flight, so contention is effectively nil; a few short retries cover the
-/// pathological case and dropping the answer is strictly better than wedging the
-/// pump.
+/// Waits for the writer however long it takes. An earlier version used
+/// `try_lock` with a 100 ms budget on the theory that the query lands at session
+/// start, before any input is in flight, so contention would be negligible. That
+/// was wrong: `handle_delegate` writes into a pane it has just spawned and holds
+/// this mutex across its submit delay, so the budget expired and the answer was
+/// dropped — leaving ConPTY blocked forever and the pane permanently dead
+/// (`build-windows` reproduced exactly that, with the delegate panes stuck on a
+/// snapshot of `ESC[6n` and nothing else).
+///
+/// Blocking is safe here, and cheaper than it looks:
+/// - No writer-holding path awaits on PTY *output*, so there is no cycle back
+///   onto this thread. Holders write bytes and sleep; the one caller-supplied
+///   future awaited under the lock (`write_and_submit_guarded`'s `revalidate`)
+///   checks session state, not pane output.
+/// - Stalling the pump costs nothing at the moment it happens: the sender is
+///   withholding output *pending this very answer*, so there is nothing to read
+///   while we wait.
+/// - Holds are bounded in practice. The longest deliberate one is ~250 ms, in
+///   the `daemon_protocol` TOCTOU tests that pin the writer to hold the
+///   post-lock revalidation barrier open.
 fn answer_dsr(writer: &Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>) {
-    for _ in 0..50 {
-        if let Ok(mut w) = writer.try_lock() {
-            let _ = w.write_all(DSR_CURSOR_REPORT);
-            let _ = w.flush();
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
+    // `blocking_lock` panics inside a runtime; this runs on the plain
+    // `std::thread` spawned for the pump, which has no runtime context.
+    let mut w = writer.blocking_lock();
+    let _ = w.write_all(DSR_CURSOR_REPORT);
+    let _ = w.flush();
 }
 
 /// Snapshot of the writer + bus needed to attach a streaming client.
