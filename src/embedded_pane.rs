@@ -191,6 +191,26 @@ impl PaneLostReason {
     }
 }
 
+/// The error every pane-input path returns when its send finds no receiver.
+///
+/// There is more than one way for input to reach a pane — raw keystrokes
+/// ([`EmbeddedPaneController::write_raw_bytes`]) and queued text
+/// ([`EmbeddedPaneController::queue_stream_input`], behind `write_to_pane` and
+/// so behind mode init, config prompts and permission responses). They all fail
+/// for the same reason and must explain it the same way; the first cut of this
+/// only fixed the keystroke path, so a config prompt into a dead pane still
+/// reported `stream I/O task ended` (caught in review on #286).
+///
+/// A recorded loss reason means the I/O task gave up on the agent — say so in
+/// the user's terms. No reason means a deliberate detach or a teardown still in
+/// flight, which is not a failure to explain.
+fn input_failure(pane_id: &str, backend: &StreamBackend) -> PaneError {
+    match *backend.lost.lock().unwrap() {
+        Some(reason) => PaneError::CommandFailed(reason.user_message().to_string()),
+        None => PaneError::CommandFailed(format!("Pane {pane_id} is detached")),
+    }
+}
+
 impl Drop for StreamBackend {
     /// Plain drop = implicit detach (PRD #76 line 199 — agents survive the
     /// TUI). Aborting the io_task closes the attach socket; the daemon
@@ -427,17 +447,7 @@ impl EmbeddedPaneController {
                 .send(StreamCmd::Input(bytes.to_vec()))
                 .is_err()
             {
-                // The send failed because the I/O task is gone. If it gave up on
-                // the agent, say so in the user's terms — the old message named
-                // an internal task and left the pane looking healthy, so a dead
-                // pane was indistinguishable from a quiet one.
-                let reason = pane.backend.lost.lock().unwrap().as_ref().copied();
-                return Err(PaneError::CommandFailed(match reason {
-                    Some(r) => r.user_message().to_string(),
-                    // No recorded reason: a deliberate detach or a teardown
-                    // still in flight, not an agent failure.
-                    None => format!("Pane {pane_id} is detached"),
-                }));
+                return Err(input_failure(pane_id, &pane.backend));
             }
             Ok(())
         } else {
@@ -556,7 +566,7 @@ impl EmbeddedPaneController {
         pane.backend
             .input_tx
             .send(StreamCmd::Input(payload))
-            .map_err(|_| PaneError::CommandFailed(format!("Pane {pane_id} stream I/O task ended")))
+            .map_err(|_| input_failure(pane_id, &pane.backend))
     }
 
     /// Build a stream-backed pane against the daemon. The PTY lives in
