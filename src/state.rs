@@ -2010,29 +2010,9 @@ impl AppState {
         // display_name metadata). Capture the retired session's friendly name,
         // keyed by the stable pane, so the replacement created below can
         // inherit it when the superseding event carries none.
-        //
-        // Widened beyond `SessionStart` (2026-07-29). A fresh `agent_id` is
-        // minted per spawn, so ANY event bearing one that differs from the
-        // pane's existing card already proves the pane changed hands — the
-        // `SessionStart` requirement was never what made the inference valid,
-        // it was just the event every hook-based agent happened to send first.
-        //
-        // Pi doesn't send one. Its extension reports status over
-        // `dot-agent-deck agent-event` (`main.rs`), whose vocabulary is
-        // running/waiting/finished — so a respawned Pi worker's first event was
-        // a `Thinking`/`Idle` carrying the NEW agent id, which the reuse guard
-        // above declines to fold onto the old card (ids differ) and this block
-        // then declined to retire (not a `SessionStart`). The result was two
-        // permanent cards on one pane, and because the orchestration deck
-        // derives its highlight by pane id, the second was unreachable.
-        //
-        // Guarded by the same monotonicity rule the `SessionEnd` arm below
-        // uses: only retire on behalf of an event at least as new as the
-        // session it is replacing. Without it, a DELAYED event from the
-        // outgoing agent would arrive after the incoming one had established
-        // its card and retire the live card instead of the dead one.
         let mut inherited_display_name: Option<String> = None;
-        if event.agent_id.is_some()
+        if event.event_type == EventType::SessionStart
+            && event.agent_id.is_some()
             && let Some(ref pane_id) = event.pane_id
         {
             let to_remove: Vec<String> = self
@@ -2042,7 +2022,6 @@ impl AppState {
                     session.pane_id.as_ref().is_some_and(|p| p == pane_id)
                         && *id != &event.session_id
                         && session.agent_id != event.agent_id
-                        && event.timestamp >= session.last_activity
                 })
                 .map(|(id, _)| id.clone())
                 .collect();

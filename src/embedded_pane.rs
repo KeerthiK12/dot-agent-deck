@@ -139,6 +139,56 @@ struct StreamBackend {
     /// drops (the receiver's `changed()` returns `Err`), but explicitly
     /// aborting bounds the cleanup window.
     resize_task: Option<tokio::task::JoinHandle<()>>,
+    /// Why this pane's I/O task gave up, once it has.
+    ///
+    /// `None` while attached, and also after a *deliberate* end (explicit
+    /// detach, or pane teardown dropping `input_tx`) — those are not failures
+    /// and must not be reported as one. `Some(_)` only for the two give-up
+    /// exits in [`run_pane_io_task`], after which the pane can never accept
+    /// input again.
+    ///
+    /// Before this existed the pane simply went quiet: it kept rendering its
+    /// last frame and looking alive, every keystroke was dropped, and the only
+    /// hint was a transient `PTY write failed: … stream I/O task ended` naming
+    /// an internal detail. Recording the reason lets the pane say what actually
+    /// happened.
+    lost: Arc<Mutex<Option<PaneLostReason>>>,
+}
+
+/// Why a pane's attach I/O task stopped trying to reach its agent.
+///
+/// Both variants are terminal: the reader/writer pair is gone and the pane's
+/// input channel has no receiver. They are distinguished because the causes are
+/// unrelated — one is an agent that will not stay up, the other an agent the
+/// daemon no longer has at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneLostReason {
+    /// The agent was respawned but produced no output across
+    /// [`REATTACH_MAX_EMPTY_SESSIONS`] consecutive attaches — it crashes on
+    /// every spawn.
+    AgentKeptCrashing,
+    /// No live agent claimed this `pane_id` within
+    /// [`REATTACH_LOOKUP_TOTAL_BUDGET`] — the agent is gone daemon-side.
+    AgentGone,
+}
+
+impl PaneLostReason {
+    /// One-line, non-internal explanation for the status line.
+    pub fn user_message(self) -> &'static str {
+        match self {
+            Self::AgentKeptCrashing => {
+                "Agent exited on every restart — pane is disconnected. Close it to start over."
+            }
+            Self::AgentGone => {
+                "Agent is no longer running — pane is disconnected. Close it to start over."
+            }
+        }
+    }
+
+    /// Short marker for the pane title.
+    pub fn title_marker(self) -> &'static str {
+        "disconnected"
+    }
 }
 
 impl Drop for StreamBackend {
@@ -377,9 +427,17 @@ impl EmbeddedPaneController {
                 .send(StreamCmd::Input(bytes.to_vec()))
                 .is_err()
             {
-                return Err(PaneError::CommandFailed(format!(
-                    "Pane {pane_id} stream I/O task ended"
-                )));
+                // The send failed because the I/O task is gone. If it gave up on
+                // the agent, say so in the user's terms — the old message named
+                // an internal task and left the pane looking healthy, so a dead
+                // pane was indistinguishable from a quiet one.
+                let reason = pane.backend.lost.lock().unwrap().as_ref().copied();
+                return Err(PaneError::CommandFailed(match reason {
+                    Some(r) => r.user_message().to_string(),
+                    // No recorded reason: a deliberate detach or a teardown
+                    // still in flight, not an agent failure.
+                    None => format!("Pane {pane_id} is detached"),
+                }));
             }
             Ok(())
         } else {
@@ -404,6 +462,17 @@ impl EmbeddedPaneController {
             };
             parser.screen_mut().set_scrollback(new_offset);
         }
+    }
+
+    /// Why this pane's agent connection was given up on, or `None` if the pane
+    /// is still attached (or ended deliberately via detach / teardown).
+    ///
+    /// Read by the renderer so a disconnected pane is labelled as such instead
+    /// of showing a frozen frame that looks live.
+    pub fn pane_lost_reason(&self, pane_id: &str) -> Option<PaneLostReason> {
+        let panes = self.panes.lock().unwrap();
+        let pane = panes.get(pane_id)?;
+        *pane.backend.lost.lock().unwrap()
     }
 
     /// Reset a pane's scrollback offset to 0 (show latest output).
@@ -725,6 +794,14 @@ impl EmbeddedPaneController {
         let io_state_for_task = Arc::clone(&io_state);
         let io_state_for_exit = Arc::clone(&io_state);
 
+        // Distinct from `io_state`, which answers "can this pane still adopt a
+        // respawned agent?" for the close path. `lost` answers "why did it
+        // stop?" for the user, and is only ever set on the two give-up exits —
+        // `IO_FINISHED` is also reached by a deliberate detach, which is not a
+        // failure and must not be reported as one.
+        let lost = Arc::new(Mutex::new(None));
+        let lost_for_task = Arc::clone(&lost);
+
         let io_task = runtime.spawn(async move {
             run_pane_io_task(
                 pane_id_for_task,
@@ -737,6 +814,7 @@ impl EmbeddedPaneController {
                 hyperlinks_for_task,
                 rejections_for_task,
                 io_state_for_task,
+                lost_for_task,
             )
             .await;
             // The task gave up: no respawned agent will be adopted for this
@@ -757,6 +835,7 @@ impl EmbeddedPaneController {
                 daemon_path,
                 resize_tx,
                 resize_task: Some(resize_task),
+                lost,
             },
             screen: parser,
             name,
@@ -1851,6 +1930,7 @@ async fn run_pane_io_task(
     hyperlinks: Arc<Mutex<HyperlinkMap>>,
     stream_rejections: Arc<Mutex<Vec<(String, String)>>>,
     io_state: Arc<AtomicU8>,
+    lost: Arc<Mutex<Option<PaneLostReason>>>,
 ) {
     let mut conn_opt: Option<AttachConnection> = Some(initial_conn);
     let mut consecutive_empty_sessions: u32 = 0;
@@ -1979,10 +2059,19 @@ async fn run_pane_io_task(
         } else {
             consecutive_empty_sessions += 1;
             if consecutive_empty_sessions >= REATTACH_MAX_EMPTY_SESSIONS {
-                tracing::debug!(
+                // `warn!`, not `debug!`: this is a terminal, user-visible
+                // outcome — the pane stops accepting input for the rest of the
+                // session. At `debug!` (and with file logging off unless
+                // `DOT_AGENT_DECK_LOG` is set) a report of "the pane died" left
+                // no evidence of WHICH give-up fired, and the two have
+                // completely different causes.
+                tracing::warn!(
                     pane_id = %pane_id,
-                    "auto-reattach: too many consecutive empty sessions; giving up"
+                    reason = "empty-sessions",
+                    consecutive_empty_sessions,
+                    "auto-reattach: agent respawned but produced no output; giving up on this pane"
                 );
+                *lost.lock().unwrap() = Some(PaneLostReason::AgentKeptCrashing);
                 break 'outer;
             }
         }
@@ -2004,10 +2093,14 @@ async fn run_pane_io_task(
                 io_state.store(IO_ATTACHED, Ordering::SeqCst);
             }
             None => {
-                tracing::debug!(
+                // See the `warn!` rationale above: terminal and user-visible.
+                tracing::warn!(
                     pane_id = %pane_id,
-                    "auto-reattach: no live agent for pane within retry window; giving up"
+                    reason = "no-live-agent",
+                    budget_secs = REATTACH_LOOKUP_TOTAL_BUDGET.as_secs(),
+                    "auto-reattach: no live agent for pane within the retry window; giving up on this pane"
                 );
+                *lost.lock().unwrap() = Some(PaneLostReason::AgentGone);
                 break 'outer;
             }
         }
@@ -2837,6 +2930,42 @@ impl PaneController for EmbeddedPaneController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of `PaneLostReason` is that the user reads it, so guard
+    /// the strings against regressing back into internal vocabulary. The old
+    /// message was `Pane <id> stream I/O task ended` — it named a task the user
+    /// has no concept of and said nothing about what to do.
+    #[test]
+    fn pane_lost_messages_are_user_facing_and_actionable() {
+        for reason in [PaneLostReason::AgentKeptCrashing, PaneLostReason::AgentGone] {
+            let msg = reason.user_message();
+            assert!(
+                msg.contains("disconnected"),
+                "{reason:?} must name the pane's state: {msg}"
+            );
+            assert!(
+                msg.contains("Close it"),
+                "{reason:?} must tell the user what they can do: {msg}"
+            );
+            for leak in ["I/O task", "io_task", "stream", "reattach", "pane_id"] {
+                assert!(
+                    !msg.contains(leak),
+                    "{reason:?} leaks the internal term {leak:?}: {msg}"
+                );
+            }
+        }
+    }
+
+    /// The two give-up causes are unrelated (an agent that will not stay up vs.
+    /// one the daemon no longer has), so they must stay distinguishable — that
+    /// distinction is what makes a user report diagnosable.
+    #[test]
+    fn pane_lost_reasons_are_distinguishable() {
+        assert_ne!(
+            PaneLostReason::AgentKeptCrashing.user_message(),
+            PaneLostReason::AgentGone.user_message()
+        );
+    }
 
     /// Regression: `vt100` 0.16.2 panics (`col_wrap` row-underflow / an
     /// out-of-bounds cell `unwrap()` in grid.rs) when a wide character wraps in

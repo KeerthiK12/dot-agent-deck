@@ -48,7 +48,21 @@ reqwest = { version = "0.13", default-features = false, features = [
   "json",
 ] }
 semver = "1"
-portable-pty = "0.9"
+# EXACT pin, held back from 0.9 deliberately. 0.9.0 creates the Windows
+# pseudoconsole with `PSUEDOCONSOLE_INHERIT_CURSOR` (`src/win/psuedocon.rs`),
+# which makes conhost emit a DSR cursor-position query (`ESC[6n`) and withhold
+# the child's output until a terminal answers it. Nothing here answers, so every
+# Windows pane stalls — reproduced as `build-windows` red with a PTY snapshot of
+# exactly `"\u{1b}[6n"`.
+#
+# Answering it is the correct long-term fix, but the only seam available
+# (`pump_reader`) is shared by every agent on every platform, and a hardcoded
+# `ESC[1;1R` reply is truthful only at ConPTY startup — mid-session on Unix it
+# would be a wrong cursor position written into a live agent's stdin. That is not
+# a trade worth making for a platform that is not a release target (WSL2 runs the
+# Unix paths natively). Revisit together with native-Windows support; until then
+# 0.8.1 keeps the flag, and the whole problem, out of the tree.
+portable-pty = "=0.8.1"
 vt100 = "0.16"
 futures-util = "=0.3.33"
 regex = "1"

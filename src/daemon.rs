@@ -949,6 +949,36 @@ async fn run_hook_loop(
                             // inside the registry; a no-op when the type is
                             // `None` or the pane id is unknown/absent.
                             if let Some(ref pane_id) = event.pane_id {
+                                // A SessionStart naming a pane this daemon never
+                                // spawned is always wrong, and silently so: it
+                                // registers a card no local pane backs, which
+                                // surfaces on the dashboard and is then retired
+                                // again — the "ghost agent that appeared and
+                                // disappeared" report. The usual cause is another
+                                // deck's agent posting here, most often a test
+                                // child that inherited an ambient
+                                // `DOT_AGENT_DECK_SOCKET`.
+                                //
+                                // Warn rather than drop the event: the pane may
+                                // legitimately belong to a client whose agent this
+                                // daemon does not own, and refusing hooks would
+                                // break that. Naming it is what was missing —
+                                // without this line the only trace is a card
+                                // flickering past, and the log shows an ordinary
+                                // `Received event`.
+                                if event.event_type == crate::event::EventType::SessionStart
+                                    && !pty_registry.has_live_pane(pane_id)
+                                {
+                                    warn!(
+                                        pane_id = %pane_id,
+                                        session_id = %event.session_id,
+                                        agent_type = ?event.agent_type,
+                                        "SessionStart for a pane this daemon did not spawn — \
+                                         a foreign agent is posting here (a test run inheriting \
+                                         DOT_AGENT_DECK_SOCKET is the usual cause); it will \
+                                         register a card with no local pane"
+                                    );
+                                }
                                 pty_registry.set_agent_type(pane_id, &event.agent_type);
                             }
                             state.write().await.apply_event(event);

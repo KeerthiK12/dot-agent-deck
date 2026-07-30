@@ -319,6 +319,10 @@ impl TuiDeck {
 
     /// Start a fluent builder for non-default deck launches.
     pub fn builder() -> TuiDeckBuilder {
+        // The L2 harness spawns the real binary, which lazy-spawns a daemon —
+        // both inherit this process's env. `init_test_env` covers the legacy
+        // tests; this covers every `TuiDeck`-driven one.
+        detach_from_any_live_deck();
         TuiDeckBuilder {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
@@ -2575,7 +2579,60 @@ static LOCK_DIR_GUARD: OnceLock<tempfile::TempDir> = OnceLock::new();
 /// per-binary lock-dir tempdir on first call; subsequent calls are
 /// no-ops.
 #[allow(dead_code)]
+/// Endpoint env vars that point a process at a *specific* deck's daemon.
+const DECK_ENDPOINT_VARS: [&str; 4] = [
+    "DOT_AGENT_DECK_SOCKET",
+    "DOT_AGENT_DECK_ATTACH_SOCKET",
+    "DOT_AGENT_DECK_PANE_ID",
+    "DOT_AGENT_DECK_AGENT_ID",
+];
+
+/// Detach this test process from any real deck before it can spawn anything.
+///
+/// Running the suite from inside a deck pane means the shell carries that pane's
+/// `DOT_AGENT_DECK_SOCKET` / `_PANE_ID`. Anything a test spawns inherits them
+/// unless every spawn site overrides them, and then its hooks post into the
+/// developer's LIVE deck: a card appears for a fixture pane id and vanishes
+/// again. Observed repeatedly in the wild — a real `deck.log` shows 48 such
+/// events across `worker-pane`, `codex-trust-test-pane`,
+/// `pane-live-transition`, `pane-stream-postlock` and
+/// `pane-rebound-before-delivery`.
+///
+/// `ff5170d` scrubs these in `agent_pty::spawn`, which is necessary but not
+/// sufficient: four of those five ids leaked from a tree that already had that
+/// fix, via other spawn paths (harness-launched binaries, hook-posting helpers).
+/// Removing the vars from the test process itself covers every spawn path at
+/// once, including ones added later, because there is nothing left to inherit.
+///
+/// Tests that need an endpoint set it explicitly per-child (`Command::env`), so
+/// removing the ambient value changes nothing for them.
+fn detach_from_any_live_deck() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let leaked: Vec<&str> = DECK_ENDPOINT_VARS
+            .into_iter()
+            .filter(|v| std::env::var_os(v).is_some())
+            .collect();
+        if !leaked.is_empty() {
+            // Loud on purpose: the run is now safe, but the contributor should
+            // know their shell was pointed at a live deck.
+            eprintln!(
+                "note: detaching this test process from a live deck — cleared {}. \
+                 Tests set endpoints per-child; the inherited values would have \
+                 sent fixture hook events into your running dashboard.",
+                leaked.join(", ")
+            );
+        }
+        for var in DECK_ENDPOINT_VARS {
+            // SAFETY: called before the harness spawns any thread or child, via
+            // a `OnceLock` so it happens exactly once per test process.
+            unsafe { std::env::remove_var(var) };
+        }
+    });
+}
+
 pub fn init_test_env() {
+    detach_from_any_live_deck();
     LOCK_DIR_GUARD.get_or_init(|| {
         tempfile::Builder::new()
             .prefix("dot-agent-deck-test-lock-")
