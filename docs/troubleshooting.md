@@ -157,6 +157,20 @@ DOT_AGENT_DECK_LOG=1 dot-agent-deck
 
 Search the log for `giving up on this pane`. The `reason` field on that line (`empty-sessions` or `no-live-agent`) identifies which path was taken, and the surrounding lines show the reconnect attempts that preceded it — that is the detail needed to tell a genuine bug from an agent that simply died.
 
+## An agent on a remote says an image or file "does not exist"
+
+You are connected to a [remote environment](remote-environments.md), you drag a screenshot onto your terminal window (or paste one with `Ctrl+V` / `Cmd+V`), and the agent replies that the file is not there.
+
+Nothing is broken. The agent runs on the **remote**, but your terminal — and the file — are on your **laptop**. Dragging inserts a laptop path, which is meaningless from the remote's point of view; pasting reads the remote's clipboard, which has no screenshot on it. Plain `ssh remote` followed by `claude` fails the same way, and the same drag into a deck running locally works fine.
+
+Copy the file to the remote first, then reference its remote path:
+
+```bash
+scp ~/Desktop/screenshot.png my-vm:/tmp/
+```
+
+See [Remote Environments › Getting files to the remote](remote-environments.md#getting-files-to-the-remote) for the full explanation and the ssh-config note.
+
 ## Enabling Debug Logs
 
 When something goes wrong and the dashboard's status messages aren't enough to diagnose it, set the `DOT_AGENT_DECK_LOG` environment variable to capture tracing output to a file:
