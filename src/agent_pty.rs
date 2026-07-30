@@ -1250,17 +1250,113 @@ fn pump_reader(
     bus: Arc<AgentBus>,
     exited: Arc<AtomicBool>,
     change_notify: Arc<Notify>,
+    writer: Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>,
 ) {
     let mut buf = [0u8; 8192];
+    // Carry-over for a DSR query split across two reads (see `scan_dsr`).
+    let mut carry: Vec<u8> = Vec::new();
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => bus.push(buf[..n].to_vec()),
+            Ok(n) => {
+                let chunk = &buf[..n];
+                for _ in 0..scan_dsr(&mut carry, chunk) {
+                    answer_dsr(&writer);
+                }
+                bus.push(chunk.to_vec());
+            }
             Err(_) => break,
         }
     }
     exited.store(true, Ordering::SeqCst);
     change_notify.notify_one();
+}
+
+/// The DSR (Device Status Report) cursor-position query a terminal is expected
+/// to answer: `ESC [ 6 n`.
+const DSR_CURSOR_QUERY: &[u8] = b"\x1b[6n";
+
+/// Our answer: CPR (Cursor Position Report) for row 1, column 1.
+///
+/// A freshly spawned pane genuinely starts at the top-left, and this is only
+/// ever sent in response to a query on a PTY we just created, so 1;1 is the
+/// truthful answer rather than a placeholder. We do NOT consult the vt100
+/// emulator's cursor: the query arrives before any subscriber has attached, so
+/// there is no rendered state to report yet.
+const DSR_CURSOR_REPORT: &[u8] = b"\x1b[1;1R";
+
+/// Count the `ESC[6n` queries in `chunk`, treating `carry` as the bytes left
+/// over from the previous read.
+///
+/// ConPTY hands us the query in whatever slice the read happened to land on, so
+/// a 4-byte sequence can straddle two reads. `carry` retains the longest
+/// trailing fragment that is still a viable prefix of the query (at most 3
+/// bytes) and is consumed on the next call.
+fn scan_dsr(carry: &mut Vec<u8>, chunk: &[u8]) -> usize {
+    // Fast path: with nothing carried over, the chunk can be scanned in place.
+    // Every read of every agent's output comes through here, so the common case
+    // avoids the concatenation.
+    if carry.is_empty() {
+        let hits = count_dsr(chunk);
+        retain_partial_dsr(carry, chunk);
+        return hits;
+    }
+
+    let mut window = std::mem::take(carry);
+    window.extend_from_slice(chunk);
+    let hits = count_dsr(&window);
+    retain_partial_dsr(carry, &window);
+    hits
+}
+
+/// Non-overlapping occurrences of the DSR query in `haystack`.
+fn count_dsr(haystack: &[u8]) -> usize {
+    let mut hits = 0;
+    let mut i = 0;
+    while i + DSR_CURSOR_QUERY.len() <= haystack.len() {
+        if &haystack[i..i + DSR_CURSOR_QUERY.len()] == DSR_CURSOR_QUERY {
+            hits += 1;
+            i += DSR_CURSOR_QUERY.len();
+        } else {
+            i += 1;
+        }
+    }
+    hits
+}
+
+/// Stash the longest suffix of `haystack` that is still a viable *partial* DSR
+/// query, so the next read can complete it.
+///
+/// Safe against double-counting because the query starts with the only `ESC` it
+/// contains: a complete `ESC[6n` ends in `n` and therefore cannot also end with
+/// one of the proper prefixes (`ESC`, `ESC[`, `ESC[6`).
+fn retain_partial_dsr(carry: &mut Vec<u8>, haystack: &[u8]) {
+    for len in (1..DSR_CURSOR_QUERY.len()).rev() {
+        if haystack.ends_with(&DSR_CURSOR_QUERY[..len]) {
+            carry.extend_from_slice(&DSR_CURSOR_QUERY[..len]);
+            return;
+        }
+    }
+}
+
+/// Write a CPR answer back to the agent's PTY.
+///
+/// Uses `try_lock` rather than `blocking_lock`: the input path
+/// (`write_to_pane_and_submit`) holds this same mutex across `await` points, and
+/// a hard block here would stall the reader thread — and with it the pane's
+/// entire output pump. The query arrives at session start, before any input can
+/// be in flight, so contention is effectively nil; a few short retries cover the
+/// pathological case and dropping the answer is strictly better than wedging the
+/// pump.
+fn answer_dsr(writer: &Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>) {
+    for _ in 0..50 {
+        if let Ok(mut w) = writer.try_lock() {
+            let _ = w.write_all(DSR_CURSOR_REPORT);
+            let _ = w.flush();
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 /// Snapshot of the writer + bus needed to attach a streaming client.
@@ -2614,19 +2710,32 @@ impl AgentPtyRegistry {
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_thread = exited.clone();
         let notify_for_thread = self.change_notify.clone();
+        // Built here rather than inline in `RunningAgent` below so the reader
+        // thread can share it: answering the ConPTY cursor-position query
+        // (`scan_dsr`) means writing back to the master, and `take_writer` is
+        // single-shot on every platform, so there is no second handle to hand
+        // out.
+        let writer = Arc::new(AsyncMutex::new(writer));
+        let writer_for_thread = writer.clone();
         // Detached thread: exits when the PTY returns EOF (child killed).
         // On exit, pump_reader sets `exited` and signals `change_notify` so
         // the idle monitor learns about the death immediately instead of
         // waiting for the next poll cycle.
         std::thread::spawn(move || {
-            pump_reader(reader, bus_for_thread, exited_for_thread, notify_for_thread)
+            pump_reader(
+                reader,
+                bus_for_thread,
+                exited_for_thread,
+                notify_for_thread,
+                writer_for_thread,
+            )
         });
 
         let agent = RunningAgent {
             child,
             process_group,
             master,
-            writer: Arc::new(AsyncMutex::new(writer)),
+            writer,
             bus,
             pane_id_env,
             display_name,
@@ -3990,6 +4099,77 @@ mod tests {
             orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
+    }
+
+    /// A query landing whole in one read is the ordinary ConPTY case.
+    #[test]
+    fn scan_dsr_finds_a_whole_query() {
+        let mut carry = Vec::new();
+        assert_eq!(scan_dsr(&mut carry, b"\x1b[6n"), 1);
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn scan_dsr_finds_a_query_amid_other_output() {
+        let mut carry = Vec::new();
+        assert_eq!(scan_dsr(&mut carry, b"hello\x1b[6nworld"), 1);
+        assert!(carry.is_empty());
+    }
+
+    /// The reason `carry` exists: an 8 KiB read can end mid-sequence, and the
+    /// query must still be recognised once the tail arrives. Answering late is
+    /// fine; never answering wedges the pane.
+    #[test]
+    fn scan_dsr_joins_a_query_split_across_reads() {
+        for split in 1..4 {
+            let mut carry = Vec::new();
+            let (head, tail) = b"\x1b[6n".split_at(split);
+            assert_eq!(
+                scan_dsr(&mut carry, head),
+                0,
+                "partial query must not match yet (split at {split})"
+            );
+            assert_eq!(
+                scan_dsr(&mut carry, tail),
+                1,
+                "query completed by the next read must match (split at {split})"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_dsr_counts_repeated_queries() {
+        let mut carry = Vec::new();
+        assert_eq!(scan_dsr(&mut carry, b"\x1b[6n\x1b[6n"), 2);
+    }
+
+    /// An ESC that never becomes a query must not pin bytes forever, and a
+    /// non-matching tail must not be mistaken for a partial.
+    #[test]
+    fn scan_dsr_ignores_unrelated_escapes() {
+        let mut carry = Vec::new();
+        assert_eq!(scan_dsr(&mut carry, b"\x1b[0m\x1b[1;1R"), 0);
+        assert!(carry.is_empty());
+    }
+
+    /// Our own answer must never be read back as a new query — otherwise the
+    /// echo of a reply would trigger another reply, forever.
+    #[test]
+    fn scan_dsr_does_not_match_its_own_report() {
+        let mut carry = Vec::new();
+        assert_eq!(scan_dsr(&mut carry, DSR_CURSOR_REPORT), 0);
+        assert!(carry.is_empty());
+    }
+
+    /// `carry` is bounded by the query length, so a stream of bare ESCs cannot
+    /// grow it without limit.
+    #[test]
+    fn scan_dsr_carry_stays_bounded() {
+        let mut carry = Vec::new();
+        for _ in 0..1000 {
+            scan_dsr(&mut carry, b"\x1b");
+            assert!(carry.len() < DSR_CURSOR_QUERY.len());
+        }
     }
 
     #[test]
