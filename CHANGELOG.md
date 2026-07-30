@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.35.1] - 2026-07-30
+
+### Fixed
+
+- **Ctrl+W no longer destroys a pane by accident**
+  `Ctrl+W` — delete-previous-word in shells, readline, vim, and nearly every other TUI — instantly and irreversibly tore down a pane in dot-agent-deck from any mode, with no confirmation. Typing it inside an embedded shell or agent pane destroyed the pane instead of deleting a word. Three users hit this independently and reported it separately (#88, #192, #218); all three are fixed by this change.
+  **Intentional behavior change — please read if `Ctrl+W` is muscle memory for you:** `Ctrl+W` no longer closes a pane while you are inside it. It now reaches the shell or agent as a normal keystroke (word-delete), exactly as it would in any other terminal. Closing a pane is now a command-mode-only action, and it always asks for confirmation first — there is no `y`/`n` one-key shortcut for that confirmation; confirm with `Down` + `Enter` or a mouse click, and the default selection is Cancel so an accidental keypress cannot close anything.
+  Three other defects are fixed alongside the behavior change. First, a stale pane whose agent had already stopped on the daemon side used to wedge forever on close — the daemon's "Agent not found" response was treated as a failure and retried against an id that could never succeed, forcing a full detach and relaunch to clear it. That response is now treated as already-stopped, so the pane closes cleanly. Second, every path that can close a pane — the keybinding, the `[Close]` button, the tab-strip `×`, and the modal's own `[Close]` — now goes through the same confirmation, bound to the specific tab or pane that was armed when the modal opened, so navigating away while the modal is open can never close the wrong target. Third, the hints bar and help overlay are now mode-aware: they no longer advertise `close` in a mode where `Ctrl+W` does not close anything, and `Ctrl+D` is now a genuine two-way toggle between the dashboard and the pane you came from, so command mode always shows how to get back.
+  See the [keyboard shortcuts documentation](https://agent-deck.devopstoolkit.ai/docs/keyboard-shortcuts) for the updated key behavior per mode.
+- **A pane that loses its agent now says so, instead of going quietly dead**
+  When a pane's agent went away and the deck's reconnect attempts ran out, the pane kept rendering its last frame and looked completely healthy — but every keystroke was silently dropped. The only hint was a status message that flashed `PTY write failed: Pane <id> stream I/O task ended`, naming an internal task rather than telling you the agent was gone. Selecting such a pane and typing looked, from the outside, like the deck had frozen.
+  Those panes are now labelled `— disconnected` in the title, so the state is visible before you type anything, and their last output is preserved so you can still read what the agent did before it went away. Typing into one now reports what actually happened and what you can do about it — "Agent is no longer running — pane is disconnected. Close it to start over." — instead of an internal error. Nothing is closed automatically: the pane stays until you close it.
+  The two situations that lead here are reported distinctly, because their causes are unrelated: an agent that exits on every restart attempt (usually the agent's own command failing at startup) versus an agent the daemon no longer has at all (stopped deliberately, or a daemon restart underneath the pane).
+  Both give-up paths now log at warning level and name which one was taken, so a report of "my pane died" can actually be diagnosed. Previously they logged at debug level, which meant that unless you had already set `DOT_AGENT_DECK_LOG`, four different causes produced one identical symptom and left no evidence behind. See [Troubleshooting › A pane says "disconnected" and ignores what you type](https://agent-deck.devopstoolkit.ai/docs/troubleshooting) for how to capture that detail when filing an issue.
+- **An agent card that appears and vanishes now says where it came from**
+  If a card for an agent you never started flickers onto the dashboard and disappears again, that is another deck's agent posting into your daemon — most often a test run, or a second checkout, whose child process inherited a `DOT_AGENT_DECK_SOCKET` pointing at your session. The card is registered because the hook arrives, then retired because no local pane backs it.
+  Until now this left nothing to go on: the daemon logged it as an ordinary `Received event`, indistinguishable from a real agent starting, so the only way to find out was to notice the flicker by eye and then read the log afterwards knowing exactly what to grep for. The daemon now logs a warning naming the pane, the session and the agent type when a `SessionStart` arrives for a pane it never spawned, along with the usual cause. Enable file logging with `DOT_AGENT_DECK_LOG=1` and search for `did not spawn`.
+  This is a warning rather than a refusal on purpose: a pane can legitimately belong to a client whose agent the daemon does not own, and dropping those hooks would break it. Nothing about which events are accepted has changed.
+
+
+
 ## [0.35.0] - 2026-07-28
 
 ### Changed
