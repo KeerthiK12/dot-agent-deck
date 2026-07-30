@@ -19,7 +19,20 @@
 name: aarch64 cross-build check
 
 on:
+  # `workflow_dispatch` alone is not enough to run this before it reaches the
+  # default branch: GitHub only exposes dispatchable workflows that already exist
+  # there ("not found on the default branch"). The `pull_request` trigger is what
+  # lets the check actually run on this branch's PR — which is the only moment it
+  # is needed, since the point is to prove the aarch64 leg BEFORE tagging.
+  #
+  # Scoped to PRs that touch the dependency graph or this file, so it does not
+  # add ~10 minutes of cross-compilation to every unrelated PR.
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/aarch64-crossbuild-check.yml"
 
 permissions:
   contents: read
