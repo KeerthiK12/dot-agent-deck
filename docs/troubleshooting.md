@@ -140,6 +140,23 @@ See [Installation › Recycling the local daemon](installation.md#recycling-the-
 
 On every launch, the TUI performs a build-version handshake with the daemon. When the binary versions differ, the resolution depends only on whether managed agents are running. With **no agents running**, the older daemon is restarted **silently** — there is nothing to lose. With **agents running** and an interactive terminal, the TUI prompts you: the prompt **names the live agents** and warns that restarting stops them, then offers a single-keystroke choice — press **S** to restart onto the new version, or any other key to **keep the current daemon** and stay attached to it with your agents intact. Keeping the current daemon is what leaves you on the older shape. When the TUI is not attached to a terminal (CI, pipes) and agents are running, it prints the recovery hint to stderr and exits non-zero instead of prompting.
 
+## A pane says "disconnected" and ignores what you type
+
+A pane whose title ends in `— disconnected` is no longer connected to an agent. Its last output stays on screen so you can read what happened, but the pane cannot accept input again — typing into it reports that it is disconnected rather than sending anything. Close the pane and start a new one; there is nothing to recover in place.
+
+The deck reaches this state only after it has already tried to reconnect and failed. When an agent goes away — a crash, an external `kill`, or a restart that never comes back — the deck looks the agent up again and re-attaches, which is what makes a normal respawn invisible to you. It gives up in two cases, and the status message tells you which:
+
+- **"Agent exited on every restart"** — the agent was found and re-attached to repeatedly, but produced no output each time. Usually the agent itself fails immediately on startup: check its command and working directory, and try running that command directly in a shell.
+- **"Agent is no longer running"** — no agent claimed the pane within the retry window, so the daemon no longer has one. Expected if you stopped it deliberately or the daemon restarted underneath the pane.
+
+If a pane disconnects and neither cause fits — the agent looks healthy, or it keeps happening — that is worth reporting. Re-run with logging on and attach the excerpt:
+
+```bash
+DOT_AGENT_DECK_LOG=1 dot-agent-deck
+```
+
+Search the log for `giving up on this pane`. The `reason` field on that line (`empty-sessions` or `no-live-agent`) identifies which path was taken, and the surrounding lines show the reconnect attempts that preceded it — that is the detail needed to tell a genuine bug from an agent that simply died.
+
 ## Enabling Debug Logs
 
 When something goes wrong and the dashboard's status messages aren't enough to diagnose it, set the `DOT_AGENT_DECK_LOG` environment variable to capture tracing output to a file:

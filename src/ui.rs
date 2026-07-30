@@ -7830,8 +7830,10 @@ fn dispatch_action(
                     std::thread::sleep(sleep);
                 }
                 if let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes) {
-                    ui.status_message =
-                        Some((format!("PTY write failed: {e}"), std::time::Instant::now()));
+                    // `write_raw_bytes` already phrases the disconnected cases in
+                    // the user's terms, so surface it as-is rather than prefixing
+                    // it with a second, internal-sounding failure label.
+                    ui.status_message = Some((e.to_string(), std::time::Instant::now()));
                 }
                 ui.last_pane_keystroke_at = Some(std::time::Instant::now());
             }
@@ -11718,15 +11720,23 @@ fn render_terminal_panes(
     // Get pane info for display names
     let pane_infos = ctrl.list_panes().unwrap_or_default();
     let pane_name = |id: &str| -> String {
-        if let Some(name) = display_names.get(id) {
-            return name.clone();
-        }
-        if let Some(info) = pane_infos.iter().find(|p| p.pane_id == id)
+        let base = if let Some(name) = display_names.get(id) {
+            name.clone()
+        } else if let Some(info) = pane_infos.iter().find(|p| p.pane_id == id)
             && !info.title.is_empty()
         {
-            return info.title.clone();
+            info.title.clone()
+        } else {
+            format!("pane {id}")
+        };
+        // A pane whose I/O task gave up keeps rendering its last frame, so
+        // without this marker it is indistinguishable from an agent that is
+        // merely quiet — and every keystroke into it is silently dropped. Mark
+        // it in the title so the state is visible before the user types.
+        match ctrl.pane_lost_reason(id) {
+            Some(reason) => format!("{base} — {}", reason.title_marker()),
+            None => base,
         }
-        format!("pane {id}")
     };
 
     // Track the focused pane's rect and screen for hardware cursor positioning.
