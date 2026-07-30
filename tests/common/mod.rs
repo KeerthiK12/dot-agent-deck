@@ -177,10 +177,10 @@ impl TuiDeckBuilder {
         self
     }
 
-    /// Same shape as [`with_imported_claude_credentials`] but for
-    /// OpenCode (`~/.opencode/`, `~/.config/opencode/opencode.jsonc`).
-    /// The deck installs its own plugin into the tempdir HOME, so any
-    /// `~/.opencode/plugin/` directory on the host is NOT copied.
+    /// Same shape as [`with_imported_claude_credentials`] but for OpenCode.
+    /// Only `auth.json` is imported; the harness writes a minimal isolated
+    /// `opencode.json` and never copies host plugins, MCP commands, providers,
+    /// or other user configuration into a recorded real-agent run.
     pub fn with_imported_opencode_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::OpenCode);
         self
@@ -309,6 +309,10 @@ pub struct TuiDeck {
     cols: u16,
     rows: u16,
     record_on_success: bool,
+    /// Exact secret values learned from imported auth files. Recording artifacts
+    /// are scrubbed immediately before they are written so an agent or provider
+    /// that echoes a credential cannot persist it in `full-stream.cast`.
+    recording_redactions: Vec<String>,
 }
 
 impl TuiDeck {
@@ -415,19 +419,23 @@ impl TuiDeck {
         // (M3.1 reviewer Nit 3) so the test's harness frame doesn't
         // panic mid-suite — callers can choose whether to skip or
         // bubble up.
+        let mut recording_redactions = Vec::new();
         for kind in &builder.credential_imports {
             match kind {
                 CredentialImport::ClaudeCode => {
                     import_claude_credentials(&home).map_err(|e| e.to_string())?;
                 }
                 CredentialImport::OpenCode => {
-                    import_opencode_credentials(&home).map_err(|e| e.to_string())?;
+                    recording_redactions
+                        .extend(import_opencode_credentials(&home).map_err(|e| e.to_string())?);
                 }
                 CredentialImport::Codex => {
                     import_codex_credentials(&home).map_err(|e| e.to_string())?;
                 }
             }
         }
+        recording_redactions.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        recording_redactions.dedup();
 
         // Pre-trust folders for a daemon-spawned interactive `claude` so it
         // clears its first-run onboarding + per-folder trust gates without a
@@ -541,6 +549,22 @@ impl TuiDeck {
             // within 300s instead of leaking to PID 1 for hours/days. Idle
             // shutdown stays disabled (above) for determinism.
             ("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "300"),
+            // PRD #249 M3: the daemon reports a delegated worker that emits no
+            // event within a window (30s by default) as "possibly not
+            // delivered", writing a notice into the ORCHESTRATOR's pane. Most
+            // e2e delegate tests drive stand-in workers (`cat`, recorder
+            // scripts) that legitimately emit nothing, so the report would fire
+            // on every one of them and dirty panes that tests assert stay clean
+            // (`orchestration/delegate/001`). Pinned off here rather than via
+            // `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS=0`, which would also
+            // disable PRD #126's idle-worker detection that other tests
+            // exercise. A test that wants the report overrides it via
+            // `with_env`.
+            ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0"),
+            // PRD #249 M1: ordinary e2e scenarios do not pay the production
+            // post-respawn buffer. The two real readiness scenarios opt back in
+            // explicitly after this pin.
+            ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "0"),
         ];
         // PATH is required for the deck to spawn its own daemon
         // subcommand (it shells out via `current_exe`, but lookups like
@@ -684,6 +708,7 @@ impl TuiDeck {
             cols: builder.cols,
             rows: builder.rows,
             record_on_success,
+            recording_redactions,
         })
     }
 
@@ -1307,7 +1332,7 @@ impl TuiDeck {
         // half-written.
 
         // final-grid.txt
-        let grid = self.snapshot_grid();
+        let grid = redact_known_credentials_text(&self.snapshot_grid(), &self.recording_redactions);
         atomic_write(&dir.join("final-grid.txt"), grid.as_bytes())?;
 
         // final-grid.svg — minimal monospace render. Not pixel-perfect,
@@ -1325,7 +1350,8 @@ impl TuiDeck {
         let fixture_src = self.fixture_path.join(".dot-agent-deck.toml");
         if fixture_src.exists() {
             let bytes = std::fs::read(&fixture_src)?;
-            atomic_write(&dir.join("fixture.toml"), &bytes)?;
+            let redacted = redact_known_credentials_bytes(&bytes, &self.recording_redactions);
+            atomic_write(&dir.join("fixture.toml"), &redacted)?;
         }
         Ok(())
     }
@@ -1344,17 +1370,115 @@ impl TuiDeck {
         s.push_str(&header.to_string());
         s.push('\n');
         let events = self.cast_events.lock().unwrap();
-        for ev in events.iter() {
+        let redacted_events = redact_cast_events(&events, &self.recording_redactions);
+        for (ev, redacted) in events.iter().zip(redacted_events) {
             // Lossy UTF-8 decoding is what asciinema players expect:
             // raw bytes that are valid UTF-8 round-trip, invalid bytes
             // are replaced rather than dropped.
-            let data = String::from_utf8_lossy(&ev.data);
+            let data = String::from_utf8_lossy(&redacted);
             let line = serde_json::json!([ev.offset_secs, "o", data]);
             s.push_str(&line.to_string());
             s.push('\n');
         }
         s
     }
+}
+
+const RECORDING_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED-CREDENTIAL]";
+
+/// Locate non-overlapping credential occurrences, preferring the longest value
+/// at a shared start. Matching bytes before JSON/asciinema encoding also catches
+/// secrets that contain characters the artifact format would escape.
+fn credential_redaction_ranges(data: &[u8], credentials: &[String]) -> Vec<(usize, usize)> {
+    let patterns: Vec<&[u8]> = credentials
+        .iter()
+        .map(String::as_bytes)
+        .filter(|value| !value.is_empty())
+        .collect();
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let matched = patterns
+            .iter()
+            .filter(|pattern| data[offset..].starts_with(pattern))
+            .max_by_key(|pattern| pattern.len());
+        if let Some(pattern) = matched {
+            ranges.push((offset, offset + pattern.len()));
+            offset += pattern.len();
+        } else {
+            offset += 1;
+        }
+    }
+    ranges
+}
+
+fn redact_known_credentials_bytes(data: &[u8], credentials: &[String]) -> Vec<u8> {
+    let ranges = credential_redaction_ranges(data, credentials);
+    if ranges.is_empty() {
+        return data.to_vec();
+    }
+    let mut redacted = Vec::with_capacity(data.len());
+    let mut copied = 0;
+    for (start, end) in ranges {
+        redacted.extend_from_slice(&data[copied..start]);
+        redacted.extend_from_slice(RECORDING_CREDENTIAL_REDACTION);
+        copied = end;
+    }
+    redacted.extend_from_slice(&data[copied..]);
+    redacted
+}
+
+fn redact_known_credentials_text(text: &str, credentials: &[String]) -> String {
+    String::from_utf8_lossy(&redact_known_credentials_bytes(
+        text.as_bytes(),
+        credentials,
+    ))
+    .into_owned()
+}
+
+/// Redact against the concatenated PTY stream, then project the result back onto
+/// the original timestamped events. A provider can split a token across two PTY
+/// reads, so redacting each event independently would leave that token intact in
+/// `full-stream.cast`.
+fn redact_cast_events(events: &[CastEvent], credentials: &[String]) -> Vec<Vec<u8>> {
+    let stream: Vec<u8> = events
+        .iter()
+        .flat_map(|event| event.data.iter().copied())
+        .collect();
+    let ranges = credential_redaction_ranges(&stream, credentials);
+    if ranges.is_empty() {
+        return events.iter().map(|event| event.data.clone()).collect();
+    }
+
+    let mut projected = Vec::with_capacity(events.len());
+    let mut event_start = 0;
+    let mut range_index = 0;
+    for event in events {
+        let event_end = event_start + event.data.len();
+        while range_index < ranges.len() && ranges[range_index].1 <= event_start {
+            range_index += 1;
+        }
+        let mut out = Vec::with_capacity(event.data.len());
+        let mut copied = event_start;
+        let mut index = range_index;
+        while index < ranges.len() && ranges[index].0 < event_end {
+            let (secret_start, secret_end) = ranges[index];
+            if copied < secret_start {
+                out.extend_from_slice(&stream[copied..secret_start.min(event_end)]);
+            }
+            if secret_start >= event_start {
+                out.extend_from_slice(RECORDING_CREDENTIAL_REDACTION);
+            }
+            copied = secret_end.min(event_end).max(copied);
+            index += 1;
+        }
+        if copied < event_end {
+            out.extend_from_slice(&stream[copied..event_end]);
+        }
+        projected.push(out);
+        event_start = event_end;
+    }
+    projected
 }
 
 // ---------------------------------------------------------------------------
@@ -2259,10 +2383,8 @@ fn read_credential_file_no_symlink(
         .map_err(|e| std::io::Error::other(format!("read {redacted_display}: {e}")))
 }
 
-/// Validate that a source path is a regular file (not a symlink),
-/// without reading it. Used by paths where we want to surface
-/// symlink-rejection before delegating the actual copy/read to a
-/// caller.
+/// Validate that a source path is a regular file (not a symlink) without
+/// reading it. Claude settings use this before their JSONC sanitization pass.
 fn require_regular_file_no_symlink(
     real_path: &Path,
     redacted_display: &str,
@@ -2295,6 +2417,41 @@ fn require_regular_dir_no_symlink(real_path: &Path, redacted_display: &str) -> s
         return Err(std::io::Error::other(format!(
             "refusing to import {redacted_display}: expected a regular directory"
         )));
+    }
+    Ok(())
+}
+
+/// Validate every directory between `source_home` and a credential leaf with
+/// `symlink_metadata`, in order, before opening the leaf. Checking only
+/// `auth.json` is insufficient: `~/.local/share/opencode` itself may be a
+/// symlink, in which case leaf metadata has already followed the source root.
+fn require_nonsymlink_credential_ancestors(
+    source_home: &Path,
+    credential_path: &Path,
+    redacted_display: &str,
+) -> std::io::Result<()> {
+    let relative = credential_path.strip_prefix(source_home).map_err(|_| {
+        std::io::Error::other(format!(
+            "refusing to import {redacted_display}: path is outside the source HOME"
+        ))
+    })?;
+    let Some(parent) = relative.parent() else {
+        return Ok(());
+    };
+    let mut current = source_home.to_path_buf();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::other(format!(
+                "refusing to import {redacted_display}: a source directory ancestor is a symlink"
+            )));
+        }
+        if !metadata.file_type().is_dir() {
+            return Err(std::io::Error::other(format!(
+                "refusing to import {redacted_display}: a source ancestor is not a directory"
+            )));
+        }
     }
     Ok(())
 }
@@ -2341,76 +2498,136 @@ fn write_credential_file_atomic_0o600(dst: &Path, bytes: &[u8]) -> std::io::Resu
     Ok(())
 }
 
-/// Copy the host user's OpenCode credentials into the per-test
-/// tempdir HOME. Mirrors [`import_claude_credentials`] — copies the
-/// auth state but NOT any `plugin/` directory (the deck installs its
-/// own OpenCode plugin pointing at the per-test paths). M3.1
-/// auditor S2 + S3: atomic 0o600 creation for `auth.json`, and
-/// source-path symlinks are refused with a redacted error.
-///
-/// This helper is currently dead code (no `chain-smoke/opencode/*`
-/// test calls it — see PRD § Discovered Issues `di-001`). Kept so
-/// the OpenCode chain-smoke test can be added without harness
-/// changes once the deck install-path bug is fixed.
-fn import_opencode_credentials(test_home: &Path) -> std::io::Result<()> {
-    let mut imported_any = false;
+fn collect_credential_values(value: &serde_json::Value, key: Option<&str>, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (child_key, child) in map {
+                collect_credential_values(child, Some(child_key), out);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                collect_credential_values(child, key, out);
+            }
+        }
+        serde_json::Value::String(value) => {
+            let key = key.unwrap_or_default().to_ascii_lowercase();
+            let sensitive_key = key == "key"
+                || key == "access"
+                || key == "refresh"
+                || key.contains("token")
+                || key.contains("secret")
+                || key.contains("password")
+                || key.contains("authorization")
+                || key.contains("api_key")
+                || key.contains("apikey");
+            if !value.is_empty() && (sensitive_key || value.len() >= 16) {
+                out.push(value.clone());
+            }
+        }
+        _ => {}
+    }
+}
 
-    let source_roots = [
-        host_home().join(".local").join("share").join("opencode"),
-        host_home().join(".opencode"),
+fn opencode_recording_redactions(
+    bytes: &[u8],
+    redacted_display: &str,
+) -> std::io::Result<Vec<String>> {
+    let auth: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        std::io::Error::other(format!(
+            "refusing to import {redacted_display}: auth file is not valid JSON: {error}"
+        ))
+    })?;
+    let mut values = Vec::new();
+    collect_credential_values(&auth, None, &mut values);
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values.dedup();
+    Ok(values)
+}
+
+const MINIMAL_OPENCODE_CONFIG: &str = "{}\n";
+
+/// Copy only the host user's OpenCode `auth.json` credentials into the per-test
+/// HOME and synthesize a minimal config. Host `opencode.json(c)`, plugins, MCP
+/// commands and provider configuration are deliberately never imported: `--auto`
+/// may execute them, and the PTY stream is persisted as a recording artifact.
+/// Every source ancestor plus the auth leaf is checked without following
+/// symlinks; destination credentials are atomically created with mode 0o600.
+fn import_opencode_credentials_from(
+    source_home: &Path,
+    test_home: &Path,
+) -> std::io::Result<Vec<String>> {
+    let mut imported_auth = false;
+    let mut recording_redactions = Vec::new();
+    let credentials = [
+        (
+            source_home
+                .join(".local")
+                .join("share")
+                .join("opencode")
+                .join("auth.json"),
+            test_home
+                .join(".local")
+                .join("share")
+                .join("opencode")
+                .join("auth.json"),
+            "~/.local/share/opencode/auth.json",
+        ),
+        (
+            source_home.join(".opencode").join("auth.json"),
+            test_home.join(".opencode").join("auth.json"),
+            "~/.opencode/auth.json",
+        ),
+        (
+            source_home
+                .join(".config")
+                .join("opencode")
+                .join("auth.json"),
+            test_home.join(".config").join("opencode").join("auth.json"),
+            "~/.config/opencode/auth.json",
+        ),
     ];
-    let redacted_roots = ["~/.local/share/opencode", "~/.opencode"];
-    for (src, redacted) in source_roots.iter().zip(redacted_roots.iter()) {
-        // Stat with symlink_metadata so a symlinked root is refused
-        // rather than silently followed.
-        let Ok(meta) = std::fs::symlink_metadata(src) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::other(format!(
-                "refusing to import {redacted}: expected a regular directory, found a symlink"
-            )));
+    for (src, dst, redacted) in credentials {
+        match require_nonsymlink_credential_ancestors(source_home, &src, redacted) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
         }
-        if !meta.file_type().is_dir() {
-            continue;
+        match std::fs::symlink_metadata(&src) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
         }
-        let rel = src
-            .strip_prefix(host_home())
-            .expect("HOME-relative source path");
-        let dst = test_home.join(rel);
-        copy_dir_excluding_plugin_subdir(src, &dst)?;
-        // Re-stamp auth.json with the strict mode atomically — the
-        // dir-copy walks regular files via fs::copy which inherits
-        // host mode bits.
-        let dst_auth = dst.join("auth.json");
-        if dst_auth.is_file() {
-            let bytes = std::fs::read(&dst_auth)?;
-            write_credential_file_atomic_0o600(&dst_auth, &bytes)?;
-        }
-        imported_any = true;
+        let bytes = read_credential_file_no_symlink(
+            &src,
+            &format!("OpenCode credentials not found at {redacted}"),
+            redacted,
+        )?;
+        std::fs::create_dir_all(dst.parent().expect("OpenCode auth path has a parent"))?;
+        write_credential_file_atomic_0o600(&dst, &bytes)?;
+        recording_redactions.extend(opencode_recording_redactions(&bytes, redacted)?);
+        imported_auth = true;
     }
 
-    // ~/.config/opencode/opencode.jsonc is the user-editable config.
-    let src_cfg = host_home()
-        .join(".config")
-        .join("opencode")
-        .join("opencode.jsonc");
-    if src_cfg.exists() {
-        require_regular_file_no_symlink(&src_cfg, "~/.config/opencode/opencode.jsonc")?;
-        let dst_cfg_dir = test_home.join(".config").join("opencode");
-        std::fs::create_dir_all(&dst_cfg_dir)?;
-        std::fs::copy(&src_cfg, dst_cfg_dir.join("opencode.jsonc"))?;
-        imported_any = true;
-    }
-
-    if !imported_any {
+    if !imported_auth {
         return Err(std::io::Error::other(
-            "OpenCode credentials not found under ~/.local/share/opencode or ~/.opencode — \
-             log in with `opencode auth login`"
+            "OpenCode credentials not found at ~/.local/share/opencode/auth.json, \
+             ~/.opencode/auth.json, or ~/.config/opencode/auth.json — log in with \
+             `opencode auth login`"
                 .to_string(),
         ));
     }
-    Ok(())
+    let dst_cfg_dir = test_home.join(".config").join("opencode");
+    std::fs::create_dir_all(&dst_cfg_dir)?;
+    std::fs::write(dst_cfg_dir.join("opencode.json"), MINIMAL_OPENCODE_CONFIG)?;
+
+    recording_redactions.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    recording_redactions.dedup();
+    Ok(recording_redactions)
+}
+
+fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
+    import_opencode_credentials_from(&host_home(), test_home)
 }
 
 /// Copy only Codex's authentication state into the isolated test HOME and seed
@@ -2437,34 +2654,6 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
         })?)
     );
     write_credential_file_atomic_0o600(&dst.join("config.toml"), config.as_bytes())
-}
-
-/// Like `copy_dir_recursively` but skips any top-level `plugin/`
-/// child — the deck auto-installs its own OpenCode plugin into the
-/// tempdir HOME and we do NOT want the host's plugin firing too.
-fn copy_dir_excluding_plugin_subdir(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if ty.is_dir() {
-            if entry.file_name() == "plugin" {
-                continue;
-            }
-            copy_dir_recursively(&from, &to)?;
-        } else if ty.is_file() {
-            std::fs::copy(&from, &to)?;
-        } else {
-            return Err(std::io::Error::other(format!(
-                "OpenCode credential entry {} is not a regular file or directory \
-                 (symlinks/sockets/FIFOs are not supported)",
-                from.display()
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Write a minimal `session.toml` containing exactly one pane that
@@ -2816,6 +3005,20 @@ pub fn spawn_daemon_serve_with_env(
     // 5000ms stays comfortably above spawn/005's 2s "not yet delivered" window
     // and below every 10s delivery window. A test may override via `extra_env`.
     env.push(("DOT_AGENT_DECK_SESSION_START_WAIT_MS".into(), "5000".into()));
+    // PRD #249 M3: same pin as the TuiDeck harness above — the silent-worker
+    // report would fire on every stand-in worker that emits no events and write
+    // a notice into an orchestrator pane. Off by default here; a test that wants
+    // the report sets it in `extra_env`, which is layered after this.
+    env.push((
+        "DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS".into(),
+        "0".into(),
+    ));
+    // PRD #249 M1: same zero pin as `TuiDeck`; targeted scenarios layer a
+    // non-zero value through `extra_env` after this baseline.
+    env.push((
+        "DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS".into(),
+        "0".into(),
+    ));
     for (k, v) in extra_env {
         env.push(((*k).to_string(), (*v).to_string()));
     }
@@ -4433,5 +4636,122 @@ mod harness_unit_tests {
         );
         assert_eq!(matched, 2);
         assert!(!terminal);
+    }
+
+    /// Scenario: Import a synthetic OpenCode auth file while a hostile host config
+    /// sits beside it. Only auth is copied, a minimal isolated config is created,
+    /// and the imported token is registered for recording redaction.
+    #[test]
+    fn opencode_import_is_auth_only_and_synthesizes_minimal_config() {
+        let source = tempfile::tempdir().expect("source HOME");
+        let target = tempfile::tempdir().expect("target HOME");
+        let source_auth = source.path().join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(source_auth.parent().unwrap()).expect("source auth dir");
+        std::fs::write(
+            &source_auth,
+            r#"{"openrouter":{"type":"api","key":"test-secret-token-249"}}"#,
+        )
+        .expect("source auth");
+        let source_config = source.path().join(".config/opencode/opencode.jsonc");
+        std::fs::create_dir_all(source_config.parent().unwrap()).expect("source config dir");
+        std::fs::write(
+            &source_config,
+            r#"{"plugin":["host-plugin"],"mcp":{"host":{"command":"leak-secret"}}}"#,
+        )
+        .expect("host config");
+
+        let redactions = import_opencode_credentials_from(source.path(), target.path())
+            .expect("isolated OpenCode import");
+        let imported_auth = target.path().join(".local/share/opencode/auth.json");
+        assert_eq!(
+            std::fs::read_to_string(imported_auth).unwrap(),
+            r#"{"openrouter":{"type":"api","key":"test-secret-token-249"}}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.path().join(".config/opencode/opencode.json")).unwrap(),
+            MINIMAL_OPENCODE_CONFIG
+        );
+        assert!(
+            !target
+                .path()
+                .join(".config/opencode/opencode.jsonc")
+                .exists(),
+            "the host OpenCode config must never enter the isolated HOME"
+        );
+        assert_eq!(redactions, vec!["test-secret-token-249"]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(target.path().join(".local/share/opencode/auth.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "imported auth mode must stay private");
+        }
+    }
+
+    /// Scenario: Point an OpenCode data root at an external directory through a
+    /// symlink and attempt credential import. The importer must reject the root
+    /// before reading its otherwise-regular auth leaf.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_import_rejects_a_symlinked_source_root() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::tempdir().expect("source HOME");
+        let target = tempfile::tempdir().expect("target HOME");
+        let external = tempfile::tempdir().expect("external OpenCode root");
+        std::fs::write(
+            external.path().join("auth.json"),
+            r#"{"openrouter":{"key":"must-not-be-imported"}}"#,
+        )
+        .expect("external auth");
+        std::fs::create_dir_all(source.path().join(".local/share")).expect("source parents");
+        symlink(external.path(), source.path().join(".local/share/opencode"))
+            .expect("symlink OpenCode root");
+
+        let error = import_opencode_credentials_from(source.path(), target.path())
+            .expect_err("a symlinked OpenCode root must be refused")
+            .to_string();
+        assert!(
+            error.contains("source directory ancestor is a symlink")
+                && error.contains("~/.local/share/opencode/auth.json")
+                && !error.contains(source.path().to_string_lossy().as_ref()),
+            "the refusal must identify the redacted source without exposing HOME: {error}"
+        );
+    }
+
+    /// Scenario: Split a known credential across adjacent PTY recording chunks.
+    /// Artifact redaction must match across the chunk boundary while preserving
+    /// the two timestamped cast events.
+    #[test]
+    fn recording_redaction_catches_credentials_split_across_events() {
+        let events = vec![
+            CastEvent {
+                offset_secs: 0.1,
+                data: b"prefix token-".to_vec(),
+            },
+            CastEvent {
+                offset_secs: 0.2,
+                data: b"secret-249 suffix".to_vec(),
+            },
+        ];
+        let redacted = redact_cast_events(&events, &["token-secret-249".to_string()]);
+        assert_eq!(redacted.len(), events.len());
+        let joined: Vec<u8> = redacted.into_iter().flatten().collect();
+        assert!(
+            joined
+                .windows(RECORDING_CREDENTIAL_REDACTION.len())
+                .any(|window| window == RECORDING_CREDENTIAL_REDACTION)
+        );
+        assert!(
+            !joined
+                .windows(b"token-secret-249".len())
+                .any(|window| window == b"token-secret-249"),
+            "the split credential survived recording redaction: {:?}",
+            String::from_utf8_lossy(&joined)
+        );
     }
 }

@@ -1410,10 +1410,14 @@ pub struct DeliveryPermit {
 }
 
 /// PRD #20 R20-004 (finding #3): the outcome of physically writing a payload +
-/// submit CR to a PTY writer, classifying WHERE a write error struck.
+/// its configured terminator to a PTY writer, classifying WHERE a write error
+/// struck. The terminator is the [`SubmitMode`]'s tail — a submit CR for
+/// [`SubmitMode::Submit`], a bare LF for [`SubmitMode::Notice`] (PRD #249 M3) —
+/// so the classification is written in terms of "payload then tail", not of the
+/// CR specifically.
 #[derive(Debug, PartialEq, Eq)]
 enum PayloadDelivery {
-    /// Payload and submit CR both fully written.
+    /// Payload and the mode's terminator both fully written.
     Applied,
     /// Some bytes were written but the sequence did not complete — a partial
     /// write. The bytes may already have reached the target; the caller must NOT
@@ -1482,6 +1486,37 @@ async fn deliver_payload_and_submit(
     // The payload already landed; ANY failure writing the submit CR now leaves
     // the target holding un-submitted payload bytes — ambiguous, not clean.
     match write_all_tracked(w, b"\r") {
+        WriteProgress::Complete => {}
+        WriteProgress::Partial | WriteProgress::NothingWritten(_) => {
+            return PayloadDelivery::Ambiguous;
+        }
+    }
+    let _ = w.flush();
+    PayloadDelivery::Applied
+}
+
+/// PRD #249 M3: the [`SubmitMode::Notice`] counterpart of
+/// [`deliver_payload_and_submit`] — payload, then a single `\n`, with no
+/// `SUBMIT_DELAY` and no CR. Shares the partial-write classification for the same
+/// reason: a notice whose payload landed but whose LF did not leaves the target
+/// holding un-terminated bytes, which a blind retry would duplicate into the
+/// pane.
+///
+/// No submit delay because there is nothing to keep the terminator from fusing
+/// to: LF is not an Enter for the agents this project drives, so the pause that
+/// `SUBMIT_DELAY` exists to create has no meaning here (matching
+/// [`AgentPtyRegistry::write_to_pane_notice`]'s unguarded path).
+async fn deliver_payload_as_notice(
+    w: &mut (dyn std::io::Write + Send),
+    payload: &[u8],
+) -> PayloadDelivery {
+    match write_all_tracked(w, payload) {
+        WriteProgress::Complete => {}
+        WriteProgress::Partial => return PayloadDelivery::Ambiguous,
+        WriteProgress::NothingWritten(e) => return PayloadDelivery::CleanFailure(e),
+    }
+    let _ = w.flush();
+    match write_all_tracked(w, b"\n") {
         WriteProgress::Complete => {}
         WriteProgress::Partial | WriteProgress::NothingWritten(_) => {
             return PayloadDelivery::Ambiguous;
@@ -1832,6 +1867,13 @@ struct DelegationTracker {
     /// Keyed by the *worker's* `pane_id_env`; at most one (the newest)
     /// delegation per worker pane.
     records: HashMap<String, OutstandingDelegation>,
+    /// PRD #249 M3 review (finding B4/S4): the silent-worker watches, keyed by
+    /// the *worker's* `pane_id_env`; at most one (the newest) per worker pane.
+    /// Separate from `records` because the two watches have different clocks —
+    /// the idle watch starts when the delegate is issued, the silence watch only
+    /// once the task pointer has actually been written — but the same three
+    /// cancellation events resolve both.
+    silence_watches: HashMap<String, SilenceWatchRecord>,
     /// Panes between [`AgentPtyRegistry::begin_pane_close`] and
     /// [`AgentPtyRegistry::finish_pane_close`]. Arming is refused for a pane in
     /// this set (as worker *or* as orchestrator), which is what closes the
@@ -1839,6 +1881,61 @@ struct DelegationTracker {
     /// `AGENT_TERMINATE_GRACE` long, and a delegate landing inside it must not
     /// leave a record that nothing removes.
     closing_panes: HashSet<String>,
+    /// PRD #249 round-6 review (Greptile, the readiness buffer): live senders
+    /// handed out by [`AgentPtyRegistry::pane_close_signal`], keyed by the pane
+    /// whose close they announce. Dropping a sender IS the signal — the same
+    /// drop-to-cancel discipline as both watches' `_cancel` channels — and
+    /// [`AgentPtyRegistry::begin_pane_close`] drops every sender for the pane it
+    /// marks. Lets an in-flight wait (the M1 readiness gate) abandon promptly
+    /// instead of sleeping out its remainder against a target that is gone.
+    close_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
+}
+
+/// PRD #249 M3 review (finding B4/S4): one armed silent-worker watch — the
+/// "did this delegated worker emit anything at all?" diagnostic.
+///
+/// Exists so the watch can be **cancelled**. Without it the detached task ran to
+/// its deadline no matter what happened in between, so a hookless worker could
+/// receive the pointer, report `work-done`, and *still* be reported as possibly
+/// undelivered — a diagnostic that fires after positive proof of delivery is
+/// worse than no diagnostic, because it trains operators to ignore it.
+struct SilenceWatchRecord {
+    /// Generation of this record — see [`AgentPtyRegistry::delegation_seq`],
+    /// whose counter is shared. Proof of ownership for the conditional take in
+    /// [`AgentPtyRegistry::cancel_silence_watch_if`], so a stale watch can never
+    /// disarm a newer delegation's.
+    seq: u64,
+    /// PRD #249 round-6 review (Greptile, `handle_work_done`): how many OLDER
+    /// watches for this same worker pane were superseded without a `work-done`
+    /// ever being credited to them. The exact counterpart of
+    /// [`OutstandingDelegation::superseded`], and it exists for the exact same
+    /// defect: `WorkDoneSignal` carries no delegation generation, so an
+    /// unconditional cancel let a late/duplicated/retried completion from
+    /// delegation N disarm delegation N+1's watch — and if N+1's pointer never
+    /// landed, the undelivered-prompt detector was then silently disabled for
+    /// precisely the case it exists to surface. Completions are therefore
+    /// applied oldest-first by [`AgentPtyRegistry::retire_silence_watch`].
+    superseded: u32,
+    /// Pane of the orchestrator that issued the delegate, so closing the
+    /// ORCHESTRATOR cancels the watch too — its notice would otherwise be aimed
+    /// at a pane id a later, unrelated agent can inherit.
+    orchestrator_pane_id: String,
+    /// The live end of the watch task's cancellation channel. Never *sent* on:
+    /// the task selects on it and exits as soon as it resolves, which happens
+    /// when this record leaves the map (work-done, supersede, pane close, or the
+    /// watch's own conditional take). Mirrors
+    /// [`OutstandingDelegation::_watch_cancel`].
+    _cancel: oneshot::Sender<()>,
+}
+
+/// PRD #249 M3 review (finding B4/S4): handed back by
+/// [`AgentPtyRegistry::arm_silence_watch`] to the caller that spawns the watch
+/// task — the record's generation and the cancellation channel the task must
+/// select on alongside its event wait.
+#[derive(Debug)]
+pub struct ArmedSilenceWatch {
+    pub seq: u64,
+    pub cancel: oneshot::Receiver<()>,
 }
 
 /// PRD #126: one delegation the daemon is still waiting on a `work-done` for.
@@ -1943,6 +2040,29 @@ pub enum DelegationRetirement {
         /// Generation of the record left armed.
         seq: u64,
         /// Superseded delegations still unaccounted for after this one.
+        remaining: u32,
+    },
+}
+
+/// PRD #249 round-6 review (Greptile): what a `work-done` did to a worker pane's
+/// silent-worker watch. See [`AgentPtyRegistry::retire_silence_watch`] — the
+/// three variants exist so `handle_work_done` can log *which* delegation the
+/// completion was credited to, which is the only way the oldest-first accounting
+/// is diagnosable from a daemon log.
+#[derive(Debug)]
+pub enum SilenceWatchRetirement {
+    /// No watch was armed for that pane — the detector is disabled, the pointer
+    /// was never delivered, or a close/notice already consumed the record.
+    Nothing,
+    /// The watch belonging to this completion was disarmed; dropping its record
+    /// cancels the task, so no notice can follow proof of delivery.
+    Cancelled { seq: u64 },
+    /// The completion was credited to an older, *superseded* delegation. The
+    /// newest watch stays armed — see [`SilenceWatchRecord::superseded`].
+    KeptNewer {
+        /// Generation of the watch left armed.
+        seq: u64,
+        /// Superseded watches still unaccounted for after this one.
         remaining: u32,
     },
 }
@@ -2058,6 +2178,127 @@ impl AgentPtyRegistry {
         })
     }
 
+    /// PRD #249 M3 review (finding B4/S4): register the silent-worker watch for
+    /// `worker_pane_id` and hand back the generation + cancellation channel its
+    /// task must select on. The caller arms this BEFORE writing the task pointer
+    /// so a `work-done` that lands inside the write's own `SUBMIT_DELAY` window
+    /// cancels the watch instead of racing it.
+    ///
+    /// Returns `None` — no record, and the caller must not spawn a watch — when
+    /// either pane is mid-close ([`Self::begin_pane_close`]), for the same
+    /// arm-after-cancel reason as [`Self::arm_outstanding_delegation`].
+    ///
+    /// Inserting REPLACES any previous watch for the pane, and dropping the
+    /// replaced record cancels its task immediately: that is the supersession
+    /// cancellation. An older "did anything happen?" question is answered by the
+    /// newer delegate's own write, so the *task* carries nothing forward — but
+    /// the replaced record's unaccounted-for completion count does (PRD #249
+    /// round-6 review; see [`SilenceWatchRecord::superseded`]), because the
+    /// `work-done` that belonged to the superseded delegation may still be in
+    /// flight and must not be credited to this new watch.
+    pub fn arm_silence_watch(
+        &self,
+        worker_pane_id: &str,
+        orchestrator_pane_id: &str,
+    ) -> Option<ArmedSilenceWatch> {
+        let mut tracker = self.delegations.lock().unwrap();
+        if tracker.closing_panes.contains(worker_pane_id)
+            || tracker.closing_panes.contains(orchestrator_pane_id)
+        {
+            return None;
+        }
+        let seq = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
+        let superseded = tracker
+            .silence_watches
+            .get(worker_pane_id)
+            .map_or(0, |prev| prev.superseded.saturating_add(1));
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        tracker.silence_watches.insert(
+            worker_pane_id.to_string(),
+            SilenceWatchRecord {
+                seq,
+                superseded,
+                orchestrator_pane_id: orchestrator_pane_id.to_string(),
+                _cancel: cancel_tx,
+            },
+        );
+        Some(ArmedSilenceWatch {
+            seq,
+            cancel: cancel_rx,
+        })
+    }
+
+    /// PRD #249 M3 review (finding B4): a `work-done` arrived from
+    /// `worker_pane_id`, so ONE silent-worker watch is resolved — a completion is
+    /// positive proof the pointer landed, and `work-done` is a CLI signal rather
+    /// than an `AgentEvent`, so the watch's own event wait would never see it.
+    ///
+    /// PRD #249 round-6 review (Greptile, `handle_work_done`): "one" is
+    /// deliberate, and this used to be an unconditional `remove`. Because
+    /// [`Self::arm_silence_watch`] replaces the record, the map holds the NEWEST
+    /// delegation's watch — so a `work-done` belonging to delegation N (late,
+    /// duplicated or retried) disarmed delegation N+1's watch, and if N+1's
+    /// pointer genuinely never landed no notice was ever emitted: the
+    /// undelivered-prompt detector was silently disabled for exactly the failure
+    /// it exists to surface.
+    ///
+    /// Completions are therefore applied oldest-first, the same accounting
+    /// [`Self::retire_outstanding_delegation`] uses for the idle detector and for
+    /// the same reason (no generation on the wire). Deliberately NOT keyed to the
+    /// idle detector's record: the two detectors are independently switchable, so
+    /// with `worker_response_timeout = 0` there is no delegation record to derive
+    /// a generation from, and the silence watch must still cancel on a timely
+    /// completion.
+    ///
+    /// It inherits PRD #126's accepted hole in the other direction: an
+    /// OUT-OF-ORDER completion (the newest task reports while an older one never
+    /// does) is credited to the older watch, so the newest stays armed and may
+    /// emit one notice for work that is actually done. A discardable,
+    /// self-describing notice is strictly safer than silence, and it only occurs
+    /// in a state the orchestrator protocol already forbids (re-delegating before
+    /// the worker reports).
+    pub fn retire_silence_watch(&self, worker_pane_id: &str) -> SilenceWatchRetirement {
+        let mut tracker = self.delegations.lock().unwrap();
+        let Some(record) = tracker.silence_watches.get_mut(worker_pane_id) else {
+            return SilenceWatchRetirement::Nothing;
+        };
+        if record.superseded > 0 {
+            record.superseded -= 1;
+            return SilenceWatchRetirement::KeptNewer {
+                seq: record.seq,
+                remaining: record.superseded,
+            };
+        }
+        let seq = record.seq;
+        tracker
+            .silence_watches
+            .remove(worker_pane_id)
+            .expect("watch present under the same lock");
+        SilenceWatchRetirement::Cancelled { seq }
+    }
+
+    /// PRD #249 M3 review (finding B4): cancel `worker_pane_id`'s silent-worker
+    /// watch **only if** it is still generation `seq`. Two callers need the
+    /// conditional form: the dispatch path cleaning up after a write that was
+    /// refused or failed, and the watch task itself consuming its own record
+    /// before it reports — a `false` there means work-done, a supersede or a
+    /// pane close already resolved this delegation while the window ran, and the
+    /// notice must be suppressed. Mirrors
+    /// [`Self::take_outstanding_delegation_if`]: one mutex, exactly one winner.
+    pub fn cancel_silence_watch_if(&self, worker_pane_id: &str, seq: u64) -> bool {
+        let mut tracker = self.delegations.lock().unwrap();
+        if tracker
+            .silence_watches
+            .get(worker_pane_id)
+            .is_some_and(|w| w.seq == seq)
+        {
+            tracker.silence_watches.remove(worker_pane_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// PRD #126: atomically take the outstanding delegation for
     /// `worker_pane_id` **only if** it is still generation `seq`. This single
     /// operation is what makes the detector correct on all three fronts:
@@ -2147,9 +2388,25 @@ impl AgentPtyRegistry {
     /// The old cancellation was also keyed by worker pane ONLY, so closing the
     /// ORCHESTRATOR left every worker's timer armed pointing at a pane id that a
     /// later, unrelated agent could inherit — hence the sweep over both roles.
+    ///
+    /// PRD #249 M3 review (finding B4/S4): the sweep covers silent-worker
+    /// watches by the same two roles, for the same reason — a closed worker owes
+    /// no proof of life, and a closed orchestrator has no pane to be told in.
     pub fn begin_pane_close(&self, pane_id: &str) -> Vec<OutstandingDelegation> {
         let mut tracker = self.delegations.lock().unwrap();
         tracker.closing_panes.insert(pane_id.to_string());
+        // PRD #249 round-6 review (Greptile): wake anything waiting on this pane
+        // BEFORE the up-to-`AGENT_TERMINATE_GRACE` termination starts, by dropping
+        // its senders. Same ordering argument as the sweeps below.
+        drop(tracker.close_waiters.remove(pane_id));
+        let cancelled_watches = Self::drain_silence_watches_touching(&mut tracker, pane_id);
+        if cancelled_watches > 0 {
+            tracing::debug!(
+                pane_id = %pane_id,
+                cancelled_watches,
+                "pane close: cancelled silent-worker watches touching this pane"
+            );
+        }
         Self::drain_delegations_touching(&mut tracker, pane_id)
     }
 
@@ -2165,6 +2422,8 @@ impl AgentPtyRegistry {
     /// delegation whose pane the user explicitly asked to close.
     pub fn finish_pane_close(&self, pane_id: &str, closed: bool) -> Vec<OutstandingDelegation> {
         let mut tracker = self.delegations.lock().unwrap();
+        drop(tracker.close_waiters.remove(pane_id));
+        Self::drain_silence_watches_touching(&mut tracker, pane_id);
         let swept = Self::drain_delegations_touching(&mut tracker, pane_id);
         if !closed {
             tracing::debug!(
@@ -2188,6 +2447,39 @@ impl AgentPtyRegistry {
             .contains(pane_id)
     }
 
+    /// PRD #249 round-6 review (Greptile, the readiness buffer): a future that
+    /// resolves when `pane_id`'s close BEGINS, so a wait already in flight can be
+    /// cancelled instead of sleeping out its remainder against a target that is
+    /// being torn down. Deliberately the same shape as the two watches'
+    /// cancellation channels — a `oneshot` the caller `select!`s on, resolved by
+    /// the sender being DROPPED, never sent on.
+    ///
+    /// A pane that is ALREADY mid-close gets a pre-resolved receiver, which closes
+    /// the register-after-`begin_pane_close` race the way
+    /// [`Self::arm_outstanding_delegation`]'s refusal closes the arm-after-cancel
+    /// one. A close that fully completed *before* the caller asked (mark set and
+    /// cleared again) is not signalled — for that window the caller still relies
+    /// on its identity-guarded write refusing, which is where the correctness
+    /// lives either way.
+    ///
+    /// Senders whose receiver has already been dropped are pruned on each call, so
+    /// the waiter list tracks live waits rather than growing with every delegate.
+    pub fn pane_close_signal(&self, pane_id: &str) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        let mut tracker = self.delegations.lock().unwrap();
+        if tracker.closing_panes.contains(pane_id) {
+            // Dropping `tx` here resolves `rx` immediately.
+            return rx;
+        }
+        let waiters = tracker
+            .close_waiters
+            .entry(pane_id.to_string())
+            .or_default();
+        waiters.retain(|waiter| !waiter.is_closed());
+        waiters.push(tx);
+        rx
+    }
+
     /// Remove every record that names `pane_id` as its worker key or as its
     /// orchestrator target. Caller holds the tracker lock.
     fn drain_delegations_touching(
@@ -2205,6 +2497,25 @@ impl AgentPtyRegistry {
         keys.iter()
             .filter_map(|key| tracker.records.remove(key))
             .collect()
+    }
+
+    /// PRD #249 M3 review (finding B4/S4): the [`Self::drain_delegations_touching`]
+    /// counterpart for silent-worker watches — remove every watch that names
+    /// `pane_id` as its worker key or as its orchestrator target, cancelling each
+    /// one by dropping its record. Returns how many were cancelled, for logging.
+    /// Caller holds the tracker lock.
+    fn drain_silence_watches_touching(tracker: &mut DelegationTracker, pane_id: &str) -> usize {
+        let keys: Vec<String> = tracker
+            .silence_watches
+            .iter()
+            .filter(|(worker_pane, watch)| {
+                worker_pane.as_str() == pane_id || watch.orchestrator_pane_id == pane_id
+            })
+            .map(|(worker_pane, _)| worker_pane.clone())
+            .collect();
+        keys.iter()
+            .filter(|key| tracker.silence_watches.remove(*key).is_some())
+            .count()
     }
 
     /// PRD #126 M1 audit (finding 2): the orchestration membership of the live
@@ -2927,6 +3238,66 @@ impl AgentPtyRegistry {
     where
         Fut: std::future::Future<Output = bool>,
     {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Submit,
+            expected_agent_id,
+            revalidate,
+        )
+        .await
+    }
+
+    /// PRD #249 M3: [`Self::write_to_pane_notice`] under
+    /// [`Self::write_and_submit_guarded`]'s identity gate — the LF-terminated
+    /// visibility path, but bound to an EXACT target identity.
+    ///
+    /// A pane id is just a string: an orchestrator that exited (or was closed)
+    /// frees its `pane_id_env` for the next spawn, and an unguarded notice would
+    /// then write one orchestration's diagnostics into a stranger's pane —
+    /// `scheduler/idle-worker/008` and `/014` pin exactly that. The bytes are
+    /// unsubmitted, so the stranger is not made to *act* on them, but they are
+    /// still someone else's context and someone else's scrollback.
+    ///
+    /// Failure and refusal are reported through the same [`GuardedSend`] vocabulary
+    /// so callers classify a refused notice the way they classify a refused prompt.
+    pub async fn write_notice_guarded<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: Option<&str>,
+        revalidate: impl FnOnce() -> Fut,
+    ) -> Result<GuardedSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Notice,
+            expected_agent_id,
+            revalidate,
+        )
+        .await
+    }
+
+    /// The shared body of [`Self::write_and_submit_guarded`] (payload +
+    /// `SUBMIT_DELAY` + CR) and [`Self::write_notice_guarded`] (payload + LF).
+    /// Only the delivery tail differs; every identity, liveness and rebind check
+    /// — and the writer-held re-validation barrier that closes the TOCTOU — is
+    /// common, so the two entrypoints cannot drift apart on the parts that make
+    /// the send safe.
+    async fn write_guarded<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        mode: SubmitMode,
+        expected_agent_id: Option<&str>,
+        revalidate: impl FnOnce() -> Fut,
+    ) -> Result<GuardedSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
         let is_paneless = pane_id == "<no-pane>";
         let target = if is_paneless {
             // Resolve BY agent identity; no identity → nothing to route to.
@@ -2977,13 +3348,39 @@ impl AgentPtyRegistry {
         if !revalidate().await {
             return Ok(GuardedSend::Stale);
         }
-        // Authorized — write + submit, holding the writer across the whole
-        // sequence (mirrors `write_to_pane_internal`'s atomic submit contract).
+        // Authorized — write the payload and the mode's configured terminator,
+        // holding the writer across the whole sequence (mirrors
+        // `write_to_pane_internal`'s atomic submit contract).
+        //
+        // PRD #249 review (finding B1): the same `pane_write` byte trace the
+        // unguarded [`Self::write_to_pane_internal`] emits, and for the same
+        // reason — it is the surface an operator diagnosing a lost delegate is
+        // told to turn on (`RUST_LOG=pane_write=trace`), and the delegate task
+        // pointer now travels this path instead of that one. Emitted INSIDE the
+        // writer critical section so trace order matches write order under
+        // concurrent writers, with both keys so it joins against the STREAM_IN
+        // trace on either.
+        tracing::trace!(
+            target: "pane_write",
+            source = "daemon",
+            guarded = true,
+            mode = ?mode,
+            pane_id = %pane_id,
+            agent_id = %target.agent_id,
+            payload_len = payload.len(),
+            payload = %escape_bytes_for_log(&payload),
+            "daemon write_guarded: payload bytes"
+        );
         // PRD #20 R20-004 (finding #3): classify WHERE a writer error struck. A
         // failure before any byte reached the PTY is a clean, retryable transport
-        // error; a partial write (payload started, or the submit CR failed after
-        // the payload landed) is AMBIGUOUS and must not be blind-retried.
-        match deliver_payload_and_submit(&mut **w, &payload).await {
+        // error; a partial write (payload started, or the tail — submit CR for
+        // `Submit`, LF for `Notice` — failed after the payload landed) is
+        // AMBIGUOUS and must not be blind-retried.
+        let delivery = match mode {
+            SubmitMode::Submit => deliver_payload_and_submit(&mut **w, &payload).await,
+            SubmitMode::Notice => deliver_payload_as_notice(&mut **w, &payload).await,
+        };
+        match delivery {
             PayloadDelivery::Applied => Ok(GuardedSend::Applied),
             PayloadDelivery::Ambiguous => Ok(GuardedSend::Ambiguous),
             PayloadDelivery::CleanFailure(e) => Err(AgentPtyError::Writer(e)),
@@ -6614,6 +7011,116 @@ mod spawn_tests {
             reg.retire_outstanding_delegation("worker"),
             DelegationRetirement::Nothing
         ));
+    }
+
+    /// PRD #249 round-6 review (Greptile): the silent-worker watch needs the same
+    /// oldest-first accounting as the idle detector. `arm_silence_watch` replaces
+    /// the record, so the map holds the NEWEST watch — an unconditional cancel on
+    /// `work-done` let a stale completion from delegation N disarm delegation
+    /// N+1's watch, silently switching off the undelivered-prompt detector for
+    /// exactly the case it exists to surface.
+    #[test]
+    fn retire_silence_watch_applies_work_done_to_the_oldest_watch() {
+        let reg = AgentPtyRegistry::new();
+        let first = reg.arm_silence_watch("worker", "orch").expect("arm #1");
+        let mut first_cancel = first.cancel;
+        let second = reg.arm_silence_watch("worker", "orch").expect("arm #2");
+        let mut second_cancel = second.cancel;
+        assert!(second.seq > first.seq, "seq must be monotonic");
+        assert!(
+            matches!(
+                first_cancel.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ),
+            "the superseding arm must cancel the older watch's task"
+        );
+
+        // Delegation #1's late completion is credited to the superseded watch.
+        match reg.retire_silence_watch("worker") {
+            SilenceWatchRetirement::KeptNewer { seq, remaining } => {
+                assert_eq!(seq, second.seq, "the newest watch stays armed");
+                assert_eq!(remaining, 0);
+            }
+            other => panic!("expected the newest watch to survive, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                second_cancel.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "a stale work-done must leave the newer delegation's watch armed"
+        );
+
+        // #2's own completion does disarm it, which is the timely case.
+        match reg.retire_silence_watch("worker") {
+            SilenceWatchRetirement::Cancelled { seq } => assert_eq!(seq, second.seq),
+            other => panic!("expected a cancellation, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                second_cancel.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ),
+            "the retired watch's task must be woken, not just unlinked"
+        );
+        assert!(matches!(
+            reg.retire_silence_watch("worker"),
+            SilenceWatchRetirement::Nothing
+        ));
+    }
+
+    /// PRD #249 round-6 review (Greptile): the M1 readiness buffer must be able
+    /// to abandon a pane that starts closing mid-wait instead of sleeping out the
+    /// remainder (up to the 30 s clamp) before its guarded write discovers the
+    /// target is gone.
+    #[test]
+    fn pane_close_signal_resolves_when_the_close_begins() {
+        let reg = AgentPtyRegistry::new();
+        let mut waiting = reg.pane_close_signal("worker");
+        assert!(
+            matches!(waiting.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "an open pane must not look like a closing one"
+        );
+        drop(reg.begin_pane_close("other"));
+        assert!(
+            matches!(waiting.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "an unrelated pane's close must not cancel this wait"
+        );
+
+        drop(reg.begin_pane_close("worker"));
+        assert!(
+            matches!(
+                waiting.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ),
+            "the pane's own close must wake the wait"
+        );
+        // Asking while the pane is already mid-close is pre-resolved, which is
+        // what closes the register-after-`begin_pane_close` race.
+        let mut mid_close = reg.pane_close_signal("worker");
+        assert!(matches!(
+            mid_close.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+
+        reg.finish_pane_close("worker", true);
+        let mut after = reg.pane_close_signal("worker");
+        assert!(
+            matches!(after.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "after the transition completes, a fresh wait is live again"
+        );
+        drop(after);
+        // Abandoned waits are pruned rather than accumulating one sender per
+        // delegate for the lifetime of the daemon.
+        for _ in 0..5 {
+            drop(reg.pane_close_signal("worker"));
+        }
+        let _live = reg.pane_close_signal("worker");
+        assert_eq!(
+            reg.delegations.lock().unwrap().close_waiters["worker"].len(),
+            1,
+            "senders whose receiver is gone must be pruned on the next call"
+        );
     }
 
     /// PRD #126 M1 review (finding 2) / audit (finding 3): removing a record
