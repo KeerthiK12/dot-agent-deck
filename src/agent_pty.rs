@@ -3674,6 +3674,25 @@ impl AgentPtyRegistry {
     /// display-only write leaked into the respawn's `SpawnOptions::agent_type`
     /// and silently rewrote a bare `devbox run codex-big` pane into a wrapped
     /// one on its first `clear = true` delegate (Defect 2).
+    /// Whether any live agent in this registry was spawned with
+    /// `DOT_AGENT_DECK_PANE_ID` == `pane_id_env`.
+    ///
+    /// A hook event naming a pane this daemon never spawned did not come from
+    /// this deck. In practice that means another deck's agent — most often a
+    /// test run whose child inherited an ambient `DOT_AGENT_DECK_SOCKET` —
+    /// posting into this daemon, where it registers a card no local pane backs.
+    /// Exited entries are excluded, matching every other operational lookup, so
+    /// a genuine respawn racing its own first hook is not misreported.
+    pub fn has_live_pane(&self, pane_id_env: &str) -> bool {
+        if pane_id_env.is_empty() {
+            return false;
+        }
+        let inner = self.inner.lock().unwrap();
+        inner.agents.values().any(|a| {
+            a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+        })
+    }
+
     pub fn set_agent_type(&self, pane_id_env: &str, agent_type: &AgentType) {
         if *agent_type == AgentType::None || pane_id_env.is_empty() {
             return;
