@@ -1,0 +1,55 @@
+# TEMPORARY — delete once it has served its purpose (see below).
+#
+# `release.yml` cross-compiles `aarch64-unknown-linux-gnu` with `cross`, and that
+# leg runs ONLY on a tag. The reqwest 0.13 bump moved the TLS backend from ring to
+# aws-lc-rs, so that build must now compile `aws-lc-sys` — a cmake/C library —
+# inside the cross container. Nothing had exercised it, which meant the first
+# proof would have been a failed release.
+#
+# This reproduces exactly the aarch64 leg of `release.yml`'s build matrix (same
+# runner, same toolchain action, same `cargo install cross --locked`, same
+# `cross build --release`) and nothing else — no tag, no publish, no artifacts.
+# Run it from the Actions tab against a branch before tagging.
+#
+# It cannot be checked locally: the maintainer's devbox/Nix toolchain makes
+# `cross` derive an invalid rustup toolchain name from `rustc --print sysroot`,
+# a failure mode CI does not have. A container probe confirmed the cross image
+# ships cmake 3.23.1, cc, aarch64-linux-gnu-gcc, make and perl, so the
+# prerequisites are present — this proves the actual build.
+name: aarch64 cross-build check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  aarch64-crossbuild:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-unknown-linux-gnu
+      - name: Install cross
+        run: cargo install cross --locked
+      - name: Build (this is the step that must not fail at tag time)
+        run: cross build --release --target aarch64-unknown-linux-gnu
+      - name: Prove aws-lc-sys actually built for aarch64
+        run: |
+          set -euo pipefail
+          # The binary must exist AND be ARM64 — a silent host-arch fallback
+          # would otherwise look like success.
+          bin=target/aarch64-unknown-linux-gnu/release/dot-agent-deck
+          test -f "$bin"
+          file "$bin"
+          file "$bin" | grep -q 'ARM aarch64'
+          # aws-lc-sys compiles to a static archive under its build dir; its
+          # presence is what distinguishes "linked fine" from "never needed".
+          find target/aarch64-unknown-linux-gnu -name 'libaws_lc_*.a' -o -name '*aws-lc-sys*' \
+            | head -20
+          echo "OK: aarch64 binary produced with the aws-lc-rs TLS backend"
