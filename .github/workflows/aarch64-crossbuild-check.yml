@@ -1,21 +1,32 @@
-# TEMPORARY — delete once it has served its purpose (see below).
+# WHY THIS EXISTS
 #
 # `release.yml` cross-compiles `aarch64-unknown-linux-gnu` with `cross`, and that
-# leg runs ONLY on a tag. The reqwest 0.13 bump moved the TLS backend from ring to
-# aws-lc-rs, so that build must now compile `aws-lc-sys` — a cmake/C library —
-# inside the cross container. Nothing had exercised it, which meant the first
-# proof would have been a failed release.
+# leg runs ONLY on a tag. So a change that breaks it is invisible until the
+# release is already going out, and the failure lands at the worst moment.
 #
-# This reproduces exactly the aarch64 leg of `release.yml`'s build matrix (same
+# That is not hypothetical. reqwest 0.13 moved the TLS backend from ring to
+# aws-lc-rs, which means the aarch64 build must now compile `aws-lc-sys` — a
+# cmake/C library — inside the cross container. Nothing exercised it, so the
+# first proof would have been a failed release. This job proved it works
+# (`ELF ... ARM aarch64` plus `libaws_lc_0_43_0_crypto.a`) before the tag.
+#
+# It reproduces exactly the aarch64 leg of `release.yml`'s build matrix — same
 # runner, same toolchain action, same `cargo install cross --locked`, same
-# `cross build --release`) and nothing else — no tag, no publish, no artifacts.
-# Run it from the Actions tab against a branch before tagging.
+# `cross build --release` — and nothing else: no tag, no publish, no artifacts.
 #
-# It cannot be checked locally: the maintainer's devbox/Nix toolchain makes
-# `cross` derive an invalid rustup toolchain name from `rustc --print sysroot`,
-# a failure mode CI does not have. A container probe confirmed the cross image
-# ships cmake 3.23.1, cc, aarch64-linux-gnu-gcc, make and perl, so the
-# prerequisites are present — this proves the actual build.
+# KEPT DELIBERATELY, not temporary. It is scoped to PRs that touch `Cargo.toml` /
+# `Cargo.lock` / this file, so it costs nothing on unrelated PRs and fires exactly
+# when the dependency graph — the thing that can break a C-library cross-build —
+# actually changed. It is the only pre-tag coverage of that leg.
+#
+# It cannot be replaced by a local check: a devbox/Nix toolchain makes `cross`
+# derive an invalid rustup toolchain name from `rustc --print sysroot`, a failure
+# mode CI does not have. Verified separately that the cross image ships cmake
+# 3.23.1, cc, aarch64-linux-gnu-gcc, make and perl.
+#
+# The final step asserts the ARTIFACT rather than the exit status, because a
+# host-arch fallback would otherwise read as success — and because a pipeline
+# during this work reported exit 0 for a build that had in fact failed.
 name: aarch64 cross-build check
 
 on:
