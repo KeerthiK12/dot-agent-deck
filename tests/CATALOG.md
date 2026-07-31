@@ -471,6 +471,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** modal rendering or actual close dispatch (`prompt/close-confirm/005` covers the PTY-attached behavior).
 - **Platform coverage:** mac+linux+windows.
 
+##### status/supersede/003 — A delayed outgoing `SessionEnd` cannot erase the live replacement card from its pane.
+- **Layer:** L1 (in-process terminal event applied through `AppState::apply_event`).
+- **Agent:** none (synthetic ClaudeCode generations).
+- **Asserts:** after live agent B establishes a card, a newer-stamped `SessionEnd` from outgoing agent A on the same pane leaves B's card present instead of leaving the live pane with zero cards.
+- **Does not assert:** daemon hook transport, placeholder restoration for the ending session, or rendered card layout.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/004 — Reordered same-session activity cannot weaken the outgoing-straggler guard.
+- **Layer:** L1 (in-process reordered events applied through `AppState::apply_event`).
+- **Agent:** none (synthetic Pi generations).
+- **Asserts:** live agent B established at T=30 survives an outgoing agent A straggler at T=20 even after B's delayed same-session event at T=10 is delivered between them.
+- **Does not assert:** daemon socket task scheduling or that the outgoing straggler is dropped entirely; only the live card's survival is required.
+- **Platform coverage:** mac+linux+windows.
+
 ### Agent protocol
 
 #### protocol/live-target

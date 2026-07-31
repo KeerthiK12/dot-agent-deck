@@ -151,3 +151,81 @@ fn status_supersede_002_replaced_armed_session_identity_resolves_as_vanished() {
         "session replacement must not leave the armed generation beside the live one"
     );
 }
+
+/// Scenario: A live agent B owns a pane when a delayed `SessionEnd` arrives from outgoing agent A with a newer timestamp. Because a terminal event announces a generation ending rather than taking over, B's live card must remain visible on the pane.
+#[spec("status/supersede/003")]
+#[test]
+fn status_supersede_003_outgoing_session_end_keeps_the_live_card() {
+    let live_timestamp = Utc::now();
+    let live = event(
+        "live-agent-session",
+        AgentType::ClaudeCode,
+        EventType::Thinking,
+        Some("live-agent-id"),
+        live_timestamp,
+    );
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.apply_event(live);
+
+    assert!(
+        state.sessions.contains_key("live-agent-session"),
+        "precondition: agent B has a live card on the pane"
+    );
+
+    let outgoing_end = event(
+        "outgoing-agent-session",
+        AgentType::ClaudeCode,
+        EventType::SessionEnd,
+        Some("outgoing-agent-id"),
+        live_timestamp + Duration::seconds(1),
+    );
+    state.apply_event(outgoing_end);
+
+    assert!(
+        state.sessions.contains_key("live-agent-session"),
+        "a SessionEnd from outgoing agent A removed live agent B's card, leaving zero cards on a live pane — the inverse of the two-cards bug"
+    );
+}
+
+/// Scenario: A live agent B card established at T=30 receives its own delayed T=10 event because hook sends use separate accepted connections and spawned tasks, so production delivery can reorder. An outgoing agent A straggler at T=20 must not retire B after that same-session delay.
+#[spec("status/supersede/004")]
+#[test]
+fn status_supersede_004_reordered_same_session_event_cannot_weaken_the_guard() {
+    let t30 = Utc::now();
+    let live = event(
+        "live-agent-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("live-agent-id"),
+        t30,
+    );
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.apply_event(live);
+
+    let delayed_same_session = event(
+        "live-agent-session",
+        AgentType::Pi,
+        EventType::Idle,
+        Some("live-agent-id"),
+        t30 - Duration::seconds(20),
+    );
+    state.apply_event(delayed_same_session);
+
+    let outgoing_straggler = event(
+        "outgoing-agent-session",
+        AgentType::Pi,
+        EventType::Idle,
+        Some("outgoing-agent-id"),
+        t30 - Duration::seconds(10),
+    );
+    state.apply_event(outgoing_straggler);
+
+    assert!(
+        state.sessions.contains_key("live-agent-session"),
+        "a reordered same-session event moved last_activity backward and let an outgoing-agent straggler retire the LIVE card"
+    );
+}
