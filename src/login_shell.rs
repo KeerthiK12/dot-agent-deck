@@ -27,10 +27,27 @@ use std::time::{Duration, Instant};
 /// Upper bound on the login-shell capture. An interactive login shell sourcing
 /// the user's profile *and* `~/.bashrc` is normally well under a second, but a
 /// heavy interactive setup (nvm / conda / rbenv init, version-manager hooks)
-/// can take longer, so we allow generous headroom. The bound only ever bites a
-/// hung shell — a healthy one exits in milliseconds — and on timeout we fall
-/// back to the inherited PATH (no regression).
-const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+/// can take longer, so we allow generous headroom. On timeout we fall back to
+/// the inherited PATH (no regression).
+///
+/// **Public because it is a startup-latency budget the *launcher* must respect,
+/// not a private implementation detail.** This capture runs at `daemon serve`
+/// startup (`main`'s `DaemonCmd::Serve` arm) *before* the daemon binds its
+/// endpoint, so it is time the lazy-spawn launcher spends waiting for a socket
+/// that cannot exist yet. If
+/// [`crate::daemon_attach::DAEMON_START_POLL_TIMEOUT`] were ever less than this
+/// bound, every first attach on a machine whose interactive shell is merely
+/// *slow* — not hung — would fail deterministically while the daemon it spawned
+/// went on to bind successfully seconds later, leaving an orphan and an error
+/// that disappears on retry. That is exactly the bug this constant's visibility
+/// prevents from recurring; the coupling is asserted in
+/// `daemon_attach`'s tests.
+///
+/// Note the bound does NOT only bite a hung shell, which is what the earlier
+/// wording here implied: a real `zsh -ilc` with `compinit` + a plugin manager +
+/// generated completions measures ~6s, so healthy-but-slow is the common case
+/// this budget exists for.
+pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the capture polls the child for completion while waiting.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
