@@ -715,7 +715,16 @@ fn card_border_at_mid(status: SessionStatus) -> (Color, Modifier) {
 /// encodes STATUS — the SAME role the deck card uses (`src/terminal_widget.rs`
 /// resolves it from the centralized [`palette`]). With `status = None` the
 /// widget keeps the legacy focus-only border (focused → Cyan, else dimmed).
-fn pane_border_at_mid(status: Option<SessionStatus>, focused: bool) -> (Color, Modifier) {
+///
+/// Issue #88 follow-up: `input_active` is the `UiMode::PaneInput` bit. The Cyan
+/// `focused` accent now requires it, so `focused=true, input_active=false`
+/// (command mode) falls through to the status role and thickens the border
+/// instead — read the glyph with [`border_glyph_at_mid`] to see that.
+fn render_pane_border_buffer(
+    status: Option<SessionStatus>,
+    focused: bool,
+    input_active: bool,
+) -> ratatui::buffer::Buffer {
     let area = Rect {
         x: 0,
         y: 0,
@@ -729,13 +738,32 @@ fn pane_border_at_mid(status: Option<SessionStatus>, focused: bool) -> (Color, M
         Some(s) => format!("{s:?}"),
         None => "pane".to_string(),
     };
-    let mut widget = TerminalWidget::new(parser, title, focused);
+    let mut widget = TerminalWidget::new(parser, title, focused).with_input_active(input_active);
     if let Some(s) = status {
         widget = widget.with_status(s);
     }
     let mut buf = ratatui::buffer::Buffer::empty(area);
     widget.render(area, &mut buf);
-    border_style_at_mid(&buf)
+    buf
+}
+
+/// Resolved `(fg, modifier)` of an embedded pane's border. See
+/// [`render_pane_border_buffer`] for the fixture geometry.
+fn pane_border_at_mid(
+    status: Option<SessionStatus>,
+    focused: bool,
+    input_active: bool,
+) -> (Color, Modifier) {
+    border_style_at_mid(&render_pane_border_buffer(status, focused, input_active))
+}
+
+/// The border GLYPH at the same mid-height left-edge cell `border_style_at_mid`
+/// samples. `BorderType::Plain` paints `│` there and `BorderType::Thick` paints
+/// `┃`, so this is how a test tells the two border weights apart — the channel
+/// that carries focus once colour is reserved for liveness (issue #88 follow-up).
+fn border_glyph_at_mid(buffer: &ratatui::buffer::Buffer) -> String {
+    let y = buffer.area().height / 2;
+    buffer[(0, y)].symbol().to_string()
 }
 
 /// The six status roles in the centralized palette and the named-ANSI color each
@@ -804,7 +832,7 @@ fn palette_001_deck_card_border_is_status_role() {
 fn palette_002_pane_border_matches_deck_status_color() {
     for (status, role) in status_role_colors() {
         let card_fg = card_border_at_mid(status.clone()).0;
-        let pane_fg = pane_border_at_mid(Some(status.clone()), false).0;
+        let pane_fg = pane_border_at_mid(Some(status.clone()), false, true).0;
         assert_eq!(
             pane_fg, card_fg,
             "embedded pane border for {status:?} must match the deck card's status color \
@@ -866,19 +894,21 @@ fn palette_003_selected_card_border_is_magenta_bold_marker() {
     );
 }
 
-/// Scenario: Render a FOCUSED embedded pane and assert its border is the
-/// dedicated `focused` accent role — Color::Cyan — and that this color is
-/// distinct from every status role (green/blue/yellow/red/dark-gray) and from
-/// the `selected` accent (magenta). This pins the Option-A split that keeps
-/// focus on Cyan while selection moves to Magenta, so status/selection/focus
-/// are provably distinct. Then render a pane that is focused AND carries a real
-/// `Working` status and assert its border is still Cyan (the focused accent),
-/// NOT Green (the Working status color) — locking the precedence invariant that
-/// focus OVERRIDES a present status color.
+/// Scenario: Render a FOCUSED, LIVE (`UiMode::PaneInput`) embedded pane and
+/// assert its border is the dedicated `focused` accent role — Color::Cyan — and
+/// that this color is distinct from every status role
+/// (green/blue/yellow/red/dark-gray) and from the `selected` accent (magenta).
+/// This pins the Option-A split that keeps focus on Cyan while selection moves
+/// to Magenta, so status/selection/focus are provably distinct. Then render a
+/// pane that is focused AND live AND carries a real `Working` status and assert
+/// its border is still Cyan (the focused accent), NOT Green (the Working status
+/// color) — locking the precedence invariant that focus OVERRIDES a present
+/// status color while the pane is accepting input. (The command-mode half of
+/// that precedence — focused but NOT live — is `theme/palette/005`.)
 #[spec("theme/palette/004")]
 #[test]
 fn palette_004_focused_pane_border_is_cyan_distinct() {
-    let (fg, _modifier) = pane_border_at_mid(None, true);
+    let (fg, _modifier) = pane_border_at_mid(None, true, true);
     assert_eq!(
         fg,
         Color::Cyan,
@@ -905,7 +935,7 @@ fn palette_004_focused_pane_border_is_cyan_distinct() {
     // accent (Cyan), never the Working/Green status color — locking Option A's
     // "focused overrides status" rule in the unified border precedence.
     let (focused_with_status_fg, _modifier) =
-        pane_border_at_mid(Some(SessionStatus::Working), true);
+        pane_border_at_mid(Some(SessionStatus::Working), true, true);
     assert_eq!(
         focused_with_status_fg,
         Color::Cyan,
@@ -918,6 +948,80 @@ fn palette_004_focused_pane_border_is_cyan_distinct() {
         "focus must OVERRIDE a present status: the border must not fall back to the \
          Working-status Green when the pane is focused"
     );
+}
+
+/// Scenario: Render the SAME focused embedded pane twice — once live
+/// (`UiMode::PaneInput`, keystrokes reach it) and once in command mode
+/// (`Ctrl+D` pressed, keys drive the deck) — and assert the two are visually
+/// distinguishable. Live keeps the Cyan `focused` accent on a thin `│` border;
+/// command mode drops the accent to the agent's own `Working`/Green status color
+/// and thickens the border to `┃`, so colour reports whether keystrokes land
+/// here while thickness still reports which pane is focused.
+#[spec("theme/palette/005")]
+#[test]
+fn palette_005_command_mode_focused_pane_drops_cyan_accent() {
+    let working = Some(SessionStatus::Working);
+
+    // Live: unchanged from palette_004 — Cyan accent, thin border.
+    let live = render_pane_border_buffer(working.clone(), true, true);
+    let (live_fg, _) = border_style_at_mid(&live);
+    assert_eq!(
+        live_fg,
+        Color::Cyan,
+        "a focused pane that is ACCEPTING INPUT must keep the `focused` accent (Cyan), \
+         got {live_fg:?}"
+    );
+
+    // Command mode: the accent is withheld, so the border reports what the
+    // agent is DOING instead of falsely advertising "type here".
+    let parked = render_pane_border_buffer(working.clone(), true, false);
+    let (parked_fg, _) = border_style_at_mid(&parked);
+    assert_eq!(
+        parked_fg,
+        Color::Green,
+        "a focused pane in COMMAND MODE must fall through to its agent's status role \
+         (Working=Green), got {parked_fg:?}"
+    );
+    assert_ne!(
+        parked_fg,
+        Color::Cyan,
+        "command mode must NOT render the `focused` accent — that cyan border is the \
+         signal that keystrokes reach the pane, and in command mode they do not"
+    );
+
+    // The two modes must be tellable apart at all — the whole point of the
+    // change. A regression that reinstates the accent unconditionally trips here
+    // even if the assertions above are somehow satisfied.
+    assert_ne!(
+        live_fg, parked_fg,
+        "live and command mode must resolve to DIFFERENT border colors, both were {live_fg:?}"
+    );
+
+    // FOCUS SURVIVES: thickness takes over the job colour just gave up, so a
+    // multi-pane mode tab still shows which pane `Ctrl+D` / `Enter` returns to.
+    let live_glyph = border_glyph_at_mid(&live);
+    let parked_glyph = border_glyph_at_mid(&parked);
+    assert_eq!(
+        live_glyph, "│",
+        "a live focused pane keeps the thin (Plain) border, got {live_glyph:?}"
+    );
+    assert_eq!(
+        parked_glyph, "┃",
+        "a focused pane in command mode must thicken its border so focus stays legible \
+         once the cyan accent is gone, got {parked_glyph:?}"
+    );
+
+    // An UNFOCUSED pane must not thicken in either mode — thickness means
+    // "focused", so it has to stay exclusive to the focused pane.
+    for input_active in [true, false] {
+        let unfocused = render_pane_border_buffer(working.clone(), false, input_active);
+        let glyph = border_glyph_at_mid(&unfocused);
+        assert_eq!(
+            glyph, "│",
+            "an unfocused pane must keep the thin border (input_active={input_active}), \
+             got {glyph:?}"
+        );
+    }
 }
 
 /// Extract the source region of the top-level function whose signature contains

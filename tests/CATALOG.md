@@ -2676,7 +2676,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none (one focused `TerminalWidget`).
 - **Asserts:** rendering a focused embedded pane resolves its border to `Color::Cyan`, and that this color is distinct from every status role (green/blue/yellow/red/dark-gray) and from the `selected` accent (magenta) — focus stays Cyan while selection moves to Magenta, so status/selection/focus are provably distinct (PRD #155 success criterion #3). Also asserts the PRECEDENCE invariant: a pane that is focused AND carries a present `Working` status still renders the focused accent (Cyan), never the Working/Green status color — focus OVERRIDES a present status in the unified border precedence (Option A).
-- **Does not assert:** unfocused-pane status coloring (covered by `theme/palette/002`); pane content rendering.
+- **Does not assert:** unfocused-pane status coloring (covered by `theme/palette/002`); pane content rendering; the command-mode half of the focus precedence (covered by `theme/palette/005`).
+- **Platform coverage:** mac+linux+windows.
+
+##### theme/palette/005 — A focused pane in command mode drops the Cyan accent for its status color and thickens its border.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
+- **Agent:** none (one `TerminalWidget` rendered twice, live vs. command mode).
+- **Asserts:** rendering the SAME focused pane with `input_active=true` (`UiMode::PaneInput`) vs. `input_active=false` (command mode) produces visually distinguishable borders — live resolves to `Color::Cyan` on a thin `│` (`BorderType::Plain`) border, command mode falls through to the agent's status role (`Working`=`Color::Green`) on a thick `┃` (`BorderType::Thick`) border — and that the two colors differ, so colour encodes whether keystrokes reach the pane while thickness still encodes which pane is focused. Also asserts an UNFOCUSED pane keeps the thin border in BOTH modes, so thickness stays exclusive to the focused pane.
+- **Does not assert:** that the inner area / PTY size is unaffected by the border weight (`BorderType` never feeds `Block::inner`, and the PRD #84 invariant-3 contract assert covers a regression there); the bottom-bar and hint-string mode cues (covered by the PRD #241 M4 button-bar specs); the status-less focused pane's dim fallback.
 - **Platform coverage:** mac+linux+windows.
 
 

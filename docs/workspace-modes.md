@@ -147,7 +147,9 @@ Side panes in a mode tab support focus, selection, and direct interaction.
 
 ### Focus & Navigation
 
-A cyan border highlights the currently focused pane. Use `j`/`k` (or `Down`/`Up`) to cycle focus through all panes — agent and side panes — in a continuous loop. Press `Esc` to jump focus back to the agent pane. You can also click any pane to focus it.
+A **thicker border** (`┃` rather than `│`) marks the currently focused pane. Use `j`/`k` (or `Down`/`Up`) to cycle focus through all panes — agent and side panes — in a continuous loop. Press `Esc` to jump focus back to the agent pane. You can also click any pane to focus it.
+
+The focused pane's border **turns cyan only while you are typing into it** (PaneInput mode). In command mode every border — focused pane included — shows its agent's status color instead: green for working, blue for thinking, yellow for waiting on you, red for an error, gray for idle. So the border answers two questions at once: its *weight* tells you which pane `Enter` / `Ctrl+d` will drop you into, and its *color* tells you whether your keystrokes are reaching it yet.
 
 ### PaneInput Mode
 

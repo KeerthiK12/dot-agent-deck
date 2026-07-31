@@ -5,7 +5,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
 use crate::palette;
 use crate::state::SessionStatus;
@@ -64,6 +64,22 @@ pub struct TerminalWidget {
     /// focus-only behavior: focused → cyan, else a dimmed terminal foreground.
     /// Set it via [`TerminalWidget::with_status`].
     status: Option<SessionStatus>,
+    /// Issue #88 follow-up: is the UI in `PaneInput` — i.e. do keystrokes
+    /// actually reach this pane right now?
+    ///
+    /// `focused` alone answers "which pane would receive input", which is NOT
+    /// the same question. In command mode the focused pane keeps its focus (it
+    /// is where `Ctrl+D` / `Enter` return you) but accepts no keys, and the
+    /// Cyan `focused` accent used to render identically in both modes — so the
+    /// single loudest border signal claimed "type here" while the keyboard was
+    /// driving the deck. The accent is now gated on this flag: colour encodes
+    /// *liveness* and border THICKNESS encodes focus, so the two facts stop
+    /// competing for one channel.
+    ///
+    /// Defaults to `true` in [`TerminalWidget::new`] (the pre-gating behaviour),
+    /// so a caller that never sets it renders exactly as before. Set it via
+    /// [`TerminalWidget::with_input_active`].
+    input_active: bool,
     /// PRD #84 M5 (invariant 3): when `true`, the caller attests that the
     /// upstream layout/resize contract held for this pane — i.e. its PTY was
     /// sized to this widget's inner area by `resize_panes_to_layout` earlier in
@@ -84,8 +100,19 @@ impl TerminalWidget {
             title,
             focused,
             status: None,
+            input_active: true,
             contract_guaranteed: false,
         }
+    }
+
+    /// Issue #88 follow-up: tell the widget whether keystrokes currently reach
+    /// this pane (`UiMode::PaneInput`). Passing `false` withholds the Cyan
+    /// `focused` accent so the border falls through to the agent's STATUS
+    /// colour, and thickens the focused pane's border so focus stays legible
+    /// without borrowing the colour channel. See the `input_active` field doc.
+    pub fn with_input_active(mut self, input_active: bool) -> Self {
+        self.input_active = input_active;
+        self
     }
 
     /// PRD #155 (Option A): make the pane border STATUS-aware. When the pane is
@@ -127,7 +154,15 @@ impl Widget for TerminalWidget {
         // status it falls back to a dimmed terminal foreground. The pane block is
         // left unfilled so the terminal's background shows through (no absolute
         // `terminal_bg` slab).
-        let border_style = if self.focused {
+        //
+        // Issue #88 follow-up: the `focused` accent additionally requires
+        // `input_active`. Focus and liveness are different facts, and packing
+        // both into one colour made command mode invisible — a focused pane
+        // looked the same whether or not it was accepting keys. Now colour
+        // answers "do my keystrokes land here?" and thickness answers "which
+        // pane is focused?", so command mode is legible AND the border reports
+        // what every agent is doing while you navigate the deck.
+        let border_style = if self.focused && self.input_active {
             Style::default().fg(palette::FOCUSED)
         } else if let Some(status) = self.status.as_ref() {
             Style::default().fg(palette::status_color(status))
@@ -137,8 +172,19 @@ impl Widget for TerminalWidget {
                 .add_modifier(Modifier::DIM)
         };
 
+        // Thickness carries focus in command mode, where the colour no longer
+        // can. `BorderType` never affects `Block::inner`, so the inner area —
+        // and therefore the PTY size and the PRD #84 invariant-3 contract below
+        // — is byte-for-byte unchanged by this.
+        let border_type = if self.focused && !self.input_active {
+            BorderType::Thick
+        } else {
+            BorderType::Plain
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(border_type)
             .border_style(border_style)
             // Borrow the title (no per-frame clone): the block is consumed by
             // `block.render` below, releasing the borrow, so `self.title` stays

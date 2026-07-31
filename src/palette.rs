@@ -15,11 +15,35 @@
 //! always visually distinct. The unified border-resolution precedence is:
 //!
 //! 1. **selected** → [`SELECTED`] (Magenta) + BOLD + the `▸ ` title marker.
-//! 2. else **focused** → [`FOCUSED`] (Cyan).
+//! 2. else **focused AND live** → [`FOCUSED`] (Cyan).
 //! 3. else → the agent's **status** role ([`status_color`]).
 //!
 //! The per-card status **badge** always shows status, so the accent override
 //! in (1)/(2) never loses status information.
+//!
+//! ### Why (2) requires "live" (issue #88 follow-up)
+//!
+//! For an **embedded pane**, "focused" and "keystrokes reach it" are different
+//! facts: in command mode the focused pane is still the one `Ctrl+D` / `Enter`
+//! return you to, but it accepts no keys. The Cyan accent originally rendered
+//! in both cases, which made the loudest border signal on screen claim "type
+//! here" while the keyboard was driving the deck — the mode was invisible on a
+//! full-screen mode tab, where nothing else in the frame changes.
+//!
+//! So for panes, (2) applies only in `UiMode::PaneInput`
+//! (`TerminalWidget::with_input_active`). In command mode the focused pane
+//! falls through to (3) and reports its agent's status like any other pane,
+//! while **border thickness** (`BorderType::Thick`) carries focus instead.
+//! Colour answers "are my keystrokes landing here?", thickness answers "which
+//! pane is focused?" — one channel each, no longer competing. A **deck card**
+//! has no input mode, so its precedence is unchanged.
+//!
+//! Thickness was chosen over a fourth accent colour because the 16-colour-safe
+//! palette is full (green/blue/yellow/red are statuses, cyan is focus, magenta
+//! is selection) and the remaining candidates are grays — the exact
+//! light-background hazard PRD #13 exists to prevent. `BorderType` never feeds
+//! `Block::inner`, so it costs no layout: the pane's inner area, its PTY size,
+//! and the PRD #84 invariant-3 contract are all unaffected.
 //!
 //! All roles are **named ANSI** colors only — no absolute `Color::Rgb`, which
 //! the theme guards (`theme/contrast/001`) forbid so terminal themes can remap

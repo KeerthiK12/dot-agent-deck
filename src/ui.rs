@@ -11404,6 +11404,7 @@ fn render_frame(
                 &pane_status,
                 &ui.selection,
                 None,
+                ui.mode == UiMode::PaneInput,
                 Some(&pane_outer_rects),
             );
         }
@@ -11493,6 +11494,7 @@ fn render_frame(
                 &pane_status,
                 &ui.selection,
                 None,
+                ui.mode == UiMode::PaneInput,
                 Some(&pane_outer_rects),
             );
         }
@@ -11610,6 +11612,7 @@ fn render_frame(
             &pane_status,
             &ui.selection,
             None,
+            ui.mode == UiMode::PaneInput,
             Some(&pane_outer_rects),
         );
     }
@@ -11702,6 +11705,13 @@ fn render_terminal_panes(
     pane_status: &HashMap<&str, SessionStatus>,
     selection: &Option<TextSelection>,
     visual_focus_id: Option<&str>,
+    // Issue #88 follow-up: is the UI in `PaneInput` (do keystrokes reach the
+    // focused pane right now)? Threaded to `TerminalWidget::with_input_active`
+    // so the Cyan `focused` accent appears ONLY when the pane is actually live.
+    // In command mode the focused pane's border falls through to its agent's
+    // status colour and thickens instead, which is what makes the mode visible
+    // on a full-screen mode tab where nothing else on screen changes.
+    input_active: bool,
     // PRD #84: per-pane OUTER rects (aligned 1:1 with `pane_ids`) precomputed by
     // `compute_frame_layout` — the SAME rects `resize_panes_to_layout` sized the
     // PTYs to this frame. `Some` => draw into exactly those; `None` => recompute
@@ -11773,7 +11783,8 @@ fn render_terminal_panes(
                     // PRD #84 M5: this pane was sized to `chunks[i]` by
                     // `resize_panes_to_layout` this frame, so attest the contract.
                     let mut widget = TerminalWidget::new(Arc::clone(&screen), title, focused)
-                        .contract_guaranteed(true);
+                        .contract_guaranteed(true)
+                        .with_input_active(input_active);
                     // PRD #155 (M3): supply the pane's status so a non-focused
                     // pane renders its status-colored border via the palette (the
                     // focus override stays inside TerminalWidget). Panes without a
@@ -11804,7 +11815,8 @@ fn render_terminal_panes(
                         // by `resize_panes_to_layout` this frame — attest it.
                         let mut widget =
                             TerminalWidget::new(Arc::clone(&screen), title, is_focused)
-                                .contract_guaranteed(true);
+                                .contract_guaranteed(true)
+                                .with_input_active(input_active);
                         // PRD #155 (M3): same status threading as the Tiled arm.
                         if let Some(status) = pane_status.get(pane_id.as_str()) {
                             widget = widget.with_status(status.clone());
@@ -11950,6 +11962,7 @@ fn render_mode_tab(
             pane_status,
             &ui.selection,
             agent_visual_focus,
+            ui.mode == UiMode::PaneInput,
             // Mode-tab panes recompute their rects (out of the Cards finding's
             // scope); the agent pane is a single Stacked pane filling agent_area.
             None,
@@ -11971,6 +11984,7 @@ fn render_mode_tab(
             pane_status,
             &ui.selection,
             side_visual_focus.as_deref(),
+            ui.mode == UiMode::PaneInput,
             // Mode side panes recompute via pane_stack_rects (Tiled) — same
             // split as the `side_pane_rects` above; out of the Cards finding's scope.
             None,
