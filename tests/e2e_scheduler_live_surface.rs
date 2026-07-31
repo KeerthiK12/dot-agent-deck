@@ -14,16 +14,32 @@
 //! fires are triggered with the existing `RunNow` control message over the
 //! deck's attach socket (no real LLM, no real-time cron wait).
 //!
-//! RED today (the symptoms this pins):
-//!   - `live/001`: a fire with a NON-hook command (`cat`) registers an agent in
-//!     the daemon but NEVER paints a card on the attached dashboard, because the
-//!     BroadcastMsg stream carries no "agent-spawned" message and
-//!     `hydrate_from_daemon` only wires daemon agents at TUI startup.
-//!   - `live/002`: a fire whose agent emits a `SessionStart` hook DOES paint a
-//!     card (the hook event reaches the attached TUI over the existing event
-//!     stream), but the card is not backed by a local pane, so FOCUSING it makes
-//!     `focus_deck` treat it as stale and DELETE it — the card vanishes instead
-//!     of becoming usable.
+//! All four tests here are GREEN and have been since the fixes below landed —
+//! do NOT read them as known-failing. A failure in this file is a real
+//! regression at the live-surfacing / supersession seam (issue #284: an earlier
+//! stale `RED today:` note here caused exactly that misclassification, so an
+//! investigation stopped looking at a genuine break).
+//!
+//! What each one pins, and the fix it guards:
+//!   - `live/001`: a fire with a NON-hook command (`cat`) paints a card on the
+//!     ALREADY-ATTACHED dashboard. Was RED when written — the daemon registered
+//!     the agent but no broadcast carried it, and `hydrate_from_daemon` wires
+//!     daemon agents only at TUI startup. Closed by `ed0c3bf`, which publishes a
+//!     synthetic `SessionStart` for single-agent fires (`surface_spawned_pane`)
+//!     through the daemon's existing hook-event broadcast.
+//!   - `live/002`: focusing such a card KEEPS it and makes it usable. Was RED —
+//!     the card is backed by a live daemon agent but not by a local pane, so
+//!     `focus_deck` treated it as stale and deleted it. Closed by `ed0c3bf`,
+//!     which attaches the daemon's pane on demand (`try_hydrate_pane`) and
+//!     retries `focus_pane` before writing the card off.
+//!   - `live/003`: the live-surfaced card's TITLE shows the schedule's friendly
+//!     name, not the truncated spawn pane id. Was RED; closed by `b0bdc4b`,
+//!     which threads the task name onto the synthetic `SessionStart` as
+//!     `metadata["display_name"]` and onto `SessionState.display_name`.
+//!   - `live/004`: that friendly title SURVIVES the agent's real `SessionStart`
+//!     hook superseding the placeholder. Was RED; closed by `ccadbbc`, which
+//!     captures the retired session's `display_name` (keyed by the stable pane
+//!     id) and seeds the replacement session with it. Shipped green in v0.35.0.
 
 mod common;
 
@@ -63,9 +79,11 @@ fn run_now(deck: &TuiDeck, name: &str) {
 /// then fire the schedule via the `RunNow` control message WITHOUT detaching.
 /// First confirm the daemon actually spawned the agent (it appears in the
 /// registry under the task's display name), then assert a card for it surfaces
-/// LIVE on the rendered dashboard. RED today: the daemon has the agent but the
-/// attached TUI never paints a card (it stays on "No active sessions"), because
-/// no "agent-spawned" broadcast triggers live hydration.
+/// LIVE on the rendered dashboard. Pins live surfacing for a bare (hookless)
+/// command: green since `ed0c3bf` publishes a synthetic `SessionStart` for
+/// single-agent fires. When written this was RED — the daemon had the agent but
+/// the attached TUI stayed on "No active sessions", because no broadcast
+/// triggered live hydration.
 #[spec("scheduler/live/001")]
 #[test]
 fn live_001_scheduled_card_surfaces_to_attached_tui() {
@@ -103,9 +121,10 @@ fn live_001_scheduled_card_surfaces_to_attached_tui() {
         "the daemon must spawn the scheduled agent (precondition for live surfacing)"
     );
 
-    // The bug: a card must appear on the ALREADY-ATTACHED dashboard, live, with
-    // no disconnect/reconnect. RED today — the dashboard stays on its empty
-    // state and `wait_for_string` times out with the empty grid shown.
+    // The pin: a card must appear on the ALREADY-ATTACHED dashboard, live, with
+    // no disconnect/reconnect. If this times out with the empty grid shown, the
+    // dashboard is back to its pre-`ed0c3bf` behaviour and live surfacing has
+    // regressed.
     deck.wait_for_string("livecard");
 }
 
@@ -115,9 +134,11 @@ fn live_001_scheduled_card_surfaces_to_attached_tui() {
 /// the daemon-spawned agent's own `DOT_AGENT_DECK_PANE_ID` (read back from the
 /// registry). That paints a card on the attached dashboard. Press `1` to focus
 /// the card. The card must SURVIVE and become usable (the TUI enters PaneInput
-/// mode on the re-hydrated pane). RED today: the card is not backed by a local
-/// pane, so `focus_deck` treats it as stale and DELETES it — focus never enters
-/// PaneInput mode because the card vanishes.
+/// mode on the re-hydrated pane). Pins on-demand pane hydration on focus: green
+/// since `ed0c3bf` retries `focus_pane` after `try_hydrate_pane`. When written
+/// this was RED — the card is backed by a live daemon agent but not by a local
+/// pane, so `focus_deck` treated it as stale and DELETED it, and focus never
+/// reached PaneInput mode because the card vanished.
 #[spec("scheduler/live/002")]
 #[test]
 fn live_002_focusing_scheduled_card_does_not_delete_it() {
@@ -185,10 +206,10 @@ fn live_002_focusing_scheduled_card_does_not_delete_it() {
     // Focus the (only) card with the `1` jump key → `focus_deck`.
     deck.send_keys(b"1");
 
-    // GREEN-only signal: focusing a card backed by a live daemon agent must
-    // re-hydrate its pane and enter PaneInput mode (the card stays usable). RED
-    // today: `focus_deck` deletes the orphan card instead, so PaneInput mode is
-    // never reached and this times out with the card gone.
+    // The pin: focusing a card backed by a live daemon agent must re-hydrate its
+    // pane and enter PaneInput mode (the card stays usable). If this times out
+    // with the card gone, `focus_deck` is deleting the orphan card again instead
+    // of hydrating it.
     deck.wait_for_string("PaneInput mode");
 
     drop(scratch);
@@ -201,9 +222,11 @@ fn live_002_focusing_scheduled_card_does_not_delete_it() {
 /// under its friendly name (precondition) and the card surfaced live (its Dir
 /// line shows `runbox`), assert the card's TITLE shows the friendly schedule
 /// name `morning-digest` — matching what a disconnect/reconnect already renders
-/// — and is NOT the truncated pane-id form (`… · sched-morni…`). RED today: the
-/// live-surfacing path titles the card from the spawned pane id, so the header
-/// reads `No agent · sched-morni` instead of the schedule's name.
+/// — and is NOT the truncated pane-id form (`… · sched-morni…`). Pins title
+/// parity between the live path and a reconnect: green since `b0bdc4b` threads
+/// the task name onto the synthetic `SessionStart` as `metadata["display_name"]`.
+/// When written this was RED — the live-surfacing path titled the card from the
+/// spawned pane id, so the header read `No agent · sched-morni`.
 #[spec("scheduler/live/003")]
 #[test]
 fn live_003_scheduled_card_title_shows_friendly_name() {
@@ -260,8 +283,9 @@ fn live_003_scheduled_card_title_shows_friendly_name() {
 
     let grid = deck.snapshot_grid();
 
-    // DESIRED (matches a reconnect): the live-surfaced card's TITLE shows the
-    // friendly schedule name. Because the cwd basename is `runbox` and the
+    // The pin (title parity with a reconnect, which reads the friendly name from
+    // the daemon registry's `display_name`): the live-surfaced card's TITLE shows
+    // the friendly schedule name. Because the cwd basename is `runbox` and the
     // placeholder card renders no prompt, `morning-digest` can ONLY appear on
     // the grid via the card header — so this is a title assertion, not a stray
     // substring match.
@@ -298,9 +322,13 @@ fn live_003_scheduled_card_title_shows_friendly_name() {
 /// and a fresh live card replaces it). After the supersession lands (the card
 /// turns from a "No agent" placeholder into a live ClaudeCode agent), assert the
 /// card TITLE STILL shows `morning-digest` and has NOT reverted to the
-/// session-id hash form. RED today: the superseding session is created with
-/// display_name=None, so its title falls back to the session id and the friendly
-/// name vanishes.
+/// session-id hash form. Pins the friendly title across supersession: green
+/// since `ccadbbc` carries the retired placeholder's `display_name` onto the
+/// replacement session, and SHIPPED GREEN in v0.35.0. When written this was RED
+/// — the superseding session was created with display_name=None, so its title
+/// fell back to the session id. This test is also one of the two guards the
+/// reverted `78f92b6` broke, so treat a failure here as a real regression at the
+/// retire predicate (issue #284), never as a known-RED expectation.
 #[spec("scheduler/live/004")]
 #[test]
 fn live_004_real_hook_supersession_keeps_friendly_title() {
@@ -403,17 +431,17 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
 
     let grid = deck.snapshot_grid();
 
-    // DESIRED (matches a reconnect, which reads the friendly name from the daemon
-    // registry's `display_name`): the superseding live card's TITLE STILL shows
-    // `morning-digest`. Because the cwd basename is `runbox`, the only way
-    // `morning-digest` reaches the grid is via the card header. RED today: the
-    // hook creates the session with display_name=None, so the title reverts to
-    // the session-id hash and the friendly name vanishes.
+    // The pin (title parity with a reconnect, which reads the friendly name from
+    // the daemon registry's `display_name`): the superseding live card's TITLE
+    // STILL shows `morning-digest`. Because the cwd basename is `runbox`, the only
+    // way `morning-digest` reaches the grid is via the card header. If this fails,
+    // the retire path dropped the display_name again and the title reverted to
+    // the session-id hash — the pre-`ccadbbc` behaviour.
     assert!(
         grid.contains("morning-digest"),
         "after a real SessionStart hook supersedes the synthetic placeholder, the \
          card TITLE must STILL show the friendly name 'morning-digest' (a reconnect \
-         keeps it). RED: the title reverts to the session-id hash.\nGrid:\n{grid}"
+         keeps it), but it reverted to the session-id hash.\nGrid:\n{grid}"
     );
 
     // ...and must NOT fall back to the session-id hash form. `9f8e7d6c-5b` is the

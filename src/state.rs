@@ -2839,10 +2839,10 @@ impl AppState {
             }
         }
 
-        // PRD #110 follow-up: when a `SessionStart` arrives whose
-        // `agent_id` differs from an existing session on the same
-        // pane, the previous agent has been replaced (F9 clear=true
-        // respawn — the daemon SIGKILLs the old child so no graceful
+        // PRD #110 follow-up: when an event arrives whose `agent_id`
+        // differs from an existing session on the same pane, the
+        // previous agent has been replaced (F9 clear=true respawn —
+        // the daemon SIGKILLs the old child so no graceful
         // `SessionEnd` ever fires). The same-agent reuse guard above
         // doesn't match, so without retiring the stale session here
         // the dashboard would end up with two cards on the same pane:
@@ -2850,6 +2850,70 @@ impl AppState {
         // stale sibling(s) before falling through to the
         // session-create path below so the orchestration deck shows
         // exactly one card per pane after a respawn.
+        //
+        // PRD #284: which events may retire, and on what evidence.
+        // A fresh `agent_id` is minted per spawn, so ANY event bearing
+        // one that differs already proves the pane changed hands —
+        // `SessionStart` was never what made that inference valid, it
+        // is merely the frame most hook-based agents happen to send
+        // first. Pi sends none at all (its extension reports through
+        // `dot-agent-deck agent-event`, whose vocabulary is
+        // running/waiting/finished), so a respawned Pi worker's first
+        // frame is a `Thinking`/`Idle` carrying the NEW agent id, and
+        // gating on `SessionStart` left it stacking a second permanent
+        // card on the pane (`status/agent-event/005`).
+        //
+        // The two admissible frames differ in the evidence they carry,
+        // so they are admitted on different terms:
+        //
+        //   * `SessionStart` is the incoming generation ANNOUNCING
+        //     itself: self-describing and authoritative, so the
+        //     takeover is asserted rather than inferred. Its producer
+        //     timestamp is NOT evidence about ordering and must not be
+        //     weighed — a real hook can legitimately be stamped
+        //     EARLIER than the card it supersedes, because the
+        //     superseded card's `last_activity` is bumped by whatever
+        //     happened after it was created. A scheduler's synthetic
+        //     `No agent` placeholder is exactly that: the agent's real
+        //     `SessionStart` routinely carries an older stamp than the
+        //     placeholder it must retire (`status/supersede/001`,
+        //     `scheduler/live/004`).
+        //
+        //     Residual, unchanged from pre-#284: a LATE `SessionStart`
+        //     from the OUTGOING agent would retire the live card. That
+        //     frame is not hypothetical — PRD #92 F9 followup-7
+        //     (see [`wait_for_session_start`]) documents a slow-booting
+        //     old agent firing one inside the subscribe→kill window —
+        //     but there it precedes the new agent's boot, so it lands
+        //     before the live card exists and the new agent's own start
+        //     retires it in turn. Ordering it correctly needs a per-pane
+        //     GENERATION discriminator, not a timestamp; `pane_hook_session`
+        //     already tracks one but is keyed on hook session ids the
+        //     retire path cannot resolve. Left as-is deliberately:
+        //     admitting it here is exactly the pre-existing behaviour
+        //     that ships in v0.35.0, so #284 neither widens nor narrows
+        //     it, and narrowing it on a timestamp is what broke case B.
+        //
+        //   * A non-`SessionStart` frame (`Thinking`, `Idle`, tool
+        //     traffic) is NOT self-describing: the generation change is
+        //     INFERRED from the changed `agent_id` alone, and the very
+        //     same shape is produced by a DELAYED frame from the
+        //     OUTGOING agent, which must not evict the card the
+        //     incoming one just established. For that inference the
+        //     timestamp is the only available discriminator, so an
+        //     inferred retire additionally requires the event to be no
+        //     older than the session it would replace
+        //     (`status/agent-event/006`).
+        //
+        // Net effect: this is a pure WIDENING of the pre-#284
+        // `SessionStart`-only gate. Every frame that could retire
+        // before still retires on identical terms, so the pane-close
+        // semantics keyed on session identity (`prompt/close-confirm/005`,
+        // `status/supersede/002`) are untouched; only the previously
+        // ignored non-`SessionStart` case is added, and it is added
+        // under a guard. Applying the monotonicity check to
+        // `SessionStart` too — what the reverted `78f92b6` did — is
+        // what traded case B for case A.
         //
         // Backward-compat (auditor finding #3 follow-up; reaffirmed
         // against CodeRabbit PR #118 finding #1): skip the retire
@@ -2883,10 +2947,10 @@ impl AppState {
         // keyed by the stable pane, so the replacement created below can
         // inherit it when the superseding event carries none.
         let mut inherited_display_name: Option<String> = None;
-        if event.event_type == EventType::SessionStart
-            && event.agent_id.is_some()
+        if event.agent_id.is_some()
             && let Some(ref pane_id) = event.pane_id
         {
+            let announced = event.event_type == EventType::SessionStart;
             let to_remove: Vec<String> = self
                 .sessions
                 .iter()
@@ -2894,6 +2958,10 @@ impl AppState {
                     session.pane_id.as_ref().is_some_and(|p| p == pane_id)
                         && *id != &event.session_id
                         && session.agent_id != event.agent_id
+                        // PRD #284: an announced (`SessionStart`) takeover needs
+                        // no ordering evidence; an INFERRED one may not evict a
+                        // session it is older than.
+                        && (announced || event.timestamp >= session.last_activity)
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
