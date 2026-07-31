@@ -232,13 +232,6 @@ pub struct DashboardStats {
     pub idle: usize,
     pub compacting: usize,
     pub total_tools: u64,
-    /// PRD #20 finding #10: per-agent-type active counts, in registry
-    /// (`agent_registry::ALL`) order, including only real agent types that have
-    /// at least one active session. The stats bar renders a compact breakdown
-    /// (`1 ClaudeCode │ 1 Codex`) from this ONLY when more than one distinct
-    /// agent type is active, so a single-agent dashboard is unchanged. Defaults
-    /// to empty (a hand-built `DashboardStats` carries no breakdown).
-    pub by_agent_type: Vec<(AgentType, usize)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2151,20 +2144,6 @@ impl AppState {
             }
             stats.total_tools += session.tool_count as u64;
         }
-        // PRD #20 finding #10: per-agent-type active counts in stable registry
-        // (`ALL`) order, so the rendered bar / snapshot is deterministic. Only
-        // types with at least one active session are included.
-        stats.by_agent_type = crate::agent_registry::ALL
-            .iter()
-            .filter_map(|spec| {
-                let count = self
-                    .sessions
-                    .values()
-                    .filter(|s| s.agent_type == spec.agent_type)
-                    .count();
-                (count > 0).then(|| (spec.agent_type.clone(), count))
-            })
-            .collect();
         stats
     }
 

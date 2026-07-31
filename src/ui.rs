@@ -12052,20 +12052,16 @@ fn render_stats_bar(
         }
     }
 
-    // PRD #20 finding #10: when more than one real agent type is active, show a
-    // compact per-agent-type breakdown (e.g. `1 ClaudeCode │ 1 Codex`), each in
-    // its registry badge color. A single-agent deck shows nothing extra — the
-    // breakdown would just restate the `active` count.
-    if stats.by_agent_type.len() > 1 {
-        for (agent_type, count) in &stats.by_agent_type {
-            let spec = crate::agent_registry::spec(agent_type);
-            spans.push(Span::styled("  \u{2502}  ", text_dim()));
-            spans.push(Span::styled(
-                format!("{count} {}", spec.label),
-                Style::default().fg(spec.badge_color),
-            ));
-        }
-    }
+    // The per-agent-type breakdown (PRD #20 finding #10) used to render here.
+    // Removed: this bar is drawn into the LAST ROW OF `dashboard_area` — the
+    // left column, narrower than the terminal whenever panes are open — as an
+    // unwrapped Paragraph, so it clips silently at the right edge. One segment
+    // per agent type (~12-18 columns each) pushed the `tools` total and the
+    // `mode:` indicator off-screen on a real multi-agent deck, which is how the
+    // breakdown was actually observed: `… │ 19 idle │ 14 ClaudeCode` and
+    // nothing after it. The information was redundant anyway — every card
+    // already carries its registry-colored type badge (`render_session_card`),
+    // directly under this bar.
 
     // Always show total tools
     spans.push(Span::styled("  \u{2502}  ", text_dim()));

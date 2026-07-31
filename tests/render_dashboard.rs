@@ -173,7 +173,6 @@ fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
         idle: 1,
         compacting: 1,
         total_tools: 42,
-        ..Default::default()
     };
     vec![
         (
@@ -524,20 +523,24 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
     insta::assert_snapshot!("pane_008_named_agent_badges", named_badges);
 }
 
-/// Scenario: Aggregate a dashboard containing one Claude Code session and one
-/// Codex session, then render its stats bar. Because multiple real agent types
-/// are active, the visible bar must include a compact per-type count breakdown.
+/// Scenario: Aggregate a busy mixed deck (14 Claude Code + 8 Codex sessions) and
+/// render its stats bar at 60 columns — the width the bar actually gets, since it
+/// draws into the last row of the left dashboard column whenever panes are open.
+/// The bar must spend that width on the status counts and the `tools` total, with
+/// no per-agent-type breakdown: the breakdown used to consume ~30 columns here and
+/// silently clip the `tools` total off the right edge.
 #[spec("dashboard/stats/001")]
 #[test]
-fn stats_001_mixed_agents_render_per_type_breakdown() {
+fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
     let mut state = AppState::default();
-    for (session_id, pane_id, agent_type) in [
-        ("mixed-claude", "pane-claude", AgentType::ClaudeCode),
-        ("mixed-codex", "pane-codex", AgentType::Codex),
-    ] {
-        state.register_pane(pane_id.to_string());
+    let panes = std::iter::repeat_n(AgentType::ClaudeCode, 14)
+        .chain(std::iter::repeat_n(AgentType::Codex, 8))
+        .enumerate();
+    for (i, agent_type) in panes {
+        let pane_id = format!("pane-{i:02}");
+        state.register_pane(pane_id.clone());
         state.apply_event(AgentEvent {
-            session_id: session_id.to_string(),
+            session_id: format!("mixed-{i:02}"),
             agent_type,
             event_type: EventType::SessionStart,
             tool_name: None,
@@ -546,7 +549,7 @@ fn stats_001_mixed_agents_render_per_type_breakdown() {
             timestamp: chrono::Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
-            pane_id: Some(pane_id.to_string()),
+            pane_id: Some(pane_id.clone()),
             agent_id: Some(format!("agent-{pane_id}")),
             agent_version: None,
             schema_version: None,
@@ -555,11 +558,21 @@ fn stats_001_mixed_agents_render_per_type_breakdown() {
     }
 
     let stats = state.aggregate_stats();
-    let buffer = render_stats_bar_to_buffer(&stats, None, 160, 1);
+    assert_eq!(
+        stats.active, 22,
+        "all 22 mixed-agent sessions count as active"
+    );
+
+    let buffer = render_stats_bar_to_buffer(&stats, None, 60, 1);
     let rendered = buffer_to_text(&buffer);
     assert!(
-        rendered.contains("1 ClaudeCode") && rendered.contains("1 Codex"),
-        "a mixed-agent dashboard must show per-agent-type counts in its stats bar:\n{rendered}"
+        rendered.contains("22 active") && rendered.contains("tools"),
+        "a narrow stats bar must still fit the active count AND the tools total:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("ClaudeCode") && !rendered.contains("Codex"),
+        "the stats bar must not spend its width on a per-agent-type breakdown \
+         (every card already carries a registry-colored type badge):\n{rendered}"
     );
 }
 
