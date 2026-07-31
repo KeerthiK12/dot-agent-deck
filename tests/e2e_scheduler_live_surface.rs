@@ -14,8 +14,11 @@
 //! fires are triggered with the existing `RunNow` control message over the
 //! deck's attach socket (no real LLM, no real-time cron wait).
 //!
-//! All four tests here are GREEN and have been since the fixes below landed —
-//! do NOT read them as known-failing. A failure in this file is a real
+//! All four tests here are GREEN today, and have been since the fixes below
+//! landed — with ONE exception: `78f92b6` widened the retire predicate and made
+//! `/004` RED again for the window it was on the tree, until `8f579dd` reverted
+//! it (see `/004`'s own note below). Outside that window they have been green,
+//! so do NOT read any of them as known-failing. A failure in this file is a real
 //! regression at the live-surfacing / supersession seam (issue #284: an earlier
 //! stale `RED today:` note here caused exactly that misclassification, so an
 //! investigation stopped looking at a genuine break).
@@ -30,8 +33,14 @@
 //!   - `live/002`: focusing such a card KEEPS it and makes it usable. Was RED —
 //!     the card is backed by a live daemon agent but not by a local pane, so
 //!     `focus_deck` treated it as stale and deleted it. Closed by `ed0c3bf`,
-//!     which attaches the daemon's pane on demand (`try_hydrate_pane`) and
-//!     retries `focus_pane` before writing the card off.
+//!     which attaches the daemon's pane on demand and retries `focus_pane`
+//!     before writing the card off — at that point via a
+//!     `downcast_ref::<EmbeddedPaneController>()` calling the new
+//!     `EmbeddedPaneController::hydrate_pane`, and only from `focus_deck`. The
+//!     `PaneController::try_hydrate_pane` trait method that carries this today
+//!     arrived LATER, in `f1e9f82`, which replaced the downcast (untestable —
+//!     it silently no-ops for every controller but the concrete production one)
+//!     and extended the same retry to `Action::Focus`.
 //!   - `live/003`: the live-surfaced card's TITLE shows the schedule's friendly
 //!     name, not the truncated spawn pane id. Was RED; closed by `b0bdc4b`,
 //!     which threads the task name onto the synthetic `SessionStart` as

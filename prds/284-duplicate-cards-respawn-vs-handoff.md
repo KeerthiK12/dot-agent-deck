@@ -34,7 +34,18 @@ The trap: two duplicate-card bugs sit at the **same seam** — the retire predic
 
 Items 3–4 go in a **new `status/supersede/*` sub-area** rather than extending `status/agent-event/*`: case B is a scheduler-placeholder handoff, not an agent-event concern, and a distinct prefix keeps `cargo test-fast status_supersede` targeted.
 
-Every one of the four fast-tier tests must be shown RED against a tree where it *should* fail — items 1–2 against the current (reverted) tree, items 3–4 against a tree with the naive predicate temporarily applied (then reverted). Case B is green today, so a case-B test that passes on first run proves nothing. Toggling in one direction only is precisely how `78f92b6` shipped its defect despite having tests.
+### Toggle verification: what each test is RED against
+
+Every one of the four fast-tier tests must be shown RED against a tree where it *should* fail. Case B is green today, so a case-B test that passes on first run proves nothing, and toggling in one direction only is precisely how `78f92b6` shipped its defect despite having tests. But the tree each test is RED against is **not** the same for all four, and that per-test matrix — not a blanket "all four RED against the reverted tree" — is the contract:
+
+| Catalog ID | RED against | What it actually guards |
+|---|---|---|
+| `status/agent-event/005` | the current (reverted) tree | A true case-A reproduction: a Pi respawn whose first frame is `Thinking`, not `SessionStart`, leaves two cards stacked on one pane under the reverted `SessionStart`-only predicate. |
+| `status/agent-event/006` | **not** the reverted tree — it is GREEN there. RED only under a predicate widened **without** a monotonicity (`timestamp >= last_activity`) check. | A **sensitivity guard against an unguarded widening**, not a reproduction. Restored verbatim, it asserts only that the LIVE card survives a delayed straggler from the outgoing generation; under the old `SessionStart`-only predicate a delayed `Idle` never retires that live card, so the assertion holds and the test passes. It goes RED the moment the predicate is widened to non-start frames with no ordering guard. |
+| `status/supersede/001` | the naive `78f92b6` predicate (temporarily applied, then reverted) | Case B at state level. GREEN on the reverted tree — case B is not broken today. |
+| `status/supersede/002` | the naive `78f92b6` predicate (temporarily applied, then reverted) | The armed-close-target-vanished seam at state level. GREEN on the reverted tree, for the same reason. |
+
+**Correction to the signed-off matrix (2026-07-31).** This section previously required all four tests to be RED against the reverted tree. That is **false and not achievable** while *also* honouring test-plan items 1–2, which restore `/005` and `/006` **verbatim** from `78f92b6`. Verbatim `/006` asserts only the survival of the live card (it tolerates a stale sibling, which `tests/CATALOG.md` records explicitly), and that assertion already holds on the reverted tree. The tester measured this and the reviewer independently confirmed it. Two ways out existed: rewrite `/006` so it fails on the reverted tree, or keep it verbatim and accept that it guards a different axis. **Restoring verbatim was chosen** — `/006` is the exact guard `78f92b6` wrote against its own widening, and its value is precisely that it pins the ordering rule any future widening must carry. The claim is corrected in place rather than deleted so the record shows it was caught and resolved; a silently-corrected acceptance criterion is how the next reader loses the thread.
 
 ## Definition of done
 
