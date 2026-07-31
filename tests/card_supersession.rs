@@ -229,3 +229,135 @@ fn status_supersede_004_reordered_same_session_event_cannot_weaken_the_guard() {
         "a reordered same-session event moved last_activity backward and let an outgoing-agent straggler retire the LIVE card"
     );
 }
+
+/// Scenario: Pi reports two successive respawn generations through its pane-derived stable session id. The second generation must replace the first card's agent identity without creating a duplicate card.
+#[spec("status/supersede/005")]
+#[test]
+fn status_supersede_005_repeated_pi_respawn_refreshes_the_stable_card_identity() {
+    let stable_session_id = format!("{PANE_ID}-session");
+    let first_timestamp = Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.apply_event(event(
+        &stable_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-2"),
+        first_timestamp,
+    ));
+
+    assert_eq!(
+        state.sessions[&stable_session_id].agent_id.as_deref(),
+        Some("pi-agent-2"),
+        "precondition: the first respawn generation owns the stable Pi card"
+    );
+
+    state.apply_event(event(
+        &stable_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-3"),
+        first_timestamp + Duration::seconds(1),
+    ));
+
+    assert_eq!(
+        state.sessions.len(),
+        1,
+        "repeated Pi respawn must keep exactly one card on the pane"
+    );
+    assert_eq!(
+        state.sessions[&stable_session_id].agent_id.as_deref(),
+        Some("pi-agent-3"),
+        "the stable Pi card kept the stale agent identity from the previous respawn generation"
+    );
+}
+
+/// Scenario: A close target is armed against Pi's stable session id before another Pi generation reports through that same id. This state-seam guard requires the armed identity to vanish rather than resolve to the replacement; it does not execute `CloseTarget` or `resolve_close_plan`.
+#[spec("status/supersede/006")]
+#[test]
+fn status_supersede_006_stable_pi_respawn_does_not_retarget_an_armed_identity() {
+    let stable_session_id = format!("{PANE_ID}-session");
+    let original_timestamp = Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.apply_event(event(
+        &stable_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-2"),
+        original_timestamp,
+    ));
+
+    // CloseTarget::Session stores this stable session identity at arm time.
+    let armed_session_id = stable_session_id.clone();
+    assert!(state.sessions.contains_key(&armed_session_id));
+
+    state.apply_event(event(
+        &stable_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-3"),
+        original_timestamp + Duration::seconds(1),
+    ));
+
+    assert!(
+        !state.sessions.contains_key(&armed_session_id),
+        "the session identity captured by close confirmation still resolves after a replacement generation took over the stable Pi producer id"
+    );
+}
+
+/// Scenario: A scheduler placeholder with a friendly name lands before an older-stamped Pi frame, so the first Pi frame creates a sibling card without retiring it. A later Pi status retires the placeholder and must transfer its friendly name onto the already-existing Pi card.
+#[spec("status/supersede/007")]
+#[test]
+fn status_supersede_007_existing_pi_session_inherits_the_retired_placeholder_name() {
+    let stable_session_id = format!("{PANE_ID}-session");
+    let placeholder_timestamp = Utc::now();
+    let mut placeholder = event(
+        "scheduler-placeholder",
+        AgentType::None,
+        EventType::SessionStart,
+        None,
+        placeholder_timestamp,
+    );
+    placeholder
+        .metadata
+        .insert(DISPLAY_NAME_METADATA_KEY.to_string(), TASK_NAME.to_string());
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.apply_event(placeholder);
+
+    state.apply_event(event(
+        &stable_session_id,
+        AgentType::Pi,
+        EventType::Idle,
+        Some("pi-agent-2"),
+        placeholder_timestamp - Duration::seconds(1),
+    ));
+    assert_eq!(
+        state.sessions.len(),
+        2,
+        "precondition: the older first Pi frame cannot yet retire the newer scheduler placeholder"
+    );
+
+    state.apply_event(event(
+        &stable_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-2"),
+        placeholder_timestamp + Duration::seconds(1),
+    ));
+
+    assert_eq!(
+        state.sessions.len(),
+        1,
+        "the newer Pi frame must retire the scheduler placeholder"
+    );
+    assert_eq!(
+        state.sessions[&stable_session_id].display_name.as_deref(),
+        Some(TASK_NAME),
+        "the existing Pi card dropped the friendly name inherited from the retired scheduler placeholder"
+    );
+}
