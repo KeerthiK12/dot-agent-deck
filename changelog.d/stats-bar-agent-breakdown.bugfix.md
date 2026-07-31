@@ -1,7 +1,0 @@
-## The dashboard stats bar no longer loses its `tools` total to a per-agent-type breakdown
-
-On a deck running more than one kind of agent, the stats bar appended a per-agent-type count breakdown (`14 ClaudeCode │ 8 Codex`) after the status totals. That bar is drawn into the last row of the *left dashboard column* — not the full terminal width — and as an unwrapped single-line paragraph it clips silently at the right edge, with no ellipsis to show anything was dropped. Each type segment costs roughly 12-18 columns, so on a real multi-agent deck the breakdown pushed the segments after it off-screen: the `tools` total, which the renderer treats as always-present, and the `mode:` indicator. The reported symptom was a bar that appeared to simply end at `… │ 19 idle │ 14 ClaudeCode`, which also made it look as though only one agent type was active when several were.
-
-The breakdown is now removed rather than made narrower. The information it carried was already on screen and better placed: every deck card renders its agent type as a registry-colored badge (`Claude · name`, `Codex · name`) directly below the bar, so the aggregate restated in one scarce row what the cards show per session. Removing it also stops the cost from growing with each agent type added to the registry. The status totals, the `tools` total, and the `mode:` indicator are unchanged.
-
-Bars narrow enough to clip even the status counts still truncate at the right edge without an ellipsis; giving the bar a defined truncation priority is a separate change.
