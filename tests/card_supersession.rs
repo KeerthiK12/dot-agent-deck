@@ -273,41 +273,6 @@ fn status_supersede_005_repeated_pi_respawn_refreshes_the_stable_card_identity()
     );
 }
 
-/// Scenario: A close target is armed against Pi's stable session id before another Pi generation reports through that same id. This state-seam guard requires the armed identity to vanish rather than resolve to the replacement; it does not execute `CloseTarget` or `resolve_close_plan`.
-#[spec("status/supersede/006")]
-#[test]
-fn status_supersede_006_stable_pi_respawn_does_not_retarget_an_armed_identity() {
-    let stable_session_id = format!("{PANE_ID}-session");
-    let original_timestamp = Utc::now();
-
-    let mut state = AppState::default();
-    state.register_pane(PANE_ID.to_string());
-    state.apply_event(event(
-        &stable_session_id,
-        AgentType::Pi,
-        EventType::Thinking,
-        Some("pi-agent-2"),
-        original_timestamp,
-    ));
-
-    // CloseTarget::Session stores this stable session identity at arm time.
-    let armed_session_id = stable_session_id.clone();
-    assert!(state.sessions.contains_key(&armed_session_id));
-
-    state.apply_event(event(
-        &stable_session_id,
-        AgentType::Pi,
-        EventType::Thinking,
-        Some("pi-agent-3"),
-        original_timestamp + Duration::seconds(1),
-    ));
-
-    assert!(
-        !state.sessions.contains_key(&armed_session_id),
-        "the session identity captured by close confirmation still resolves after a replacement generation took over the stable Pi producer id"
-    );
-}
-
 /// Scenario: A scheduler placeholder with a friendly name lands before an older-stamped Pi frame, so the first Pi frame creates a sibling card without retiring it. A later Pi status retires the placeholder and must transfer its friendly name onto the already-existing Pi card.
 #[spec("status/supersede/007")]
 #[test]

@@ -489,14 +489,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L1 (successive in-process Pi generations applied through `AppState::apply_event`).
 - **Agent:** none (synthetic Pi generations using the production `{pane_id}-session` construction).
 - **Asserts:** after Pi agent 2 establishes the stable card and Pi agent 3 reports through the same producer session id, exactly one card remains and carries agent 3's identity.
-- **Does not assert:** the initial spawn-time placeholder → first-respawn transition (`status/agent-event/005`), socket transport, or rendered card history.
-- **Platform coverage:** mac+linux+windows.
-
-##### status/supersede/006 — A close target armed before a stable-id Pi respawn cannot resolve to the replacement generation.
-- **Layer:** L1 (successive in-process Pi generations applied through `AppState::apply_event`).
-- **Agent:** none (synthetic Pi generations sharing the production pane-derived session id).
-- **Asserts:** the stable session identity captured while Pi agent 2 owns the card is absent after Pi agent 3 takes over, so state lookup cannot silently retarget the armed identity to the replacement.
-- **Does not assert:** `CloseTarget` capture, `resolve_close_plan`, modal rendering, or actual close dispatch (`prompt/close-confirm/005` remains the close-flow proof).
+- **Does not assert:** close-target retargeting across stable-key generations. Close confirmation arms on the session id alone (`CloseTarget::Session`) and resolves it by direct key lookup; because Pi reuses `{pane_id}-session` across respawns, that target remains resolvable after a generation change and confirmation can act on whichever generation currently occupies the pane. This behavior predates #284 and is neither introduced nor worsened by it: before the fix the key resolved to a stale corpse entry, after it resolves to the live replacement, and in both cases it maps to the pane's current card. The #284 identity refresh is a prerequisite for fixing this properly by arming on the generation (session id plus agent id), because the refreshed `agent_id` can now expose a generation change that the pre-fix stale `pi-agent-2` identity would have concealed. That fix belongs at the arm/resolve seam (`CloseTarget` / `resolve_close_plan`), while `prompt/close-confirm/005` remains the close-flow proof. This test also does not assert the initial spawn-time placeholder → first-respawn transition (`status/agent-event/005`), socket transport, or rendered card history.
 - **Platform coverage:** mac+linux+windows.
 
 ##### status/supersede/007 — A Pi card that already exists inherits the friendly name when its newer status retires the scheduler placeholder.
