@@ -2785,6 +2785,24 @@ impl AppState {
         }
     }
 
+    /// PRD #284: does `event` carry enough evidence to supersede `session`'s
+    /// generation on the pane they share?
+    ///
+    /// A `SessionStart` is the incoming generation ANNOUNCING itself, so the
+    /// takeover is asserted and no ordering evidence is needed (nor available —
+    /// see the long rationale in [`Self::apply_event`]). Any other frame only
+    /// lets the takeover be INFERRED from the changed `agent_id`, and a DELAYED
+    /// frame from the OUTGOING agent has that exact shape, so an inferred
+    /// supersession additionally requires the event to be no older than the
+    /// generation it would displace.
+    ///
+    /// Named once and shared by both supersession sites — the cross-session
+    /// retire loop and the same-producer identity refresh — so the two cannot
+    /// drift apart.
+    fn supersedes_generation(event: &AgentEvent, session: &SessionState) -> bool {
+        event.event_type == EventType::SessionStart || event.timestamp >= session.last_activity
+    }
+
     pub fn apply_event(&mut self, mut event: AgentEvent) {
         // PRD #20 R20-003 (finding #4): the ORIGINAL hook `session_id` on the
         // wire, captured BEFORE the same-agent reuse guard below remaps it onto
@@ -2839,10 +2857,10 @@ impl AppState {
             }
         }
 
-        // PRD #110 follow-up: when a `SessionStart` arrives whose
-        // `agent_id` differs from an existing session on the same
-        // pane, the previous agent has been replaced (F9 clear=true
-        // respawn — the daemon SIGKILLs the old child so no graceful
+        // PRD #110 follow-up: when an event arrives whose `agent_id`
+        // differs from an existing session on the same pane, the
+        // previous agent has been replaced (F9 clear=true respawn —
+        // the daemon SIGKILLs the old child so no graceful
         // `SessionEnd` ever fires). The same-agent reuse guard above
         // doesn't match, so without retiring the stale session here
         // the dashboard would end up with two cards on the same pane:
@@ -2850,6 +2868,98 @@ impl AppState {
         // stale sibling(s) before falling through to the
         // session-create path below so the orchestration deck shows
         // exactly one card per pane after a respawn.
+        //
+        // PRD #284: which events may retire, and on what evidence.
+        // A fresh `agent_id` is minted per spawn, so ANY event bearing
+        // one that differs already proves the pane changed hands —
+        // `SessionStart` was never what made that inference valid, it
+        // is merely the frame most hook-based agents happen to send
+        // first. Pi sends none at all (its extension reports through
+        // `dot-agent-deck agent-event`, whose vocabulary is
+        // running/waiting/finished), so a respawned Pi worker's first
+        // frame is a `Thinking`/`Idle` carrying the NEW agent id, and
+        // gating on `SessionStart` left it stacking a second permanent
+        // card on the pane (`status/agent-event/005`).
+        //
+        // But a differing `agent_id` is only half the question. The
+        // FIRST question is whether the frame is a CLAIM THAT A
+        // GENERATION IS RUNNING at all — because only such a frame can
+        // be evidence that this pane changed hands:
+        //
+        //   * `SessionEnd` is a TERMINAL frame: semantically the
+        //     OPPOSITE of a takeover, and it must never retire a
+        //     sibling. It carries an `agent_id` like any other frame,
+        //     so gating solely on "the id differs" admitted it: a
+        //     delayed (or forged) `SessionEnd` from outgoing agent A
+        //     retired LIVE agent B here, and then the terminal branch
+        //     below removed the already-absent A and returned WITHOUT
+        //     restoring a placeholder. The pane stayed live with its
+        //     card, history and stable close target GONE — zero cards
+        //     on a live pane, the exact inverse of the two-cards bug
+        //     this seam exists to fix (`status/supersede/003`).
+        //     Excluding it also restores the pre-#284 property that a
+        //     terminal frame retires nothing.
+        //
+        // Among the frames that DO claim a running generation, the two
+        // kinds differ in the evidence they carry, so they are admitted
+        // on different terms (see [`Self::supersedes_generation`]):
+        //
+        //   * `SessionStart` is the incoming generation ANNOUNCING
+        //     itself: self-describing and authoritative, so the
+        //     takeover is asserted rather than inferred. Its producer
+        //     timestamp is NOT evidence about ordering and must not be
+        //     weighed — a real hook can legitimately be stamped
+        //     EARLIER than the card it supersedes, because the
+        //     superseded card's `last_activity` is bumped by whatever
+        //     happened after it was created. A scheduler's synthetic
+        //     `No agent` placeholder is exactly that: the agent's real
+        //     `SessionStart` routinely carries an older stamp than the
+        //     placeholder it must retire (`status/supersede/001`,
+        //     `scheduler/live/004`).
+        //
+        //     Residual, unchanged from pre-#284: a LATE `SessionStart`
+        //     from the OUTGOING agent would retire the live card. That
+        //     frame is not hypothetical — PRD #92 F9 followup-7
+        //     (see [`wait_for_session_start`]) documents a slow-booting
+        //     old agent firing one inside the subscribe→kill window —
+        //     but there it precedes the new agent's boot, so it lands
+        //     before the live card exists and the new agent's own start
+        //     retires it in turn. Ordering it correctly needs a per-pane
+        //     GENERATION discriminator, not a timestamp; `pane_hook_session`
+        //     already tracks one but is keyed on hook session ids the
+        //     retire path cannot resolve. Left as-is deliberately:
+        //     admitting it here is exactly the pre-existing behaviour
+        //     that ships in v0.35.0, so #284 neither widens nor narrows
+        //     it, and narrowing it on a timestamp is what broke case B.
+        //
+        //   * A non-`SessionStart` frame (`Thinking`, `Idle`, tool
+        //     traffic) is NOT self-describing: the generation change is
+        //     INFERRED from the changed `agent_id` alone, and the very
+        //     same shape is produced by a DELAYED frame from the
+        //     OUTGOING agent, which must not evict the card the
+        //     incoming one just established. For that inference the
+        //     timestamp is the only available discriminator, so an
+        //     inferred retire additionally requires the event to be no
+        //     older than the session it would replace
+        //     (`status/agent-event/006`).
+        //
+        //     That discriminator is only as good as the mark it reads.
+        //     `last_activity` is PRODUCER-supplied, so assigning it
+        //     unconditionally let a reordered frame drag it BACKWARD and
+        //     disarm the guard entirely; it is kept a high-water mark at
+        //     the assignment site below (`status/supersede/004`).
+        //
+        // Net effect on the retire predicate: still a pure WIDENING of
+        // the pre-#284 `SessionStart`-only gate. `SessionStart` is
+        // admitted unconditionally, exactly as before, so every frame
+        // that could retire before still retires on identical terms and
+        // the pane-close semantics keyed on session identity
+        // (`prompt/close-confirm/005`, `status/supersede/002`) are
+        // untouched; the additions are the non-terminal non-start case
+        // (guarded) and the exclusion of `SessionEnd`, which only ever
+        // NARROWS what may retire. Applying the monotonicity check to
+        // `SessionStart` too — what the reverted `78f92b6` did — is
+        // what traded case B for case A.
         //
         // Backward-compat (auditor finding #3 follow-up; reaffirmed
         // against CodeRabbit PR #118 finding #1): skip the retire
@@ -2883,7 +2993,10 @@ impl AppState {
         // keyed by the stable pane, so the replacement created below can
         // inherit it when the superseding event carries none.
         let mut inherited_display_name: Option<String> = None;
-        if event.event_type == EventType::SessionStart
+        // PRD #284 sub-problem (a): a terminal frame claims no generation, so it
+        // is not evidence of a takeover and may retire nothing.
+        let claims_generation = event.event_type != EventType::SessionEnd;
+        if claims_generation
             && event.agent_id.is_some()
             && let Some(ref pane_id) = event.pane_id
         {
@@ -2894,6 +3007,7 @@ impl AppState {
                     session.pane_id.as_ref().is_some_and(|p| p == pane_id)
                         && *id != &event.session_id
                         && session.agent_id != event.agent_id
+                        && Self::supersedes_generation(&event, session)
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -2904,6 +3018,65 @@ impl AppState {
                         inherited_display_name = removed.display_name;
                     }
                 }
+            }
+        }
+
+        // PRD #284 sub-problem (c): a generation change on the SAME producer
+        // key. The retire loop above can never see this one — it excludes the
+        // incoming `session_id` by construction — and `SessionState.agent_id` is
+        // written only by the `or_insert_with` below, never refreshed on an
+        // entry that already exists.
+        //
+        // Pi's `agent-event` subcommand always reports under the stable
+        // `{pane_id}-session` id derived from the pane (see `src/main.rs`); only
+        // `agent_id` changes across respawns. So the FIRST respawn worked by
+        // accident — the pane's spawn-time placeholder is a DIFFERENT key and
+        // the loop above retires it — while every respawn after that landed on
+        // the surviving stable entry and silently kept the STALE `agent_id` plus
+        // the dead generation's `recent_events` / `tool_count` / `first_prompts`
+        // (`status/supersede/005`). A stale `agent_id` is not cosmetic: it is
+        // what the reuse guard above and the daemon's pane→session resolution
+        // match on, so the card stops resolving to the agent actually running.
+        //
+        // This is NOT a retire case — nothing should disappear from the pane,
+        // the one card must change HANDS. Drop the superseded entry so the
+        // create path below rebuilds it for the new generation under the same
+        // key, which gives the same-producer respawn exactly the same treatment
+        // as the different-key respawn (fresh generation state, pane-scoped
+        // `started_at` and friendly name carried across).
+        //
+        // Guarded by the same evidence test as an inferred retire: Pi's
+        // outgoing generation reports under this very key too, so an unguarded
+        // refresh would let a straggler drag the identity BACK to the dead
+        // agent. Only a differing `Some` → `Some` counts; an existing `None`
+        // learning an identity is not a generation change and must not cost the
+        // card its history (the pre-F9 / placeholder shape the backward-compat
+        // note above protects).
+        //
+        // Residual, by construction: because the producer key is STABLE, the one
+        // card changing hands means a close target armed against Pi generation N
+        // still RESOLVES after generation N+1 takes over — it now resolves to the
+        // replacement rather than to a stale corpse. Fixing that belongs at the
+        // close-target seam (arm on generation, not on session id alone), not
+        // here: the alternative — deleting the card so the armed id reads as
+        // vanished — would leave ZERO cards on a live pane, which is exactly the
+        // failure `status/supersede/003` forbids one screen up. Distinct-session
+        // supersession is unaffected and still vanishes the armed id
+        // (`status/supersede/002`, `prompt/close-confirm/005`).
+        if claims_generation
+            && let Some(incoming_agent_id) = event.agent_id.as_deref()
+            && self.sessions.get(&event.session_id).is_some_and(|session| {
+                session
+                    .agent_id
+                    .as_deref()
+                    .is_some_and(|current| current != incoming_agent_id)
+                    && Self::supersedes_generation(&event, session)
+            })
+        {
+            let superseded = self.sessions.remove(&event.session_id);
+            // First non-empty friendly name on this pane wins, as above.
+            if inherited_display_name.is_none() {
+                inherited_display_name = superseded.and_then(|session| session.display_name);
             }
         }
 
@@ -3031,16 +3204,44 @@ impl AppState {
                 first_prompts: Vec::new(),
                 pane_id: event.pane_id.clone(),
                 agent_id: event.agent_id.clone(),
-                // PRD #127 finding #2: seed with the friendly name inherited
-                // from a session this event just superseded on the same pane
-                // (above). The event-metadata case is handled unconditionally
-                // by the refresh block below — which takes precedence — so we
-                // do NOT recompute it from metadata here (reviewer LOW-2: it
-                // was a redundant duplicate of that block).
-                display_name: inherited_display_name,
+                // PRD #127 finding #2 / #284 sub-problem (d): the friendly name
+                // inherited from a session this event just superseded is applied
+                // by the block below, which reaches an already-existing card
+                // too. The event-metadata case is handled unconditionally by the
+                // refresh further down — which takes precedence — so we do NOT
+                // recompute it from metadata here (reviewer LOW-2: it was a
+                // redundant duplicate of that block).
+                display_name: None,
             });
 
-        session.last_activity = event.timestamp;
+        // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
+        // friendly name captured from whatever this event just superseded on the
+        // same pane. Applied AFTER the entry is resolved rather than inside
+        // `or_insert_with`, because the surviving card is not always a NEW one:
+        // when an earlier, too-old frame already created the incoming session,
+        // the later qualifying frame retires the friendly placeholder but lands
+        // on an EXISTING entry, and a name consumed only at insert time was
+        // silently dropped (`status/supersede/007`). Widening the retire gate to
+        // non-start frames is what made that ordering reachable. Fills a hole
+        // only — never overwrites a name the surviving card already carries.
+        if session.display_name.is_none() {
+            session.display_name = inherited_display_name;
+        }
+
+        // PRD #284 sub-problem (b): keep this a HIGH-WATER mark. It is the
+        // ordering evidence [`Self::supersedes_generation`] weighs, and
+        // `event.timestamp` is PRODUCER-supplied, so an unconditional assignment
+        // let a delayed frame move it BACKWARD — after which an even older
+        // straggler from the outgoing agent satisfied `>=` and retired the LIVE
+        // card, i.e. the guard stopped protecting anything it was added for.
+        // Reachable in production: hook sends arrive on separate accepted
+        // connections handled by separate spawned tasks (see `src/daemon.rs`),
+        // so delivery order does not follow producer stamps. Now it advances
+        // with the newest frame OBSERVED for the session and never regresses
+        // (`status/supersede/004`).
+        if event.timestamp > session.last_activity {
+            session.last_activity = event.timestamp;
+        }
 
         // PRD #127 finding #2: a later event carrying the friendly-name
         // metadata refreshes it (the synthetic live-surface `SessionStart`

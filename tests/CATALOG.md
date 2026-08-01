@@ -441,6 +441,64 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** stdout classification or socket transport (covered by `codex/wrap/001`).
 - **Platform coverage:** mac+linux+windows.
 
+##### status/agent-event/005 — A respawned agent whose first event is NOT a `SessionStart` still retires the previous card, so one pane keeps one card.
+- **Layer:** L1 (two `SyntheticAgent` generations on one pane, applied through `AppState::apply_event`).
+- **Agent:** synthetic Pi identity (the only shipped agent with no `SessionStart`).
+- **Asserts:** after a `clear = true` respawn mints a new `agent_id`, the outgoing generation's card is retired by the incoming generation's first `agent-event` (`Thinking`), leaving exactly one session on the pane, carrying the new `agent_id`.
+- **Does not assert:** repeated respawns after the initial spawn-time placeholder → first-respawn transition (`status/supersede/005` covers the stable producer id reused by later generations); the orchestration deck's rendering of the duplicate (the unreachable-highlight consequence is pinned by the `sync_and_derive_selection` unit tests in `src/tab.rs`); the Pi extension's own state mapping (TS unit tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/agent-event/006 — A delayed event from the OUTGOING agent does not retire the incoming agent's live card.
+- **Layer:** L1 (out-of-order `AgentEvent` timestamps applied through `AppState::apply_event`).
+- **Agent:** synthetic Pi identity.
+- **Asserts:** once the incoming generation has established its card, an older-timestamped event from the previous `agent_id` leaves that live card intact — the monotonicity guard that makes retiring on a non-`SessionStart` event safe.
+- **Does not assert:** that the stale event is dropped entirely (it may still surface its own card; what must hold is that the LIVE card survives).
+- **Platform coverage:** mac+linux+windows.
+
+#### status/supersede
+
+##### status/supersede/001 — A real scheduler agent supersedes its friendly `No agent` placeholder without creating a duplicate card or losing the task name.
+- **Layer:** L1 (in-process scheduler placeholder and real `SessionStart` events applied through `AppState::apply_event`).
+- **Agent:** none (synthetic ClaudeCode identity for the real hook).
+- **Asserts:** a `Some(agent_id)` real session replaces the same-pane `None` placeholder even when its producer timestamp is older, leaving exactly one live card that inherits the placeholder's friendly display name.
+- **Does not assert:** the rendered card grid or daemon hook transport (`scheduler/live/004` covers the PTY-attached surface).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/002 — Replacing a session identity on an armed pane leaves the close-confirm target vanished rather than retargeting the replacement.
+- **Layer:** L1 (in-process state replacement through `AppState::apply_event`).
+- **Agent:** none (synthetic ClaudeCode generations).
+- **Asserts:** after a different-agent `SessionStart` takes over the same pane, the armed session id is absent, the replacement id remains, and only one card owns the pane, which makes stable-id close resolution return vanished.
+- **Does not assert:** modal rendering or actual close dispatch (`prompt/close-confirm/005` covers the PTY-attached behavior).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/003 — A delayed outgoing `SessionEnd` cannot erase the live replacement card from its pane.
+- **Layer:** L1 (in-process terminal event applied through `AppState::apply_event`).
+- **Agent:** none (synthetic ClaudeCode generations).
+- **Asserts:** after live agent B establishes a card, a newer-stamped `SessionEnd` from outgoing agent A on the same pane leaves B's card present instead of leaving the live pane with zero cards.
+- **Does not assert:** daemon hook transport, placeholder restoration for the ending session, or rendered card layout.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/004 — Reordered same-session activity cannot weaken the outgoing-straggler guard.
+- **Layer:** L1 (in-process reordered events applied through `AppState::apply_event`).
+- **Agent:** none (synthetic Pi generations).
+- **Asserts:** live agent B established at T=30 survives an outgoing agent A straggler at T=20 even after B's delayed same-session event at T=10 is delivered between them.
+- **Does not assert:** daemon socket task scheduling or that the outgoing straggler is dropped entirely; only the live card's survival is required.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/005 — A repeated Pi respawn refreshes the card identity carried under the pane-derived stable producer session id.
+- **Layer:** L1 (successive in-process Pi generations applied through `AppState::apply_event`).
+- **Agent:** none (synthetic Pi generations using the production `{pane_id}-session` construction).
+- **Asserts:** after Pi agent 2 establishes the stable card and Pi agent 3 reports through the same producer session id, exactly one card remains and carries agent 3's identity.
+- **Does not assert:** close-target retargeting across stable-key generations. Close confirmation arms on the session id alone (`CloseTarget::Session`) and resolves it by direct key lookup; because Pi reuses `{pane_id}-session` across respawns, that target remains resolvable after a generation change and confirmation can act on whichever generation currently occupies the pane. This behavior predates #284 and is neither introduced nor worsened by it: before the fix the key resolved to a stale corpse entry, after it resolves to the live replacement, and in both cases it maps to the pane's current card. The #284 identity refresh is a prerequisite for fixing this properly by arming on the generation (session id plus agent id), because the refreshed `agent_id` can now expose a generation change that the pre-fix stale `pi-agent-2` identity would have concealed. That fix belongs at the arm/resolve seam (`CloseTarget` / `resolve_close_plan`), while `prompt/close-confirm/005` remains the close-flow proof. This test also does not assert the initial spawn-time placeholder → first-respawn transition (`status/agent-event/005`), socket transport, or rendered card history.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/007 — A Pi card that already exists inherits the friendly name when its newer status retires the scheduler placeholder.
+- **Layer:** L1 (out-of-order scheduler placeholder and Pi events applied through `AppState::apply_event`).
+- **Agent:** none (synthetic scheduler placeholder and Pi identity).
+- **Asserts:** an older first Pi frame initially coexists with the friendly scheduler placeholder, then a newer Pi status retires it and leaves one Pi card carrying `morning-digest`.
+- **Does not assert:** scheduler dispatch, daemon socket delivery, or rendered card layout.
+- **Platform coverage:** mac+linux+windows.
+
 ### Agent protocol
 
 #### protocol/live-target
