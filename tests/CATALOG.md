@@ -2945,6 +2945,20 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the whitespace-only variant of the fallback (the same code path); the mode-locked form's render (covered by `scheduler/form/001`).
 - **Platform coverage:** mac+linux.
 
+##### scheduler/manager/016 — Wheel input over the Scheduled Tasks dialog does not scroll a mode-tab side pane behind the modal (issue #142).
+- **Layer:** L2 (real TUI in a PTY; opens a synthetic `scroll` mode tab whose persistent right-hand side pane is filled with deterministic scrollback, then sends precise SGR wheel reports over the overlapping manager dialog).
+- **Agent:** none (the mode side pane runs a synthetic shell command; no LLM is invoked).
+- **Asserts:** after the side pane is scrolled into history and the manager is opened over it, wheel-down must first move the manager selection from `alpha` to `bravo`, then wheel-up must move it back to `alpha`, while the exposed side-pane marker sequence remains unchanged; the modal consumes the wheel events instead of leaking them to the pane behind it.
+- **Does not assert:** focused dashboard-pane wheel behavior; child-app mouse forwarding; the manager list viewport behavior (covered by `scheduler/manager/017`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/017 — Wheel input over a windowed Scheduled Tasks list moves its selection and derived viewport (issue #142).
+- **Layer:** L2 (real TUI in a constrained-height PTY; a fixture global `schedules.toml` contains 30 distinct tasks, more than the manager can render at once, and the first visible task row supplies the coordinate for precise SGR wheel reports over the list viewport).
+- **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`).
+- **Asserts:** the first row starts selected and `wheel-task-13` starts below the viewport; twelve wheel-down reports over the list move the `▶` marker to `wheel-task-13`, which drags the selection-derived viewport until that initially hidden row is visible.
+- **Does not assert:** an independent list scroll offset (none exists); wheel-up wrapping at the first row; background side-pane isolation (covered by `scheduler/manager/016`).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/form
 
 ##### scheduler/form/001 — The new-pane form mode-locked to schedule renders ONLY Dir + Command (no Mode cycler, no Name field) and titles itself ` New Schedule ` (Add) / ` Edit Schedule ` (Edit) (PRD #170 unified Add/Edit flow).

@@ -675,6 +675,189 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
     drop(scratch);
 }
 
+/// Return the visible synthetic side-pane line markers from a rendered grid.
+/// Comparing the marker sequence isolates pane scrollback from manager-dialog
+/// changes such as moving the selected schedule row.
+fn visible_side_scroll_markers(grid: &str) -> Vec<String> {
+    const PREFIX: &str = "SIDE_SCROLL_LINE_";
+    grid.lines()
+        .filter_map(|line| {
+            let start = line.find(PREFIX)?;
+            line.get(start..start + PREFIX.len() + 3)
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+/// Scenario: Open an output-filled mode tab, scroll its right-hand side pane into history, then open Scheduled Tasks and wheel down and up over the dialog where it overlaps that pane. The visible side-pane lines must remain unchanged while the dialog handles the wheel events instead of leaking them to the pane behind it.
+#[spec("scheduler/manager/016")]
+#[test]
+fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
+    let (scratch, sched_path) = scratch_with_schedules(
+        "[[scheduled_tasks]]\n\
+         name = \"alpha\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"alpha prompt\"\n\
+         enabled = true\n\n\
+         [[scheduled_tasks]]\n\
+         name = \"bravo\"\n\
+         cron = \"0 10 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"bravo prompt\"\n\
+         enabled = true\n",
+    );
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .launch_with_fixture("scheduler-manager-scroll");
+    deck.wait_for_string("No active sessions");
+
+    // Open the fixture's `scroll` mode. Its persistent side pane occupies the
+    // right half of the active mode tab, registering the rect that currently
+    // receives wheel events leaked through the manager dialog.
+    deck.send_bytes(b"\x0e"); // Ctrl+N -> directory picker
+    deck.wait_for_string("Select Directory");
+    deck.send_bytes(b" "); // choose current dir -> new-pane form
+    deck.wait_for_string("Mode:");
+    deck.send_bytes(b"\x1b[C"); // No mode -> scroll
+    deck.wait_for_string("scroll mode");
+    let (submit_col, submit_row) = deck
+        .find_in_grid("[Submit]")
+        .expect("new-pane form must render [Submit]");
+    deck.click(submit_col, submit_row);
+    deck.wait_for_string("SIDE_SCROLL_LINE_119");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    deck.send_bytes(b"\x04"); // detach to Normal mode on the active mode tab
+    deck.wait_for_absence("[Command Mode Ctrl+D]");
+
+    // Move the side pane away from the bottom so both wheel directions have
+    // room to change its scrollback if the manager lets either event leak.
+    let bottom_markers = visible_side_scroll_markers(&deck.snapshot_grid());
+    assert!(
+        !bottom_markers.is_empty(),
+        "precondition: the mode side pane must visibly contain synthetic scrollback"
+    );
+    for _ in 0..8 {
+        deck.scroll(100, 10, false);
+    }
+    deck.wait_until_grid("side pane scrolled into its history", |grid| {
+        visible_side_scroll_markers(grid) != bottom_markers
+    });
+
+    deck.send_keys(b"s");
+    deck.wait_for_string("NEXT FIRE");
+    let before = visible_side_scroll_markers(&deck.snapshot_grid());
+    assert!(
+        before.len() >= 5,
+        "precondition: several side-pane markers must remain visible around the centered dialog.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // NEXT FIRE sits inside the visible dialog and, in this mode-tab layout,
+    // inside the right-half side-pane rect behind it.
+    let (dialog_col, dialog_row) = deck
+        .find_in_grid("NEXT FIRE")
+        .expect("manager dialog must render the NEXT FIRE header");
+    let wheel_col = dialog_col + "NEXT FIRE".len() as u16 + 2;
+    assert!(
+        wheel_col >= 60,
+        "precondition: the wheel target must overlap the right-half side pane (col {wheel_col})"
+    );
+
+    deck.scroll(wheel_col, dialog_row, true);
+    let selection_moved_down = deck
+        .wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
+            grid.contains("\u{25b6} bravo")
+        });
+    let after_down_grid = deck.snapshot_grid();
+    let after_down = visible_side_scroll_markers(&after_down_grid);
+    assert!(
+        selection_moved_down,
+        "wheel-down over the Scheduled Tasks dialog must move the selection from `alpha` to `bravo` before wheel-up is sent.\nGrid after wheel-down:\n{after_down_grid}"
+    );
+
+    deck.scroll(wheel_col, dialog_row, false);
+    let selection_moved_up = deck.wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
+        grid.contains("\u{25b6} alpha")
+    });
+    let after_up_grid = deck.snapshot_grid();
+    let after_up = visible_side_scroll_markers(&after_up_grid);
+    assert!(
+        selection_moved_up,
+        "wheel-up over the Scheduled Tasks dialog must move the selection from `bravo` back to `alpha`.\nGrid after wheel-up:\n{after_up_grid}"
+    );
+
+    assert_eq!(
+        after_down, before,
+        "wheel-down over the Scheduled Tasks dialog leaked into the mode side pane behind it; the visible side-pane scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-down: {after_down:?}\nGrid after wheel-down:\n{after_down_grid}"
+    );
+    assert_eq!(
+        after_up, before,
+        "wheel-up over the Scheduled Tasks dialog leaked into the mode side pane behind it; the visible side-pane scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-up: {after_up:?}\nGrid after wheel-up:\n{after_up_grid}"
+    );
+    drop(scratch);
+}
+
+/// Scenario: Open Scheduled Tasks in a short PTY with more rows than the manager viewport can show, then send wheel-down reports over the visible list. The selection marker must move from the first task and drag the viewport far enough that the initially hidden thirteenth task becomes visible and selected.
+#[spec("scheduler/manager/017")]
+#[test]
+fn manager_017_wheel_scrolls_windowed_schedule_list() {
+    let mut schedules = String::new();
+    for i in 1..=30 {
+        schedules.push_str(&format!(
+            "[[scheduled_tasks]]\n\
+             name = \"wheel-task-{i:02}\"\n\
+             cron = \"0 9 * * *\"\n\
+             working_dir = \"/tmp\"\n\
+             command = \"cat\"\n\
+             prompt = \"wheel prompt {i:02}\"\n\
+             enabled = true\n\n"
+        ));
+    }
+    let (scratch, sched_path) = scratch_with_schedules(&schedules);
+
+    // At 20 rows the content-sized dialog is capped to 90% of the terminal,
+    // leaving an 11-row schedule viewport for these 30 fixture tasks.
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 20)
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+    deck.send_keys(b"s");
+    deck.wait_for_string("NEXT FIRE");
+
+    let initial = deck.snapshot_grid();
+    assert!(
+        initial.contains("\u{25b6} wheel-task-01"),
+        "precondition: the first schedule must start selected.\nGrid:\n{initial}"
+    );
+    assert!(
+        !initial.contains("wheel-task-13"),
+        "precondition: wheel-task-13 must begin below the constrained manager viewport.\nGrid:\n{initial}"
+    );
+
+    let (list_col, list_row) = deck
+        .find_in_grid("wheel-task-01")
+        .expect("manager dialog must render the first visible task row");
+    for _ in 0..12 {
+        deck.scroll(list_col, list_row, true);
+    }
+
+    let moved_and_revealed = deck.wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
+        grid.contains("\u{25b6} wheel-task-13") && !grid.contains("\u{25b6} wheel-task-01")
+    });
+    let grid = deck.snapshot_grid();
+    assert!(
+        moved_and_revealed,
+        "wheel-down over the Scheduled Tasks list must move the selection and its derived viewport: expected the initially hidden `wheel-task-13` row to become visible and selected, but the wheel input was a no-op.\nGrid after 12 wheel-down reports:\n{grid}"
+    );
+    drop(scratch);
+}
+
 // ---------------------------------------------------------------------------
 // scheduler/form — the manager Add/Edit now reuse the Ctrl+n dir-picker +
 // new-pane form mode-locked to schedule (PRD #170 unify).
