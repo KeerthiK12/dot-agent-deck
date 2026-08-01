@@ -658,10 +658,18 @@ fn is_bidi_format_char(c: char) -> bool {
 
 /// Render the non-TTY (CI / piped-stdout) error message. Trailing
 /// newline included so the caller can write it directly.
+///
+/// Both build ids go through [`sanitize_for_prompt`] — the same sanitizer the
+/// interactive path applies at its render seam. The daemon's build id arrives
+/// over the wire from a possibly-remote daemon, so an ESC or bidi sequence in it
+/// could otherwise clear or spoof the terminal (or the redirected log) this
+/// message lands in. Newlines are stripped too: this is a two-line message whose
+/// line structure is ours, not the daemon's.
 fn render_non_tty_error(daemon_build: Option<&str>, local_build: &str) -> String {
-    let daemon_display = daemon_build.unwrap_or("<unknown>");
+    let daemon_display = sanitize_for_prompt(daemon_build.unwrap_or("<unknown>"), false);
+    let local_display = sanitize_for_prompt(local_build, false);
     format!(
-        "error: local daemon is build {daemon_display} but this TUI is build {local_build}\n\
+        "error: local daemon is build {daemon_display} but this TUI is build {local_display}\n\
          recover with: dot-agent-deck daemon stop\n"
     )
 }
@@ -876,6 +884,33 @@ mod tests {
             "missing daemon build_version must surface <unknown> placeholder, got: {msg:?}"
         );
         assert!(msg.ends_with("recover with: dot-agent-deck daemon stop\n"));
+    }
+
+    #[test]
+    fn non_tty_error_message_sanitizes_control_and_bidi_build_ids() {
+        // Issue #250 audit finding 2: the daemon's build id arrives over the
+        // wire, so this stderr surface needs the same sanitizer the interactive
+        // render seam already applies — otherwise an ESC or bidi sequence in it
+        // can clear or spoof the terminal / redirected log this message lands
+        // in. The local id is sanitized too, for symmetry and because a
+        // pre-#250 binary could have been built with any DAD_BUILD_ID at all.
+        let msg = render_non_tty_error(
+            Some("0.25.0-g\u{1b}[2Jabc\u{202e}1234"),
+            "0.25.0-gdead\nbee",
+        );
+        // The ESC / bidi / newline codepoints are gone; the `[2J` that followed
+        // the ESC survives as inert literal text, which is the point — only the
+        // characters that can act on a terminal are removed.
+        assert_eq!(
+            msg,
+            "error: local daemon is build 0.25.0-g[2Jabc1234 but this TUI is build \
+             0.25.0-gdeadbee\nrecover with: dot-agent-deck daemon stop\n"
+        );
+        assert_eq!(
+            msg.lines().count(),
+            2,
+            "a newline in a build id must not add lines to a two-line message: {msg:?}"
+        );
     }
 
     #[test]

@@ -17,8 +17,31 @@ path = "target/nextest/default/junit.xml"
 filter = 'test(route_001_two_tabs_same_cwd_do_not_cross_deliver)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
+# Issue #250: `lifecycle/version/001` is the only test that has to `cargo build`
+# the binary itself (with DAD_VERSION / DAD_BUILD_ID pre-set in the build env),
+# so its wall clock is a compile, not a run. It runs three builds — one cold,
+# then one per changed variable, which is what pins the two
+# `cargo:rerun-if-env-changed` directives individually — all into its own
+# `target/version-injection-e2e` CARGO_TARGET_DIR. That isolation is required so
+# it cannot clobber the `target/debug` binary the rest of the suite spawns, and
+# it means the FIRST run on a machine pays a cold ~10 min dependency build;
+# later runs are incremental, as are builds 2 and 3 within a run (build-script
+# rerun + relink). The nested builds are `--jobs`-capped so they cannot starve
+# the timed e2e tests running alongside them. Widened here rather than globally,
+# and still bounded so a wedged build cannot run forever.
+[[profile.default.overrides]]
+filter = 'test(version_001_injected_build_env_reaches_the_binary)'
+slow-timeout = { period = "120s", terminate-after = 10 }
+
 [profile.e2e]
 slow-timeout = { period = "120s", terminate-after = 2 }
+
+# Same carve-out under the `e2e` profile, for runs that select it explicitly
+# (`cargo test-e2e` uses the default profile; `-P e2e` does not inherit the
+# override list above).
+[[profile.e2e.overrides]]
+filter = 'test(version_001_injected_build_env_reaches_the_binary)'
+slow-timeout = { period = "120s", terminate-after = 10 }
 
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see

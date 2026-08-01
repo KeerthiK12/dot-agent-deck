@@ -1,16 +1,93 @@
 use std::process::Command;
 
+// Issue #250: the version/build-id resolution order lives in a shared file so
+// a unit test can exercise it. `cargo test` cannot reach code inside a build
+// script — this script is compiled as its own binary and the test crate cannot
+// import from it — so the pure functions live next door and
+// `tests/build_version.rs` declares the same file as a module via `#[path]`.
+// Everything impure (the `git` subprocesses and the `cargo:` emission below)
+// stays here. A `mod` rather than an `include!` because rustfmt does not follow
+// `include!` and the shared file would then escape `cargo fmt --check`.
+mod build_version_resolve;
+
+use build_version_resolve::{
+    VersionSource, escape_for_cargo_warning, is_single_line_directive_value, normalize_build_id,
+    normalize_version, resolve_build_id, resolve_version,
+};
+
 fn main() {
-    // Derive version from git tags (e.g. "v0.7.1" -> "0.7.1", "v0.25.0-alpha.0" -> "0.25.0-alpha.0").
-    // Falls back to CARGO_PKG_VERSION when not in a git repo or no tags exist.
-    let version = git_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-    println!("cargo:rustc-env=DAD_VERSION={version}");
+    // Both values are injectable from the build environment (issue #250), so
+    // cargo has to watch them: without these, an injected value would be baked
+    // in once and then silently go stale across rebuilds.
+    println!("cargo:rerun-if-env-changed=DAD_VERSION");
+    println!("cargo:rerun-if-env-changed=DAD_BUILD_ID");
+
+    let injected_version = build_env("DAD_VERSION");
+    let injected_build_id = build_env("DAD_BUILD_ID");
+
+    // Resolution order (issue #250): injected env -> git tag -> CARGO_PKG_VERSION.
+    // Git tags look like "v0.7.1" -> "0.7.1", "v0.25.0-alpha.0" -> "0.25.0-alpha.0";
+    // an injected DAD_VERSION is validated the same way and falls through when
+    // invalid, because `src/version.rs` parses it with `semver` and `.expect()`s.
+    // The rejected value is rendered with `escape_for_cargo_warning`, never
+    // interpolated raw: it failed validation precisely because it can be
+    // anything, and `cargo:warning=` is parsed by the same line-oriented
+    // protocol as every other directive.
+    if let Some(raw) = injected_version.as_deref()
+        && normalize_version(raw).is_none()
+    {
+        println!(
+            "cargo:warning=DAD_VERSION=\"{}\" is not a valid SemVer version and was ignored \
+             (`semver::Version::parse` grammar: an X.Y.Z core, an optional `v` prefix, an \
+             optional `-<prerelease>` suffix, an optional `+<build>` suffix). Falling back to \
+             the git tag / CARGO_PKG_VERSION.",
+            escape_for_cargo_warning(raw)
+        );
+    }
+    let version = resolve_version(
+        injected_version.as_deref(),
+        git_tag().as_deref(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    if version.source == VersionSource::Placeholder {
+        println!(
+            "cargo:warning=No version available: neither DAD_VERSION nor a git tag resolved, so \
+             this build reports the CARGO_PKG_VERSION placeholder `{}` (issue #250). Version \
+             negotiation, the upgrade nudge and `remote add` will all misbehave against it. Set \
+             DAD_VERSION=<x.y.z> in the build environment, or build from a checkout with tags.",
+            version.value
+        );
+    }
+    emit_rustc_env("DAD_VERSION", &version.value);
 
     // PRD #103 M1.0: emit a finer-grained build identifier alongside DAD_VERSION.
     // Shape: `<DAD_VERSION>-g<short-sha>[-dirty]`, falling back to
     // `<DAD_VERSION>-unknown` when git metadata is unavailable.
-    let build_id = compose_build_id(&version);
-    println!("cargo:rustc-env=DAD_BUILD_ID={build_id}");
+    let short_sha = git_short_sha();
+    // Only ask git whether the tree is dirty when there is a sha to qualify;
+    // without one the answer cannot reach the composed id anyway.
+    let dirty = short_sha.is_some() && git_is_dirty();
+    // An injected build id outside the bounded alphabet is ignored the same way
+    // an invalid version is — it falls through to the composed / `-unknown`
+    // value — and the warning escapes it, because an interior newline in this
+    // value is exactly what used to inject a second `cargo:` directive.
+    if let Some(raw) = injected_build_id.as_deref()
+        && normalize_build_id(raw).is_none()
+    {
+        println!(
+            "cargo:warning=DAD_BUILD_ID=\"{}\" was ignored: a build id must be a single line of \
+             ASCII alphanumerics, `.`, `-`, `+` or `_` (the shape is \
+             `<version>-g<short-sha>[-dirty]`). Falling back to the git-composed build id.",
+            escape_for_cargo_warning(raw)
+        );
+    }
+    let build_id = resolve_build_id(
+        injected_build_id.as_deref(),
+        &version.value,
+        short_sha.as_deref(),
+        dirty,
+    );
+    emit_rustc_env("DAD_BUILD_ID", &build_id);
 
     // Re-run if HEAD changes (new commit, branch switch, detached-HEAD move).
     // `.git/HEAD` alone is necessary but not sufficient on a normal branch —
@@ -37,6 +114,25 @@ fn main() {
     }
 }
 
+/// Emit `cargo:rustc-env=<name>=<value>` after a final line-protocol check.
+///
+/// Cargo reads build-script stdout line by line, so a value containing CR/LF
+/// would let whoever supplied it append a second directive of their choosing
+/// (`rustc-cfg`, `rustc-link-arg`, another `rustc-env`). Every value reaching
+/// here has already been validated — `semver` for the version, the bounded
+/// alphabet for the build id, Cargo itself for `CARGO_PKG_VERSION`, hex for the
+/// short sha — so this is a backstop that only fires if a future edit adds an
+/// unvalidated source. Failing the build loudly is the right outcome then:
+/// emitting the value is the one thing we must not do.
+fn emit_rustc_env(name: &str, value: &str) {
+    assert!(
+        is_single_line_directive_value(value),
+        "refusing to emit cargo:rustc-env={name}: the value is not a single safe line (\"{}\")",
+        escape_for_cargo_warning(value)
+    );
+    println!("cargo:rustc-env={name}={value}");
+}
+
 /// Emit `cargo:rerun-if-changed` for a git-internal path resolved via
 /// `git rev-parse --git-path <relative>`. In a worktree this returns the
 /// real path under `.git/worktrees/<name>/...` (for HEAD/index) or the
@@ -59,11 +155,32 @@ fn emit_rerun_if_changed_git_path(relative: &str) {
             }
         })
         .filter(|s| !s.is_empty())
+        // Same line-protocol rule as `emit_rustc_env`: a path is git-supplied,
+        // so a CR/LF in it would open a second directive. Fall back to the
+        // literal path rather than emitting it.
+        .filter(|s| is_single_line_directive_value(s))
         .unwrap_or_else(|| format!(".git/{relative}"));
+    if !is_single_line_directive_value(&resolved) {
+        // Only reachable if `relative` itself is unsafe, which
+        // `parse_head_ref_path` already rules out. Watching nothing is a
+        // stale-build-id risk; emitting it is a directive-injection one.
+        return;
+    }
     println!("cargo:rerun-if-changed={resolved}");
 }
 
-fn git_version() -> Option<String> {
+/// Read `name` from the build environment, treating unset, empty and
+/// all-whitespace alike as "not injected" so `DAD_VERSION=` in a CI script
+/// behaves like no injection at all rather than emitting a blank version.
+fn build_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// The raw `git describe --tags --abbrev=0` output for the build checkout, or
+/// `None` when git is unavailable / this is not a repo / no tags are reachable.
+/// Validation and the `v` strip happen in [`normalize_version`], which the
+/// injected value goes through too.
+fn git_tag() -> Option<String> {
     let output = Command::new("git")
         .args(["describe", "--tags", "--abbrev=0"])
         .output()
@@ -74,36 +191,13 @@ fn git_version() -> Option<String> {
     }
 
     let tag = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    let stripped = tag
-        .strip_prefix('v')
-        .or_else(|| tag.strip_prefix('V'))
-        .unwrap_or(&tag);
-
-    // SemVer check: digits.digits.digits, optionally followed by a `-<prerelease>`
-    // suffix (alphanumeric + dots/dashes per the SemVer grammar). The pre-release
-    // suffix is accepted opaquely — we only validate the X.Y.Z core.
-    let core = stripped.split_once('-').map(|(c, _)| c).unwrap_or(stripped);
-    let core_parts: Vec<&str> = core.split('.').collect();
-    if core_parts.len() == 3 && core_parts.iter().all(|p| p.parse::<u64>().is_ok()) {
-        Some(stripped.to_string())
-    } else {
-        None
-    }
+    if tag.is_empty() { None } else { Some(tag) }
 }
 
-/// Compose `<version>-g<short-sha>[-dirty]`, or `<version>-unknown` when
-/// git is not available. Mirrors the fallback discipline of `git_version`:
-/// any git failure degrades to the `-unknown` sentinel rather than aborting
-/// the build, so tarball / shallow-clone builds still produce a usable
-/// `DAD_BUILD_ID`.
-fn compose_build_id(version: &str) -> String {
-    let Some(short_sha) = git_short_sha() else {
-        return format!("{version}-unknown");
-    };
-    let dirty_suffix = if git_is_dirty() { "-dirty" } else { "" };
-    format!("{version}-g{short_sha}{dirty_suffix}")
-}
-
+/// The short HEAD sha, or `None` when git metadata is unavailable. Any git
+/// failure degrades to `None` rather than aborting the build, so tarball /
+/// shallow-clone builds still produce a usable `DAD_BUILD_ID` (the
+/// `-unknown` sentinel composed by [`resolve_build_id`]).
 fn git_short_sha() -> Option<String> {
     let output = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -145,7 +239,7 @@ fn parse_head_ref_path() -> Option<String> {
         return None;
     }
     let ref_path = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if ref_path.is_empty() {
+    if ref_path.is_empty() || !is_single_line_directive_value(&ref_path) {
         None
     } else {
         Some(ref_path)
