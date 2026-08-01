@@ -2199,25 +2199,103 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     }
 
     // 3. Delegation protocol.
+    //
+    // Issue #303: the task text reaches this CLI through YOUR shell, so
+    // `--task "…"` is rewritten before argv is built — backticks and `$(…)` are
+    // executed, `$VAR` substituted, an unescaped `"` ends the argument, a `\`
+    // removes itself — while the delegation still reports success. The file form
+    // is therefore the unconditional default here, with the reason stated inline
+    // (an orchestrator that does not know WHY drifts back to `--task`).
+    //
+    // The audit of the first cut (auditor finding 1) showed that protecting only
+    // the final `--task-file` read is not enough: an `echo "…"` expands the
+    // content BEFORE it reaches disk, and an unquoted path can itself carry
+    // command substitution or `..` traversal. Hence the four creation rules, and
+    // the persistence/secrets note (#329's advice half).
+    //
+    // Round 3 then deleted the shell fallback that round 2 had recommended. A
+    // quoted `<<'EOF'` delimiter disables expansion inside the heredoc, but a
+    // task line that is exactly `EOF` terminates it and Bash parses and executes
+    // every line after it — and task files are exactly where untrusted text
+    // (issue bodies, code, another agent's brief) lands. "Use a fresh
+    // unpredictable delimiter and check the payload for it" is a rule an agent
+    // must get right on every single input, with silent command execution as the
+    // failure mode, so the only recommendation left is a non-shell file writer.
+    //
+    // Round 4 restored the *inline* fallback — not the shell one. Round 3's
+    // premise, "every agent in this system has a file-writing tool", confused
+    // having a tool with being authorized to use it: the e2e gate then caught a
+    // real Haiku worker launched with `--allowedTools Bash Read` calling `Write`
+    // and parking forever on the approval prompt. Guidance that depends on an
+    // unguaranteed permission produces exactly the silent stall #303 is about,
+    // so all three branches (file / short plain inline / say you cannot) are now
+    // stated outright rather than left to inference.
     content.push_str("\n## Delegation protocol\n\n");
     content.push_str(
-        "To delegate work to an agent, use `delegate` with one command per agent:\n\
+        "To delegate work to an agent, use `delegate` with one command per agent. \
+         Pass the task as a **file** — `--task-file` is the default, not an escape hatch:\n\n\
          ```bash\n\
-         dot-agent-deck delegate --to <role-name> --task \"Task description with context, file paths, and constraints.\"\n\
+         dot-agent-deck delegate --to <role-name> --task-file '.dot-agent-deck/<task-slug>.md'\n\
          ```\n\n\
-         To delegate to multiple agents in parallel, make **one call per agent** so each gets its own task:\n\
+         Four rules for producing that file. The last two are about the *path*, not the \
+         contents:\n\n\
+         - Write it with your **file-writing tool**. Do not construct it with shell redirection \
+         or a heredoc: a line of the task text can terminate the heredoc, and everything after \
+         that line is then executed as shell commands.\n\
+         - Invent a **fresh slug** for `<task-slug>` from `[a-z0-9][a-z0-9-]*` only, at most 40 \
+         characters. Never build it out of an issue title, a branch name, or any other text you \
+         did not write yourself.\n\
+         - No `/`, no `\\` and no `..` in the slug — the file goes directly in \
+         `.dot-agent-deck/`.\n\
+         - **Single-quote the whole path** in every command you run.\n\n\
+         Task and summary files persist on disk after the handoff. Keep credentials, customer \
+         data and other secrets out of them, pick a path that does not already exist, and delete \
+         exactly that path once the handoff has succeeded.\n\n\
+         **If you have no file-writing tool, or it is not authorized and invoking it would stop \
+         you at an approval prompt, do not wait there — skip the file and use the inline form \
+         below.** Never substitute shell redirection or a heredoc for the missing tool.\n\n\
+         `--task \"…\"` is the fallback for exactly that case, and is safe only when the whole \
+         task is **a single line of plain text with no backticks, no `$`, no `\"`, no `\\` and no \
+         `!`**:\n\n\
          ```bash\n\
-         dot-agent-deck delegate --to coder --task \"Implement the login endpoint...\"\n\
-         dot-agent-deck delegate --to reviewer --task \"Review the auth module...\"\n\
+         dot-agent-deck delegate --to <role-name> --task \"Short plain task description.\"\n\
          ```\n\n\
-         If all agents should receive the **exact same task**, you may combine them in one call:\n\
+         Why the allowlist is that narrow: everything after `--task` is processed by **your own \
+         shell** before dot-agent-deck receives it. Backticks and `$(…)` are executed and \
+         replaced by their output — usually empty — `$VAR` becomes its value or nothing, a \
+         balanced inner `\"` is removed and changes how the rest of the argument is quoted, a \
+         `\\` before `$`, a backtick, `\"` or `\\` removes itself, and a `\\` at the end of a \
+         line removes itself *and* the newline. `!` is excluded because a Bash with history \
+         expansion on rewrites it before argv is built. An unmatched `\"` aborts the command \
+         outright; everything else is dropped silently while the delegation still reports \
+         success, so the worker acts on a task with pieces missing and nobody sees an error. \
+         `--task-file` is read from disk verbatim, so none of this applies to it.\n\n\
+         If a task will not fit that one plain line and you cannot write a file, say so plainly \
+         to the user and ask for the file-writing tool to be authorized, rather than improvising \
+         a way around the allowlist.\n\n\
+         To delegate to multiple agents in parallel, make **one call per agent** so each gets its own task:\n\n\
          ```bash\n\
-         dot-agent-deck delegate --to <role1> --to <role2> --task \"Same task for all.\"\n\
+         dot-agent-deck delegate --to coder --task-file '.dot-agent-deck/login-endpoint-coder.md'\n\
+         dot-agent-deck delegate --to reviewer --task-file '.dot-agent-deck/login-endpoint-reviewer.md'\n\
          ```\n\n\
-         When all work is complete and you are satisfied with the results:\n\
+         If all agents should receive the **exact same task**, you may combine them in one call:\n\n\
          ```bash\n\
-         dot-agent-deck work-done --done --task \"Final summary of what was accomplished.\"\n\
-         ```\n",
+         dot-agent-deck delegate --to <role1> --to <role2> --task-file '.dot-agent-deck/<task-slug>.md'\n\
+         ```\n\n\
+         When all work is complete and you are satisfied with the results:\n\n\
+         ```bash\n\
+         dot-agent-deck work-done --done --task-file '.dot-agent-deck/final-summary-<summary-slug>.md'\n\
+         ```\n\
+         (or `dot-agent-deck work-done --done --task \"Final summary.\"` when that summary really is \
+         one plain line). The same four rules apply to that file: `<summary-slug>` is a fresh slug \
+         you invent, the path must not already exist before you write it, and you delete exactly \
+         that path once the command has exited successfully.\n\n\
+         **Shell safety and context length are two different problems.** Writing long context to \
+         `.dot-agent-deck/<task-slug>.md` and *referencing that path inside* `--task \"…\"` keeps the \
+         task description short, but the description itself still goes through your shell. Passing \
+         the file with `--task-file` is what keeps the shell out of the text. One file solves both \
+         at once: write the full task to `.dot-agent-deck/<task-slug>.md` and hand it over with \
+         `--task-file`.\n",
     );
 
     // 4. Important guidelines.
@@ -17794,6 +17872,117 @@ mod tests {
         // Contains delegation protocol.
         assert!(content.contains("Delegation protocol"));
         assert!(content.contains("dot-agent-deck work-done"));
+        // Issue #303: the protocol advertises the shell-safe input path, says
+        // when it is required, and explains why — an orchestrator told only
+        // "use --task-file" without the reason drifts back to `--task`.
+        //
+        // The anchors are deliberately formatting-independent (reviewer finding
+        // 4): pinning `expanded by **your own shell**` or a full punctuated
+        // character list makes a harmless copy edit fail the test without
+        // making anything safer.
+        let file_form = content
+            .find("delegate --to <role-name> --task-file")
+            .expect("delegation protocol must show a --task-file delegate invocation");
+        let inline_form = content
+            .find("delegate --to <role-name> --task \"")
+            .expect("delegation protocol must keep the inline --task form as the secondary option");
+        // The regression guard that actually matters: the default must stay the
+        // file form. Substring presence alone would still pass if a future edit
+        // put the inline command back on top.
+        assert!(
+            file_form < inline_form,
+            "the --task-file delegate command must come BEFORE the inline --task one, \
+             so the file form reads as the default"
+        );
+        assert!(
+            content.contains("work-done --done --task-file"),
+            "delegation protocol must show a --task-file work-done invocation"
+        );
+        // Round 4 / the #303 e2e gate: the file form is a preference, not a hard
+        // dependency on a permission the agent may not hold. A restricted tool
+        // allowlist otherwise turns this guidance into a stall at an approval
+        // prompt — the same silent-failure class #303 exists to remove.
+        let fallback = content.find("not authorized").expect(
+            "delegation protocol must state what to do when the file-writing tool is not \
+             authorized",
+        );
+        assert!(
+            content.contains("approval prompt"),
+            "delegation protocol must name the approval prompt as the failure to avoid"
+        );
+        assert!(
+            fallback < inline_form,
+            "the no-file-writing-tool branch must appear BEFORE the inline --task example \
+             it redirects to"
+        );
+        assert!(
+            content.contains("will not fit that one plain line"),
+            "delegation protocol must say what to do when neither form fits"
+        );
+        assert!(
+            content.contains("backticks"),
+            "delegation protocol must name backticks as genuinely transformed"
+        );
+        assert!(
+            content.contains("own shell"),
+            "delegation protocol must explain WHY --task is unsafe"
+        );
+        // The shell-safety advice stays distinct from the context-length advice
+        // about referencing `.dot-agent-deck/<task-slug>.md` inside `--task`.
+        assert!(
+            content.contains("context length"),
+            "delegation protocol must not conflate shell safety with context length"
+        );
+        // Auditor finding 1: the advice has to cover creating the file and the
+        // path, not only the final read. Round 3 deleted the heredoc fallback
+        // round 2 had recommended — a task line equal to the delimiter ends the
+        // heredoc and Bash executes every line after it, and task files are
+        // exactly where untrusted text lands — so the guard is now that a
+        // non-shell writer is the recommendation AND that no heredoc operator
+        // appears anywhere in the generated protocol.
+        assert!(
+            content.contains("file-writing tool"),
+            "delegation protocol must tell the orchestrator to write the task file with a \
+             file-writing tool"
+        );
+        assert!(
+            !content.contains("<<"),
+            "delegation protocol must not recommend a heredoc: a task line equal to the \
+             delimiter terminates it and everything after it is executed as shell commands"
+        );
+        assert!(
+            content.contains("[a-z0-9][a-z0-9-]*"),
+            "delegation protocol must require a slug from a strict ASCII allowlist"
+        );
+        assert!(
+            content.contains("--task-file '.dot-agent-deck/"),
+            "every executable --task-file example must single-quote the path"
+        );
+        // Auditor findings 4/5 (#329's advice half): the file outlives the handoff.
+        assert!(
+            content.contains("secrets"),
+            "delegation protocol must warn that task files persist and must not carry secrets"
+        );
+        // Auditor round-3 finding 4: the final-completion example used a fixed
+        // `final-summary.md` while the text above it demanded a fresh path — a
+        // copied example truncates a prior summary, and follows a symlink if one
+        // is parked there. It must carry the same replaceable slug.
+        assert!(
+            content.contains("final-summary-<summary-slug>.md"),
+            "the final work-done example must use a replaceable per-summary path, not a \
+             fixed clobber target"
+        );
+        assert!(
+            content.contains("does not already exist"),
+            "the protocol must require a path that does not already exist, not merely one \
+             git does not track"
+        );
+        // Round-3 blocker 2: the defining allowlist sentence must be
+        // self-sufficient and agree with its own explanation.
+        crate::state::assert_inline_allowlist_agrees_with_explanation(
+            &content,
+            "orchestrator delegation protocol",
+        );
         // Instructs orchestrator to wait then delegate.
         assert!(content.contains("Wait for the user to tell you what to work on"));
         assert!(content.contains("delegate immediately"));

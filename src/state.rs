@@ -502,11 +502,255 @@ pub struct AppState {
 
 pub type SharedState = Arc<RwLock<AppState>>;
 
-const WORK_DONE_FOOTER: &str = "## When done\n\n\
-Signal completion by running this command via Bash:\n\
-```bash\n\
-dot-agent-deck work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
-```";
+/// Bytes of the human-readable half of a role slug that survive into the
+/// suggested report path. #303 round-3 (auditor finding 5): nothing bounds a
+/// configured role name, and `NAME_MAX` is 255 bytes on the filesystems we
+/// target, so an unusually long role could push the suggested basename past the
+/// limit and make the report file impossible to create — a denial of completion
+/// rather than a cosmetic problem.
+const ROLE_SLUG_READABLE_MAX: usize = 24;
+
+/// Hex characters of the digest [`role_path_slug`] appends. 32 bits keeps the
+/// handful of roles in one deck apart with room to spare; the digest is there to
+/// break *accidental* collisions between configured names, not to resist an
+/// operator who already controls both role names in their own config.
+const ROLE_SLUG_DIGEST_HEX: usize = 8;
+
+/// FNV-1a over the original role bytes, truncated to [`ROLE_SLUG_DIGEST_HEX`]
+/// lowercase hex characters.
+///
+/// Deliberately not `DefaultHasher`: its output is only guaranteed stable within
+/// one toolchain build, and this value is baked into generated agent-facing text
+/// and into pinned test expectations, so it has to be reproducible forever.
+fn role_digest_hex(role: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in role.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!(
+        "{:0width$x}",
+        hash & 0xffff_ffff,
+        width = ROLE_SLUG_DIGEST_HEX
+    )
+}
+
+/// Reduce a role name to a bounded, collision-resistant ASCII slug that is safe
+/// to interpolate into the single-quoted example path in [`work_done_footer`].
+///
+/// Role names come from project config and [`sanitize_role_name`] only strips
+/// separators from them, so a role called `bo'b` or `deploy $stage` would
+/// otherwise land inside a shell command the worker is told to copy. The
+/// readable half uses the same allowlist the footer asks the worker to use for
+/// its own slug: runs of `[a-z0-9]` joined by single `-`.
+///
+/// That reduction is lossy on purpose — it has to be, to stay shell-quotable —
+/// so #303 round-3 (auditor finding 2 / reviewer finding 3) appends a digest of
+/// the *original* bytes. Without it `Coder`/`coder` and `qa.a`/`qa-a` shared a
+/// path, and every role with no ASCII alphanumerics at all (any name written in
+/// a non-Latin script) collapsed onto the single `worker` fallback, so a whole
+/// deck of such roles was pointed at one report file.
+fn role_path_slug(role: &str) -> String {
+    let mut out = String::new();
+    for ch in role.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    // `out` is ASCII by construction, so a byte truncation is always on a char
+    // boundary.
+    out.truncate(ROLE_SLUG_READABLE_MAX);
+    let readable = out.trim_end_matches('-');
+    let readable = if readable.is_empty() {
+        "worker"
+    } else {
+        readable
+    };
+    format!("{readable}-{}", role_digest_hex(role))
+}
+
+/// Assert that the inline `--task` allowlist condition on a generated surface
+/// names every character that surface's own prose calls excluded.
+///
+/// #303 round-3 blocker 2: round 2 defined the condition as "a single line of
+/// plain text with no backticks, no `$`, no `\"` and no `\\`" — which admits
+/// `!` — while the explanation two paragraphs down claimed `!` was outside the
+/// allowlist. An agent applying the rule mechanically, which is the entire point
+/// of a positive allowlist, therefore let `!` through. This guard is what would
+/// have caught that: the defining sentence has to be self-sufficient, and it has
+/// to agree with its own justification.
+///
+/// Backticks are markup on the Markdown surfaces and absent inside the TOML
+/// worked examples, so the comparison is done with the backticks stripped, and
+/// each character is accepted either as its glyph or as its English name — a
+/// literal `\` cannot appear inside a TOML basic string, so the surfaces that
+/// live in one have to spell it out.
+///
+/// Round-3 review hardening: matching a bare mention of the character was a
+/// semantic false pass — "plain text where backticks, `$`, `\"`, `\\` and `!`
+/// are allowed" named all five and sailed through, saying the opposite of what
+/// the guard exists to enforce. The condition now has to *deny* each character
+/// in the canonical `no <glyph>` / `no <English name>` form, which is what every
+/// real surface already writes. The prose scan was likewise widened from two
+/// hard-coded words to the `EXCLUSION_PHRASES` list below, so an exclusion added
+/// in a different voice ("do not use `;` …") is not silently skipped.
+#[cfg(test)]
+pub(crate) fn assert_inline_allowlist_agrees_with_explanation(text: &str, surface: &str) {
+    /// `(glyph, label, accepted spellings in the condition)`.
+    const CHARS: [(&str, &str, &[&str]); 5] = [
+        ("`", "backticks", &["backticks", "backtick"]),
+        ("$", "a dollar sign", &["$", "dollar"]),
+        ("\"", "a double quote", &["\"", "double quote"]),
+        ("\\", "a backslash", &["\\", "backslash"]),
+        ("!", "an exclamation mark", &["!", "exclamation"]),
+    ];
+
+    /// Lowercase markers for "this sentence puts a character off-limits".
+    ///
+    /// Deliberately a short explicit list rather than anything resembling a
+    /// parser. Bare `must not` is *not* on it, measured rather than assumed:
+    /// with it, the config-generation prompt's role-name rule ("must not contain
+    /// `..`, `/`, `\`") reads as an exclusion sentence and the guard demands the
+    /// inline-`--task` condition deny `/`. The narrower `must not use` keeps the
+    /// negative voice without borrowing rules from a different subject.
+    const EXCLUSION_PHRASES: [&str; 5] = [
+        "excluded",
+        "outside the allowlist",
+        "do not use",
+        "never use",
+        "must not use",
+    ];
+
+    let start = text
+        .find("a single line of plain text")
+        .unwrap_or_else(|| panic!("{surface}: no inline --task allowlist condition found"));
+    let rest = &text[start..];
+    let end = rest.find(['\n', ':', '.', '—']).unwrap_or(rest.len());
+    let condition = rest[..end].replace('`', "");
+    let condition_lower = condition.to_lowercase();
+    // Presence is not exclusion: only the negative form counts.
+    let denies =
+        |spelling: &str| condition_lower.contains(&format!("no {}", spelling.to_lowercase()));
+
+    for (_, label, spellings) in CHARS {
+        assert!(
+            spellings.iter().any(|s| denies(s)),
+            "{surface}: the defining allowlist condition must say \"no …\" for {label} — \
+             merely naming the character is not exclusion, and an agent applying the rule \
+             mechanically admits whatever the sentence does not deny. Got: {condition:?}"
+        );
+    }
+
+    // Nothing the surrounding prose puts off-limits may be missing from the
+    // condition, or the rule contradicts its own justification again.
+    for sentence in text.split(". ") {
+        let sentence_lower = sentence.to_lowercase();
+        if !EXCLUSION_PHRASES
+            .iter()
+            .any(|phrase| sentence_lower.contains(phrase))
+        {
+            continue;
+        }
+        for token in sentence.split('`').skip(1).step_by(2) {
+            if token.chars().count() != 1 {
+                continue;
+            }
+            let satisfied = match CHARS.iter().find(|(glyph, _, _)| *glyph == token) {
+                Some((_, _, spellings)) => spellings.iter().any(|s| denies(s)),
+                None => denies(token),
+            };
+            assert!(
+                satisfied,
+                "{surface}: the explanation puts `{token}` off-limits, but the defining \
+                 condition does not deny it. Got: {condition:?}"
+            );
+        }
+    }
+}
+
+/// Footer appended to every worker task file (see [`compose_worker_task_file`]).
+///
+/// Issue #303: the summary reaches the CLI through the worker's own shell, so
+/// `--task "…"` is rewritten before argv is built — backticks and `$(…)` are
+/// executed, `$VAR` is substituted, a balanced inner `"` is removed and a `\`
+/// removes itself, all while the signal still reports success. The file form is
+/// therefore the default here, with the inline form kept as an explicitly narrow
+/// exception, and the reason stated inline so the worker does not fall back to
+/// `--task` out of habit.
+///
+/// The suggested path is role-interpolated and deliberately outside the
+/// `work-done-*` namespace: the daemon writes its own summary to
+/// `.dot-agent-deck/work-done-<role>.md` (see `handle_work_done`), so a worker
+/// that parked its report there would have it silently overwritten (#331), and
+/// a shared fixed filename would let parallel workers in one cwd clobber each
+/// other (reviewer finding 1). The role component is reduced by
+/// [`role_path_slug`], whose digest is what keeps two distinct configured roles
+/// apart. That is collision *resistance*, not injectivity — two roles whose
+/// original bytes hash to the same 32 bits would still share a path — but the
+/// readable slug alone collided on ordinary names (`Coder`/`coder`,
+/// `qa.a`/`qa-a`) and on every role with no ASCII alphanumerics, which is a
+/// realistic configuration rather than a 1-in-4-billion one.
+///
+/// Round 3 also removed the shell fallback for *writing* the report. A quoted
+/// `<<'EOF'` delimiter stops expansion inside the heredoc, but a report line
+/// that is exactly `EOF` terminates it and Bash executes everything after it —
+/// and a report is precisely where untrusted text (issue bodies, code, another
+/// agent's brief) ends up. A non-shell file-writing tool is now the only
+/// recommended way to produce it.
+///
+/// Round 4 then had to put the *inline* fallback back on the page, because
+/// round 3's premise ("every agent has a file-writing tool") confused having a
+/// tool with being allowed to use it. The pre-PR e2e gate caught it: a real
+/// Haiku worker launched as `claude … --allowedTools Bash Read` followed this
+/// footer, called `Write`, and parked forever on the interactive approval
+/// prompt — the silent stall #303 exists to remove. So the footer now states
+/// all three branches outright (file / short plain inline / say you cannot),
+/// adjacent to the primary instruction, because a worker that cannot write a
+/// file has to resolve it from this text alone. The shell forms stay deleted:
+/// the fallback is inline `--task`, never a heredoc.
+fn work_done_footer(role: &str) -> String {
+    let slug = role_path_slug(role);
+    format!(
+        "## When done\n\n\
+         Signal completion by running this command via Bash:\n\n\
+         ```bash\n\
+         dot-agent-deck work-done --task-file '.dot-agent-deck/report-{slug}-<summary-slug>.md'\n\
+         ```\n\n\
+         Write that report with your **file-writing tool**. Do not construct it with shell \
+         redirection or a heredoc: a line of your own text can terminate the heredoc, and \
+         everything after that line is then executed as shell commands. Replace \
+         `<summary-slug>` with a short name you invent from `[a-z0-9][a-z0-9-]*`, at most 40 \
+         characters, containing no `/` and no `..`, and keep the whole path single-quoted. Do not \
+         give the file a `work-done-*` name: the deck writes its own summary to \
+         `.dot-agent-deck/work-done-<your-role>.md`, so a report parked there is overwritten and \
+         lost.\n\n\
+         The file stays on disk after the handoff. Keep credentials, customer data, and other \
+         secrets out of it, pick a path that does not already exist, and delete exactly that path \
+         once the handoff has succeeded.\n\n\
+         **If you have no file-writing tool, or it is not authorized and invoking it would stop \
+         you at an approval prompt, do not wait there — skip the file and use the inline form \
+         below.** Never substitute shell redirection or a heredoc for the missing tool.\n\n\
+         The inline form is the fallback for exactly that case, and is safe only for a summary \
+         that is **a single line of plain text with no backticks, no `$`, no `\"`, no `\\` and no \
+         `!`**:\n\n\
+         ```bash\n\
+         dot-agent-deck work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
+         ```\n\n\
+         Anything outside that allowlist is rewritten by your own shell before dot-agent-deck \
+         sees it: backticks and `$(…)` are executed and replaced by their output (usually empty), \
+         `$VAR` becomes its value or nothing, a balanced inner `\"` is removed and changes how the \
+         rest of the argument is quoted, a `\\` before `$`, a backtick, `\"` or `\\` removes \
+         itself, and a `\\` at the end of a line removes itself *and* the newline. `!` is \
+         excluded because a Bash with history expansion on rewrites it before argv is built. An \
+         unmatched `\"` aborts the command outright; everything else is dropped silently while \
+         the signal still reports success. `--task-file` is read from disk verbatim.\n\n\
+         If your summary cannot go in a file and cannot be reduced to that one plain line, still \
+         signal: send a short plain-text `--task` saying what you did and stating that the detail \
+         could not be delivered. Do not improvise a way around the allowlist."
+    )
+}
 
 /// Compose the prompt that the daemon writes into a worker pane on
 /// delegation. In the normal file-backed path this is intentionally only
@@ -1435,12 +1679,17 @@ fn arm_delegate_silence_watch(
 /// along. The work-done footer is appended to the file rather than the
 /// PTY-injected pointer so workers still get completion instructions
 /// without forcing a multi-line bracketed-paste write into the agent TUI.
-pub fn compose_worker_task_file(prompt_template: Option<&str>, task: &str) -> String {
+///
+/// `role` only feeds the footer's suggested summary path (#303 / #331): the
+/// path is role-interpolated, via [`role_path_slug`]'s readable-slug-plus-digest
+/// form, so two workers sharing a cwd are not handed the same report path (see
+/// [`work_done_footer`] for the exact strength of that claim).
+pub fn compose_worker_task_file(prompt_template: Option<&str>, task: &str, role: &str) -> String {
     let body = match prompt_template {
         Some(tpl) if !tpl.trim().is_empty() => format!("{tpl}\n\n## Task\n\n{task}"),
         _ => task.to_string(),
     };
-    format!("{}\n\n{}", body.trim_end(), WORK_DONE_FOOTER)
+    format!("{}\n\n{}", body.trim_end(), work_done_footer(role))
 }
 
 /// Look up the role config for `role_name` inside the orchestration
@@ -1703,7 +1952,7 @@ async fn dispatch_one_owned(
             );
         }
         let file_path = dir.join(format!("worker-task-{safe_name}.md"));
-        let file_content = compose_worker_task_file(prompt_template, &task);
+        let file_content = compose_worker_task_file(prompt_template, &task, &target_role);
         if let Err(e) = std::fs::write(&file_path, &file_content) {
             warn!(
                 path = %file_path.display(),
@@ -1726,7 +1975,7 @@ async fn dispatch_one_owned(
             pane_id = %pane_id,
             "delegate: no cwd recorded for worker pane — inlining task body"
         );
-        compose_worker_task_file(prompt_template, &task)
+        compose_worker_task_file(prompt_template, &task, &target_role)
     };
     // The single-line pointer the worker receives ("Read
     // .dot-agent-deck/worker-task-<role>.md for your task."). Computed here so
@@ -3189,7 +3438,8 @@ mod tests {
 
     #[test]
     fn compose_worker_task_file_appends_work_done_footer() {
-        let content = compose_worker_task_file(Some("You are coder."), "Implement the thing.");
+        let content =
+            compose_worker_task_file(Some("You are coder."), "Implement the thing.", "coder");
         assert!(content.starts_with("You are coder.\n\n## Task\n\nImplement the thing."));
         assert!(
             content.contains("## When done"),
@@ -3200,8 +3450,297 @@ mod tests {
             "task file must instruct the worker to call dot-agent-deck work-done"
         );
 
-        let no_template = compose_worker_task_file(None, "Implement the fallback.");
+        // Issue #303: BOTH forms must be offered — the shell-safe file one as
+        // the default, the short inline one as the explicit exception. Substring
+        // presence cannot tell them apart (`--task` is a prefix of
+        // `--task-file`), so pin each form to a character the other cannot have:
+        // the `-file` suffix plus a single-quoted path, and the opening double
+        // quote of the inline argument.
+        let file_form = content
+            .find("dot-agent-deck work-done --task-file '.dot-agent-deck/")
+            .expect("footer must offer the shell-safe --task-file form with a quoted path");
+        let inline_form = content
+            .find("dot-agent-deck work-done --task \"")
+            .expect("footer must keep the short inline --task form for a brief summary");
+        // Reviewer finding 2 / auditor finding 2: the file form must be the
+        // FIRST command the worker sees, or the footer keeps teaching the
+        // copy-first behavior that #303 is about.
+        assert!(
+            file_form < inline_form,
+            "the --task-file command must come BEFORE the inline --task one, \
+             so the file form reads as the default"
+        );
+
+        // Round 4 / the #303 e2e gate: preferring the file form must not become
+        // a hard dependency on a permission the worker may not hold. A real
+        // Haiku worker launched with `--allowedTools Bash Read` read this exact
+        // footer, called `Write`, and stalled forever on the approval prompt.
+        // The branch has to be STATED (a worker cannot infer it) and has to come
+        // before the inline example it points at, so reading top-down works.
+        let fallback = content
+            .find("not authorized")
+            .expect("footer must state what to do when the file-writing tool is not authorized");
+        assert!(
+            content.contains("approval prompt"),
+            "footer must name the approval prompt as the failure to avoid, so a worker \
+             recognises the situation it is in"
+        );
+        assert!(
+            fallback < inline_form,
+            "the no-file-writing-tool branch must appear BEFORE the inline --task example \
+             it redirects to"
+        );
+        // Branch 3: neither form fits. The way out is plain words, never a shell
+        // workaround — that is what the deleted heredoc advice was.
+        assert!(
+            content.contains("cannot go in a file"),
+            "footer must tell the worker what to do when the summary fits neither form"
+        );
+
+        // Reviewer finding 1 / #331: the suggested path must stay out of the
+        // `work-done-*` namespace the daemon overwrites, and must carry the role
+        // so two workers sharing one cwd cannot clobber each other's report.
+        let suggested_path = content
+            .split("work-done --task-file '")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("footer's --task-file example must single-quote its path");
+        let file_name = suggested_path
+            .strip_prefix(".dot-agent-deck/")
+            .unwrap_or_else(|| {
+                panic!("summary path must live in .dot-agent-deck/: {suggested_path}")
+            });
+        assert!(
+            !file_name.starts_with("work-done"),
+            "the suggested summary path must not be in the daemon's own work-done-* \
+             namespace (#331), got {suggested_path}"
+        );
+        assert!(
+            file_name.contains("coder"),
+            "the suggested summary path must be role-unique, got {suggested_path}"
+        );
+
+        // Formatting-independent anchors (reviewer finding 4).
+        assert!(
+            content.contains("backticks"),
+            "footer must name backticks as genuinely transformed"
+        );
+        assert!(
+            content.contains("own shell"),
+            "footer must explain WHY --task is unsafe, not just offer the flag"
+        );
+        // Auditor finding 1: creation, not only the read. Round 3 replaced the
+        // heredoc advice outright — a report line equal to the delimiter ends
+        // the heredoc and Bash executes the rest, and reports are exactly where
+        // untrusted text lands — so the guard is now that a non-shell writer is
+        // the recommendation AND that no heredoc operator is suggested at all.
+        assert!(
+            content.contains("file-writing tool"),
+            "footer must tell the worker to write the report with a file-writing tool"
+        );
+        assert!(
+            !content.contains("<<"),
+            "footer must not recommend a heredoc for writing the report: a payload line \
+             equal to the delimiter terminates it and everything after it is executed"
+        );
+        assert!(
+            content.contains("[a-z0-9][a-z0-9-]*"),
+            "footer must require a slug from a strict ASCII allowlist"
+        );
+        // Auditor findings 4/5 (#329's advice half).
+        assert!(
+            content.contains("secrets"),
+            "footer must warn that the report persists and must not carry secrets"
+        );
+        // Auditor round-3 finding 4: "not tracked by git" is not the same as
+        // "absent", and a copied example that clobbers a prior report is the
+        // failure this advice exists to prevent.
+        assert!(
+            content.contains("does not already exist"),
+            "footer must require a report path that does not already exist"
+        );
+
+        // Round-3 blocker 2: the defining allowlist sentence must be
+        // self-sufficient and agree with its own explanation.
+        assert_inline_allowlist_agrees_with_explanation(&content, "worker work-done footer");
+
+        let no_template = compose_worker_task_file(None, "Implement the fallback.", "coder");
         assert!(no_template.starts_with("Implement the fallback.\n\n## When done"));
+    }
+
+    /// The allowlist consistency guard is only worth having if it actually
+    /// fires, so feed it the two shapes it exists to reject: the round-2 text
+    /// verbatim (condition silently admits `!` while the prose claims `!` is
+    /// outside the allowlist), and a condition that has fallen behind a prose
+    /// exclusion nobody added to it.
+    #[test]
+    fn allowlist_consistency_guard_rejects_a_condition_that_contradicts_its_prose() {
+        // nextest runs one process per test, so muting the hook cannot swallow
+        // another test's panic output.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let round_2 = "only for a summary that is **a single line of plain text with no \
+                       backticks, no `$`, no `\"` and no `\\`**:\n\nNewlines and `!` are \
+                       outside the allowlist for portability and quoting complexity.";
+        let drifted = "only for a summary that is **a single line of plain text with no \
+                       backticks, no `$`, no `\"`, no `\\` and no `!`**:\n\nA `;` is also \
+                       excluded because it separates commands.";
+
+        for (text, why) in [
+            (
+                round_2,
+                "a condition that omits `!` while the prose claims it is excluded",
+            ),
+            (
+                drifted,
+                "a prose exclusion the defining condition never picked up",
+            ),
+        ] {
+            let outcome = std::panic::catch_unwind(|| {
+                assert_inline_allowlist_agrees_with_explanation(text, "guard self-test");
+            });
+            assert!(outcome.is_err(), "the guard must reject {why}");
+        }
+
+        std::panic::set_hook(previous);
+    }
+
+    /// The two shapes that used to slip past the guard while it matched on bare
+    /// token presence and on two hard-coded prose words: a condition that names
+    /// all five characters as *allowed*, and an exclusion written in a voice the
+    /// scan did not recognise. Both must panic now.
+    #[test]
+    fn allowlist_consistency_guard_rejects_semantic_false_passes() {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        // Every character named, none of them denied — the pre-hardening guard
+        // accepted this and would have kept accepting it next to prose saying
+        // `!` is excluded.
+        let permissive = "only for a summary that is **a single line of plain text where \
+                          backticks, `$`, `\"`, `\\` and `!` are allowed**:\n\nNothing in \
+                          that sentence is excluded.";
+        // Canonical condition, but a later exclusion phrased around "do not
+        // use" instead of "excluded" — invisible to the pre-hardening scan.
+        let alternative_wording = "only for a summary that is **a single line of plain text \
+                                   with no backticks, no `$`, no `\"`, no `\\` and no `!`**:\
+                                   \n\nDo not use `;` in the summary because it separates \
+                                   commands.";
+
+        for (text, why) in [
+            (
+                permissive,
+                "a condition that lists every character as allowed rather than denied",
+            ),
+            (
+                alternative_wording,
+                "an exclusion phrased as \"do not use\" that the condition never picked up",
+            ),
+        ] {
+            let outcome = std::panic::catch_unwind(|| {
+                assert_inline_allowlist_agrees_with_explanation(text, "guard self-test");
+            });
+            assert!(outcome.is_err(), "the guard must reject {why}");
+        }
+
+        std::panic::set_hook(previous);
+    }
+
+    /// Extract the single-quoted `--task-file` path out of a generated footer.
+    fn footer_suggested_path(role: &str) -> String {
+        work_done_footer(role)
+            .split("work-done --task-file '")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("footer must single-quote the suggested path")
+            .to_string()
+    }
+
+    /// Reviewer finding 1: the footer interpolates the role into a single-quoted
+    /// example path, and role names come from project config. A name carrying a
+    /// quote, a space, or a `$` must not end up inside the command the worker is
+    /// told to copy.
+    #[test]
+    fn work_done_footer_path_is_shell_quotable() {
+        let path = footer_suggested_path("bo'b $HOME");
+        assert_eq!(
+            path,
+            ".dot-agent-deck/report-bo-b-home-51701b14-<summary-slug>.md"
+        );
+
+        // The readable half survives for humans, and nothing that could break
+        // the surrounding single quotes does.
+        assert!(footer_suggested_path("coder").starts_with(".dot-agent-deck/report-coder-"));
+        for role in ["bo'b $HOME", "deploy `whoami`", "a\\b", "qa\nteam"] {
+            let path = footer_suggested_path(role);
+            assert!(
+                !path.contains(['\'', '"', '$', '`', '\\', ' ', '\n']),
+                "role {role:?} leaked shell syntax into the suggested path: {path}"
+            );
+        }
+
+        // A role with nothing slug-able still yields a usable path.
+        assert!(footer_suggested_path("!!!").contains("report-worker-"));
+    }
+
+    /// Round-3 blocker 3 (auditor finding 2 / reviewer finding 3): the readable
+    /// slug alone is not injective — it lowercases, collapses every punctuation
+    /// run to one `-`, and drops non-ASCII entirely, so a deck whose roles are
+    /// written in a non-Latin script had ALL of them fall back to `worker` and
+    /// share one report path. The appended digest is what makes the claim in
+    /// [`compose_worker_task_file`]'s doc comment hold, so assert real path
+    /// inequality for each collision class the reduction creates — the old test
+    /// only compared `coder` against `reviewer`, which the broken version passed.
+    #[test]
+    fn work_done_footer_path_is_role_unique_across_collision_classes() {
+        for (a, b, class) in [
+            ("Coder", "coder", "case-differing"),
+            ("qa.a", "qa-a", "punctuation-differing"),
+            ("研究", "監査", "Unicode-only (the `worker` fallback class)"),
+            ("!!!", "???", "no-alphanumerics fallback"),
+            ("worker", "!!!", "explicit role vs fallback"),
+        ] {
+            let (pa, pb) = (footer_suggested_path(a), footer_suggested_path(b));
+            assert_ne!(
+                pa, pb,
+                "roles {a:?} and {b:?} ({class}) share a report path"
+            );
+        }
+    }
+
+    /// Round-3 blocker 3 + suggestion 5 (auditor finding 5): `NAME_MAX` is 255
+    /// bytes, nothing bounds a configured role name, and the round-2 slug was
+    /// unbounded — a long enough role made the suggested report file impossible
+    /// to create, i.e. denial of completion. The slug is now capped, and the
+    /// cap must not cost uniqueness.
+    #[test]
+    fn work_done_footer_path_is_length_bounded() {
+        let long = "a".repeat(240);
+        let slug = role_path_slug(&long);
+        assert_eq!(
+            slug.len(),
+            ROLE_SLUG_READABLE_MAX + 1 + ROLE_SLUG_DIGEST_HEX,
+            "the role slug must be capped at the readable maximum plus its digest"
+        );
+
+        // Worst realistic basename: the capped role slug plus a summary slug at
+        // the 40-character limit the footer asks for.
+        let basename = format!("report-{slug}-{}.md", "s".repeat(40));
+        assert!(
+            basename.len() < 255,
+            "suggested basename must stay under NAME_MAX, got {} bytes",
+            basename.len()
+        );
+
+        // Truncation must not reintroduce collisions: two roles that differ only
+        // beyond the cap still get different paths.
+        let other = format!("{long}-tail");
+        assert_ne!(role_path_slug(&long), role_path_slug(&other));
+
+        // A role that is exactly the cap keeps its readable half intact.
+        let exact = "b".repeat(ROLE_SLUG_READABLE_MAX);
+        assert!(role_path_slug(&exact).starts_with(&format!("{exact}-")));
     }
 
     /// PRD #126 M1 audit (finding 1): a printable instruction-shaped role name

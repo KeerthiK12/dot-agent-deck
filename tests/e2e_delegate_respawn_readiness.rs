@@ -224,7 +224,12 @@ fn run_real_clear_true_delegate(deck: TuiDeck, worker_command: &str, case: RealD
 fn delegate_014_real_claude_worker_acts_on_clear_true_delegate() {
     skip_unless!(common::check_claude_available());
 
-    let worker_command = format!("claude --model {CLAUDE_MODEL} --allowedTools Bash Read");
+    // `Write` is here for the footer, not the assertion (#303). The sentinel is
+    // created with Bash, so this test would still pass without it — but the task
+    // file's `## When done` footer then sends the worker into a `Write` approval
+    // prompt it cannot answer, and this case is `[reel]`-marked, so that dialog
+    // would be the last thing on its recorded cast.
+    let worker_command = format!("claude --model {CLAUDE_MODEL} --allowedTools Bash Read Write");
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
         .with_env("PATH", path_with_binary_dir())

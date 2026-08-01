@@ -86,7 +86,7 @@ To write the config by hand, use the [configuration reference](#configuration-re
 | `command` | string | yes | — | Shell command that launches the agent for this role. Must result in a `claude`, `opencode`, `pi`, or `codex` process (e.g. `claude`, `devbox run agent-big`, `opencode --model gpt-4o`, `pi --provider openrouter`, `codex`). Other commands will run but won't get live status tracking on the role card. |
 | `start` | bool | no | `false` | `true` marks this role as the orchestrator. Exactly one role per orchestration must have `start = true`. |
 | `description` | string | no | — | Tells the orchestrator when to use this role and what it is for, so it can decide which worker to delegate to in a given situation. Also shown on the role card in the deck. |
-| `prompt_template` | string | no | — | Standing instructions the orchestrator prepends to every task it sends this role. When set, the orchestrator's `--task` content is appended under a `## Task` heading — the worker sees both the template and the task together. |
+| `prompt_template` | string | no | — | Standing instructions the orchestrator prepends to every task it sends this role. When set, the orchestrator's task text — however it was passed, `--task` or `--task-file` — is appended under a `## Task` heading, so the worker sees both the template and the task together. |
 | `clear` | bool | no | `true` | Restart the agent before each delegation, so every task starts from a clean context. The deck terminates the running agent, launches the role's `command` again in the same pane, waits through a readiness buffer, and only then delivers the task. Set to `false` for roles that need to carry state across delegations (e.g. a `release` role that must remember the PR URL and branch name when retrying after a CI failure). See [What `clear` does to delivery](#what-clear-does-to-delivery). |
 
 ### Minimal example
@@ -109,8 +109,11 @@ Workflow:
 - Once the work is clean, delegate to release.
 
 Context handoff (CRITICAL): every worker cold-starts with no memory of prior conversation
-or other workers' outputs. Whatever you write in --task is the entire context the worker has.
+or other workers' outputs. The task text you send is the entire context the worker has.
 Always include file paths, the relevant spec path, and any prior worker's findings when chaining.
+Send it with --task-file '.dot-agent-deck/<task-slug>.md' — the file is read verbatim, while
+--task "..." is expanded by your own shell first. Keep --task for short plain one-liners, and
+use it too when you have no authorized file-writing tool rather than stalling on its prompt.
 """
 
 [[orchestrations.roles]]
@@ -216,6 +219,10 @@ The orchestrator can delegate to multiple workers simultaneously — for example
 
 Workers cold-start with no memory of prior conversation, no access to other workers' outputs, and no shared scratchpad. Whatever the orchestrator includes in a delegation is the **entire context the worker has** — plus the worker's `prompt_template`. The orchestrator's `prompt_template` is where you tell it how to delegate well: which files to reference, how to summarise prior findings when chaining workers, and what to include when retrying after a failure.
 
+That task text reaches the worker one of two ways: inline with `dot-agent-deck delegate --to coder --task "..."`, or from a file with `dot-agent-deck delegate --to coder --task-file '.dot-agent-deck/coder-task.md'`. Tell the orchestrator to default to `--task-file`, because the inline form is processed by the orchestrator's own shell before dot-agent-deck ever sees it — backticks and `$(...)` get executed and replaced by their output (usually nothing), `$VAR` is substituted, a balanced inner `"` is removed and changes how the rest of the argument is quoted while an unmatched one aborts the command with a parse error, a `\` before `$`, a backtick, `"` or `\` removes itself, and a `\` at the end of a line removes itself *and* the newline — while the delegation still reports success. A task file is read off disk verbatim, provided the file itself was written with a file-writing tool and the path is single-quoted. Do not build the file with shell redirection or a heredoc: a line of the task text can terminate the heredoc, and Bash then executes everything after it as commands. Keep `--task` for a single line of plain text with no backticks, no `$`, no `"`, no `\` and no `!` — `!` is rewritten by a Bash with history expansion on — and use `work-done --task-file` for the same reason on the worker side. This is a separate problem from context length: a long brief belongs in a file either way, but it is passing that file with `--task-file` that keeps the shell out of the text.
+
+That default assumes the agent is *authorized* to write a file, which is not the same as having a file-writing tool: a role launched with a restricted tool allowlist — `claude --allowedTools Bash Read`, say — hits an interactive approval prompt instead, and an unattended pane parks there forever. So tell the agent all three branches: write the file and pass `--task-file`; with no authorized file-writing tool, keep the task within the plain-text allowlist above and send it inline with `--task`; and if it fits neither, say so plainly rather than improvising. Never let the fallback be shell redirection or a heredoc — that is the injection this guidance exists to avoid. If a role is expected to take the primary path, add the file-writing tool to its `command`'s allowlist (e.g. `--allowedTools Bash Read Write`) so it never meets the prompt.
+
 ### Use a tracking file
 
 The most effective pattern is to give the orchestrator a spec or task file — a PRD, a checklist, whatever suits your workflow — and tell it to read the file and keep it updated as work progresses. You can do this in the orchestrator's `prompt_template`, in your opening message to it, or both.
@@ -268,8 +275,15 @@ Workflow:
 6. Delegate the release flow to release.
 
 Context handoff (CRITICAL): workers cold-start with no memory of prior conversation or other
-workers' outputs. Include all context in --task: file paths, spec paths, error messages, findings.
-If context is long, write it to .dot-agent-deck/<slug>.md and reference the path in --task.
+workers' outputs. Include all context in the task: file paths, spec paths, error messages, findings.
+If context is long, write it to .dot-agent-deck/<slug>.md and pass that file rather than pasting it.
+Send the task itself with --task-file '.dot-agent-deck/<slug>-task.md': it is read verbatim, while
+--task "..." is processed by your own shell first, so backticks and $(...) are executed and replaced
+by their output while the delegation still reports success. Write the file with your file-writing tool,
+never with shell redirection or a heredoc — a line of the task text can terminate the heredoc and Bash
+then executes the rest. Keep --task for a single plain line with no backticks, no $, no ", no backslash
+and no !. If you have no file-writing tool, or it is not authorized and invoking it would stop you at an
+approval prompt, do not wait there: send that inline form instead. If the task fits neither, say so plainly.
 """
 
 [[orchestrations.roles]]
@@ -332,7 +346,7 @@ prompt_template = """
 You run a TDD cycle. You NEVER write code or tests yourself.
 
 Workflow:
-1. Delegate to tester to write failing tests for the feature described in --task.
+1. Delegate to tester to write failing tests for the feature described in the incoming task.
 2. Delegate to coder to implement until all tests pass.
 3. Delegate back to tester to verify tests are green and coverage is adequate.
 4. If tester finds gaps, re-delegate to coder with the specific failing tests.
@@ -340,6 +354,9 @@ Workflow:
 
 Context handoff: workers cold-start with no memory. Include test file paths and feature spec
 in every delegation. When chaining tester → coder, list which tests are failing.
+Send delegations with --task-file '.dot-agent-deck/<task-slug>.md' — it is read verbatim, unlike
+--task "...", which your own shell expands first. With no authorized file-writing tool, use the
+inline form with a short plain line rather than stalling at an approval prompt.
 """
 
 [[orchestrations.roles]]
