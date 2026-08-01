@@ -5310,6 +5310,23 @@ fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> Action {
     Action::Continue
 }
 
+/// Issue #142: one step of the Scheduled Tasks manager selection, WRAPPING at
+/// both ends. Extracted so the mouse wheel and the keyboard (`j`/Down,
+/// `k`/Up) share one definition of "next/previous row" and cannot drift apart —
+/// the wheel has no independent scroll offset, it moves `scheduled_selected` and
+/// the rendered viewport follows via [`visible_window`]. An empty list returns
+/// `selected` unchanged, so it neither panics nor underflows on `len - 1`.
+fn step_scheduled_selection(selected: usize, len: usize, forward: bool) -> usize {
+    if len == 0 {
+        return selected;
+    }
+    if forward {
+        (selected + 1) % len
+    } else {
+        (selected + len - 1) % len
+    }
+}
+
 /// PRD #127 M3.3: key handling for the "Scheduled Tasks" manager dialog.
 /// Read-only-plus-actions: `j`/`k` move the selection, `a` adds, `Enter`/`e`
 /// edits the selected row (both spawn the seeded authoring agent), `d` asks to
@@ -5348,15 +5365,11 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
             Action::Continue
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            if len > 0 {
-                ui.scheduled_selected = (ui.scheduled_selected + 1) % len;
-            }
+            ui.scheduled_selected = step_scheduled_selection(ui.scheduled_selected, len, true);
             Action::Continue
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if len > 0 {
-                ui.scheduled_selected = (ui.scheduled_selected + len - 1) % len;
-            }
+            ui.scheduled_selected = step_scheduled_selection(ui.scheduled_selected, len, false);
             Action::Continue
         }
         // Add: PRD #170 (unify) — reuse the `Ctrl+n` flow. Open the directory
@@ -6009,7 +6022,7 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
 /// destructive, and two of them are the way *out* of a pane.
 ///
 /// PRD #241 review F1: `UiMode::CloseConfirm` claims **nothing** here. The
-/// `blocking_overlay` / `modal_active` guards that make the dialog topmost are
+/// [`overlay_blocks_mouse`] / `modal_active` guards that make the dialog topmost are
 /// mouse-only, and this resolution runs *before* the per-mode key handler — so
 /// `Ctrl+PgUp` / `Ctrl+PgDn` (and `Ctrl+D`/`Ctrl+N`/`Ctrl+T`) still landed while
 /// the modal was up, moving the ground under an open confirmation. The armed
@@ -6198,6 +6211,38 @@ pub fn hit_test_button(button_rects: &[(Action, Rect)], col: u16, row: u16) -> O
     button_rects
         .iter()
         .find_map(|(action, rect)| point_in_rect(rect, col, row).then(|| action.clone()))
+}
+
+/// PRD #80 review FIX 5 / issue #142: whether `mode` puts a **blocking overlay**
+/// (a modal, the directory picker, or the new-pane form) on top of the deck, so
+/// mouse-wheel events must not reach the pane rendered behind it. Scroll in
+/// `Normal` / `PaneInput` stays untouched (pane scroll + child-app forwarding).
+///
+/// Deliberately an EXHAUSTIVE `match` with no `_` arm: this guard was originally
+/// a local `bool` in [`run_tui`], and `ScheduledTasks` — added long after — was
+/// simply forgotten, so wheeling over the Scheduled Tasks dialog scrolled the
+/// mode-tab side pane behind it (issue #142). A wildcard arm would let the next
+/// new `UiMode` repeat that silently; without one, adding a variant fails to
+/// COMPILE until its modality is declared here.
+fn overlay_blocks_mouse(mode: &UiMode) -> bool {
+    match mode {
+        UiMode::QuitConfirm
+        | UiMode::StopConfirm
+        // PRD #241 M3: the close confirmation is a topmost modal too —
+        // scrolling behind it must not reach a pane the user may be about to
+        // destroy.
+        | UiMode::CloseConfirm
+        | UiMode::ConfigGenPrompt
+        | UiMode::StarPrompt
+        | UiMode::Help
+        | UiMode::DirPicker
+        | UiMode::NewPaneForm
+        // Issue #142: the Scheduled Tasks manager is a topmost modal as well.
+        // The wheel over it belongs to ITS list (handled before this guard),
+        // never to whatever pane the centered dialog happens to cover.
+        | UiMode::ScheduledTasks => true,
+        UiMode::Normal | UiMode::Filter | UiMode::Rename | UiMode::PaneInput => false,
+    }
 }
 
 /// Whether the cell `(col, row)` falls inside `rect` (upper bounds exclusive).
@@ -9794,31 +9839,46 @@ pub fn run_tui(
                     crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 );
 
-                // PRD #80 review FIX 5: when a blocking overlay (any modal, the
-                // directory picker, or the new-pane form) is the topmost layer,
-                // swallow scroll-wheel events so they don't scroll the pane
-                // behind the overlay. Scroll in Normal / PaneInput is left
-                // untouched below (pane scroll + child-app forwarding).
-                let blocking_overlay = matches!(
-                    ui.mode,
-                    UiMode::QuitConfirm
-                        | UiMode::StopConfirm
-                        // PRD #241 M3: the close confirmation is a topmost
-                        // modal too — scrolling behind it must not reach a pane
-                        // the user may be about to destroy.
-                        | UiMode::CloseConfirm
-                        | UiMode::ConfigGenPrompt
-                        | UiMode::StarPrompt
-                        | UiMode::Help
-                        | UiMode::DirPicker
-                        | UiMode::NewPaneForm
-                );
                 let is_scroll = matches!(
                     mouse.kind,
                     crossterm::event::MouseEventKind::ScrollUp
                         | crossterm::event::MouseEventKind::ScrollDown
                 );
-                if is_scroll && blocking_overlay {
+
+                // Issue #142: the Scheduled Tasks manager owns the wheel while
+                // it is open — handled BEFORE the generic overlay swallow below
+                // so the wheel scrolls the manager's own list instead of merely
+                // being eaten (and instead of leaking to the side pane the
+                // centered dialog covers). The manager has no independent list
+                // offset: one wheel notch moves `scheduled_selected` by one row
+                // exactly like `j`/`k`, and the rendered viewport follows it
+                // through `visible_window`.
+                if is_scroll && ui.mode == UiMode::ScheduledTasks {
+                    // While the delete confirmation is armed it is the only
+                    // input layer (`y`/`n`/Esc) — the wheel must NOT move the
+                    // selection out from under the row being confirmed, so it is
+                    // swallowed without effect.
+                    if !ui.scheduled_delete_confirm {
+                        let forward =
+                            matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollDown);
+                        ui.scheduled_selected = step_scheduled_selection(
+                            ui.scheduled_selected,
+                            ui.scheduled_tasks.len(),
+                            forward,
+                        );
+                    }
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // PRD #80 review FIX 5: when a blocking overlay (any modal, the
+                // directory picker, or the new-pane form) is the topmost layer,
+                // swallow scroll-wheel events so they don't scroll the pane
+                // behind the overlay. Scroll in Normal / PaneInput is left
+                // untouched below (pane scroll + child-app forwarding).
+                if is_scroll && overlay_blocks_mouse(&ui.mode) {
                     if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                         break;
                     }
@@ -22426,6 +22486,147 @@ mod tests {
         // Degenerate inputs.
         assert_eq!(visible_window(0, 0, 4), (0, 0));
         assert_eq!(visible_window(5, 0, 0), (0, 0));
+    }
+
+    // Issue #142 — every `UiMode`'s wheel modality is declared explicitly. The
+    // bug was an OMISSION: `ScheduledTasks` was missing from the wheel-blocking
+    // guard, so wheeling over the manager dialog scrolled the mode-tab side pane
+    // behind it. Listing all variants here (paired with the exhaustive `match` in
+    // `overlay_blocks_mouse`, which has no `_` arm) makes a repeat of that
+    // omission fail loudly rather than silently leak.
+    #[test]
+    fn overlay_blocks_mouse_is_declared_for_every_ui_mode() {
+        // Topmost overlays: the wheel must never reach the pane behind them.
+        for mode in [
+            UiMode::QuitConfirm,
+            UiMode::StopConfirm,
+            UiMode::CloseConfirm,
+            UiMode::ConfigGenPrompt,
+            UiMode::StarPrompt,
+            UiMode::Help,
+            UiMode::DirPicker,
+            UiMode::NewPaneForm,
+            UiMode::ScheduledTasks,
+        ] {
+            assert!(
+                overlay_blocks_mouse(&mode),
+                "{mode:?} is a topmost overlay — the wheel must not reach the pane behind it"
+            );
+        }
+
+        // Non-overlay modes keep the ordinary pane scroll / child-app forwarding.
+        for mode in [
+            UiMode::Normal,
+            UiMode::Filter,
+            UiMode::Rename,
+            UiMode::PaneInput,
+        ] {
+            assert!(
+                !overlay_blocks_mouse(&mode),
+                "{mode:?} has no blocking overlay — pane scrolling must stay live"
+            );
+        }
+    }
+
+    // Issue #142 — the wheel and `j`/`k` share one step definition, so the
+    // manager's wheel WRAPS at both ends exactly like the keyboard, and an empty
+    // list can neither panic nor underflow.
+    #[test]
+    fn manager_selection_step_wraps_like_the_keyboard() {
+        assert_eq!(step_scheduled_selection(0, 3, true), 1);
+        assert_eq!(step_scheduled_selection(1, 3, false), 0);
+        // Wrap at both ends, matching `(sel + 1) % len` / `(sel + len - 1) % len`.
+        assert_eq!(step_scheduled_selection(2, 3, true), 0);
+        assert_eq!(step_scheduled_selection(0, 3, false), 2);
+        // Single row: every step is a no-op.
+        assert_eq!(step_scheduled_selection(0, 1, true), 0);
+        assert_eq!(step_scheduled_selection(0, 1, false), 0);
+        // Empty list: `selected` comes back UNCHANGED, no underflow on `len - 1`.
+        // A nonzero input is the only one that proves "unchanged" — `0 -> 0`
+        // would also pass for a helper that clamped everything to zero.
+        assert_eq!(step_scheduled_selection(4, 0, true), 4);
+        assert_eq!(step_scheduled_selection(4, 0, false), 4);
+    }
+
+    // Issue #142 (review finding 3) — pin the KEYBOARD ENTRY POINT, not just the
+    // shared helper: `j`/Down step forward, `k`/Up step back, both wrap at both
+    // ends, and an empty list leaves the selection alone. The helper test above
+    // exercises `step_scheduled_selection` in isolation and the e2e tests drive
+    // the WHEEL, so neither would notice a future edit that unwires one of these
+    // four keys or flips its direction. This test would.
+    #[test]
+    fn manager_keyboard_steps_selection_in_both_directions() {
+        fn press(ui: &mut UiState, code: KeyCode) -> usize {
+            let action = handle_scheduled_tasks_key(KeyEvent::new(code, KeyModifiers::NONE), ui);
+            assert!(
+                matches!(action, Action::Continue),
+                "{code:?} must only move the selection, never emit an action"
+            );
+            assert_eq!(
+                ui.mode,
+                UiMode::ScheduledTasks,
+                "{code:?} must leave the manager dialog open"
+            );
+            ui.scheduled_selected
+        }
+
+        let mut ui = default_ui();
+        ui.mode = UiMode::ScheduledTasks;
+        ui.scheduled_tasks = vec![
+            make_scheduled_task("a", true),
+            make_scheduled_task("b", true),
+            make_scheduled_task("c", true),
+        ];
+        ui.scheduled_selected = 0;
+
+        // Forward: `j` and Down each advance exactly one row...
+        assert_eq!(press(&mut ui, KeyCode::Char('j')), 1, "`j` must move DOWN");
+        assert_eq!(press(&mut ui, KeyCode::Down), 2, "Down must move DOWN");
+        // ...and wrap off the last row back to the first.
+        assert_eq!(
+            press(&mut ui, KeyCode::Char('j')),
+            0,
+            "`j` on the last row must wrap to the first"
+        );
+        assert_eq!(press(&mut ui, KeyCode::Down), 1, "Down must move DOWN");
+        assert_eq!(press(&mut ui, KeyCode::Down), 2, "Down must move DOWN");
+        assert_eq!(
+            press(&mut ui, KeyCode::Down),
+            0,
+            "Down on the last row must wrap to the first"
+        );
+
+        // Backward: `k` and Up each retreat one row, wrapping off the first row
+        // back to the last.
+        assert_eq!(
+            press(&mut ui, KeyCode::Char('k')),
+            2,
+            "`k` on the first row must wrap to the last"
+        );
+        assert_eq!(press(&mut ui, KeyCode::Char('k')), 1, "`k` must move UP");
+        assert_eq!(press(&mut ui, KeyCode::Up), 0, "Up must move UP");
+        assert_eq!(
+            press(&mut ui, KeyCode::Up),
+            2,
+            "Up on the first row must wrap to the last"
+        );
+
+        // Empty list: a NONZERO selection survives every one of the four keys
+        // untouched — no clamp to zero, no underflow on `len - 1`, no panic.
+        ui.scheduled_tasks.clear();
+        ui.scheduled_selected = 4;
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Down,
+            KeyCode::Up,
+        ] {
+            assert_eq!(
+                press(&mut ui, code),
+                4,
+                "{code:?} must leave an empty list's selection unchanged"
+            );
+        }
     }
 
     // PRD #127 N2 — the manager dialog stays OPEN after run-now and after a
