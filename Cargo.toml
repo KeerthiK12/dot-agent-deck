@@ -70,6 +70,16 @@ open = "5"
 unicode-width = "0.2"
 cron = "0.17.0"
 
+# Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
+# parser `src/version.rs` uses (`semver::Version::parse`), so the set of
+# versions the build script accepts is by construction the set the binary can
+# parse. A hand-rolled grammar drifted in both directions: it rejected valid
+# SemVer (`1.2.3+meta`, an over-`u64` numeric prerelease), which sent a
+# correctly-injected packager build down the `0.1.0` placeholder path and
+# revived the bug #250 exists to fix. Same version pin as the package dep.
+[build-dependencies]
+semver = "1"
+
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
