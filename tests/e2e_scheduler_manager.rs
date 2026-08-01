@@ -741,9 +741,7 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
         !bottom_markers.is_empty(),
         "precondition: the mode side pane must visibly contain synthetic scrollback"
     );
-    for _ in 0..8 {
-        deck.scroll(100, 10, false);
-    }
+    deck.scroll_n(100, 10, false, 8);
     deck.wait_until_grid("side pane scrolled into its history", |grid| {
         visible_side_scroll_markers(grid) != bottom_markers
     });
@@ -843,9 +841,7 @@ fn manager_017_wheel_scrolls_windowed_schedule_list() {
     let (list_col, list_row) = deck
         .find_in_grid("wheel-task-01")
         .expect("manager dialog must render the first visible task row");
-    for _ in 0..12 {
-        deck.scroll(list_col, list_row, true);
-    }
+    deck.scroll_n(list_col, list_row, true, 12);
 
     let moved_and_revealed = deck.wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
         grid.contains("\u{25b6} wheel-task-13") && !grid.contains("\u{25b6} wheel-task-01")

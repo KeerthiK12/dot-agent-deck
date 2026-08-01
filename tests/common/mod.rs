@@ -1207,6 +1207,15 @@ impl TuiDeck {
         self.send_bytes(format!("\x1b[<{cb};{cx};{cy}M").as_bytes());
     }
 
+    /// Send `count` mouse wheel notches at the given 0-based grid cell.
+    /// Keeps repeated input emission in the harness so E2E test bodies can
+    /// describe the intended interaction without fixed-count polling loops.
+    pub fn scroll_n(&self, col: u16, row: u16, down: bool, count: usize) {
+        for _ in 0..count {
+            self.scroll(col, row, down);
+        }
+    }
+
     /// Locate the first occurrence of `needle` in the current rendered
     /// grid, returning its 0-based `(col, row)` start cell, or `None` if it
     /// is not on screen. Used by click tests to find a button's on-screen
