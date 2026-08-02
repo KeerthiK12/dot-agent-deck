@@ -251,26 +251,9 @@ jobs:
           # `path:gcloud#google-cloud-sdk` flake pulls nixpkgs-unstable and
           # builds the SDK, which dominates a cold run.
           enable-cache: true
-      # Resolving the lock is most of the value and has already happened by the
-      # time this runs — a dropped nixpkgs entry or a missing system fails in the
-      # step above. Invoking the tools then proves the binaries are usable rather
-      # than merely fetched.
-      #
-      # `vals version` does NOT prove the gcpsecrets provider is still compiled
-      # in; that needs GCP credentials. The shell init_hook only calls
-      # `vals env` when USE_VALS is set, which CI never sets, so nothing here
-      # reads .env.vals.yaml or needs auth.
-      - run: |
-          devbox run -- bash -c '
-            set -euxo pipefail
-            rustc --version
-            cargo --version
-            cargo clippy --version
-            rustfmt --version
-            cargo nextest --version
-            vals version
-            gh --version
-            task --version
-            jq --version
-            rg --version
-          '
+      # A FILE, not an inline `bash -c '…'`: devbox flattens its trailing args
+      # into one string and re-parses them through a shell, so a quoted
+      # multi-line argument is destroyed before bash sees it. That is what broke
+      # the first version of this job on main (devbox 0.17.5, `invalid version
+      # 'set'`). See the header of the script for the detail.
+      - run: devbox run -- bash scripts/devbox-smoke.sh
