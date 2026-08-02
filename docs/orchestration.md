@@ -91,6 +91,8 @@ To write the config by hand, use the [configuration reference](#configuration-re
 
 ### Minimal example
 
+The deck writes the delegation protocol — how to pass a task safely, and the `--task-file` default — into the orchestrator's context automatically at launch, so no `prompt_template` below needs to restate it.
+
 ```toml
 [[orchestrations]]
 name = "code-review"
@@ -111,9 +113,6 @@ Workflow:
 Context handoff (CRITICAL): every worker cold-starts with no memory of prior conversation
 or other workers' outputs. The task text you send is the entire context the worker has.
 Always include file paths, the relevant spec path, and any prior worker's findings when chaining.
-Send it with --task-file '.dot-agent-deck/<task-slug>.md' — the file is read verbatim, while
---task "..." is expanded by your own shell first. Keep --task for short plain one-liners, and
-use it too when you have no authorized file-writing tool rather than stalling on its prompt.
 """
 
 [[orchestrations.roles]]
@@ -219,9 +218,9 @@ The orchestrator can delegate to multiple workers simultaneously — for example
 
 Workers cold-start with no memory of prior conversation, no access to other workers' outputs, and no shared scratchpad. Whatever the orchestrator includes in a delegation is the **entire context the worker has** — plus the worker's `prompt_template`. The orchestrator's `prompt_template` is where you tell it how to delegate well: which files to reference, how to summarise prior findings when chaining workers, and what to include when retrying after a failure.
 
-That task text reaches the worker one of two ways: inline with `dot-agent-deck delegate --to coder --task "..."`, or from a file with `dot-agent-deck delegate --to coder --task-file '.dot-agent-deck/coder-task.md'`. Tell the orchestrator to default to `--task-file`, because the inline form is processed by the orchestrator's own shell before dot-agent-deck ever sees it — backticks and `$(...)` get executed and replaced by their output (usually nothing), `$VAR` is substituted, a balanced inner `"` is removed and changes how the rest of the argument is quoted while an unmatched one aborts the command with a parse error, a `\` before `$`, a backtick, `"` or `\` removes itself, and a `\` at the end of a line removes itself *and* the newline — while the delegation still reports success. A task file is read off disk verbatim, provided the file itself was written with a file-writing tool and the path is single-quoted. Do not build the file with shell redirection or a heredoc: a line of the task text can terminate the heredoc, and Bash then executes everything after it as commands. Keep `--task` for a single line of plain text with no backticks, no `$`, no `"`, no `\` and no `!` — `!` is rewritten by a Bash with history expansion on — and use `work-done --task-file` for the same reason on the worker side. This is a separate problem from context length: a long brief belongs in a file either way, but it is passing that file with `--task-file` that keeps the shell out of the text.
+That task text reaches the worker one of two ways: inline with `dot-agent-deck delegate --to coder --task "..."`, or from a file with `dot-agent-deck delegate --to coder --task-file '.dot-agent-deck/coder-task.md'`. The generated protocol makes `--task-file` the default, because the inline form is processed by the orchestrator's own shell before dot-agent-deck ever sees it — backticks and `$(...)` get executed and replaced by their output (usually nothing), `$VAR` is substituted, a balanced inner `"` is removed and changes how the rest of the argument is quoted while an unmatched one aborts the command with a parse error, a `\` before `$`, a backtick, `"` or `\` removes itself, and a `\` at the end of a line removes itself *and* the newline — while the delegation still reports success. A task file is read off disk verbatim, provided the file itself was written with a file-writing tool and the path is single-quoted; built with shell redirection or a heredoc it is no safer, because a line of the task text can terminate the heredoc and Bash then executes everything after it as commands. The inline form stays intact only for a single line of plain text with no backticks, no `$`, no `"`, no `\` and no `!` — `!` is rewritten by a Bash with history expansion on — and `work-done --task-file` matters for the same reason on the worker side. This is a separate problem from context length: a long brief belongs in a file either way, but it is passing that file with `--task-file` that keeps the shell out of the text.
 
-That default assumes the agent is *authorized* to write a file, which is not the same as having a file-writing tool: a role launched with a restricted tool allowlist — `claude --allowedTools Bash Read`, say — hits an interactive approval prompt instead, and an unattended pane parks there forever. So tell the agent all three branches: write the file and pass `--task-file`; with no authorized file-writing tool, keep the task within the plain-text allowlist above and send it inline with `--task`; and if it fits neither, say so plainly rather than improvising. Never let the fallback be shell redirection or a heredoc — that is the injection this guidance exists to avoid. If a role is expected to take the primary path, add the file-writing tool to its `command`'s allowlist (e.g. `--allowedTools Bash Read Write`) so it never meets the prompt.
+That default assumes the agent is *authorized* to write a file, which is not the same as having a file-writing tool: a role launched with a restricted tool allowlist — `claude --allowedTools Bash Read`, say — hits an interactive approval prompt instead, and an unattended pane parks there forever. The protocol covers that branch — with no authorized writer the agent keeps the task inside the plain-text allowlist above and sends it inline, and if it fits neither form it says so plainly rather than improvising with shell redirection — but it cannot grant itself the tool. That part is yours: if a role is expected to take the primary path, add the file-writing tool to its `command`'s allowlist (e.g. `--allowedTools Bash Read Write`) so it never meets the prompt.
 
 ### Use a tracking file
 
@@ -277,13 +276,6 @@ Workflow:
 Context handoff (CRITICAL): workers cold-start with no memory of prior conversation or other
 workers' outputs. Include all context in the task: file paths, spec paths, error messages, findings.
 If context is long, write it to .dot-agent-deck/<slug>.md and pass that file rather than pasting it.
-Send the task itself with --task-file '.dot-agent-deck/<slug>-task.md': it is read verbatim, while
---task "..." is processed by your own shell first, so backticks and $(...) are executed and replaced
-by their output while the delegation still reports success. Write the file with your file-writing tool,
-never with shell redirection or a heredoc — a line of the task text can terminate the heredoc and Bash
-then executes the rest. Keep --task for a single plain line with no backticks, no $, no ", no backslash
-and no !. If you have no file-writing tool, or it is not authorized and invoking it would stop you at an
-approval prompt, do not wait there: send that inline form instead. If the task fits neither, say so plainly.
 """
 
 [[orchestrations.roles]]
@@ -354,9 +346,6 @@ Workflow:
 
 Context handoff: workers cold-start with no memory. Include test file paths and feature spec
 in every delegation. When chaining tester → coder, list which tests are failing.
-Send delegations with --task-file '.dot-agent-deck/<task-slug>.md' — it is read verbatim, unlike
---task "...", which your own shell expands first. With no authorized file-writing tool, use the
-inline form with a short plain line rather than stalling at an approval prompt.
 """
 
 [[orchestrations.roles]]
