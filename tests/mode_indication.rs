@@ -5,13 +5,20 @@
 //! TestBackend seam because `Frame::set_cursor_position` has no buffer cell to
 //! inspect.
 
+use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use dot_agent_deck::event::AgentType;
 use dot_agent_deck::keybindings::KeybindingConfig;
+use dot_agent_deck::state::{SessionState, SessionStatus};
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
-    UiMode, render_button_bar_for_mode_to_buffer, render_button_bar_to_buffer,
-    render_button_bar_with_bindings_to_buffer, render_focused_pane_cursor_for_mode_to_position,
+    CardDensityKind, UiMode, observe_focused_agent_key_scroll, observe_focused_agent_mouse_scroll,
+    render_button_bar_for_mode_to_buffer, render_button_bar_to_buffer,
+    render_button_bar_with_bindings_to_buffer, render_card_for_mode_to_buffer,
+    render_card_to_buffer, render_focused_pane_cursor_for_mode_to_position,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -34,6 +41,70 @@ fn buffer_to_text(buffer: &Buffer) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn buffer_to_styled_text(buffer: &Buffer) -> String {
+    fn flush(line: &mut String, style: ratatui::style::Style, run: &str) {
+        if run.trim().is_empty() && style == ratatui::style::Style::default() {
+            return;
+        }
+        let _ = write!(line, "[{style:?}]{run:?} ");
+    }
+
+    let area = buffer.area();
+    let mut out = String::new();
+    for y in 0..area.height {
+        let mut line = String::new();
+        let mut run = String::new();
+        let mut run_style = buffer[(0, y)].style();
+        for x in 0..area.width {
+            let cell = &buffer[(x, y)];
+            if cell.style() != run_style {
+                flush(&mut line, run_style, &run);
+                run.clear();
+                run_style = cell.style();
+            }
+            run.push_str(cell.symbol());
+        }
+        flush(&mut line, run_style, &run);
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+fn selected_card_fixture() -> SessionState {
+    let now = chrono::Utc::now();
+    SessionState {
+        session_id: "mode-card".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        cwd: Some("/work/mode-card".to_string()),
+        status: SessionStatus::Working,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: None,
+        first_prompts: Vec::new(),
+        pane_id: Some("pane-mode-card".to_string()),
+        agent_id: None,
+        display_name: None,
+    }
+}
+
+fn assert_no_rgb(buffer: &Buffer, context: &str) {
+    let area = buffer.area();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let cell = &buffer[(x, y)];
+            assert!(
+                !matches!(cell.fg, Color::Rgb(..)) && !matches!(cell.bg, Color::Rgb(..)),
+                "{context} cell ({x}, {y}) must not carry an absolute RGB colour, got {:?}",
+                cell.style()
+            );
+        }
+    }
 }
 
 fn assert_mode_chip_at_origin(buffer: &Buffer, expected: &str, context: &str) {
@@ -168,5 +239,215 @@ fn mode_chip_002_is_universal_and_keeps_destination_button() {
     assert!(
         typing_text.contains("[Command Mode Ctrl+D]"),
         "PaneInput must retain the destination button alongside the TYPING chip\n{typing_text}"
+    );
+}
+
+/// Scenario: Render the same selected Dashboard card in command mode and PaneInput through the production card renderer. Command mode must retain the full Magenta+BOLD accent, while PaneInput keeps the `▸ ` marker but visibly de-emphasises the selection without introducing an absolute RGB colour; a colour-and-modifier-aware snapshot pins both states.
+#[spec("mode/deck/001")]
+#[test]
+fn mode_deck_001_selected_card_accent_tracks_mode() {
+    let session = selected_card_fixture();
+    let width = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height(true);
+    let command = render_card_for_mode_to_buffer(
+        &session,
+        Some("mode-card"),
+        Some(1),
+        density,
+        0,
+        true,
+        UiMode::Normal,
+        width,
+        height,
+    );
+    let typing = render_card_for_mode_to_buffer(
+        &session,
+        Some("mode-card"),
+        Some(1),
+        density,
+        0,
+        true,
+        UiMode::PaneInput,
+        width,
+        height,
+    );
+    let legacy = render_card_to_buffer(
+        &session,
+        Some("mode-card"),
+        Some(1),
+        density,
+        0,
+        true,
+        width,
+        height,
+    );
+
+    assert_eq!(
+        command, legacy,
+        "command-mode selection must stay byte-identical to today's selected-card rendering"
+    );
+
+    let border_y = height / 2;
+    let command_border = &command[(0, border_y)];
+    let typing_border = &typing[(0, border_y)];
+    assert_eq!(command_border.fg, Color::Magenta);
+    assert!(command_border.modifier.contains(Modifier::BOLD));
+    assert!(
+        buffer_to_text(&command).contains("▸ "),
+        "command mode must retain the selected-card title marker"
+    );
+    assert!(
+        buffer_to_text(&typing).contains("▸ "),
+        "PaneInput must retain the selected-card title marker"
+    );
+    assert_ne!(
+        typing_border.style(),
+        command_border.style(),
+        "PaneInput selection must be visibly de-emphasised relative to command mode"
+    );
+    assert!(
+        !typing_border.modifier.contains(Modifier::BOLD)
+            || typing_border.modifier.contains(Modifier::DIM),
+        "PaneInput selection must drop BOLD and/or add DIM, got {:?}",
+        typing_border.style()
+    );
+    assert_no_rgb(&command, "command-mode selected card");
+    assert_no_rgb(&typing, "PaneInput selected card");
+
+    insta::assert_snapshot!(
+        "mode_deck_001_selected_card_styles",
+        format!(
+            "COMMAND MODE\n{}\nPANE INPUT\n{}",
+            buffer_to_styled_text(&command),
+            buffer_to_styled_text(&typing)
+        )
+    );
+}
+
+/// Scenario: Send one wheel-up event over the focused agent pane in all four combinations of command/PaneInput mode and child mouse reporting on/off. PaneInput may forward only when reporting is enabled; command mode must always move dot-agent-deck's scrollback and must never emit mouse-protocol bytes to the child.
+#[spec("mode/scroll/001")]
+#[test]
+fn mode_scroll_001_mouse_wheel_routes_by_mode_and_child_mouse_state() {
+    for (mode, mouse_mode_enabled, should_forward, context) in [
+        (
+            UiMode::PaneInput,
+            true,
+            true,
+            "PaneInput with child mouse reporting",
+        ),
+        (
+            UiMode::PaneInput,
+            false,
+            false,
+            "PaneInput without child mouse reporting",
+        ),
+        (
+            UiMode::Normal,
+            true,
+            false,
+            "command mode with child mouse reporting",
+        ),
+        (
+            UiMode::Normal,
+            false,
+            false,
+            "command mode without child mouse reporting",
+        ),
+    ] {
+        let observed = observe_focused_agent_mouse_scroll(mode, mouse_mode_enabled, true, 0, 3, 2);
+        if should_forward {
+            assert_eq!(
+                observed.forwarded_bytes, b"\x1b[<64;4;3M",
+                "{context} must forward exactly one wheel-up report to the child"
+            );
+            assert_eq!(
+                observed.scrollback_after, observed.scrollback_before,
+                "{context} must leave dot-agent-deck's scrollback at live output"
+            );
+        } else {
+            assert!(
+                observed.scrollback_after > observed.scrollback_before,
+                "{context} must scroll dot-agent-deck's own scrollback: {observed:?}"
+            );
+            assert!(
+                observed.forwarded_bytes.is_empty(),
+                "{context} must not emit mouse-protocol bytes to the child: {observed:?}"
+            );
+        }
+    }
+}
+
+/// Scenario: In command mode, press the configured focused-pane scroll-up and scroll-down keys against a pane with synthetic history. The PageUp/PageDown defaults and custom `[dashboard]` remaps must move dot-agent-deck's scrollback in the expected direction without emitting bytes to the child, while each remap disables its former default.
+#[spec("mode/scroll/002")]
+#[test]
+fn mode_scroll_002_keyboard_scroll_is_semantic_and_remappable() {
+    let default = KeybindingConfig::default();
+    let page_up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+    let page_down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+
+    let up = observe_focused_agent_key_scroll(&default, UiMode::Normal, page_up, 0);
+    assert!(
+        up.scrollback_after > up.scrollback_before,
+        "default PageUp must scroll back through the focused agent pane: {up:?}"
+    );
+    assert!(
+        up.forwarded_bytes.is_empty(),
+        "command-mode PageUp must not emit bytes to the child: {up:?}"
+    );
+
+    let down = observe_focused_agent_key_scroll(&default, UiMode::Normal, page_down, 6);
+    assert!(
+        down.scrollback_after < down.scrollback_before,
+        "default PageDown must scroll toward live output in the focused agent pane: {down:?}"
+    );
+    assert!(
+        down.forwarded_bytes.is_empty(),
+        "command-mode PageDown must not emit bytes to the child: {down:?}"
+    );
+
+    let (remapped, warnings) = KeybindingConfig::from_toml_str(
+        "[dashboard]\nscroll_pane_up = \"Alt+u\"\nscroll_pane_down = \"Alt+d\"\n",
+    )
+    .expect("focused-pane scroll remaps must parse");
+    assert!(
+        warnings.is_empty(),
+        "focused-pane scroll keys must be registered semantic actions: {warnings:?}"
+    );
+
+    let old_up = observe_focused_agent_key_scroll(&remapped, UiMode::Normal, page_up, 0);
+    assert_eq!(
+        old_up.scrollback_after, old_up.scrollback_before,
+        "remapping scroll_pane_up must disable its PageUp default"
+    );
+    let remapped_up = observe_focused_agent_key_scroll(
+        &remapped,
+        UiMode::Normal,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+        0,
+    );
+    assert!(
+        remapped_up.scrollback_after > remapped_up.scrollback_before,
+        "the custom scroll_pane_up binding must scroll the focused pane: {remapped_up:?}"
+    );
+
+    let old_down = observe_focused_agent_key_scroll(&remapped, UiMode::Normal, page_down, 6);
+    assert_eq!(
+        old_down.scrollback_after, old_down.scrollback_before,
+        "remapping scroll_pane_down must disable its PageDown default"
+    );
+    let remapped_down = observe_focused_agent_key_scroll(
+        &remapped,
+        UiMode::Normal,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
+        6,
+    );
+    assert!(
+        remapped_down.scrollback_after < remapped_down.scrollback_before,
+        "the custom scroll_pane_down binding must scroll the focused pane: {remapped_down:?}"
+    );
+    assert!(
+        remapped_up.forwarded_bytes.is_empty() && remapped_down.forwarded_bytes.is_empty(),
+        "command-mode keyboard scrolling must never write to the child"
     );
 }

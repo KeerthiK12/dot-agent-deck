@@ -2788,6 +2788,31 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** click dispatch for the destination button; exact spacing after the chip; context-specific buttons after the universal prefix.
 - **Platform coverage:** mac+linux+windows.
 
+#### mode/deck
+
+##### mode/deck/001 — The selected deck-card accent is full-strength only in command mode.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, colour-and-modifier-aware card capture through the production renderer).
+- **Agent:** none (one synthetic selected Working session rendered in both modes).
+- **Asserts:** command mode remains byte-identical to the legacy selected-card rendering and carries Magenta+BOLD+`▸ `; PaneInput keeps `▸ ` but has a different, de-emphasised border style where BOLD is absent and/or DIM is present; neither rendering contains `Color::Rgb`; the snapshot pins both styled cards.
+- **Does not assert:** unselected-card styling; focused terminal-pane styling; a single mandated de-emphasis recipe beyond the property that it drops BOLD and/or adds DIM.
+- **Platform coverage:** mac+linux+windows.
+
+#### mode/scroll
+
+##### mode/scroll/001 — Focused agent-pane wheel routing obeys the full mode × child-mouse matrix.
+- **Layer:** L1 (in-process synthetic pane with real vt100 scrollback and a recording child-input channel; no PTY subprocess).
+- **Agent:** none (one in-memory focused pane with synthetic history).
+- **Asserts:** PaneInput forwards a wheel report only when the child has mouse reporting enabled and otherwise moves dot-agent-deck scrollback; command mode moves dot-agent-deck scrollback for both child-mouse states and emits no mouse-protocol bytes, explicitly pinning the Normal+mouse-enabled safety cell.
+- **Does not assert:** wheel-down direction (the same production route receives a direction parameter); side-pane hit-testing, which already works in every mode; real terminal mouse-report decoding.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/scroll/002 — PageUp/PageDown provide a remappable command-mode keyboard equivalent for focused agent-pane scrollback.
+- **Layer:** L1 (in-process production keybinding resolution plus synthetic focused-pane scroll observation).
+- **Agent:** none (one in-memory focused pane with synthetic history).
+- **Asserts:** the default PageUp/PageDown bindings move focused-agent scrollback away from/toward live output in `UiMode::Normal` without writing to the child; `[dashboard] scroll_pane_up` and `scroll_pane_down` remaps parse without warnings, disable the old defaults, and move scrollback on their replacement chords.
+- **Does not assert:** PaneInput key forwarding; help-overlay or bottom-bar discoverability; filesystem loading of `keybindings.toml`.
+- **Platform coverage:** mac+linux+windows.
+
 ### Scheduled tasks (PRD #127)
 
 #### scheduler/reload
