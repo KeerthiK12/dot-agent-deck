@@ -67,77 +67,7 @@ The fastest way to get an orchestration config is to let an agent generate it fr
 
 The generated file includes both `[[modes]]` and `[[orchestrations]]`. You can remove either section if you only need one.
 
-To write the config by hand, use the [configuration reference](#configuration-reference) below as a guide. `dot-agent-deck init` generates a modes-only starter template — it does not include an orchestration block.
-
-## Configuration reference
-
-### `[[orchestrations]]`
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `name` | string | no | cwd basename | Display name shown in the tab bar. Defaults to the project directory name when empty. |
-| `roles` | array | yes | — | Role definitions. Must contain at least one role with `start = true`. |
-
-### `[[orchestrations.roles]]`
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `name` | string | yes | — | Role identifier. Shown on the role card in the deck so you can tell agents apart at a glance. Also used in `--to` arguments and in task/work-done file names. Must be unique within the orchestration. Must not contain `/`, `\`, or `..`. |
-| `command` | string | yes | — | Shell command that launches the agent for this role. Must result in a `claude`, `opencode`, `pi`, or `codex` process (e.g. `claude`, `devbox run agent-big`, `opencode --model gpt-4o`, `pi --provider openrouter`, `codex`). Other commands will run but won't get live status tracking on the role card. |
-| `start` | bool | no | `false` | `true` marks this role as the orchestrator. Exactly one role per orchestration must have `start = true`. |
-| `description` | string | no | — | Tells the orchestrator when to use this role and what it is for, so it can decide which worker to delegate to in a given situation. Also shown on the role card in the deck. |
-| `prompt_template` | string | no | — | Standing instructions the orchestrator prepends to every task it sends this role. When set, the orchestrator's `--task` content is appended under a `## Task` heading — the worker sees both the template and the task together. |
-| `clear` | bool | no | `true` | Restart the agent before each delegation, so every task starts from a clean context. The deck terminates the running agent, launches the role's `command` again in the same pane, waits through a readiness buffer, and only then delivers the task. Set to `false` for roles that need to carry state across delegations (e.g. a `release` role that must remember the PR URL and branch name when retrying after a CI failure). See [What `clear` does to delivery](#what-clear-does-to-delivery). |
-
-### Minimal example
-
-```toml
-[[orchestrations]]
-name = "code-review"
-
-[[orchestrations.roles]]
-name = "orchestrator"
-command = "claude"
-start = true
-prompt_template = """
-You coordinate the team. You NEVER write or review code yourself — only delegate.
-
-Workflow:
-- Delegate implementation to coder.
-- After coder reports done, delegate to reviewer and auditor in parallel.
-- If either flags blocking issues, re-delegate to coder with the specific feedback.
-- Once the work is clean, delegate to release.
-
-Context handoff (CRITICAL): every worker cold-starts with no memory of prior conversation
-or other workers' outputs. Whatever you write in --task is the entire context the worker has.
-Always include file paths, the relevant spec path, and any prior worker's findings when chaining.
-"""
-
-[[orchestrations.roles]]
-name = "coder"
-command = "claude --model sonnet"
-description = "Implements features, fixes bugs, refactors code"
-prompt_template = "Implement the requested change. Run the project's test command before reporting completion."
-
-[[orchestrations.roles]]
-name = "reviewer"
-command = "claude"
-description = "Reviews code changes for correctness, style, and edge cases"
-prompt_template = "Review the change. Report findings only — do not modify code."
-
-[[orchestrations.roles]]
-name = "auditor"
-command = "claude"
-description = "Audits code for security vulnerabilities and unsafe patterns"
-prompt_template = "Audit the change for security vulnerabilities. Report findings only — do not modify code."
-
-[[orchestrations.roles]]
-name = "release"
-command = "claude --model haiku"
-clear = false
-description = "Runs the project's release flow; never modifies source code"
-prompt_template = "Run the release flow (open PR, wait for CI, merge). Do NOT modify source code. If any step fails, report the exact error and stop."
-```
+To write the config by hand, use the [configuration reference](#configuration-reference) later on this page as a guide. `dot-agent-deck init` generates a modes-only starter template — it does not include an orchestration block.
 
 ## Starting an orchestration tab
 
@@ -146,7 +76,7 @@ Opening an orchestration tab uses the same `Ctrl+n` flow as a regular pane, but 
 1. Press `Ctrl+n` to open the new-pane form.
 2. Use `Enter` to step into directories and `Space` to select the project directory that contains your `.dot-agent-deck.toml` with an `[[orchestrations]]` block.
 3. In the unified form, use `Left`/`Right` (or `h`/`l`) to cycle the **Mode** field past any workspace modes until the orchestration name appears.
-4. Press `Enter`. The command field is not used for orchestration tabs — each role pane is launched with its own `command` from the config.
+4. Press `Enter`. The command field is not used for orchestration tabs — each role pane is launched with its own [`command`](#configuration-reference) from the config.
 
 A new tab opens with one pane per role. The role cards appear on the left sidebar; the orchestrator's pane is active on the right. Each pane has the role's `command` running inside it.
 
@@ -172,7 +102,7 @@ The sidebar shows each role's status live (thinking, working, waiting, idle, err
 
 ## How delegation works
 
-The orchestrator delegates a task to one or more workers. The deck delivers the task to each worker's pane automatically, including the worker's `prompt_template` as standing context. Each worker works independently, then signals completion. The deck notifies the orchestrator, which reads the summary and decides what to do next.
+The orchestrator delegates a task to one or more workers. The deck delivers the task to each worker's pane automatically, including the worker's [`prompt_template`](#configuration-reference) as standing context. Each worker works independently, then signals completion. The deck notifies the orchestrator, which reads the summary and decides what to do next.
 
 ![Coder pane active and working after receiving a delegation from the orchestrator](./img/orchestration-coder.png)
 
@@ -180,7 +110,7 @@ A worker that never signals completion would otherwise stall the pipeline silent
 
 ### What `clear` does to delivery
 
-`clear` decides whether the worker that receives a task is the same process that handled the last one, and that has consequences for how the task is delivered.
+[`clear`](#configuration-reference) decides whether the worker that receives a task is the same process that handled the last one, and that has consequences for how the task is delivered.
 
 With `clear = false` the agent is left running. The task is typed straight into the session that is already sitting there, so delivery is immediate and the worker keeps everything it learned from previous delegations.
 
@@ -216,6 +146,10 @@ The orchestrator can delegate to multiple workers simultaneously — for example
 
 Workers cold-start with no memory of prior conversation, no access to other workers' outputs, and no shared scratchpad. Whatever the orchestrator includes in a delegation is the **entire context the worker has** — plus the worker's `prompt_template`. The orchestrator's `prompt_template` is where you tell it how to delegate well: which files to reference, how to summarise prior findings when chaining workers, and what to include when retrying after a failure.
 
+Task text passed inline goes through the orchestrator's own shell before dot-agent-deck ever sees it, so parts of it can be executed or quietly dropped while the delegation still reports success. The generated protocol therefore defaults to handing the task over as a file, which is read off disk verbatim — nothing for you to configure.
+
+That default assumes the agent is *authorized* to write a file, which is not the same as having a file-writing tool: a role launched with a restricted tool allowlist — `claude --allowedTools Bash Read`, say — hits an interactive approval prompt instead, and an unattended pane parks there forever. The protocol has a fallback for that case, but it cannot grant itself the tool. That part is yours: if a role is expected to take the primary path, add the file-writing tool to its `command`'s allowlist (e.g. `--allowedTools Bash Read Write`) so it never meets the prompt.
+
 ### Use a tracking file
 
 The most effective pattern is to give the orchestrator a spec or task file — a PRD, a checklist, whatever suits your workflow — and tell it to read the file and keep it updated as work progresses. You can do this in the orchestrator's `prompt_template`, in your opening message to it, or both.
@@ -241,6 +175,78 @@ When generating a config, the deck's agent picks from these built-in suggestions
 ### Why `release` has `clear = false`
 
 The release flow is stateful: open branch → push → create PR → wait for CI → merge. If the agent is restarted between the PR creation and the CI wait, it loses the PR URL and branch name. `clear = false` lets the release agent carry state across delegations and retries, so it can pick up where it left off after a CI failure.
+
+## Configuration reference
+
+### `[[orchestrations]]`
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | no | cwd basename | Display name shown in the tab bar. Defaults to the project directory name when empty. |
+| `roles` | array | yes | — | Role definitions. Must contain at least one role with `start = true`. |
+
+### `[[orchestrations.roles]]`
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | yes | — | Role identifier. Shown on the role card in the deck so you can tell agents apart at a glance. Also used in `--to` arguments and in task/work-done file names. Must be unique within the orchestration. Must not contain `/`, `\`, or `..`. |
+| `command` | string | yes | — | Shell command that launches the agent for this role. Must result in a `claude`, `opencode`, `pi`, or `codex` process (e.g. `claude`, `devbox run agent-big`, `opencode --model gpt-4o`, `pi --provider openrouter`, `codex`). Other commands will run but won't get live status tracking on the role card. |
+| `start` | bool | no | `false` | `true` marks this role as the orchestrator. Exactly one role per orchestration must have `start = true`. |
+| `description` | string | no | — | Tells the orchestrator when to use this role and what it is for, so it can decide which worker to delegate to in a given situation. Also shown on the role card in the deck. |
+| `prompt_template` | string | no | — | Standing instructions the orchestrator prepends to every task it sends this role. When set, the orchestrator's task text — however it was passed, `--task` or `--task-file` — is appended under a `## Task` heading, so the worker sees both the template and the task together. |
+| `clear` | bool | no | `true` | Restart the agent before each delegation, so every task starts from a clean context. The deck terminates the running agent, launches the role's `command` again in the same pane, waits through a readiness buffer, and only then delivers the task. Set to `false` for roles that need to carry state across delegations (e.g. a `release` role that must remember the PR URL and branch name when retrying after a CI failure). See [What `clear` does to delivery](#what-clear-does-to-delivery). |
+
+### Minimal example
+
+The deck writes the delegation protocol — how to pass a task safely — into the orchestrator's context automatically at launch, so no `prompt_template` below needs to restate it.
+
+```toml
+[[orchestrations]]
+name = "code-review"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude"
+start = true
+prompt_template = """
+You coordinate the team. You NEVER write or review code yourself — only delegate.
+
+Workflow:
+- Delegate implementation to coder.
+- After coder reports done, delegate to reviewer and auditor in parallel.
+- If either flags blocking issues, re-delegate to coder with the specific feedback.
+- Once the work is clean, delegate to release.
+
+Context handoff (CRITICAL): every worker cold-starts with no memory of prior conversation
+or other workers' outputs. The task text you send is the entire context the worker has.
+Always include file paths, the relevant spec path, and any prior worker's findings when chaining.
+"""
+
+[[orchestrations.roles]]
+name = "coder"
+command = "claude --model sonnet"
+description = "Implements features, fixes bugs, refactors code"
+prompt_template = "Implement the requested change. Run the project's test command before reporting completion."
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "claude"
+description = "Reviews code changes for correctness, style, and edge cases"
+prompt_template = "Review the change. Report findings only — do not modify code."
+
+[[orchestrations.roles]]
+name = "auditor"
+command = "claude"
+description = "Audits code for security vulnerabilities and unsafe patterns"
+prompt_template = "Audit the change for security vulnerabilities. Report findings only — do not modify code."
+
+[[orchestrations.roles]]
+name = "release"
+command = "claude --model haiku"
+clear = false
+description = "Runs the project's release flow; never modifies source code"
+prompt_template = "Run the release flow (open PR, wait for CI, merge). Do NOT modify source code. If any step fails, report the exact error and stop."
+```
 
 ## Example orchestrations
 
@@ -268,8 +274,8 @@ Workflow:
 6. Delegate the release flow to release.
 
 Context handoff (CRITICAL): workers cold-start with no memory of prior conversation or other
-workers' outputs. Include all context in --task: file paths, spec paths, error messages, findings.
-If context is long, write it to .dot-agent-deck/<slug>.md and reference the path in --task.
+workers' outputs. Include all context in the task: file paths, spec paths, error messages, findings.
+If context is long, write it to .dot-agent-deck/<slug>.md and pass that file rather than pasting it.
 """
 
 [[orchestrations.roles]]
@@ -332,7 +338,7 @@ prompt_template = """
 You run a TDD cycle. You NEVER write code or tests yourself.
 
 Workflow:
-1. Delegate to tester to write failing tests for the feature described in --task.
+1. Delegate to tester to write failing tests for the feature described in the incoming task.
 2. Delegate to coder to implement until all tests pass.
 3. Delegate back to tester to verify tests are green and coverage is adequate.
 4. If tester finds gaps, re-delegate to coder with the specific failing tests.

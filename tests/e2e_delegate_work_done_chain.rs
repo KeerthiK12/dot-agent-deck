@@ -252,7 +252,15 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delegate_work_done_chain_claude() {
     skip_unless!(common::check_claude_available());
-    let command = format!("claude --model {PINNED_CLAUDE_MODEL} --allowedTools Bash Read");
+    // `Write` is load-bearing, not incidental (#303): the task file's `## When
+    // done` footer tells the worker to write its report with a file-writing tool
+    // and pass it to `work-done --task-file`. With only `Bash Read` the worker
+    // called `Write`, hit Claude's interactive approval prompt, and never reached
+    // `work-done` — so this test asserted the guidance's own primary path while
+    // withholding the permission that path needs. Sibling real-agent worker roles
+    // (`e2e_pi_orchestrator`, `e2e_pi_live`, `fixtures/orchestration-route`)
+    // already allow `Write` for the same reason.
+    let command = format!("claude --model {PINNED_CLAUDE_MODEL} --allowedTools Bash Read Write");
     run_delegate_work_done_loop(&command, true).await;
 }
 
