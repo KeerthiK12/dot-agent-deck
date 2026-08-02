@@ -198,7 +198,7 @@ The release flow is stateful: open branch → push → create PR → wait for CI
 
 ### Minimal example
 
-The deck writes the delegation protocol — how to pass a task safely, and the `--task-file` default — into the orchestrator's context automatically at launch, so no `prompt_template` below needs to restate it.
+The deck writes the delegation protocol — how to pass a task safely — into the orchestrator's context automatically at launch, so no `prompt_template` below needs to restate it.
 
 ```toml
 [[orchestrations]]
