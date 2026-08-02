@@ -1,11 +1,13 @@
 #![cfg(all(feature = "e2e", unix))]
 
-//! Reel-eligible PTY coverage for the dashboard card resize contract. The test
-//! drives a genuine interactive Claude Code turn, then records the same live
-//! card at wide and narrow terminal widths.
+//! Reel-eligible PTY coverage for the dashboard card width contract. The test
+//! drives a genuine interactive Claude Code turn through one client while a
+//! second, fixed-size client records the same live card before and after it
+//! attaches the agent's pane.
 
 mod common;
 
+use std::cell::RefCell;
 use std::time::Duration;
 
 use common::TuiDeck;
@@ -16,6 +18,10 @@ const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 const PANE_NAME_SUFFIX: &str = "card-layout-haiku";
 const SENTINEL: &str = "card-layout-sentinel-8f3c2a.txt";
 const SENTINEL_PREFIX: &str = "card-layout-sentinel-";
+const RECORDING_COLS: u16 = 68;
+const RECORDING_ROWS: u16 = 16;
+const CONTROL_COLS: u16 = 120;
+const CONTROL_ROWS: u16 = 40;
 
 #[derive(Debug)]
 struct CardSnapshot {
@@ -33,6 +39,10 @@ impl CardSnapshot {
 
     fn height(&self) -> usize {
         self.rows.len()
+    }
+
+    fn inner_width(&self) -> usize {
+        self.rows[0].chars().count().saturating_sub(2)
     }
 
     fn row_of(&self, needle: &str) -> usize {
@@ -100,22 +110,31 @@ fn assert_stats_are_border_only(card: &CardSnapshot, context: &str) {
     );
 }
 
-/// Scenario: Launch a 200-column deck, create a genuine interactive Claude Haiku pane, and ask it to use Bash once to discover and report a uniquely named sentinel file while its live dashboard card shows Working and a nonzero tool count.
-/// Resize the attached PTY to 60 columns and hold the resulting frame so the recording visibly demonstrates that the card keeps every content field and the same height while its full bottom-right `Last: … Tools: …` label degrades to the shorter `… · … tools` rung without losing either corner.
+/// Scenario: Launch a fixed laptop-proportioned dashboard plus a second real client on the same daemon, then use that client's Ctrl+N flow to run interactive Claude Haiku and discover a uniquely named sentinel with Bash. Hold the observer's full-width real-agent card, attach its live pane without resizing the recorded PTY, and return to the narrowed dashboard so the bottom-border counters visibly degrade while every content row and both corners remain intact.
 #[spec("dashboard/card-stats/005")]
 #[test]
-fn card_stats_005_real_agent_card_resizes_without_restructuring() {
+fn card_stats_005_real_agent_card_narrows_without_restructuring() {
     skip_unless!(common::check_claude_available());
 
-    let mut deck = TuiDeck::builder()
-        .with_pty_size(200, 50)
+    let deck = TuiDeck::builder()
+        .with_pty_size(RECORDING_COLS, RECORDING_ROWS)
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
 
-    std::fs::write(deck.workdir().join(SENTINEL), "reel fixture\n")
+    let attach_socket = deck.attach_socket_path().to_string_lossy().into_owned();
+    let hook_socket = deck.hook_socket_path().to_string_lossy().into_owned();
+    let control = TuiDeck::builder()
+        .with_pty_size(CONTROL_COLS, CONTROL_ROWS)
+        .with_env("DOT_AGENT_DECK_ATTACH_SOCKET", attach_socket)
+        .with_env("DOT_AGENT_DECK_SOCKET", hook_socket)
+        .without_success_recording()
+        .launch_with_fixture("minimal");
+    control.wait_for_string("No active sessions");
+
+    std::fs::write(control.workdir().join(SENTINEL), "reel fixture\n")
         .expect("write card-layout sentinel");
-    let cwd = deck.workdir().to_path_buf();
+    let cwd = control.workdir().to_path_buf();
     let mut trust_paths = vec![cwd.to_string_lossy().into_owned()];
     if let Ok(canonical) = cwd.canonicalize() {
         let canonical = canonical.to_string_lossy().into_owned();
@@ -127,23 +146,23 @@ fn card_stats_005_real_agent_card_resizes_without_restructuring() {
         .expect("seed Claude onboarding and project trust");
 
     let events = deck.subscribe_events();
-    deck.send_keys(b"\x0e");
-    deck.wait_for_string("Select Directory");
-    deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
-    deck.send_keys(b"\t");
-    deck.send_keys(PANE_NAME_SUFFIX.as_bytes());
-    deck.send_keys(b"\t");
-    deck.send_keys(format!("claude --model {HAIKU_MODEL} --allowedTools Bash").as_bytes());
-    let (submit_col, submit_row) = deck
+    control.send_keys(b"\x0e");
+    control.wait_for_string("Select Directory");
+    control.send_keys(b" ");
+    control.wait_for_string("New Agent");
+    control.send_keys(b"\t");
+    control.send_keys(PANE_NAME_SUFFIX.as_bytes());
+    control.send_keys(b"\t");
+    control.send_keys(format!("claude --model {HAIKU_MODEL} --allowedTools Bash").as_bytes());
+    let (submit_col, submit_row) = control
         .find_in_grid("[Submit]")
         .expect("new-pane form should render [Submit]");
-    deck.click(submit_col, submit_row);
+    control.click(submit_col, submit_row);
 
     assert!(
-        deck.wait_for_grid_string_within("? for shortcuts", Duration::from_secs(120)),
+        control.wait_for_grid_string_within("? for shortcuts", Duration::from_secs(120)),
         "the genuine interactive Claude prompt never became ready:\n{}",
-        deck.snapshot_grid()
+        control.snapshot_grid()
     );
     let records = common::agent_records_on(deck.attach_socket_path());
     let agent_id = records
@@ -165,8 +184,8 @@ fn card_stats_005_real_agent_card_resizes_without_restructuring() {
     let prompt = format!(
         "Use Bash exactly once to run sleep 4; ls -1. Then respond with only the exact complete filename beginning with {SENTINEL_PREFIX} that the listing revealed. Do not use any other tool."
     );
-    deck.send_keys(prompt.as_bytes());
-    deck.send_keys(b"\r");
+    control.send_keys(prompt.as_bytes());
+    control.send_keys(b"\r");
     events.wait_for(
         |event| {
             event.agent_id.as_deref() == Some(agent_id.as_str())
@@ -176,8 +195,8 @@ fn card_stats_005_real_agent_card_resizes_without_restructuring() {
         Duration::from_secs(120),
     );
 
-    deck.send_keys(b"\x04");
-    deck.wait_for_string("Dir:");
+    control.send_keys(b"\x04");
+    control.wait_for_string("Dir:");
     let tool_start = events.wait_for(
         |event| {
             event.agent_id.as_deref() == Some(agent_id.as_str())
@@ -205,9 +224,9 @@ fn card_stats_005_real_agent_card_resizes_without_restructuring() {
     common::wait_until(Duration::from_secs(2), || false);
 
     assert!(
-        deck.wait_for_grid_string_within(SENTINEL, Duration::from_secs(120)),
+        control.wait_for_grid_string_within(SENTINEL, Duration::from_secs(120)),
         "Claude never visibly reported the full sentinel discovered by ls (the prompt contained only {SENTINEL_PREFIX:?}):\n{}",
-        deck.snapshot_grid()
+        control.snapshot_grid()
     );
     events.wait_for(
         |event| {
@@ -238,21 +257,42 @@ fn card_stats_005_real_agent_card_resizes_without_restructuring() {
         wide.rows.join("\n")
     );
     assert_stats_are_border_only(&wide, "idle wide");
-    common::wait_until(Duration::from_secs(2), || false);
+    common::wait_until(Duration::from_secs(6), || false);
 
-    deck.resize(60, 50);
+    drop(control);
+    deck.send_keys(b"1");
+    assert!(
+        deck.wait_for_grid_string_within(SENTINEL, Duration::from_secs(30)),
+        "the fixed-size recording client did not attach the completed real Claude pane with its sentinel response:\n{}",
+        deck.snapshot_grid()
+    );
+    common::wait_until(Duration::from_secs(2), || false);
+    deck.send_keys(b"\x04");
+    let narrowed_snapshot = RefCell::new(None);
     assert!(
         deck.wait_for_grid_predicate_within(Duration::from_secs(30), |grid| {
             try_first_card(grid).is_some_and(|card| {
-                card.bottom().contains('·')
+                let complete = card.height() == wide.height()
+                    && ["Dir:", "Prmt:", "Bash"]
+                        .iter()
+                        .all(|field| card.rows.iter().any(|row| row.contains(field)));
+                let degraded = card.bottom().contains('·')
                     && !card.bottom().contains("Last:")
-                    && !card.bottom().contains("Tools:")
+                    && !card.bottom().contains("Tools:");
+                if complete && degraded {
+                    narrowed_snapshot.replace(Some(card));
+                    true
+                } else {
+                    false
+                }
             })
         }),
-        "the resized card never selected a shorter stats rung:\n{}",
+        "the card never selected a shorter stats rung after its pane narrowed the dashboard:\n{}",
         deck.snapshot_grid()
     );
-    let narrow = first_card(&deck.snapshot_grid());
+    let narrow = narrowed_snapshot
+        .into_inner()
+        .expect("the successful narrowed-card predicate stores its complete snapshot");
     assert!(
         narrow.bottom().starts_with('└') && narrow.bottom().ends_with('┘'),
         "narrow stats must preserve both bottom corners:\n{}",
@@ -266,10 +306,18 @@ fn card_stats_005_real_agent_card_resizes_without_restructuring() {
         narrow.rows.join("\n")
     );
     assert_stats_are_border_only(&narrow, "narrow");
+    assert!(
+        narrow.inner_width() < wide.inner_width(),
+        "opening the pane must narrow the same card without resizing the recording PTY\nWIDE ({} inner cols):\n{}\nNARROW ({} inner cols):\n{}",
+        wide.inner_width(),
+        wide.rows.join("\n"),
+        narrow.inner_width(),
+        narrow.rows.join("\n")
+    );
     assert_eq!(
         narrow.height(),
         wide.height(),
-        "width-only resize must not change card height\nWIDE:\n{}\nNARROW:\n{}",
+        "opening the pane must not change card height\nWIDE:\n{}\nNARROW:\n{}",
         wide.rows.join("\n"),
         narrow.rows.join("\n")
     );
@@ -277,7 +325,7 @@ fn card_stats_005_real_agent_card_resizes_without_restructuring() {
         assert_eq!(
             narrow.row_of(field),
             wide.row_of(field),
-            "{field} must remain on the same card row across the resize\nWIDE:\n{}\nNARROW:\n{}",
+            "{field} must remain on the same card row when the pane narrows the dashboard\nWIDE:\n{}\nNARROW:\n{}",
             wide.rows.join("\n"),
             narrow.rows.join("\n")
         );
