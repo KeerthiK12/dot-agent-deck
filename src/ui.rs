@@ -10379,33 +10379,22 @@ pub fn run_tui(
                     && let Some(pane_id) = embedded.focused_pane_id()
                 {
                     match mouse.kind {
+                        // PRD #341 M5: the wheel scrolls the focused agent pane in
+                        // ANY mode — matching the side panes above, which have
+                        // always hit-tested without consulting `ui.mode`. Whether
+                        // the event reaches the child is the ONE decision
+                        // `scroll_focused_agent_pane` owns; it is command mode's
+                        // job never to.
                         crossterm::event::MouseEventKind::ScrollUp
-                            if ui.mode == UiMode::PaneInput =>
-                        {
-                            if embedded.mouse_mode_enabled(&pane_id) {
-                                let (col, row) = pane_relative_coords(
-                                    mouse.column,
-                                    mouse.row,
-                                    &ui.focused_pane_rect,
-                                );
-                                let _ = embedded.forward_mouse_scroll(&pane_id, true, col, row);
-                            } else {
-                                embedded.scroll_pane(&pane_id, 3);
-                            }
-                        }
-                        crossterm::event::MouseEventKind::ScrollDown
-                            if ui.mode == UiMode::PaneInput =>
-                        {
-                            if embedded.mouse_mode_enabled(&pane_id) {
-                                let (col, row) = pane_relative_coords(
-                                    mouse.column,
-                                    mouse.row,
-                                    &ui.focused_pane_rect,
-                                );
-                                let _ = embedded.forward_mouse_scroll(&pane_id, false, col, row);
-                            } else {
-                                embedded.scroll_pane(&pane_id, -3);
-                            }
+                        | crossterm::event::MouseEventKind::ScrollDown => {
+                            let up =
+                                matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp);
+                            let (col, row) = pane_relative_coords(
+                                mouse.column,
+                                mouse.row,
+                                &ui.focused_pane_rect,
+                            );
+                            scroll_focused_agent_pane(embedded, &pane_id, ui.mode, up, col, row);
                         }
                         crossterm::event::MouseEventKind::Down(
                             crossterm::event::MouseButton::Left,
@@ -10725,6 +10714,18 @@ pub fn run_tui(
             // while the user is typing in a pane.
             if action.is_none() && !is_ctrl_c {
                 action = global_action_for_mode(&kb, ui.mode, &key);
+            }
+
+            // PRD #341 M5: command-mode focused-pane scrolling (`scroll_pane_up` /
+            // `scroll_pane_down`, defaults PageUp / PageDown) — the keyboard
+            // equivalent of the wheel, so command mode is a real read-only inspect
+            // mode. The scroll is applied in place; `Action::Continue` stops the
+            // key falling through to `dispatch_normal_mode_key`.
+            if action.is_none()
+                && !is_ctrl_c
+                && handle_focused_pane_scroll_key(&kb, ui.mode, &key, &*pane)
+            {
+                action = Some(Action::Continue);
             }
 
             // Tab cycling in Normal mode: move_left/move_right (defaults h/l)
@@ -11716,6 +11717,9 @@ fn render_frame(
                 card_number,
                 density,
                 idle_art,
+                // PRD #341 M4: the live deck's mode, so the seam that pins the
+                // selection accent and the running app cannot disagree.
+                ui.mode,
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -12427,29 +12431,44 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
 /// an empty input). A button wider than `width` is still placed at the start of
 /// its own row (the caller clips it to the buffer). Pure data: no rendering, so
 /// the same layout drives the render AND the reserved height budget.
-fn layout_button_bar(label_widths: &[u16], width: u16) -> (Vec<Rect>, u16) {
+///
+/// PRD #341 M2: `first_row_indent` is the cells row 0 must leave free at its left
+/// edge for the mode chip. Only row 0 pays it — wrapped continuation rows start at
+/// `x = 0` and get the full `width`, because the chip is one row tall. Reserving
+/// the band across the whole bar area instead charged every row for a chip drawn
+/// on one of them, which cost the dashboard a content row at several widths (with
+/// the default button set: 4 rows instead of 3 at 60 cols, 5 instead of 4 at 50).
+/// Row 0's own indent is unavoidable, so a width where the chip pushes row 0's
+/// last button over still pays (78–86 cols with the default set).
+fn layout_button_bar(label_widths: &[u16], width: u16, first_row_indent: u16) -> (Vec<Rect>, u16) {
     const SEP: u16 = 1;
     let mut rects = Vec::with_capacity(label_widths.len());
-    let mut x = 0u16;
+    let mut x = first_row_indent.min(width);
     let mut y = 0u16;
     let mut row_has_button = false;
     for &w in label_widths {
-        if row_has_button && x.saturating_add(SEP).saturating_add(w) > width {
-            // Would overflow the current row — wrap to a fresh one.
+        // Where this button would start if it stayed on the current row.
+        let mut start = if row_has_button {
+            x.saturating_add(SEP)
+        } else {
+            x
+        };
+        // Wrap when it would overflow AND a fresh row would actually help — a
+        // fresh row starts at column 0, so that is exactly "we are not already
+        // there". This is what lets an indented row 0 push its FIRST button down
+        // instead of off the right edge, while a button wider than the whole bar
+        // still sits at the start of its own row and is clipped by the caller.
+        if start > 0 && start.saturating_add(w) > width {
             y += 1;
-            x = 0;
-            row_has_button = false;
-        }
-        if row_has_button {
-            x = x.saturating_add(SEP);
+            start = 0;
         }
         rects.push(Rect {
-            x,
+            x: start,
             y,
             width: w,
             height: 1,
         });
-        x = x.saturating_add(w);
+        x = start.saturating_add(w);
         row_has_button = true;
     }
     let rows = if label_widths.is_empty() { 0 } else { y + 1 };
@@ -12466,11 +12485,18 @@ fn layout_button_bar(label_widths: &[u16], width: u16) -> (Vec<Rect>, u16) {
 /// [`layout_button_bar`]; a button whose wrapped row falls outside `area`'s
 /// reserved height is dropped whole (the height budget reserves the bar's
 /// actual row count, so on the dashboard this never clips a real button).
+///
+/// PRD #341 M2: `area` is the FULL bar area including the mode chip's cells, and
+/// `first_row_indent` is what the chip took off row 0 — so the buttons flow around
+/// a one-row chip instead of the whole bar being shifted right. `bottom_bar_rows`
+/// passes the identical pair to the identical `layout_button_bar`, which is what
+/// keeps the reserved height equal to the rendered height.
 fn render_button_bar(
     frame: &mut Frame,
     keybindings: &KeybindingConfig,
     mode: UiMode,
     area: Rect,
+    first_row_indent: u16,
     has_pane_control: bool,
     extra_buttons: &[Button],
 ) -> Vec<(Action, Rect)> {
@@ -12483,7 +12509,7 @@ fn render_button_bar(
         .iter()
         .map(|b| b.display_label().chars().count() as u16)
         .collect();
-    let (placements, _rows) = layout_button_bar(&widths, area.width);
+    let (placements, _rows) = layout_button_bar(&widths, area.width, first_row_indent);
 
     let mut rects = Vec::with_capacity(buttons.len());
     let buf = frame.buffer_mut();
@@ -12539,15 +12565,20 @@ const GAP_AFTER_CHIP: u16 = 1;
 /// content.
 ///
 /// The ONE source of truth for the chip's width budget, read by
-/// [`render_mode_chip`] AND by [`bottom_bar_rows`]. The reserved height is
-/// derived from `rest`, so if the two disagreed the reservation would not match
-/// what renders and the bar would clip or overlap the cards — the PRD #144
-/// height-budget contract `render/layout/004` pins.
+/// [`render_mode_chip`] AND by [`bottom_bar_rows`] AND by the button-bar render.
+/// All three derive the layout from the same `chip_band`, so the reservation
+/// cannot disagree with what renders — if it did, the bar would clip or overlap
+/// the cards, the PRD #144 height-budget contract `render/layout/004` pins.
 ///
 /// `chip_band` covers the chip plus one separating space. It is 0 — no chip at
 /// all — for a mode with no label, and for a row too narrow to spend the cells
 /// on one: under twice the chip's width the bar's own labels are the scarcer
 /// resource, and the mode-aware border and cursor still carry the signal.
+///
+/// `rest` is what a SINGLE-ROW bar (an input field, a status message) has left
+/// after the chip. The wrapping button bar does not use it: the chip is one row
+/// tall, so only its row 0 is indented (see [`layout_button_bar`]'s
+/// `first_row_indent`) and continuation rows get the full width back.
 fn mode_chip_bar_split(mode: UiMode, width: u16) -> (u16, u16) {
     let Some(label) = mode_chip_label(mode) else {
         return (0, width);
@@ -12620,10 +12651,11 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16, tab_view: &Activ
                 .map(|b| b.display_label().chars().count() as u16)
                 .collect();
             // PRD #341 M2: the mode chip is part of the bar's width budget, so
-            // the buttons wrap inside what it leaves. Same split the renderer
-            // applies — a second opinion here would mis-reserve the height.
-            let (_, bar_width) = mode_chip_bar_split(ui.mode, width);
-            let (_, rows) = layout_button_bar(&widths, bar_width);
+            // the buttons flow around it — indenting row 0 only, exactly as
+            // `render_button_bar` does. Same split, same call, same arguments: a
+            // second opinion here would mis-reserve the height.
+            let (chip_band, _) = mode_chip_bar_split(ui.mode, width);
+            let (_, rows) = layout_button_bar(&widths, width, chip_band);
             rows.max(1)
         }
     };
@@ -12643,6 +12675,12 @@ fn render_bottom_bar(
     // Mode-tab path, and the PaneInput row alike — so the current mode is stated
     // in words in the SAME screen position on every tab, in both modes.
     // Everything else in the bar draws into what it leaves.
+    //
+    // The single-row branches take the chip-shortened rect; the wrapping button
+    // bar keeps the FULL rect and indents only its row 0, so a wrapped bar does
+    // not pay the chip's ~10 cells on every row (see `layout_button_bar`).
+    let full_area = area;
+    let (chip_band, _) = mode_chip_bar_split(ui.mode, area.width);
     let area = render_mode_chip(frame, ui.mode, area);
     match ui.mode {
         UiMode::Filter => {
@@ -12723,7 +12761,8 @@ fn render_bottom_bar(
                     frame,
                     &ui.keybindings,
                     ui.mode,
-                    area,
+                    full_area,
+                    chip_band,
                     has_pane_control,
                     extra_buttons,
                 );
@@ -13458,6 +13497,20 @@ fn render_help_overlay(
             "Approve / deny permission",
         ),
         help_key_line(&n(KbAction::OpenScheduledTasks), "Scheduled Tasks manager"),
+        // PRD #341 M5: command mode is a real read-only inspect mode — the wheel
+        // and these keys scroll the focused pane's own scrollback without ever
+        // reaching the agent.
+        help_key_line(
+            &format!(
+                "{} / {}",
+                n(KbAction::ScrollPaneUp),
+                n(KbAction::ScrollPaneDown)
+            ),
+            // Kept short on purpose: `help_key_line` leaves 29 cells for the
+            // description in a 50-cell column, and the two-key notation already
+            // says which way each one goes.
+            "Scroll focused pane",
+        ),
         help_key_line(&n(KbAction::Help), "Toggle this help"),
     ];
 
@@ -14500,6 +14553,97 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     (field_rects, chip_rects, button_rects)
 }
 
+/// PRD #341 M5 — how far one scroll input moves the focused pane's view. Shared
+/// by the wheel and the keyboard bindings so the two cannot drift apart.
+const FOCUSED_PANE_SCROLL_LINES: isize = 3;
+
+/// PRD #341 M5 — move dot-agent-deck's OWN scrollback for the focused pane.
+///
+/// The single scroll operation both doors funnel into: the mouse wheel
+/// ([`scroll_focused_agent_pane`]) and the `scroll_pane_up` / `scroll_pane_down`
+/// bindings ([`handle_focused_pane_scroll_key`]). Nothing here can reach the
+/// child — it only sets a vt100 scrollback offset.
+fn scroll_focused_pane_scrollback(embedded: &EmbeddedPaneController, pane_id: &str, up: bool) {
+    let delta = if up {
+        FOCUSED_PANE_SCROLL_LINES
+    } else {
+        -FOCUSED_PANE_SCROLL_LINES
+    };
+    embedded.scroll_pane(pane_id, delta);
+}
+
+/// PRD #341 M5 — the ONE decision a wheel event over the focused agent pane
+/// makes: forward it into the child's mouse protocol, or move our own scrollback.
+///
+/// Extracted out of the event loop so the live mouse arm and the L1 seam
+/// ([`observe_focused_agent_mouse_scroll`]) exercise the same code rather than two
+/// agreeing copies. `pane_col` / `pane_row` are already pane-relative (the caller
+/// applies [`pane_relative_coords`]).
+///
+/// Forwarding is a `PaneInput`-only behaviour — it is how you drive the *agent's*
+/// pager while typing to it. In command mode the wheel must always drive our
+/// scrollback and never reach the agent's mouse protocol (PRD #341 risk row
+/// "Scroll-forwarding regression"): command mode is the safe resting state, and a
+/// wheel that leaks into a full-screen TUI there would move the ground under a
+/// user who is only reading. That is why the mode test and the `mouse_mode_enabled`
+/// test are ANDed in ONE expression instead of nesting the second inside a
+/// mode-gated arm: this is the only `forward_mouse_scroll` call site on the
+/// focused-pane path, and it is structurally unreachable unless
+/// `mode == UiMode::PaneInput`.
+fn scroll_focused_agent_pane(
+    embedded: &EmbeddedPaneController,
+    pane_id: &str,
+    mode: UiMode,
+    up: bool,
+    pane_col: u16,
+    pane_row: u16,
+) {
+    if mode == UiMode::PaneInput && embedded.mouse_mode_enabled(pane_id) {
+        let _ = embedded.forward_mouse_scroll(pane_id, up, pane_col, pane_row);
+    } else {
+        scroll_focused_pane_scrollback(embedded, pane_id, up);
+    }
+}
+
+/// PRD #341 M5 — the keyboard door to the focused-pane scroll operation. Returns
+/// `true` when `key` was claimed (so the caller must not fall through to the
+/// per-mode handler).
+///
+/// Resolution goes through [`KeybindingConfig`] alone: there is no hardcoded
+/// `KeyCode::PageUp` / `PageDown` match anywhere on this path, so remapping
+/// `scroll_pane_up` / `scroll_pane_down` in `[dashboard]` both enables the new
+/// chord and retires the default — the property `mode/scroll/002` pins.
+///
+/// Command mode only. In `PaneInput` PageUp/PageDown belong to the agent
+/// (`keyevent_to_bytes` forwards them as `ESC [ 5 ~` / `ESC [ 6 ~`), and claiming
+/// them here would steal a pager key from every child app.
+///
+/// A claimed key with no focused embedded pane is a silent no-op, matching every
+/// other bound-but-inapplicable command in the deck.
+fn handle_focused_pane_scroll_key(
+    kb: &KeybindingConfig,
+    mode: UiMode,
+    key: &KeyEvent,
+    pane: &dyn PaneController,
+) -> bool {
+    if mode != UiMode::Normal {
+        return false;
+    }
+    let up = if kb.matches(KbAction::ScrollPaneUp, key) {
+        true
+    } else if kb.matches(KbAction::ScrollPaneDown, key) {
+        false
+    } else {
+        return false;
+    };
+    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+        && let Some(pane_id) = embedded.focused_pane_id()
+    {
+        scroll_focused_pane_scrollback(embedded, &pane_id, up);
+    }
+    true
+}
+
 /// Convert screen-absolute mouse coordinates to pane-relative coordinates.
 /// Returns (col, row) relative to the pane's inner area (inside border).
 fn pane_relative_coords(screen_col: u16, screen_row: u16, pane_rect: &Option<Rect>) -> (u16, u16) {
@@ -14522,6 +14666,30 @@ fn grid_columns(width: u16) -> usize {
     }
 }
 
+/// PRD #341 M4 — the selected card's border accent, de-emphasised when the
+/// keyboard is NOT driving the deck.
+///
+/// Selection deliberately survives the mode switch (it is where `Ctrl+D` sends
+/// you back to), so before this the deck looked equally live in both modes — on
+/// the Dashboard the pane overlay sits off to the right and the deck is where the
+/// user's eyes already are, which made it the weakest tab for mode signalling.
+///
+/// The colour is [`palette::SELECTED`] in both modes and the `▸ ` title marker
+/// stays in both (Decision 5: the user must still be able to tell WHAT is
+/// selected while typing). Only the accent's weight moves: command mode keeps
+/// today's full-strength BOLD, `PaneInput` drops BOLD **and** adds
+/// `Modifier::DIM`. Two channels rather than one because DIM is not honoured by
+/// every terminal — where it is ignored, the missing BOLD still reads as
+/// de-emphasised.
+fn selected_card_border_style(mode: UiMode) -> Style {
+    let base = Style::default().fg(palette::SELECTED);
+    if mode == UiMode::PaneInput {
+        base.add_modifier(Modifier::DIM)
+    } else {
+        base.add_modifier(Modifier::BOLD)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_session_card(
     frame: &mut Frame,
@@ -14533,6 +14701,9 @@ fn render_session_card(
     card_number: Option<u8>,
     density: CardDensity,
     idle_art: Option<&IdleArtEntry>,
+    // PRD #341 M4: which mode the deck is being rendered in. Only the selected
+    // card's accent reads it (see `selected_card_border_style`).
+    mode: UiMode,
 ) {
     let is_placeholder = session.agent_type == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
@@ -14610,11 +14781,11 @@ fn render_session_card(
 
     let border_style = if is_selected {
         // PRD #155 Option A: selection uses the dedicated `selected` accent role
-        // (Magenta + BOLD, paired with the `▸ ` title marker above) — distinct
-        // from every status color and from the focused-pane cyan.
-        Style::default()
-            .fg(palette::SELECTED)
-            .add_modifier(Modifier::BOLD)
+        // (Magenta, paired with the `▸ ` title marker above) — distinct from
+        // every status color and from the focused-pane cyan. PRD #341 M4: its
+        // WEIGHT now tracks the mode, so the deck looks live exactly when the
+        // keyboard is driving it.
+        selected_card_border_style(mode)
     } else if is_placeholder {
         // Placeholder ("No agent") cards read as secondary: dim the terminal's
         // own foreground (matching the prior DarkGray intent) so the empty slot
@@ -15215,6 +15386,12 @@ pub fn render_config_gen_prompt_to_buffer(
 /// `dashboard/pane/004`. The `selected` flag drives the renderer's
 /// selection-highlight path so tests can pin the highlight styling
 /// (PRD #13 `theme/guard/001`).
+///
+/// PRD #341 M4: the selection accent is now mode-dependent, so this seam is the
+/// explicit **command-mode (`UiMode::Normal`) compatibility baseline** — the
+/// full-strength Magenta+BOLD+`▸ ` rendering, byte-for-byte what it produced
+/// before the mode became an input. Use [`render_card_for_mode_to_buffer`] to
+/// vary the mode.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_card_to_buffer(
@@ -15224,6 +15401,40 @@ pub fn render_card_to_buffer(
     density: CardDensityKind,
     tick: u64,
     selected: bool,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    render_card_for_mode_to_buffer(
+        session,
+        display_name,
+        card_number,
+        density,
+        tick,
+        selected,
+        UiMode::Normal,
+        width,
+        height,
+    )
+}
+
+/// PRD #341 M4 L1 seam: render exactly one session card **as the running deck
+/// draws it in `mode`**.
+///
+/// Routes through the same private `render_session_card` the live Dashboard calls
+/// (`render_dashboard`, which passes `ui.mode`), so an assertion made here is an
+/// assertion about what the user actually sees. `mode` is the ONLY input
+/// [`render_card_to_buffer`] does not expose; that seam is this one pinned to
+/// `UiMode::Normal`.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn render_card_for_mode_to_buffer(
+    session: &SessionState,
+    display_name: Option<&str>,
+    card_number: Option<u8>,
+    density: CardDensityKind,
+    tick: u64,
+    selected: bool,
+    mode: UiMode,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -15251,6 +15462,7 @@ pub fn render_card_to_buffer(
                 card_number,
                 density.into(),
                 None,
+                mode,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -15264,6 +15476,10 @@ pub fn render_card_to_buffer(
 /// the derived index (see `sync_and_derive_selection`). PRD #113: `selected`
 /// is now `Option<usize>` — `Some(i)` paints the highlight on card `i`, `None`
 /// (an inactive selection) paints no highlight at all.
+///
+/// PRD #341 M4: like [`render_card_to_buffer`], this is the command-mode
+/// (`UiMode::Normal`) baseline — the full-strength selection accent. The
+/// mode-varying single-card seam is [`render_card_for_mode_to_buffer`].
 #[doc(hidden)]
 pub fn render_dashboard_cards_to_buffer(
     cards: &[(&SessionState, Option<&str>)],
@@ -15315,6 +15531,7 @@ pub fn render_dashboard_cards_to_buffer(
                     card_number,
                     card_density,
                     None,
+                    UiMode::Normal,
                 );
             }
         })
@@ -15489,6 +15706,137 @@ pub fn render_focused_pane_cursor_for_mode_to_position(
 
     let backend = terminal.backend();
     backend.cursor_visible().then(|| backend.cursor_position())
+}
+
+/// PRD #341 M5 — what one scroll input did to the focused agent pane: where our
+/// own scrollback stood before and after, and every byte the pane queued for the
+/// child while handling it.
+///
+/// The two numbers and the byte log are the whole M5 contract. "Command mode
+/// scrolls our scrollback" is `scrollback_after != scrollback_before`; "command
+/// mode never reaches the agent's mouse protocol" is `forwarded_bytes.is_empty()`.
+/// Recording the bytes rather than asserting on a flag is deliberate — a flag can
+/// be right while the write still happens.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FocusedPaneScrollObservation {
+    /// Our vt100 scrollback offset before the input (0 = live output).
+    pub scrollback_before: usize,
+    /// Our vt100 scrollback offset after the input.
+    pub scrollback_after: usize,
+    /// Every byte the pane queued for the child, flattened in order. Empty means
+    /// the agent saw nothing at all.
+    pub forwarded_bytes: Vec<u8>,
+}
+
+/// Rows/cols and history for the M5 scroll seams. The screen is small and the
+/// history generous so a 3-line scroll always has somewhere to go — vt100 clamps
+/// the offset to the real scrollback size, so a short history would make a
+/// correctly-scrolling path look like a no-op.
+const SCROLL_SEAM_ROWS: u16 = 6;
+const SCROLL_SEAM_COLS: u16 = 20;
+const SCROLL_SEAM_HISTORY_LINES: usize = 60;
+const SCROLL_SEAM_PANE_ID: &str = "1";
+
+/// Build the M5 seam's focused pane: a real vt100 parser carrying
+/// [`SCROLL_SEAM_HISTORY_LINES`] of scrolled-off output, parked at
+/// `initial_scrollback`, plus the recorder standing in for the child.
+fn scroll_seam_pane(
+    mouse_mode_enabled: bool,
+    initial_scrollback: usize,
+) -> (
+    EmbeddedPaneController,
+    crate::embedded_pane::SeamChildInput,
+    usize,
+) {
+    let history: String = (0..SCROLL_SEAM_HISTORY_LINES)
+        .map(|i| format!("line {i}\r\n"))
+        .collect();
+    let (ctrl, mut child_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
+        SCROLL_SEAM_PANE_ID,
+        SCROLL_SEAM_ROWS,
+        SCROLL_SEAM_COLS,
+        history.as_bytes(),
+        mouse_mode_enabled,
+    );
+    // Park the view where the caller wants it, through the production scroll
+    // primitive, then discard anything the setup itself queued so the observation
+    // only covers the input under test.
+    ctrl.reset_scrollback(SCROLL_SEAM_PANE_ID);
+    if initial_scrollback > 0 {
+        ctrl.scroll_pane(SCROLL_SEAM_PANE_ID, initial_scrollback as isize);
+    }
+    let _ = child_input.drain_bytes();
+    let before = scroll_seam_scrollback(&ctrl);
+    assert_eq!(
+        before, initial_scrollback,
+        "the seam's pane must hold enough history to park at initial_scrollback"
+    );
+    (ctrl, child_input, before)
+}
+
+/// The focused pane's current vt100 scrollback offset.
+fn scroll_seam_scrollback(ctrl: &EmbeddedPaneController) -> usize {
+    ctrl.get_screen(SCROLL_SEAM_PANE_ID)
+        .and_then(|screen| screen.lock().ok().map(|p| p.screen().scrollback()))
+        .expect("the seam's focused pane always has a screen")
+}
+
+/// PRD #341 M5 L1 seam: send ONE wheel event over the focused agent pane and
+/// report what it did.
+///
+/// Drives [`scroll_focused_agent_pane`] — the exact function the live mouse arm
+/// calls, and the only place the forward-or-scroll decision is made — so the four
+/// `(mode, mouse_mode_enabled)` cells this seam sweeps are the four the running app
+/// takes. `pane_col` / `pane_row` are pane-relative, as they are at the live call
+/// site (which applies [`pane_relative_coords`] first).
+#[doc(hidden)]
+pub fn observe_focused_agent_mouse_scroll(
+    mode: UiMode,
+    mouse_mode_enabled: bool,
+    up: bool,
+    initial_scrollback: usize,
+    pane_col: u16,
+    pane_row: u16,
+) -> FocusedPaneScrollObservation {
+    let (ctrl, mut child_input, scrollback_before) =
+        scroll_seam_pane(mouse_mode_enabled, initial_scrollback);
+
+    scroll_focused_agent_pane(&ctrl, SCROLL_SEAM_PANE_ID, mode, up, pane_col, pane_row);
+
+    FocusedPaneScrollObservation {
+        scrollback_before,
+        scrollback_after: scroll_seam_scrollback(&ctrl),
+        forwarded_bytes: child_input.drain_bytes(),
+    }
+}
+
+/// PRD #341 M5 L1 seam: press ONE key against the focused agent pane and report
+/// what it did.
+///
+/// Drives [`handle_focused_pane_scroll_key`] — the exact function the live key
+/// dispatch calls, resolving `key` against `keybindings` with no hardcoded
+/// `KeyCode` of its own — so a remap that the app would honour is honoured here,
+/// and a default the app would have retired is retired here.
+#[doc(hidden)]
+pub fn observe_focused_agent_key_scroll(
+    keybindings: &KeybindingConfig,
+    mode: UiMode,
+    key: KeyEvent,
+    initial_scrollback: usize,
+) -> FocusedPaneScrollObservation {
+    // Child mouse reporting is irrelevant to a keystroke; leaving it ON is the
+    // stricter setup — a keyboard path that leaked into the child's mouse protocol
+    // would be caught rather than masked.
+    let (ctrl, mut child_input, scrollback_before) = scroll_seam_pane(true, initial_scrollback);
+
+    handle_focused_pane_scroll_key(keybindings, mode, &key, &ctrl);
+
+    FocusedPaneScrollObservation {
+        scrollback_before,
+        scrollback_after: scroll_seam_scrollback(&ctrl),
+        forwarded_bytes: child_input.drain_bytes(),
+    }
 }
 
 /// PRD #80 M6 L1 seam: render the filter-mode bottom row (the inline filter
@@ -16206,18 +16554,55 @@ mod tests {
         // one row; at 31 the third wraps to a second row.
         let widths = [10u16, 10, 10];
 
-        let (fit, rows) = layout_button_bar(&widths, 32);
+        let (fit, rows) = layout_button_bar(&widths, 32, 0);
         assert_eq!(rows, 1, "32 cols fits all three on one row");
         assert_eq!(fit[0], Rect::new(0, 0, 10, 1));
         assert_eq!(fit[1], Rect::new(11, 0, 10, 1)); // after a 1-col separator
         assert_eq!(fit[2], Rect::new(22, 0, 10, 1));
 
-        let (wrapped, rows) = layout_button_bar(&widths, 31);
+        let (wrapped, rows) = layout_button_bar(&widths, 31, 0);
         assert_eq!(rows, 2, "31 cols forces the third button onto a second row");
         assert_eq!(wrapped[2], Rect::new(0, 1, 10, 1));
 
         // Empty input occupies no rows.
-        assert_eq!(layout_button_bar(&[], 80), (Vec::new(), 0));
+        assert_eq!(layout_button_bar(&[], 80, 0), (Vec::new(), 0));
+    }
+
+    // PRD #341 M2 — the mode chip is one row tall, so only row 0 pays for it. A
+    // wrapped continuation row must reclaim the band's cells: charging every row
+    // for it cost the dashboard a content row at several widths (see
+    // `layout_button_bar`).
+    #[test]
+    fn layout_button_bar_indents_only_the_first_row() {
+        let widths = [10u16, 10, 10];
+
+        // With a 10-cell chip band, 32 cols no longer fits all three on row 0 —
+        // but the wrapped row starts at column 0, NOT at the indent.
+        let (placed, rows) = layout_button_bar(&widths, 32, 10);
+        assert_eq!(rows, 2);
+        assert_eq!(
+            placed[0],
+            Rect::new(10, 0, 10, 1),
+            "row 0 starts after the chip"
+        );
+        assert_eq!(placed[1], Rect::new(21, 0, 10, 1));
+        assert_eq!(
+            placed[2],
+            Rect::new(0, 1, 10, 1),
+            "a continuation row reclaims the chip band"
+        );
+
+        // An indent that leaves row 0 too narrow for even the first button pushes
+        // it down rather than off the right edge.
+        let (pushed, rows) = layout_button_bar(&[10u16], 15, 10);
+        assert_eq!(rows, 2);
+        assert_eq!(pushed[0], Rect::new(0, 1, 10, 1));
+
+        // A button wider than the whole bar still sits at the start of its own row
+        // (the caller clips it) — unchanged by the indent parameter.
+        let (oversized, rows) = layout_button_bar(&[40u16], 20, 0);
+        assert_eq!(rows, 1);
+        assert_eq!(oversized[0], Rect::new(0, 0, 40, 1));
     }
 
     // PRD #144 A2 — `bottom_bar_rows` must never reserve so many rows that the

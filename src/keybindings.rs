@@ -79,6 +79,8 @@ pub enum Action {
     DenyPermission,
     GenerateConfig,
     OpenScheduledTasks,
+    ScrollPaneUp,
+    ScrollPaneDown,
 }
 
 /// Static description of one action: which section it lives in, its config
@@ -292,6 +294,25 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "open_scheduled_tasks",
         default: "s",
         description: "Scheduled Tasks manager",
+    },
+    // PRD #341 M5: the keyboard equivalent of the mouse wheel over the focused
+    // agent pane. Command mode is the safe resting state, so reading back
+    // through a pane must not require entering the mode where a stray keypress
+    // reaches the agent. Registered actions rather than hardcoded `PageUp` /
+    // `PageDown` matches, so both are remappable like every other key.
+    ActionSpec {
+        action: Action::ScrollPaneUp,
+        section: Section::Dashboard,
+        name: "scroll_pane_up",
+        default: "PageUp",
+        description: "Scroll focused pane back",
+    },
+    ActionSpec {
+        action: Action::ScrollPaneDown,
+        section: Section::Dashboard,
+        name: "scroll_pane_down",
+        default: "PageDown",
+        description: "Scroll focused pane forward",
     },
 ];
 

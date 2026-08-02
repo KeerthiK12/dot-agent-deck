@@ -2695,11 +2695,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### theme/guard
 
-##### theme/guard/001 — No absolute background on any cheaply-seamable surface; selection is cued by the Magenta+BOLD border, not an absolute fill.
+##### theme/guard/001 — No absolute background on any cheaply-seamable surface; command-mode selection is cued by the Magenta+BOLD border, not an absolute fill.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none.
-- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states, (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card is distinguished from the unselected one by a terminal-relative cue (the `▸ ` title prefix and a `Color::Magenta`+BOLD border — the dedicated PRD #155 `selected` accent role, which never reuses a status color or the `focused` cyan) rather than an absolute `selected_bg` fill.
-- **Does not assert:** named-ANSI accents/status colors; the `render_frame` canvas/tab-bar fills (not cheaply reachable through a render seam — guarded by `theme/guard/002`).
+- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states **in command mode** (`UiMode::Normal`), (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card is distinguished from the unselected one by a terminal-relative cue (the `▸ ` title prefix and a `Color::Magenta`+BOLD border — the dedicated PRD #155 `selected` accent role, which never reuses a status color or the `focused` cyan) rather than an absolute `selected_bg` fill.
+- **Does not assert:** named-ANSI accents/status colors; the `render_frame` canvas/tab-bar fills (not cheaply reachable through a render seam — guarded by `theme/guard/002`); the PaneInput de-emphasis of the same accent (PRD #341 M4 — covered by `mode/deck/001`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/guard/002 — `src/ui.rs` carries no forbidden absolute-background patterns (source lint).
@@ -2732,11 +2732,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** pane content/title rendering; the focused/selected pane accents (covered by `theme/palette/004` / `theme/guard/001`).
 - **Platform coverage:** mac+linux+windows.
 
-##### theme/palette/003 — Selected deck-card border is the dedicated `selected` accent (Magenta+BOLD+marker), never a status/focus color.
+##### theme/palette/003 — Selected deck-card border in command mode is the dedicated `selected` accent (Magenta+BOLD+marker), never a status/focus color.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none (one selected live session fixture).
-- **Asserts:** rendering a selected deck card resolves its border to `Color::Magenta` + `Modifier::BOLD` with a `▸ ` title marker, and that this color is neither the working-status green nor the focused-pane cyan — the `selected` role never collides with the status palette or the `focused` accent.
-- **Does not assert:** the status badge (still shows status independent of selection); the absolute-background guard (covered by `theme/guard/001`).
+- **Asserts:** rendering a selected deck card **in command mode** (`UiMode::Normal`) resolves its border to `Color::Magenta` + `Modifier::BOLD` with a `▸ ` title marker, and that this color is neither the working-status green nor the focused-pane cyan — the `selected` role never collides with the status palette or the `focused` accent.
+- **Does not assert:** the status badge (still shows status independent of selection); the absolute-background guard (covered by `theme/guard/001`); the de-emphasised PaneInput strength of the same accent (PRD #341 M4 — covered by `mode/deck/001`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/palette/004 — Focused-pane border is the dedicated `focused` accent (Cyan), distinct from every status and from `selected`.

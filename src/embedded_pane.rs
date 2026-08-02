@@ -72,6 +72,32 @@ enum StreamCmd {
     Detach,
 }
 
+/// PRD #341 M5 — the child-input side of
+/// [`EmbeddedPaneController::for_scroll_seam_with_focused_pane`]: everything the
+/// pane queued for the agent, standing in for the I/O task that would have framed
+/// it as `KIND_STREAM_IN`.
+///
+/// Opaque on purpose — [`StreamCmd`] is a private wire detail, and a test only
+/// needs the flattened bytes.
+#[doc(hidden)]
+pub struct SeamChildInput {
+    rx: tokio::sync::mpsc::UnboundedReceiver<StreamCmd>,
+}
+
+impl SeamChildInput {
+    /// Take every byte queued for the child since the last call, in order.
+    /// `Detach` carries no payload and contributes nothing.
+    pub fn drain_bytes(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = self.rx.try_recv() {
+            if let StreamCmd::Input(bytes) = cmd {
+                out.extend_from_slice(&bytes);
+            }
+        }
+        out
+    }
+}
+
 /// Backing state for a single pane: the PTY lives in the daemon, and this
 /// side owns one [`crate::daemon_client::AttachConnection`]. Bytes flow
 /// daemon → STREAM_OUT → vt100 parser; keystrokes flow vt100 → input
@@ -445,15 +471,66 @@ impl EmbeddedPaneController {
         cols: u16,
         bytes: &[u8],
     ) -> Self {
+        // The receiver is dropped immediately: an inert backend must not be able
+        // to queue input at an agent that does not exist.
+        let (controller, _child_input) =
+            Self::seam_with_focused_pane(pane_id, rows, cols, bytes, false);
+        controller
+    }
+
+    /// PRD #341 M5 — L1 scroll-seam constructor: the same single-focused-pane
+    /// controller as [`Self::for_render_seam_with_focused_pane`], but with the
+    /// child-input channel KEPT so a test can see exactly which bytes (if any) the
+    /// pane queued for the agent, and with the child's mouse-reporting flag
+    /// settable.
+    ///
+    /// Those two are the whole point: the M5 safety property is "in command mode
+    /// the wheel never reaches the agent's mouse protocol", and the only honest way
+    /// to assert it is to record what the child would have received. Dropping the
+    /// receiver (as the render seam does) would make every write fail as "detached"
+    /// and a forwarding regression would look identical to correct behaviour.
+    #[doc(hidden)]
+    pub fn for_scroll_seam_with_focused_pane(
+        pane_id: &str,
+        rows: u16,
+        cols: u16,
+        bytes: &[u8],
+        mouse_mode_enabled: bool,
+    ) -> (Self, SeamChildInput) {
+        let (controller, rx) =
+            Self::seam_with_focused_pane(pane_id, rows, cols, bytes, mouse_mode_enabled);
+        (controller, SeamChildInput { rx })
+    }
+
+    /// Shared body of the two L1 seam constructors: one focused pane whose vt100
+    /// screen has already consumed `bytes`, with no daemon behind it.
+    ///
+    /// [`Self::for_render_only_tests`] builds an EMPTY controller, and
+    /// `render_terminal_panes` returns before it touches a cursor when there is
+    /// no pane — so a seam that renders the real pane path needs a pane that
+    /// exists. It is also `#[cfg(test)]`, hence unreachable from the integration
+    /// tests that drive the `pub` L1 seams in `ui.rs`.
+    ///
+    /// The backend is inert apart from the returned input channel: no I/O task and
+    /// no resize task are spawned, and nothing reaches a socket. Rendering only
+    /// ever reads `screen` / `is_focused` / `name`, and scrolling only ever reads
+    /// `screen` / `mouse_mode`, which is the whole point of the seams.
+    fn seam_with_focused_pane(
+        pane_id: &str,
+        rows: u16,
+        cols: u16,
+        bytes: &[u8],
+        mouse_mode_enabled: bool,
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<StreamCmd>) {
         let daemon_path = render_only_socket_path();
         let controller = Self::new(daemon_path.clone(), render_only_runtime());
 
         let mut parser = vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES);
         parser.process(bytes);
 
-        // Both halves are dropped immediately: an inert backend must not be
-        // able to queue input at, or resize, an agent that does not exist.
-        let (input_tx, _input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
+        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
+        // Dropped immediately: an inert backend must not be able to resize an
+        // agent that does not exist.
         let (resize_tx, _resize_rx) = tokio::sync::watch::channel::<Option<(u16, u16)>>(None);
 
         let pane = Pane {
@@ -473,7 +550,7 @@ impl EmbeddedPaneController {
             is_focused: true,
             command: None,
             cwd: None,
-            mouse_mode: Arc::new(AtomicBool::new(false)),
+            mouse_mode: Arc::new(AtomicBool::new(mouse_mode_enabled)),
             hyperlinks: Arc::new(Mutex::new(HyperlinkMap::new())),
         };
         controller
@@ -481,7 +558,7 @@ impl EmbeddedPaneController {
             .lock()
             .unwrap()
             .insert(pane_id.to_string(), pane);
-        controller
+        (controller, input_rx)
     }
 
     /// Access the vt100 screen for a pane (used by the terminal widget for rendering).

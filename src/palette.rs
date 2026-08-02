@@ -76,9 +76,15 @@ pub const STATUS_IDLE: Color = Color::DarkGray;
 /// selection; Option A keeps focus on Cyan and moves selection to [`SELECTED`]
 /// so the two are provably distinct.
 pub const FOCUSED: Color = Color::Cyan;
-/// The selected deck card (rendered BOLD with a `▸ ` title marker). Magenta is
-/// free — status uses green/blue/yellow/red and focus uses cyan — so selection
-/// never collides with a status color or with focus (PRD #155 criterion #3).
+/// The selected deck card (paired with a `▸ ` title marker in every mode).
+/// Magenta is free — status uses green/blue/yellow/red and focus uses cyan — so
+/// selection never collides with a status color or with focus (PRD #155
+/// criterion #3).
+///
+/// PRD #341 M4: the COLOUR is unconditional, the modifier is not. The accent is
+/// BOLD in command mode, where the keyboard drives the deck, and DIM (not BOLD)
+/// in `UiMode::PaneInput`, where keystrokes go to a pane instead — see
+/// `ui::selected_card_border_style`, the one place that recipe lives.
 pub const SELECTED: Color = Color::Magenta;
 
 /// Resolve a session status to its centralized border/badge role color. This
