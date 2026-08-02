@@ -294,10 +294,25 @@ impl Widget for TerminalWidget {
             Paragraph::new(line).render(line_area, buf);
         }
 
-        // Render a visible block cursor when focused and not scrolled back.
-        // 1:1 mapping: the cursor at screen (row, col) lands at inner (row, col)
-        // — no row-window offset now that rendering starts at screen row 0.
-        if self.focused && screen.scrollback() == 0 && !screen.hide_cursor() {
+        // Render a visible block cursor when the pane is focused AND live, and
+        // not scrolled back. 1:1 mapping: the cursor at screen (row, col) lands
+        // at inner (row, col) — no row-window offset now that rendering starts
+        // at screen row 0.
+        //
+        // PRD #341 M1: `input_active` gates this the same way it gates the
+        // border accent above. A block cursor is the most universal "your
+        // keystrokes land here" affordance a terminal has, and focus
+        // deliberately survives the mode switch (`Action::DetachToNormal` keeps
+        // the focused pane so Ctrl+D knows where to go back to) — so keying the
+        // cursor off `focused` alone painted a live-looking cursor into a pane
+        // that accepts nothing, out-loudly contradicting the border. In command
+        // mode nothing is painted at all: the PRD's alternative — a dim hollow
+        // outline that keeps the cursor's POSITION visible — has no clean
+        // expression in one buffer cell, since `REVERSED` renders the same solid
+        // block we are removing and `DIM` alone is both invisible on a plain
+        // cell and unreliable across terminals. Success criterion: "in command
+        // mode, no cursor of any kind renders in the focused pane".
+        if self.focused && self.input_active && screen.scrollback() == 0 && !screen.hide_cursor() {
             let cursor_pos = screen.cursor_position();
             let cursor_row = cursor_pos.0 as usize;
             let cursor_col = cursor_pos.1 as usize;

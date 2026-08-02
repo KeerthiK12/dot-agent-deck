@@ -313,6 +313,36 @@ pub fn parser_init_dims(rows: u16, cols: u16) -> (u16, u16) {
 
 use crate::pane_input::{SUBMIT_DELAY, encode_pane_payload};
 
+/// Placeholder daemon socket path for the render-only constructors below. It
+/// intentionally points at nothing: any spawn/attach against it fails, which is
+/// exactly what a render seam wants.
+fn render_only_socket_path() -> PathBuf {
+    let mut placeholder = std::env::temp_dir();
+    placeholder.push(format!(
+        "dot-agent-deck-render-only-{}.sock",
+        std::process::id()
+    ));
+    placeholder
+}
+
+/// One lazily-built current-thread runtime shared by the render-only
+/// constructors. A [`StreamBackend`] holds a `Handle` even when it owns no task,
+/// and `Handle::current` panics outside a runtime — so a render seam that never
+/// performs I/O still needs one to exist. Built on first use, so a normal run
+/// (which always has a real runtime) never creates it.
+fn render_only_runtime() -> tokio::runtime::Handle {
+    use std::sync::OnceLock;
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("render-only runtime")
+    })
+    .handle()
+    .clone()
+}
+
 /// Embedded terminal pane controller. Spawns agents on the daemon at
 /// [`Self::client`]'s socket path and renders their PTY output through a
 /// local vt100 parser. PRD #93 Phase 2 collapsed the historical
@@ -389,20 +419,69 @@ impl EmbeddedPaneController {
     /// attempt to spawn or attach against it will fail.
     #[cfg(test)]
     pub fn for_render_only_tests() -> Self {
-        use std::sync::OnceLock;
-        static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-        let rt = RT.get_or_init(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime")
-        });
-        let mut placeholder = std::env::temp_dir();
-        placeholder.push(format!(
-            "dot-agent-deck-render-only-{}.sock",
-            std::process::id()
-        ));
-        Self::new(placeholder, rt.handle().clone())
+        Self::new(render_only_socket_path(), render_only_runtime())
+    }
+
+    /// PRD #341 M1 — L1 render-seam constructor: a controller carrying exactly
+    /// ONE focused pane whose vt100 screen has already consumed `bytes`, with no
+    /// daemon behind it.
+    ///
+    /// [`Self::for_render_only_tests`] builds an EMPTY controller, and
+    /// `render_terminal_panes` returns before it touches a cursor when there is
+    /// no pane — so a seam that renders the real pane path needs a pane that
+    /// exists. It is also `#[cfg(test)]`, hence unreachable from the integration
+    /// tests that drive the `pub` L1 seams in `ui.rs`.
+    ///
+    /// The backend is inert by construction: no I/O task, no resize task, and
+    /// the input channel's receiver is dropped, so nothing is spawned, nothing
+    /// reaches a socket, and every input path fails as "detached". Rendering
+    /// only ever reads `screen` / `is_focused` / `name`, which is the whole
+    /// point of the seam. `#[doc(hidden)]`: `pub` because integration tests
+    /// cannot enable a crate feature on demand, not because it is API.
+    #[doc(hidden)]
+    pub fn for_render_seam_with_focused_pane(
+        pane_id: &str,
+        rows: u16,
+        cols: u16,
+        bytes: &[u8],
+    ) -> Self {
+        let daemon_path = render_only_socket_path();
+        let controller = Self::new(daemon_path.clone(), render_only_runtime());
+
+        let mut parser = vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES);
+        parser.process(bytes);
+
+        // Both halves are dropped immediately: an inert backend must not be
+        // able to queue input at, or resize, an agent that does not exist.
+        let (input_tx, _input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
+        let (resize_tx, _resize_rx) = tokio::sync::watch::channel::<Option<(u16, u16)>>(None);
+
+        let pane = Pane {
+            backend: StreamBackend {
+                agent_id: Arc::new(Mutex::new(String::new())),
+                input_tx,
+                io_task: None,
+                io_state: Arc::new(AtomicU8::new(IO_FINISHED)),
+                runtime: render_only_runtime(),
+                daemon_path,
+                resize_tx,
+                resize_task: None,
+                lost: Arc::new(Mutex::new(None)),
+            },
+            screen: Arc::new(Mutex::new(parser)),
+            name: pane_id.to_string(),
+            is_focused: true,
+            command: None,
+            cwd: None,
+            mouse_mode: Arc::new(AtomicBool::new(false)),
+            hyperlinks: Arc::new(Mutex::new(HyperlinkMap::new())),
+        };
+        controller
+            .panes
+            .lock()
+            .unwrap()
+            .insert(pane_id.to_string(), pane);
+        controller
     }
 
     /// Access the vt100 screen for a pane (used by the terminal widget for rendering).

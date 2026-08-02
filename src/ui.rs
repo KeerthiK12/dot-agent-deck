@@ -11989,7 +11989,16 @@ fn render_terminal_panes(
     }
 
     // Set hardware cursor in the focused pane for real blinking.
-    if let Some(rect) = focused_pane_rect
+    //
+    // PRD #341 M1: only while the pane is LIVE. This call is the sole reason a
+    // real terminal cursor is visible anywhere in the TUI — ratatui's
+    // `Terminal::draw` hides the cursor for any frame that never asks for a
+    // position — so skipping it in command mode removes the loudest "type here"
+    // signal on screen from the one mode where typing reaches nothing. Focus
+    // deliberately survives the mode switch, so `focused_pane_rect` alone is not
+    // the right question; `input_active` is.
+    if input_active
+        && let Some(rect) = focused_pane_rect
         && let Some(screen_arc) = focused_screen
         && let Ok(parser) = screen_arc.lock()
     {
@@ -12500,6 +12509,88 @@ fn render_button_bar(
     rects
 }
 
+/// PRD #341 M2 — the persistent mode chip's text: the bottom bar's always-there
+/// "you are here" label, in the vocabulary settled for this PRD.
+///
+/// It is deliberately the complement of [`ModeGlobals::dashboard_button`], which
+/// names where the `Ctrl+D` chord GOES. With only the destination on screen the
+/// words "Command Mode" appeared precisely when the user was NOT in command mode
+/// — worse than no label at all. The chip states the current fact, the button the
+/// available trip; neither replaces the other.
+///
+/// `None` for the two inline-input modes: their bar row IS an input field with
+/// its own prompt and cursor at cell 0, and this PRD's vocabulary names no label
+/// for them. Every other mode reaches the bar through the wide-button-bar path,
+/// where keystrokes drive the deck rather than a pane, so it reads ` COMMAND `.
+fn mode_chip_label(mode: UiMode) -> Option<&'static str> {
+    match mode {
+        UiMode::PaneInput => Some(" TYPING "),
+        UiMode::Filter | UiMode::Rename => None,
+        _ => Some(" COMMAND "),
+    }
+}
+
+/// The one space between the chip and the bar content, part of the band
+/// [`mode_chip_bar_split`] reserves.
+const GAP_AFTER_CHIP: u16 = 1;
+
+/// PRD #341 M2 — split a bottom-bar row into `(chip_band, rest)`: the cells the
+/// mode chip takes off the left edge, and the width left for the bar's own
+/// content.
+///
+/// The ONE source of truth for the chip's width budget, read by
+/// [`render_mode_chip`] AND by [`bottom_bar_rows`]. The reserved height is
+/// derived from `rest`, so if the two disagreed the reservation would not match
+/// what renders and the bar would clip or overlap the cards — the PRD #144
+/// height-budget contract `render/layout/004` pins.
+///
+/// `chip_band` covers the chip plus one separating space. It is 0 — no chip at
+/// all — for a mode with no label, and for a row too narrow to spend the cells
+/// on one: under twice the chip's width the bar's own labels are the scarcer
+/// resource, and the mode-aware border and cursor still carry the signal.
+fn mode_chip_bar_split(mode: UiMode, width: u16) -> (u16, u16) {
+    let Some(label) = mode_chip_label(mode) else {
+        return (0, width);
+    };
+    let band = label.chars().count() as u16 + GAP_AFTER_CHIP;
+    if width < band.saturating_mul(2) {
+        return (0, width);
+    }
+    (band, width - band)
+}
+
+/// PRD #341 M2 — draw the mode chip at `area`'s left edge and return the rect
+/// left for the bar's own content (same row, same right edge).
+///
+/// Styled `Modifier::REVERSED | BOLD` with no colour at all — the same
+/// terminal-relative trick the active tab uses (`render_tab_strip`), so the chip
+/// inverts against whatever background the user's theme provides and reads on
+/// light and dark terminals alike without an absolute RGB value (PRD #13).
+fn render_mode_chip(frame: &mut Frame, mode: UiMode, area: Rect) -> Rect {
+    let (band, rest) = mode_chip_bar_split(mode, area.width);
+    if band == 0 {
+        return area;
+    }
+    let label = mode_chip_label(mode).expect("a non-zero chip band implies a label");
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            label,
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        )),
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: band.saturating_sub(GAP_AFTER_CHIP),
+            height: 1,
+        },
+    );
+    Rect {
+        x: area.x.saturating_add(band),
+        width: rest,
+        ..area
+    }
+}
+
 /// PRD #144 — how many rows the bottom bar will occupy this frame, so the layout
 /// pass can reserve exactly that height (a wrapped 2-row bar must cede one row
 /// from the dashboard/pane region or the cards clip/overlap). Input / status
@@ -12528,7 +12619,11 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16, tab_view: &Activ
                 .iter()
                 .map(|b| b.display_label().chars().count() as u16)
                 .collect();
-            let (_, rows) = layout_button_bar(&widths, width);
+            // PRD #341 M2: the mode chip is part of the bar's width budget, so
+            // the buttons wrap inside what it leaves. Same split the renderer
+            // applies — a second opinion here would mis-reserve the height.
+            let (_, bar_width) = mode_chip_bar_split(ui.mode, width);
+            let (_, rows) = layout_button_bar(&widths, bar_width);
             rows.max(1)
         }
     };
@@ -12543,6 +12638,12 @@ fn render_bottom_bar(
     has_pane_control: bool,
     extra_buttons: &[Button],
 ) {
+    // PRD #341 M2: the mode chip owns cell 0 of the bar wherever the bar has one
+    // — the context-rich Cards path (Dashboard / Orchestration), the global-only
+    // Mode-tab path, and the PaneInput row alike — so the current mode is stated
+    // in words in the SAME screen position on every tab, in both modes.
+    // Everything else in the bar draws into what it leaves.
+    let area = render_mode_chip(frame, ui.mode, area);
     match ui.mode {
         UiMode::Filter => {
             let line = Line::from(vec![
@@ -15326,6 +15427,68 @@ pub fn render_button_bar_for_mode_to_buffer(
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
+}
+
+/// PRD #341 M1 L1 seam: render ONE focused embedded pane through the real
+/// [`render_terminal_panes`] path in `mode`, and report where — if anywhere —
+/// the completed frame asked the terminal to put its hardware cursor.
+///
+/// This is a `*_to_position` rather than a `*_to_buffer` seam because
+/// `Frame::set_cursor_position` writes no buffer cell: it is the frame's
+/// out-of-band request, and on ratatui 0.30 `CompletedFrame` does not expose it
+/// either. `TestBackend` does — `Terminal::apply_buffer_with_cursor` calls
+/// `show_cursor` + `set_cursor_position` for a frame that asked and
+/// `hide_cursor` for one that did not — so `cursor_visible()` is the exact
+/// question M1 cares about: does a real cursor appear in this mode at all?
+///
+/// Returns `Some(position)` when the frame requested a cursor, `None` when it
+/// left it hidden. Mirrors the placement/naming of the `*_to_buffer` seams above.
+#[doc(hidden)]
+pub fn render_focused_pane_cursor_for_mode_to_position(
+    mode: UiMode,
+) -> Option<ratatui::layout::Position> {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    // The pane fills the frame, so its inner area is exactly the PTY screen —
+    // the PRD #84 invariant-3 contract `contract_guaranteed(true)` attests.
+    const SCREEN_ROWS: u16 = 6;
+    const SCREEN_COLS: u16 = 20;
+    const PANE_ID: &str = "1";
+
+    // A screen that has printed something, so the vt100 cursor sits at a real
+    // cell inside the inner area rather than on a parked / hidden one.
+    let ctrl = EmbeddedPaneController::for_render_seam_with_focused_pane(
+        PANE_ID,
+        SCREEN_ROWS,
+        SCREEN_COLS,
+        b"hi",
+    );
+    let backend = TestBackend::new(SCREEN_COLS + 2, SCREEN_ROWS + 2);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            render_terminal_panes(
+                frame,
+                Some(&ctrl),
+                area,
+                &[PANE_ID.to_string()],
+                PaneLayout::Stacked,
+                &HashMap::new(),
+                &HashMap::new(),
+                &None,
+                Some(PANE_ID),
+                // The one input the seam varies: exactly what `render_frame`
+                // passes (`ui.mode == UiMode::PaneInput`).
+                mode == UiMode::PaneInput,
+                None,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+
+    let backend = terminal.backend();
+    backend.cursor_visible().then(|| backend.cursor_position())
 }
 
 /// PRD #80 M6 L1 seam: render the filter-mode bottom row (the inline filter
