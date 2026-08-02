@@ -152,6 +152,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** ratatui title placement or styling (covered by `/001` and `/002`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/card-stats/005 — A real interactive Haiku card keeps its height while the bottom-border counters degrade during a live terminal resize. [reel]
+- **Layer:** L2 PTY-attached (the real `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, with recording enabled for a `full-stream.cast`).
+- **Agent:** REAL interactive Claude Code on `claude-haiku-4-5-20251001`, with onboarding/project trust seeded and `--allowedTools Bash`; no `-p`. The prompt is typed into the live pane after its native editor becomes ready, and the agent must use Bash to discover a sentinel whose complete name was not present in the prompt.
+- **Asserts:** the sentinel response and native Thinking/Working/Idle plus Bash hook prove the genuine spawn → agent → work path; the wide card shows a nonzero, right-aligned full `Last: … Tools: …` label only in its bottom border; resizing the attached PTY from 200 to 60 columns selects the shorter `… · … tools` rung, preserves `└`/`┘`, keeps the same tool count, retains `Dir:`/`Prmt:`/`Bash` on the same rows, and leaves card height unchanged.
+- **Does not assert:** exact Claude prose beyond the discovered sentinel filename; exact elapsed-time text; multiple cards or density changes caused by terminal height.
+- **Platform coverage:** mac+linux.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.
