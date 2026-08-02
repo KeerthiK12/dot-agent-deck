@@ -2754,6 +2754,40 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux+windows.
 
 
+### Mode indication (PRD #341)
+
+#### mode/cursor
+
+##### mode/cursor/001 — The painted terminal cursor appears only while pane input is active.
+- **Layer:** L1 (in-process `TerminalWidget` rendered into a `ratatui::buffer::Buffer`; no PTY, no subprocess).
+- **Agent:** none (one focused vt100 fixture rendered twice).
+- **Asserts:** with `input_active=true`, the known cursor cell retains today's exact black-on-`LightGreen` bold block styling; with `input_active=false`, the same cell has no solid `LightGreen` background, leaving the implementation free to omit the highlight or substitute a dim hollow treatment.
+- **Does not assert:** the terminal emulator's own cursor (covered by `mode/cursor/002`); a specific inactive-cursor replacement style; pane-border mode styling (covered by `theme/palette/005`).
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/cursor/002 — The terminal emulator cursor is hidden in command mode.
+- **Layer:** L1 (ratatui `TestBackend` frame rendering through the production focused-pane path; no PTY subprocess).
+- **Agent:** none (one in-memory focused pane fixture).
+- **Asserts:** the same focused-pane frame requests a visible terminal cursor in `UiMode::PaneInput` and no terminal cursor in `UiMode::Normal`, proving command mode skips `Frame::set_cursor_position`.
+- **Does not assert:** painted cursor-cell styling (covered by `mode/cursor/001`); cursor shape; unfocused panes; modal input cursors outside the terminal-pane path.
+- **Platform coverage:** mac+linux+windows.
+
+#### mode/chip
+
+##### mode/chip/001 — The bottom bar persistently names the current mode.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, rendered through `render_button_bar_for_mode_to_buffer` and the live `render_bottom_bar` path).
+- **Agent:** none.
+- **Asserts:** command mode begins with ` COMMAND ` and PaneInput begins with ` TYPING `; both chips use `Modifier::REVERSED | Modifier::BOLD`, carry no `Color::Rgb`, and the snapshot pins the complete production bar in both modes.
+- **Does not assert:** behavior after clicking the adjacent destination button; narrow-width wrapping; banner or pane-dimming behavior.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/chip/002 — The current-mode chip is universal and coexists with the destination button.
+- **Layer:** L1 (ratatui `TestBackend` through the production global-only and context-rich bottom-bar paths).
+- **Agent:** none.
+- **Asserts:** Dashboard, Mode, and Orchestration contexts place the chip at the same left-edge position; command mode shows ` COMMAND ` with `[Back to Pane Ctrl+D]`, while PaneInput shows ` TYPING ` with `[Command Mode Ctrl+D]`, so the current-state label never replaces the destination affordance.
+- **Does not assert:** click dispatch for the destination button; exact spacing after the chip; context-specific buttons after the universal prefix.
+- **Platform coverage:** mac+linux+windows.
+
 ### Scheduled tasks (PRD #127)
 
 #### scheduler/reload
