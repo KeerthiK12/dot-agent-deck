@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.35.5] - 2026-08-03
+
+### Added
+
+- **The mode you are in is now unmistakable**
+  `Ctrl+D` toggles between driving the deck and typing into a pane, and until now you had to infer which side of that toggle you were on. The pane border went some of the way, but the focused pane still showed a cursor in command mode — the loudest "type here" signal a terminal has, firing in the mode where typing does nothing — and the only words on screen read `[Command Mode Ctrl+D]` precisely when you were *not* in command mode. Acting on the wrong belief was easy, and the usual way to find out was a stray keystroke landing somewhere you did not mean it to.
+  Four things changed. The focused pane now shows a cursor **only** while your keystrokes reach it — neither the highlighted block nor your terminal's own blinking cursor renders in command mode. A chip at the left of the bottom bar names the mode you are in right now, ` COMMAND ` or ` TYPING `, in the same place on every tab; the button beside it still names where `Ctrl+D` would take you, so one tells you where you are and the other where you can go. Entering command mode dims the focused pane and overlays a large `COMMAND MODE · Ctrl+D to type` banner, which clears itself after 2.5 seconds or the moment you press a command-mode key — but stays up, or comes back, when you type a key that is bound to nothing, since that is exactly the moment you probably thought you were talking to the agent. And on the dashboard, the selected card's highlight is de-emphasised while you type into a pane (it keeps its `▸ ` marker), so the deck looks inert exactly when the pane looks live.
+  Command mode is also a genuine read-only inspect mode now. The pane dims but is never blanked — you can still see which agent is mid-work and which one you are about to close — and the scroll wheel over the focused agent pane scrolls it in command mode, matching side panes, which have always scrolled in any mode. Reviewing what an agent did no longer means dropping into the mode where a mistyped key goes into it. In command mode the wheel always drives Agent Deck's own scrollback and is never forwarded to the agent's mouse protocol, so a full-screen TUI in the pane cannot move under you while you read.
+  `PageUp` and `PageDown` do the same from the keyboard. They are the new `scroll_pane_up` and `scroll_pane_down` actions in the `[dashboard]` section of `keybindings.toml`, remappable like every other binding, and they apply in command mode only — while you are typing in a pane those keys still go through to whatever is running there, so pagers and editors keep them.
+  Everything here is on by default and none of it is configurable beyond the two new keybindings; the indicators use terminal-relative highlighting rather than fixed colours, so they read correctly on light and dark backgrounds alike.
+  See [Keyboard Shortcuts](https://agent-deck.devopstoolkit.ai/docs/keyboard-shortcuts) for the full mode reference and the new bindings, and [Workspace Modes](https://agent-deck.devopstoolkit.ai/docs/workspace-modes) for how command mode reads as a resting state on a mode tab.
+  Demo reel: https://youtu.be/lwir8zdUM0E
+
+### Fixed
+
+- **Session Cards Keep a Consistent Height as They Narrow**
+  Session cards no longer restructure themselves when you resize the terminal. Previously, narrowing a card past a width threshold moved the `Last`/`Tools` counters onto their own row, making the card one row taller — which could push it down a density tier and show fewer prompts and tool lines exactly when you were trying to reclaim space (the blocker behind [#336](https://github.com/vfarcic/dot-agent-deck/issues/336), the orchestration sidebar ratio toggle).
+  The `Last`/`Tools` counters now live in the card's bottom-right border, the same way the status badge already occupies the top border, so they cost no content rows at any width. Card height now depends only on density (Compact, Normal, Spacious), not on card width. The `Dir:` line also spans the card's full inner width and ellipsizes properly when a directory path is too long to fit, instead of being clipped without an ellipsis.
+  See [Session Management](https://agent-deck.devopstoolkit.ai/session-management) for a look at the updated card layout, or watch the [demo reel](https://youtu.be/W73TozxLd8A) to see a live card keep its height while the terminal narrows around it.
+
+
+
 ## [0.35.4] - 2026-08-02
 
 ### Fixed
