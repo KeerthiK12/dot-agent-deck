@@ -32,6 +32,36 @@ use thiserror::Error;
 use crate::agent_pty::DOT_AGENT_DECK_VIA_DAEMON;
 use crate::config::state_dir;
 
+/// How long [`ensure_external_daemon_or_die`] polls for the freshly-spawned
+/// daemon's endpoint before giving up.
+///
+/// **Derived from [`crate::login_shell::CAPTURE_TIMEOUT`] rather than picked as
+/// a round number, and that derivation is the point.** The daemon we spawn does
+/// real work *before* it binds: `main`'s `DaemonCmd::Serve` arm runs
+/// `apply_login_shell_path` (an interactive-login `$SHELL`, up to
+/// `CAPTURE_TIMEOUT`), then materializes the pi extension and the Codex hooks —
+/// all ahead of `IpcListener::bind`. So the launcher's budget must cover the
+/// daemon's worst-case *pre-bind* budget, or it is guaranteed to time out while
+/// the daemon is still healthy.
+///
+/// This previously read `Duration::from_secs(5)` against a `CAPTURE_TIMEOUT` of
+/// 10s — half the time the daemon was explicitly permitted to take before
+/// binding. Any machine whose `$SHELL -ilc` exceeded 5s (a `compinit` + plugin
+/// manager + generated-completions zsh measures ~6s) failed *every* first
+/// attach: the launcher errored at 5s, the daemon bound at ~6s and stayed up,
+/// and the retry then succeeded — so the bug presented as flaky startup rather
+/// than a fixed misconfiguration.
+///
+/// The slack on top absorbs the post-capture pre-bind work and a loaded host.
+/// The cost of a longer bound is only paid when a daemon is genuinely absent or
+/// dead — the healthy path returns as soon as the endpoint appears, typically in
+/// milliseconds.
+pub const DAEMON_START_POLL_TIMEOUT: Duration =
+    crate::login_shell::CAPTURE_TIMEOUT.saturating_add(Duration::from_secs(5));
+
+/// How often [`ensure_external_daemon_or_die`] re-checks for the endpoint.
+const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Errors surfaced by the lazy-spawn machinery. The CLI handler renders
 /// these to stderr before exiting nonzero; tests match on the variant.
 #[derive(Debug, Error)]
@@ -41,8 +71,19 @@ pub enum AttachError {
         #[source]
         source: std::io::Error,
     },
+    // "never became available" rather than "never appeared": on Windows the
+    // endpoint is a named pipe with no filesystem presence, so what timed out is
+    // the connect-probe, not a file materializing (PRD #163 M4).
+    // The log pointer has to disclaim itself: `daemon.log` only receives
+    // anything when the daemon was started with `DOT_AGENT_DECK_LOG` set, so on
+    // a default install this path is a 0-byte file. The bare "check the log"
+    // wording sent you looking at an empty file and implied the daemon never
+    // started, when the actual failure mode is a daemon that started fine and
+    // bound *after* the deadline.
     #[error(
-        "daemon failed to start within {timeout_ms}ms: socket {path} never appeared. Check {log_path} for daemon stderr."
+        "daemon failed to start within {timeout_ms}ms: endpoint {path} never became available. \
+         For daemon stderr see {log_path} — but note it stays empty unless the daemon was started \
+         with DOT_AGENT_DECK_LOG set, so an empty log is not evidence the daemon never ran."
     )]
     DaemonStartTimeout {
         path: PathBuf,
@@ -73,6 +114,11 @@ pub enum AttachError {
 /// Both the pre-existing-socket and freshly-spawned-socket branches run
 /// [`verify_socket_trusted`] before returning so the caller knows the
 /// socket is owned by the current uid at mode 0o600.
+///
+/// PRD #163 M4: on a platform whose endpoint is not a filesystem path (Windows
+/// named pipes), the presence test is a connect-probe instead of `exists()`, and
+/// trust verification happens inside that connect. See the body for why an
+/// unconditional `exists()` would make Windows lazy-spawn always time out.
 pub async fn ensure_daemon_running<F>(
     socket_path: &Path,
     state_dir: &Path,
@@ -99,21 +145,35 @@ where
 
     // First check happens INSIDE the lock so a waiter that lost the race sees
     // the socket the winner created and skips the spawn.
-    if socket_path.exists() {
-        verify_socket_trusted(socket_path)?;
-        // Trust check only validates the inode (type, owner, mode) — it
-        // doesn't know whether anyone is listening. A daemon that died
-        // without unlinking (crash, SIGKILL, host reboot mid-write) leaves
-        // a stale socket on disk that would otherwise short-circuit lazy-
-        // spawn forever, with every subsequent client connect failing
-        // `ECONNREFUSED`. Probe-connect here so we can distinguish a live
-        // daemon from a leftover file; on failure, the inode is ours
-        // (trust check just validated uid + mode) so unlinking and
-        // falling through to the spawn branch is safe.
-        if probe_socket_alive(socket_path).await {
-            return Ok(());
+    //
+    // PRD #163 M4: "is the endpoint there yet?" is platform-shaped, and getting
+    // it wrong breaks lazy-spawn outright on Windows. A `\\.\pipe\` name has no
+    // filesystem presence, so `exists()` is permanently false there — every
+    // attach would spawn a second daemon and then time out waiting for a socket
+    // file that can never appear. Where the endpoint is not a path, the
+    // connect-probe *is* the presence test, and it doubles as the trust check
+    // (`IpcStream::connect` verifies the pipe server's owner SID before handing
+    // back a stream), so there is nothing to verify out of band and no inode to
+    // unlink. The Unix branch below is byte-for-byte what it always was.
+    if crate::platform::ipc::ENDPOINT_IS_FILESYSTEM_PATH {
+        if socket_path.exists() {
+            verify_socket_trusted(socket_path)?;
+            // Trust check only validates the inode (type, owner, mode) — it
+            // doesn't know whether anyone is listening. A daemon that died
+            // without unlinking (crash, SIGKILL, host reboot mid-write) leaves
+            // a stale socket on disk that would otherwise short-circuit lazy-
+            // spawn forever, with every subsequent client connect failing
+            // `ECONNREFUSED`. Probe-connect here so we can distinguish a live
+            // daemon from a leftover file; on failure, the inode is ours
+            // (trust check just validated uid + mode) so unlinking and
+            // falling through to the spawn branch is safe.
+            if probe_socket_alive(socket_path).await {
+                return Ok(());
+            }
+            let _ = std::fs::remove_file(socket_path);
         }
-        let _ = std::fs::remove_file(socket_path);
+    } else if probe_socket_alive(socket_path).await {
+        return Ok(());
     }
 
     spawn_fn().map_err(|source| AttachError::DaemonSpawnFailed { source })?;
@@ -121,8 +181,12 @@ where
     let log_path = state_dir.join("daemon.log");
     let start = Instant::now();
     loop {
-        if socket_path.exists() {
-            verify_socket_trusted(socket_path)?;
+        if crate::platform::ipc::ENDPOINT_IS_FILESYSTEM_PATH {
+            if socket_path.exists() {
+                verify_socket_trusted(socket_path)?;
+                return Ok(());
+            }
+        } else if probe_socket_alive(socket_path).await {
             return Ok(());
         }
         if start.elapsed() >= poll_timeout {
@@ -245,10 +309,10 @@ pub fn via_daemon_enabled() -> bool {
 ///   would mask a same-uid attacker.
 ///
 /// Errors are surfaced as-is to the caller (the dashboard renders them to
-/// stderr and exits nonzero — there is no in-process fallback). Polling
-/// timeout is 5s with 50ms intervals; that's enough headroom for the
-/// daemon's bind path on a loaded host without making error output feel
-/// hung.
+/// stderr and exits nonzero — there is no in-process fallback). Polling uses
+/// [`DAEMON_START_POLL_TIMEOUT`] at [`DAEMON_START_POLL_INTERVAL`]; see the
+/// former's docs for why the budget is derived from the daemon's own pre-bind
+/// work rather than hardcoded.
 pub async fn ensure_external_daemon_or_die(attach_path: &Path) -> Result<(), AttachError> {
     let state = state_dir();
     let state_for_spawn = state.clone();
@@ -256,8 +320,45 @@ pub async fn ensure_external_daemon_or_die(attach_path: &Path) -> Result<(), Att
         attach_path,
         &state,
         move || spawn_daemon_serve_detached(&state_for_spawn),
-        Duration::from_millis(50),
-        Duration::from_secs(5),
+        DAEMON_START_POLL_INTERVAL,
+        DAEMON_START_POLL_TIMEOUT,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The launcher's poll budget must strictly exceed the daemon's own
+    /// worst-case *pre-bind* budget, because the daemon runs the login-shell
+    /// PATH capture before it binds the endpoint the launcher is polling for.
+    ///
+    /// This is the regression guard for the flaky-startup bug: the two
+    /// constants live in different modules, both look locally reasonable, and
+    /// nothing but this assertion couples them. A timing test would be flaky
+    /// and would only fail on a machine with a slow interactive shell — the
+    /// ordering is the real invariant, so assert the ordering.
+    #[test]
+    fn attach_poll_timeout_exceeds_daemon_pre_bind_budget() {
+        assert!(
+            DAEMON_START_POLL_TIMEOUT > crate::login_shell::CAPTURE_TIMEOUT,
+            "lazy-spawn would time out on a healthy but slow daemon: launcher waits \
+             {DAEMON_START_POLL_TIMEOUT:?} but the daemon may spend up to {:?} in the \
+             login-shell PATH capture before it even calls bind",
+            crate::login_shell::CAPTURE_TIMEOUT,
+        );
+    }
+
+    /// The endpoint poll must actually get to poll. An interval at or above the
+    /// total budget collapses the loop into a single check, which would
+    /// reintroduce the failure for any daemon that is not already bound.
+    #[test]
+    fn attach_poll_interval_allows_repeated_checks() {
+        assert!(
+            DAEMON_START_POLL_INTERVAL * 10 < DAEMON_START_POLL_TIMEOUT,
+            "poll interval {DAEMON_START_POLL_INTERVAL:?} is too coarse for a \
+             {DAEMON_START_POLL_TIMEOUT:?} budget",
+        );
+    }
 }

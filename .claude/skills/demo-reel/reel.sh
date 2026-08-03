@@ -46,16 +46,40 @@ REQUIRED_CLIS=(agg ffmpeg ffprobe)
 CRED_VARS=(YOUTUBE_CLIENT_ID YOUTUBE_CLIENT_SECRET YOUTUBE_REFRESH_TOKEN)
 
 # ---- Render constants ---------------------------------------------------
-# Clips render through agg at their RECORDED terminal grid and FONT_SIZE, so a
-# clip looks exactly as captured. Cards are deliberately different: each is
-# painted on a SMALLER fixed grid (CARD_COLS x CARD_ROWS) at a larger
-# CARD_FONT_SIZE, so the title/description fill more of the frame and read BIGGER
-# than they would on the clip's wide grid. Cards are therefore NOT pixel-identical
-# to clips — instead the ffmpeg scale+pad NORMALIZE pass (step 4 below) fits every
-# segment to one common resolution/fps/pixfmt, which is what keeps the concat
-# seamless even though cards and clips render at different sizes.
+# Clips render through agg at their RECORDED terminal GRID (a clip looks exactly
+# as captured, never cropped or reflowed); cards are painted on their own fixed
+# grid. What both share is that the agg FONT SIZE is chosen per segment so the
+# grid renders at approximately the output canvas (see fit_font_size) — a terminal
+# grid carries no pixel size of its own, so picking the font is how the engine
+# gets crisp text at the canvas resolution instead of a blurry upscale of a small
+# render. The ffmpeg scale+pad NORMALIZE pass then fits every segment to exactly
+# one resolution/fps/pixfmt, which is what keeps the concat seamless.
+
+# OUTPUT CANVAS — a FIXED, landscape 16:9 frame (a normal laptop screen), NOT
+# derived from the segments. This used to be the per-axis max of every native
+# segment size, which silently produced a canvas whose aspect ratio belonged to
+# NEITHER a card nor a clip: PRD #339's reel took its width from the card
+# (1140) and its height from a portrait 60x50 clip (1142) and came out 1140x1142,
+# a ~1:1 frame with the terminal content in a ~585px centred strip. A fixed 16:9
+# target makes the output geometry predictable (and standard for upload) instead
+# of a function of whatever the widest card and tallest clip happened to be.
+#
+# Segments are fit into the canvas (scale preserving aspect, then pad) and are
+# NEVER cropped — cropping a terminal would cut off content. So the canvas fixes
+# the FRAME, and how much of it a clip FILLS is still the recording's own aspect
+# ratio: a ~16:9 cast (roughly 4x as many columns as rows, since a character cell
+# is about 1:2.3) fills it nearly edge to edge, while a portrait 60x50 cast can
+# only ever occupy a centre strip. warn_aspect below warns when a clip is far
+# enough off 16:9 that it will letterbox badly.
+REEL_W="${REEL_W:-1920}"
+REEL_H="${REEL_H:-1080}"
 THEME="asciinema"
-FONT_SIZE=16
+# Fallback font size, used only when a segment's terminal grid can't be read (so
+# fit_font_size has nothing to fit). Normal segments derive their font from the
+# canvas instead. Set CLIP_FONT_SIZE / CARD_FONT_SIZE in the environment to pin a
+# font explicitly and skip the fit.
+FONT_SIZE="${FONT_SIZE:-16}"
+CLIP_FONT_SIZE="${CLIP_FONT_SIZE:-}"
 FPS=30
 # Cap idle gaps inside a real clip so e2e waits don't make the reel drag.
 CLIP_IDLE=2
@@ -86,23 +110,69 @@ CARD_RENDER_SPAN="0.6"
 # content-line count still drives the card GRID HEIGHT so long text doesn't clip,
 # only the hold stopped depending on it.)
 CARD_HOLD="${CARD_HOLD:-4}"
-# Card geometry: a SMALL fixed grid painted at a larger font so the text renders
-# big relative to the clip. CARD_WRAP (< CARD_COLS) word-wraps text to a
-# comfortable measure, leaving generous side margins. The TITLE is centered; the
-# DESCRIPTION is rendered as a LEFT-ALIGNED, vertically-centered multi-line block
-# (one line per sentence / source line / list item, with hanging indents on
-# bullets — see CARD_AWK) so it reads as prose instead of one wrapped wall of
-# text. CARD_ROWS is a MINIMUM: a description with more lines than fit grows the
-# grid taller (CARD_AWK reports the effective height) rather than clipping, and
-# the normalize pass letterboxes/scales the result. The grid/font are tuned so a
-# typical card's native canvas stays just UNDER a clip's native size — the card
-# is scaled UP to the clip's resolution by the normalize pass instead of driving
-# that resolution up (which would upscale the clip). The same fixed grid serves
-# cast AND gif/mp4 entries (a gif/mp4 carries no terminal grid of its own).
+# Card geometry: a fixed grid painted at a larger font so the text renders big
+# relative to the clip. CARD_WRAP (< CARD_COLS) word-wraps text to a comfortable
+# measure, leaving generous side margins. The TITLE is centered; the DESCRIPTION
+# is rendered as a LEFT-ALIGNED, vertically-centered multi-line block (one line
+# per sentence / source line / list item, with hanging indents on bullets — see
+# CARD_AWK) so it reads as prose instead of one wrapped wall of text. CARD_ROWS is
+# a MINIMUM: a description with more lines than fit grows the grid taller
+# (CARD_AWK reports the effective height) rather than clipping, and the normalize
+# pass scales/letterboxes the taller result. The same fixed grid serves cast AND
+# gif/mp4 entries (a gif/mp4 carries no terminal grid of its own).
+#
+# The grid is shaped ~16:9 (84x20 in character cells, which are about 1:2.3) so a
+# card FILLS the 16:9 canvas instead of letterboxing; its font is then derived from
+# the canvas by fit_font_size, which lands on 36 for the default 1920x1080 (84x20
+# at font 36 renders 1864x1058). Previously the card was 84x28 at a hardcoded font
+# 22 -> 1139x893, a 1.28:1 frame that both letterboxed and — because the canvas
+# used to be the max of the segments — dragged the output canvas's WIDTH up to its
+# own. A character is the same fraction of the frame as before, so the card reads
+# exactly as large; it is just painted at the canvas's real resolution. Set
+# CARD_FONT_SIZE in the environment to pin the font and skip the fit.
 CARD_COLS=84
-CARD_ROWS=28
+CARD_ROWS=20
 CARD_WRAP=58
-CARD_FONT_SIZE=22
+CARD_FONT_SIZE="${CARD_FONT_SIZE:-}"
+
+# Pick an agg --font-size that makes a cols x rows terminal grid render at about
+# REEL_W x REEL_H, so the normalize pass barely rescales it. A terminal grid has
+# no intrinsic pixel size: render a 68x16 cast at font 16 and it is 674x381, which
+# on a 1080p canvas is a ~2.8x upscale of already-rasterized glyphs (mush). At the
+# fitted font (45) it renders 1896x1071 and the text is sharp.
+#
+# CELL_*_RATIO are agg's cell metrics for its bundled font as a fraction of
+# --font-size. Measured over grids 68x16 / 84x20 / 80x24 / 60x50 at fonts
+# 16/21/30/36/45, they are NOT quite constant — per-grid rounding spreads width
+# over 0.6164-0.6222 and height over 1.4276-1.4883. Both ratios are therefore
+# pinned to the TOP of their measured range so the fit always errs SMALL:
+# undershooting means the normalize pass scales up a few percent, whereas
+# overshooting would letterbox. If agg ever changes fonts the fit just gets less
+# exact; it cannot break a reel, because normalize still fits whatever comes out.
+CELL_W_RATIO="0.623"
+CELL_H_RATIO="1.49"
+FONT_MIN=8
+FONT_MAX=160
+fit_font_size() {
+  local cols="$1" rows="$2"
+  awk -v c="$cols" -v r="$rows" -v w="$REEL_W" -v h="$REEL_H" -v fb="$FONT_SIZE" \
+      -v cw="$CELL_W_RATIO" -v ch="$CELL_H_RATIO" -v lo="$FONT_MIN" -v hi="$FONT_MAX" '
+    BEGIN {
+      # No usable grid (a cast with an unreadable header): fall back to FONT_SIZE.
+      if (c + 0 < 1 || r + 0 < 1) { print fb; exit }
+      fw = w / (c * cw)          # font that makes the grid exactly REEL_W wide
+      fh = h / (r * ch)          # font that makes the grid exactly REEL_H tall
+      f = int((fw < fh) ? fw : fh)
+      if (f < lo) f = lo
+      if (f > hi) f = hi
+      print f
+    }'
+}
+
+# A cast's declared terminal grid as "COLS ROWS" ("0 0" if unreadable).
+cast_grid() {
+  jq -sr '"\(.[0].width // 0) \(.[0].height // 0)"' "$1" 2>/dev/null || echo "0 0"
+}
 
 usage() {
   cat <<EOF
@@ -411,14 +481,14 @@ make_card_cast() {
 }
 
 # One agg invocation for both cards and clips; the caller varies the idle limit,
-# the font size (cards render larger via CARD_FONT_SIZE — see below) AND the
-# playback speed, so the card and clip canvases differ on purpose and the
-# normalize pass reconciles them into one uniform stream. `font` defaults to
-# FONT_SIZE so the clip path keeps rendering at its recorded size; `speed`
-# defaults to 1 so cards (static stills) are never slowed — only the clip path
-# passes CLIP_SPEED to slow the action. The `--` terminates option parsing so an
-# untrusted clip path like "-foo.cast" is taken as the positional input, never
-# mistaken for an agg option.
+# the font size AND the playback speed. Each caller passes a font fitted to ITS
+# OWN grid (fit_font_size), so a card and a clip land at near-identical pixel
+# sizes despite having different grids, and the normalize pass then reconciles
+# whatever residual difference is left into one uniform stream. `font` falls back
+# to FONT_SIZE only when the caller has nothing to fit; `speed` defaults to 1 so
+# cards (static stills) are never slowed — only the clip path passes CLIP_SPEED.
+# The `--` terminates option parsing so an untrusted clip path like "-foo.cast" is
+# taken as the positional input, never mistaken for an agg option.
 render_cast() {
   local cast="$1" gif="$2" idle="$3" font="${4:-$FONT_SIZE}" speed="${5:-1}"
   # Capture agg's stderr to a temp file (under WORKDIR, so the EXIT trap cleans
@@ -453,11 +523,67 @@ freeze_still() {
 n="$(jq 'length' "$MANIFEST")"
 note "building reel from $n manifest entr$([[ "$n" -eq 1 ]] && echo y || echo ies)…"
 
-# Render every segment to its NATIVE resolution first (card via agg on its small
-# fixed grid, .cast clip via agg at its recorded grid, gif/mp4 used as-is),
-# preserving manifest order. The common target resolution is then the max across
-# all of them; clips render at full size and the smaller cards are scaled up to
-# match in the normalize pass.
+# Warn when a segment's native aspect ratio is far enough from the output canvas
+# that it will letterbox badly. The engine fits and never crops, so this is the
+# ONE geometry problem it cannot fix for the caller — it belongs to the RECORDING.
+# Reported per segment, non-fatal (a reel with bars is still a reel), so the
+# recordist learns to capture at laptop-ish proportions (~4x as many terminal
+# columns as rows) instead of discovering it in the published video.
+# A segment whose aspect is off the canvas by more than ASPECT_TOLERANCE (as a
+# ratio, so 1.35 means "35% off in either direction") gets a warning naming the
+# fraction of the frame it will actually cover.
+ASPECT_TOLERANCE="${ASPECT_TOLERANCE:-1.35}"
+warn_aspect() {
+  local file="$1" label="$2" wh w h msg
+  wh="$(probe_wh "$file")"; w="${wh%x*}"; h="${wh#*x}"
+  [[ "${w:-0}" -gt 0 && "${h:-0}" -gt 0 ]] || return 0
+  msg="$(awk -v w="$w" -v h="$h" -v tw="$REEL_W" -v th="$REEL_H" \
+             -v tol="$ASPECT_TOLERANCE" -v label="$label" -v wh="$wh" '
+    BEGIN {
+      src = w / h; dst = tw / th
+      off = (src > dst) ? src / dst : dst / src
+      if (off < tol) exit 0
+      # Fit-and-pad covers 1/off of the frame along the constrained axis.
+      printf "warning: %s is %s (%.2f:1) against a %.2f:1 canvas — it will cover only %d%% of the frame; record at ~16:9 (about 4x as many terminal columns as rows)", \
+        label, wh, src, dst, int(100 / off)
+    }')"
+  [[ -z "$msg" ]] || note "$msg"
+}
+
+# Cast INTEGRITY check (non-fatal): does the recording reference screen positions
+# that its own declared grid cannot hold? An asciinema v2 header carries ONE fixed
+# terminal size and the format has NO resize event, so a recorder that was resized
+# mid-session writes the FINAL size — and every earlier, wider frame in the stream
+# then hard-wraps into garbage when replayed at that width. The tell is a
+# cursor-position escape (ESC[row;colH or ESC[colG) addressing a column beyond the
+# header width, which is exactly what PRD #339's unwatchable clip contained
+# (column 68 in a 60-column header). Cheap to check and worth knowing BEFORE
+# publishing, so it is reported here for any caller rather than left to a manual
+# eyeball. Warn-only: a cast may legitimately overshoot by a column, and the
+# engine's job is to render what it was given.
+warn_cast_geometry() {
+  local cast="$1" label="$2" msg
+  msg="$(jq -sr --arg e "$(printf '\033')" --arg label "$label" '
+    .[0].width as $w
+    | ([ .[1:][] | .[2]
+         | scan($e + "\\[([0-9]+);([0-9]+)H"), scan($e + "\\[()([0-9]+)G")
+         | .[1] | tonumber ] | max // 0) as $maxcol
+    | if ($w != null) and ($maxcol > $w) then
+        "warning: \($label) addresses column \($maxcol) but its header declares only \($w) — the terminal was almost certainly resized mid-recording (asciinema v2 stores one fixed size and has no resize event), so earlier wider frames will hard-wrap into garbage. Re-record at one fixed size."
+      else empty end
+  ' "$cast" 2>/dev/null || true)"
+  [[ -z "$msg" ]] || note "$msg"
+}
+
+# Final event timestamp of a cast, i.e. its playback duration in seconds.
+cast_duration() {
+  jq -sr '(.[1:] | if length == 0 then 0 else .[-1][0] end)' "$1" 2>/dev/null || echo 0
+}
+
+# Render every segment to its NATIVE resolution first (card via agg on its fixed
+# 16:9-ish grid, .cast clip via agg at its recorded grid, gif/mp4 used as-is),
+# preserving manifest order. Every segment is then fit into the FIXED REEL_W x
+# REEL_H canvas by the normalize pass below.
 natives=()
 holds=()          # parallel to natives: hold seconds for a card, empty for a clip
 for ((i = 0; i < n; i++)); do
@@ -466,13 +592,12 @@ for ((i = 0; i < n; i++)); do
   clip="$(jq -r  ".[$i].clip"        "$MANIFEST")"
   ext="$(printf '%s' "${clip##*.}" | tr '[:upper:]' '[:lower:]')"
 
-  # Paint the card on its SMALL fixed grid (CARD_COLS x CARD_ROWS minimum) at the
-  # larger CARD_FONT_SIZE — independent of the clip's grid — so the text reads
-  # big; the normalize pass below scales it up to the clip's resolution. The grid
-  # may grow taller for a long description (make_card_cast echoes the effective
-  # row count and the rendered content-line count). Then freeze a single painted
-  # still; the on-screen hold is applied later (looping this still to exactly
-  # $hold seconds), decoupled from agg's idle handling.
+  # Paint the card on its own fixed ~16:9 grid (CARD_COLS x CARD_ROWS minimum),
+  # independent of the clip's grid. The grid may grow taller for a long description
+  # (make_card_cast echoes the effective row count and the rendered content-line
+  # count). Then freeze a single painted still; the on-screen hold is applied later
+  # (looping this still to exactly $hold seconds), decoupled from agg's idle
+  # handling.
   read -r eff_rows content_lines < <(make_card_cast "$CARD_COLS" "$CARD_ROWS" "$title" "$desc" "$WORKDIR/card_$i.cast")
 
   # On-screen hold is a FLAT CARD_HOLD seconds — independent of how much text the
@@ -482,7 +607,10 @@ for ((i = 0; i < n; i++)); do
   # doesn't clip — only the hold stopped depending on it.)
   hold="$CARD_HOLD"
 
-  render_cast "$WORKDIR/card_$i.cast" "$WORKDIR/card_$i.gif" "$CARD_IDLE" "$CARD_FONT_SIZE"
+  # Font fitted to the EFFECTIVE grid, so a card that grew taller for a long
+  # description shrinks its text to stay inside the frame instead of letterboxing.
+  card_font="${CARD_FONT_SIZE:-$(fit_font_size "$CARD_COLS" "$eff_rows")}"
+  render_cast "$WORKDIR/card_$i.cast" "$WORKDIR/card_$i.gif" "$CARD_IDLE" "$card_font"
   freeze_still "$WORKDIR/card_$i.gif" "$WORKDIR/card_$i.png"
   natives+=("$WORKDIR/card_$i.png")
   holds+=("$hold")
@@ -492,32 +620,46 @@ for ((i = 0; i < n; i++)); do
       # Re-time the cast (rewrite event timestamps for a watchable cadence — see
       # retime.sh) BEFORE rendering, then render the RETIMED cast through agg at
       # CLIP_SPEED (default 1.0; the re-timer now controls cadence).
+      warn_cast_geometry "$clip" "clip $i ($clip)"
       "$RETIME_SCRIPT" "$clip" --out "$WORKDIR/clip_$i.retimed.cast"
-      render_cast "$WORKDIR/clip_$i.retimed.cast" "$WORKDIR/clip_$i.gif" "$CLIP_IDLE" "$FONT_SIZE" "$CLIP_SPEED"
+      # Report the re-timing as a ratio. The re-timer bounds it (MAX_STRETCH), so
+      # this is the cheap pre-publish sanity line: a clip that reads e.g. "15.5s ->
+      # 24.5s (1.6x)" is right, and anything wildly larger means a tunable was
+      # overridden into producing a slideshow.
+      orig_dur="$(cast_duration "$clip")"
+      new_dur="$(cast_duration "$WORKDIR/clip_$i.retimed.cast")"
+      note "$(awk -v a="$orig_dur" -v b="$new_dur" -v i="$i" \
+        'BEGIN { printf "clip %s: re-timed %.1fs -> %.1fs (%.2fx)", i, a, b, (a > 0 ? b / a : 0) }')"
+      # Render at the font that makes the RECORDED grid fill the canvas, so the
+      # glyphs are rasterized at output resolution rather than upscaled later.
+      read -r clip_cols clip_rows < <(cast_grid "$clip")
+      clip_font="${CLIP_FONT_SIZE:-$(fit_font_size "$clip_cols" "$clip_rows")}"
+      note "clip $i: grid ${clip_cols}x${clip_rows} rendered at font $clip_font"
+      render_cast "$WORKDIR/clip_$i.retimed.cast" "$WORKDIR/clip_$i.gif" "$CLIP_IDLE" "$clip_font" "$CLIP_SPEED"
+      warn_aspect "$WORKDIR/clip_$i.gif" "clip $i ($clip)"
       natives+=("$WORKDIR/clip_$i.gif")
       holds+=("") ;;
     gif|mp4)
+      warn_aspect "$clip" "clip $i ($clip)"
       natives+=("$clip")       # pre-rendered: fed straight to ffmpeg
       holds+=("") ;;
   esac
 done
 
-# Target resolution = max width/height across all native segments, rounded up
-# to even values (yuv420p / libx264 require even dimensions).
-TW=0; TH=0
-for f in "${natives[@]}"; do
-  wh="$(probe_wh "$f")"
-  w="${wh%x*}"; h="${wh#*x}"
-  (( w > TW )) && TW="$w"
-  (( h > TH )) && TH="$h"
-done
+# Target resolution is the FIXED canvas, not a function of the segments (see
+# REEL_W/REEL_H above for why the old per-axis max produced PRD #339's 1140x1142
+# portrait frame). Rounded up to even values because yuv420p / libx264 require
+# them, so an odd REEL_W/REEL_H override still encodes.
+TW="$REEL_W"; TH="$REEL_H"
 (( TW % 2 )) && TW=$(( TW + 1 ))
 (( TH % 2 )) && TH=$(( TH + 1 ))
 
-# Normalize each native to the common target (scale preserving aspect ratio,
-# then pad/letterbox to TWxTH), at a constant fps and yuv420p — the safety net
-# that guarantees every segment shares resolution/fps/pixfmt for a seamless
-# concat, even if a clip was recorded at a different terminal size.
+# Normalize each native to that canvas (scale preserving aspect ratio, then
+# pad/letterbox to TWxTH), at a constant fps and yuv420p — the safety net that
+# guarantees every segment shares resolution/fps/pixfmt for a seamless concat,
+# whatever terminal size a clip was recorded at. force_divisible_by=2 keeps the
+# SCALED image's own dimensions even too, so chroma subsampling has no half-pixel
+# to round when the padded image is centred.
 #
 # The untrusted clip path reaches ffmpeg only as the argument to `-i`, which
 # binds the very next token as its filename — so a leading-dash path is taken
@@ -525,7 +667,7 @@ done
 # so the agg-style `--` hardening doesn't apply here.
 list="$WORKDIR/concat.txt"
 : > "$list"
-norm_vf="fps=$FPS,scale=$TW:$TH:force_original_aspect_ratio=decrease,pad=$TW:$TH:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p"
+norm_vf="fps=$FPS,scale=$TW:$TH:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=$TW:$TH:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p"
 for idx in "${!natives[@]}"; do
   seg="$WORKDIR/seg_$idx.mp4"
   hold="${holds[$idx]}"

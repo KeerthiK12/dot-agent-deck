@@ -53,6 +53,8 @@ The daemon and a single agent are lightweight. Disk is dominated by the project'
 
 If you run in a network-restricted environment, allowlist only the specific destinations your agents and toolchains use rather than allowing wide-open outbound; the destinations vary per project.
 
+If the remote *cannot* be given access to a destination your laptop can reach — an internal git host behind a corporate VPN, say — see [Reaching networks only your laptop can see](remote-recipes.md#reaching-networks-only-your-laptop-can-see) for how to lend the remote your laptop's access over a reverse tunnel.
+
 **Inbound (required):** SSH only (port 22 by default), reachable from the laptop running the deck client. The daemon itself does not listen on any TCP port — it serves a Unix domain socket on the remote, and hooks reach it over localhost.
 
 No other inbound ports are required.

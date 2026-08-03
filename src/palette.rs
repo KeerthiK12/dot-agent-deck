@@ -14,12 +14,54 @@
 //! roles that never reuse a status color, so status / selection / focus are
 //! always visually distinct. The unified border-resolution precedence is:
 //!
-//! 1. **selected** → [`SELECTED`] (Magenta) + BOLD + the `▸ ` title marker.
-//! 2. else **focused** → [`FOCUSED`] (Cyan).
+//! 1. **selected** → [`SELECTED`] (Magenta) + the `▸ ` title marker, with a
+//!    **mode-dependent modifier**: BOLD in command mode, DIM in
+//!    `UiMode::PaneInput` (PRD #341 M4 — see below).
+//! 2. else **focused AND live** → [`FOCUSED`] (Cyan).
 //! 3. else → the agent's **status** role ([`status_color`]).
 //!
 //! The per-card status **badge** always shows status, so the accent override
 //! in (1)/(2) never loses status information.
+//!
+//! ### Why (2) requires "live" (issue #88 follow-up)
+//!
+//! For an **embedded pane**, "focused" and "keystrokes reach it" are different
+//! facts: in command mode the focused pane is still the one `Ctrl+D` / `Enter`
+//! return you to, but it accepts no keys. The Cyan accent originally rendered
+//! in both cases, which made the loudest border signal on screen claim "type
+//! here" while the keyboard was driving the deck — the mode was invisible on a
+//! full-screen mode tab, where nothing else in the frame changes.
+//!
+//! So for panes, (2) applies only in `UiMode::PaneInput`
+//! (`TerminalWidget::with_input_active`). In command mode the focused pane
+//! falls through to (3) and reports its agent's status like any other pane,
+//! while **border thickness** (`BorderType::Thick`) carries focus instead.
+//! Colour answers "are my keystrokes landing here?", thickness answers "which
+//! pane is focused?" — one channel each, no longer competing.
+//!
+//! ### Why a deck card is mode-aware too (PRD #341 M4)
+//!
+//! A card carries no cursor and takes no keystrokes of its own, so it has no
+//! input mode in the sense (2) means. But *the deck* does: in command mode the
+//! keyboard drives the cards, and in `UiMode::PaneInput` it drives a pane while
+//! the selection merely persists. The selection accent rendered identically in
+//! both, which left the Dashboard — where the pane overlay is weakest and the
+//! user's eyes are on the deck — looking equally live either way.
+//!
+//! So `UiMode` is threaded into card rendering as well, and (1) keeps its
+//! Magenta + `▸ ` in both modes while the MODIFIER carries the mode: BOLD in
+//! command mode, **DIM (never BOLD)** in `UiMode::PaneInput`. Colour still means
+//! "this is the selected card"; weight means "the keyboard is here". The recipe
+//! lives in exactly one place, `ui::selected_card_border_style` — do not restore
+//! an unconditional BOLD here, and do not conclude that mode must be kept out of
+//! the card path.
+//!
+//! Thickness was chosen over a fourth accent colour because the 16-colour-safe
+//! palette is full (green/blue/yellow/red are statuses, cyan is focus, magenta
+//! is selection) and the remaining candidates are grays — the exact
+//! light-background hazard PRD #13 exists to prevent. `BorderType` never feeds
+//! `Block::inner`, so it costs no layout: the pane's inner area, its PTY size,
+//! and the PRD #84 invariant-3 contract are all unaffected.
 //!
 //! All roles are **named ANSI** colors only — no absolute `Color::Rgb`, which
 //! the theme guards (`theme/contrast/001`) forbid so terminal themes can remap
@@ -52,9 +94,15 @@ pub const STATUS_IDLE: Color = Color::DarkGray;
 /// selection; Option A keeps focus on Cyan and moves selection to [`SELECTED`]
 /// so the two are provably distinct.
 pub const FOCUSED: Color = Color::Cyan;
-/// The selected deck card (rendered BOLD with a `▸ ` title marker). Magenta is
-/// free — status uses green/blue/yellow/red and focus uses cyan — so selection
-/// never collides with a status color or with focus (PRD #155 criterion #3).
+/// The selected deck card (paired with a `▸ ` title marker in every mode).
+/// Magenta is free — status uses green/blue/yellow/red and focus uses cyan — so
+/// selection never collides with a status color or with focus (PRD #155
+/// criterion #3).
+///
+/// PRD #341 M4: the COLOUR is unconditional, the modifier is not. The accent is
+/// BOLD in command mode, where the keyboard drives the deck, and DIM (not BOLD)
+/// in `UiMode::PaneInput`, where keystrokes go to a pane instead — see
+/// `ui::selected_card_border_style`, the one place that recipe lives.
 pub const SELECTED: Color = Color::Magenta;
 
 /// Resolve a session status to its centralized border/badge role color. This

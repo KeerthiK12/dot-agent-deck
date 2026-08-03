@@ -190,6 +190,66 @@ mod tests {
         }
     }
 
+    /// Issue #303: the prompt that generates new configs is the third surface
+    /// carrying the delegation guidance, and it had no coverage at all. Round-3
+    /// blocker 1 removed the heredoc fallback (a task line equal to the
+    /// delimiter ends the heredoc and Bash executes the rest) and blocker 2
+    /// closed the `!` hole in the inline allowlist; both have to hold here or a
+    /// freshly generated config ships the version we just retracted.
+    #[test]
+    fn prompt_shell_safety_rule_matches_the_generated_protocol() {
+        let prompt = config_gen_prompt("/tmp/test");
+
+        assert!(
+            prompt.contains("file-writing tool"),
+            "the shell-safety rule must recommend a non-shell file writer"
+        );
+        assert!(
+            !prompt.contains("<<"),
+            "the shell-safety rule must not recommend a heredoc for writing the task file"
+        );
+        assert!(
+            prompt.contains("does not already exist"),
+            "the shell-safety rule must require a path that does not already exist"
+        );
+        // Round 4 / the #303 e2e gate: a generated config must not tell its
+        // agents to depend on a file-writing tool they may not be authorized to
+        // invoke — that turns the rule into a stall at an approval prompt.
+        assert!(
+            prompt.contains("not authorized") && prompt.contains("approval prompt"),
+            "the shell-safety rule must state the fallback for an unauthorized file-writing \
+             tool"
+        );
+
+        crate::state::assert_inline_allowlist_agrees_with_explanation(
+            &prompt,
+            "config-generation prompt",
+        );
+
+        // The worked example is what an agent copies into a real
+        // `prompt_template`, so it carries the same rule in plain text. It lives
+        // inside a TOML basic string, where a literal backslash is not
+        // representable — hence the spelled-out form.
+        let worked_example = prompt
+            .split("### Worked Example")
+            .nth(1)
+            .expect("prompt must keep the worked example");
+        assert!(
+            worked_example.contains("no backticks, no $, no \", no backslash and no !"),
+            "the worked example's inline-allowlist condition must exclude the same \
+             characters as the rule above it"
+        );
+        assert!(
+            worked_example.contains("never with shell redirection or a heredoc"),
+            "the worked example must not reintroduce the heredoc fallback"
+        );
+        assert!(
+            worked_example.contains("not authorized"),
+            "the worked example must carry the unauthorized-file-writing-tool fallback too — \
+             it is the text an agent copies into a real prompt_template"
+        );
+    }
+
     #[test]
     fn release_role_has_clear_false() {
         let lib = role_library();

@@ -1,13 +1,12 @@
 ---
 source: tests/render_dashboard.rs
-assertion_line: 114
 expression: buffer_to_text(&buffer)
 ---
 ┌ 1 ClaudeCode · example-coder ───────────────────────────────────── ● Working ┐
-│Dir:  example-project                                   Last: 0s ago  Tools: 7│
+│Dir:  example-project                                                         │
 │Prmt: fix the login bug                                                       │
 │                                                                              │
 │                                                                              │
 │                                                                              │
 │                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────── Last: 0s  Tools: 7 ┘

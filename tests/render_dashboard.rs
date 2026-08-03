@@ -14,23 +14,16 @@ use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, 
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
-    CardDensityKind, render_card_to_buffer, render_config_gen_prompt_to_buffer,
-    render_dashboard_cards_to_buffer, render_quit_confirm_to_buffer, render_star_prompt_to_buffer,
-    render_stats_bar_to_buffer, render_stop_confirm_to_buffer, sync_and_derive_selection,
+    CardDensityKind, UiMode, card_stats_border_label, render_card_for_mode_to_buffer,
+    render_card_to_buffer, render_config_gen_prompt_to_buffer, render_dashboard_cards_to_buffer,
+    render_quit_confirm_to_buffer, render_star_prompt_to_buffer, render_stats_bar_to_buffer,
+    render_stop_confirm_to_buffer, sync_and_derive_selection,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
 use ratatui::widgets::Widget;
 use spec::spec;
-
-/// Width (in terminal cells) at which `render_session_card` flips
-/// into its "wide" branch — the rendered card gains an inline
-/// `Last: … Tools: …` stats row instead of a stacked one, and the
-/// inner card height grows by one row. The constant in the lib's
-/// renderer is `let wide = w >= 60;`; keep this mirror in sync
-/// (changing it on the lib side without updating here will produce
-/// a stale snapshot the next time the test runs).
-const RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH: u16 = 60;
+use unicode_width::UnicodeWidthStr;
 
 /// Stringify the rendered buffer — one line per row, with cells joined
 /// into the symbol layer. `insta` then captures this representation, so
@@ -50,15 +43,10 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
     out
 }
 
-/// Scenario: Render a single dashboard card for a Working agent
-/// session (with a Read tool active and a recent user prompt) into
-/// a `ratatui::TestBackend` buffer at 80 columns × Normal-density
-/// height, then snapshot the buffer with `insta`. The card title
-/// row should carry the card number (1), the display name
-/// `example-coder`, and the `● Working` status badge — and the
-/// stats line should show the wide layout's inline
-/// `Last: … Tools: …` because 80 cells crosses the wide-layout
-/// width threshold.
+/// Scenario: Render a single dashboard card for a Working agent with a Read
+/// tool and recent prompt into an 80-column, Normal-density L1 buffer, then
+/// snapshot it. The title must carry the card number, display name, and status
+/// badge, while the compact Last/Tools counters occupy the bottom border.
 #[spec("dashboard/pane/004")]
 #[test]
 fn pane_004_card_title_row() {
@@ -69,10 +57,9 @@ fn pane_004_card_title_row() {
     // doesn't need its own fn — keeping the test body
     // self-contained also reads as cleaner generated `.md` Steps).
     //
-    // `last_activity = Utc::now()` so the rendered `Last: Xs ago`
-    // line always reads `0s ago`; pinning it to a fixed past
-    // instant let calendar drift turn the rendered elapsed into
-    // `262h ago` once the date rolled past the pin (M3 fix).
+    // Both timestamps use one current instant so the fixture starts with a
+    // compact `0s` elapsed value; a fixed calendar instant previously drifted
+    // into a large hour count as the test aged (M3 fix).
     let now = chrono::Utc::now();
     let session = SessionState {
         session_id: "sess-abc123".to_string(),
@@ -93,14 +80,12 @@ fn pane_004_card_title_row() {
         agent_id: Some("1".to_string()),
         display_name: None,
     };
-    // 80-cell-wide buffer triggers the layout's "wide" branch
-    // (inline stats row). The height comes from the density tier
-    // itself so the snapshot's geometry tracks the production
-    // layout module — M2.1 reviewer S3 (no magic numbers).
+    // The 80-cell buffer leaves ample room for the full bottom-border stats
+    // title. Height comes from the density tier itself so the snapshot's
+    // geometry tracks the production layout module (no magic numbers).
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
-    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
-    let height = density.rendered_height(wide);
+    let height = density.rendered_height();
     let buffer = render_card_to_buffer(
         &session,
         Some("example-coder"),
@@ -112,6 +97,316 @@ fn pane_004_card_title_row() {
         height,
     );
     insta::assert_snapshot!(buffer_to_text(&buffer));
+}
+
+/// Build a live card fixture whose stable values make the card-stats layout
+/// assertions readable: one hour since activity, fourteen tools, one prompt,
+/// and one active Read tool. The hour form remains `1h` for 60 seconds of drift.
+fn card_stats_session(cwd: &str) -> SessionState {
+    let now = chrono::Utc::now();
+    SessionState {
+        session_id: "sess-card-stats".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        cwd: Some(cwd.to_string()),
+        status: SessionStatus::Thinking,
+        active_tool: Some(ActiveTool {
+            name: "Read".to_string(),
+            detail: Some("src/ui.rs".to_string()),
+        }),
+        started_at: now - chrono::Duration::hours(2),
+        last_activity: now - chrono::Duration::hours(1),
+        recent_events: VecDeque::new(),
+        tool_count: 14,
+        last_user_prompt: Some("move the stats into the border".to_string()),
+        first_prompts: vec!["move the stats into the border".to_string()],
+        pane_id: Some("pane-card-stats".to_string()),
+        agent_id: Some("agent-card-stats".to_string()),
+        display_name: Some("api-svc".to_string()),
+    }
+}
+
+/// Scenario: Render an over-long directory in a narrow L1 card, then render a
+/// multiline prompt in a 14-column card. Dir must use its full row and end in
+/// an ellipsis, while the newline costs no cell and `abcdef` fits without one.
+#[spec("dashboard/pane/006")]
+#[test]
+fn pane_006_card_fields_and_full_width_ellipsized_dir() {
+    let session = card_stats_session(
+        "/home/dev/this-is-an-extremely-long-project-directory-name-that-needs-truncation",
+    );
+    let width = 50;
+    let density = CardDensityKind::Normal;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        density,
+        0,
+        false,
+        width,
+        density.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+
+    for label in ["Dir:", "Last:", "Tools:", "Prmt:"] {
+        assert!(
+            rendered.contains(label),
+            "card must retain the `{label}` field:\n{rendered}"
+        );
+    }
+    let dir_row = rendered
+        .lines()
+        .find(|row| row.contains("Dir:"))
+        .expect("rendered card must contain a Dir row");
+    assert!(
+        dir_row.ends_with("…│"),
+        "Dir must use the full inner width and truncate with an ellipsis immediately before the right border:\n{rendered}"
+    );
+
+    insta::assert_snapshot!(rendered);
+
+    let mut multiline_session = card_stats_session("/home/dev/api-svc");
+    multiline_session.last_user_prompt = Some("abc\ndef".to_string());
+    multiline_session.first_prompts = vec!["abc\ndef".to_string()];
+    let multiline = buffer_to_text(&render_card_to_buffer(
+        &multiline_session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Compact,
+        0,
+        false,
+        14,
+        CardDensityKind::Compact.rendered_height(),
+    ));
+    assert!(
+        multiline.contains("│Prmt: abcdef│"),
+        "a newline must consume zero rendered cells, so the six visible prompt cells fit without an ellipsis:\n{multiline}"
+    );
+}
+
+/// Scenario: Render a comfortably wide live card and a wide placeholder card
+/// in L1 buffers. Both must retain full Last/Tools counters in the bottom
+/// border, with the live card snapshot proving they consume no content row.
+#[spec("dashboard/card-stats/001")]
+#[test]
+fn card_stats_001_wide_card_places_full_stats_in_bottom_right_border() {
+    let session = card_stats_session("/home/dev/api-svc");
+    let width = 80;
+    let density = CardDensityKind::Normal;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        density,
+        0,
+        false,
+        width,
+        density.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    let rows: Vec<&str> = rendered.lines().collect();
+    let bottom = rows.last().expect("card must have a bottom border");
+    let inner = rows[1..rows.len() - 1].join("\n");
+
+    assert!(
+        bottom.contains(" Last: 1h  Tools: 14 "),
+        "wide card bottom border must contain the full stats label:\n{rendered}"
+    );
+    let stats_column = bottom
+        .find("Last: 1h")
+        .expect("the full stats label was asserted above");
+    assert!(
+        stats_column > width as usize / 2,
+        "stats label must be aligned to the right half of the bottom border:\n{rendered}"
+    );
+    assert!(
+        !inner.contains("Last:") && !inner.contains("Tools:"),
+        "stats must not consume a content row:\n{rendered}"
+    );
+
+    insta::assert_snapshot!(rendered);
+
+    let placeholder = buffer_to_text(&placeholder_card(false));
+    let placeholder_bottom = placeholder
+        .lines()
+        .last()
+        .expect("placeholder card must have a bottom border");
+    assert!(
+        placeholder.contains("No agent"),
+        "fixture must render the placeholder identity:\n{placeholder}"
+    );
+    assert!(
+        placeholder_bottom.contains("Last:") && placeholder_bottom.contains("Tools: 0"),
+        "placeholder cards must retain full Last/Tools counters in the bottom border:\n{placeholder}"
+    );
+}
+
+/// Scenario: Render a card at the narrowest realistic 20-column width. The
+/// bottom-right stats title must use the `1h · 14 tools` fallback while both
+/// bottom corner glyphs remain intact and no stats row appears in the content.
+#[spec("dashboard/card-stats/002")]
+#[test]
+fn card_stats_002_narrow_card_degrades_label_without_overrunning_corners() {
+    let session = card_stats_session("/home/dev/api-svc");
+    let width = 20;
+    let density = CardDensityKind::Compact;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        density,
+        0,
+        false,
+        width,
+        density.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    let rows: Vec<&str> = rendered.lines().collect();
+    let bottom = rows.last().expect("card must have a bottom border");
+    let inner = rows[1..rows.len() - 1].join("\n");
+
+    assert!(
+        bottom.starts_with('└') && bottom.ends_with('┘'),
+        "narrow stats title must preserve both bottom corner glyphs:\n{rendered}"
+    );
+    assert!(
+        bottom.contains(" 1h · 14 tools "),
+        "18 usable columns must select the 15-column short stats form:\n{rendered}"
+    );
+    assert!(
+        !inner.contains("Last:") && !inner.contains("Tools:"),
+        "narrow stats must not fall back to a dedicated content row:\n{rendered}"
+    );
+
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Render the same Normal-density fixture immediately below and
+/// above the old 60-column inner-width breakpoint. Both real card renders must
+/// expose the same field labels on the same rows.
+#[spec("dashboard/card-stats/003")]
+#[test]
+fn card_stats_003_old_sixty_column_boundary_is_structurally_inert() {
+    let session = card_stats_session("/home/dev/api-svc");
+    let below_width = 61; // 59 inner columns
+    let above_width = 63; // 61 inner columns
+    let density = CardDensityKind::Normal;
+
+    let render = |width| {
+        buffer_to_text(&render_card_to_buffer(
+            &session,
+            Some("api-svc"),
+            Some(1),
+            density,
+            0,
+            false,
+            width,
+            density.rendered_height(),
+        ))
+    };
+    let below = render(below_width);
+    let above = render(above_width);
+    let labels = ["Dir:", "Prmt:", "Last:", "Tools:"];
+    let label_rows = |rendered: &str| {
+        labels
+            .iter()
+            .map(|label| {
+                let row = rendered
+                    .lines()
+                    .position(|line| line.contains(label))
+                    .unwrap_or_else(|| panic!("rendered card is missing `{label}`:\n{rendered}"));
+                (*label, row)
+            })
+            .collect::<Vec<_>>()
+    };
+    let below_rows = label_rows(&below);
+    let above_rows = label_rows(&above);
+
+    assert_eq!(
+        below_rows, above_rows,
+        "field labels must retain the same row structure across the old 60-column boundary\nBELOW:\n{below}\nABOVE:\n{above}"
+    );
+}
+
+/// Scenario: Pin both sides of the reference label's 9/15/21 transitions, then
+/// sweep varied elapsed strings and tool counts across every relevant display
+/// width. Every result must fit and equal the first, widest fitting form.
+#[spec("dashboard/card-stats/004")]
+#[test]
+fn card_stats_004_label_ladder_transitions_at_display_width_boundaries() {
+    let shortest = Some(" 2m · 14 ".to_string());
+    let medium = Some(" 2m · 14 tools ".to_string());
+    let full = Some(" Last: 2m  Tools: 14 ".to_string());
+
+    for (lower, upper, wider) in [
+        (8, 9, shortest.clone()),
+        (14, 15, medium.clone()),
+        (20, 21, full.clone()),
+    ] {
+        assert_ne!(
+            card_stats_border_label(lower, "2m", 14),
+            wider,
+            "below the {lower}/{upper} transition boundary, width {lower} must not admit the wider form"
+        );
+        assert_eq!(
+            card_stats_border_label(upper, "2m", 14),
+            wider,
+            "at the {lower}/{upper} transition boundary, width {upper} must admit the wider form"
+        );
+    }
+
+    for usable_width in 0..=25 {
+        let expected = match usable_width {
+            0..=8 => None,
+            9..=14 => Some(" 2m · 14 ".to_string()),
+            15..=20 => Some(" 2m · 14 tools ".to_string()),
+            _ => Some(" Last: 2m  Tools: 14 ".to_string()),
+        };
+        assert_eq!(
+            card_stats_border_label(usable_width, "2m", 14),
+            expected,
+            "wrong degradation-ladder form at usable display width {usable_width}"
+        );
+    }
+
+    for (last, tools) in [
+        ("2m", 14),
+        ("1h 5m", 1234),
+        ("2m", 999_999),
+        ("", 14),
+        ("项目e\u{301}", 14),
+    ] {
+        let candidates = [
+            format!(" Last: {last}  Tools: {tools} "),
+            format!(" {last} · {tools} tools "),
+            format!(" {last} · {tools} "),
+        ];
+        let max_candidate_width = candidates
+            .iter()
+            .map(|candidate| candidate.width())
+            .max()
+            .expect("the candidate list is non-empty");
+
+        for usable_width in
+            0..=u16::try_from(max_candidate_width + 2).expect("test labels fit in u16")
+        {
+            let actual = card_stats_border_label(usable_width, last, tools);
+            if let Some(ref label) = actual {
+                assert!(
+                    label.width() <= usable_width as usize,
+                    "selected form overruns width {usable_width} for last={last:?}, tools={tools}: {label:?}"
+                );
+            }
+            let expected = candidates
+                .iter()
+                .find(|candidate| candidate.width() <= usable_width as usize)
+                .cloned();
+            assert_eq!(
+                actual, expected,
+                "selector must return the first (widest) fitting form at width {usable_width} for last={last:?}, tools={tools}"
+            );
+        }
+    }
 }
 
 /// Color-aware sibling of [`buffer_to_text`]. `buffer_to_text` captures the
@@ -173,7 +468,6 @@ fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
         idle: 1,
         compacting: 1,
         total_tools: 42,
-        ..Default::default()
     };
     vec![
         (
@@ -187,8 +481,12 @@ fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
     ]
 }
 
-/// Build a placeholder ("No agent") session card fixture. `last_activity = now`
-/// so any rendered elapsed reads `0s ago` (mirrors `pane_004`).
+/// Build a placeholder ("No agent") card fixture with a current activity time;
+/// its compact Last/Tools counters use the same bottom-border path as live cards.
+///
+/// PRD #341 M4 made the selection accent mode-dependent, so the mode is passed
+/// explicitly: `UiMode::Normal` — command mode, where the keyboard drives the deck
+/// and the accent renders at full strength.
 fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
     let now = chrono::Utc::now();
     let placeholder = SessionState {
@@ -209,15 +507,15 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
-    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
-    let height = density.rendered_height(wide);
-    render_card_to_buffer(
+    let height = density.rendered_height();
+    render_card_for_mode_to_buffer(
         &placeholder,
         None,
         None,
         density,
         0,
         selected,
+        UiMode::Normal,
         width,
         height,
     )
@@ -246,7 +544,8 @@ fn contrast_001_overlays_reference_frame() {
 }
 
 /// Scenario: Render the five overlay seams plus a session card in both the
-/// unselected and SELECTED states, then assert two terminal-relative
+/// unselected and SELECTED states, in **command mode** (`UiMode::Normal`, where
+/// the keyboard drives the deck), then assert two terminal-relative
 /// properties. (a) NO rendered cell across any surface has a `Color::Rgb(..)`
 /// background — backgrounds must be `Color::Reset` so the terminal's own
 /// background shows through. (b) Selection is cued the PRD #155 Option-A way —
@@ -284,7 +583,8 @@ fn guard_001_no_absolute_backgrounds() {
     //     be Color::Magenta + Modifier::BOLD. Magenta is the dedicated
     //     `selected` accent role; it deliberately does not reuse the working
     //     status green or the focused-pane cyan. (The unselected placeholder
-    //     border is a dimmed terminal foreground.)
+    //     border is a dimmed terminal foreground.) PRD #341 M4: BOLD is the
+    //     command-mode strength — `mode/deck/001` owns the PaneInput recipe.
     let border_style = |buf: &ratatui::buffer::Buffer| {
         let y = buf.area().height / 2;
         let cell = &buf[(0, y)];
@@ -366,8 +666,8 @@ fn pane_007_pi_card_shows_pi_identity() {
     // default — it is NOT gated behind the experimental flag — so this test
     // touches no flag and expects the Pi identity to render unconditionally.
     //
-    // `last_activity = now` keeps any rendered `Last: Xs ago` at `0s ago`
-    // (mirrors `pane_004`).
+    // A current activity time keeps the compact bottom-border elapsed value
+    // small; this identity test does not assert its exact value.
     let now = chrono::Utc::now();
     let session = SessionState {
         session_id: "orch-01".to_string(),
@@ -389,8 +689,7 @@ fn pane_007_pi_card_shows_pi_identity() {
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
-    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
-    let height = density.rendered_height(wide);
+    let height = density.rendered_height();
     let buffer = render_card_to_buffer(
         &session,
         None, // no display name
@@ -444,7 +743,7 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
-    let height = density.rendered_height(width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH);
+    let height = density.rendered_height();
     let buffer = render_card_to_buffer(&session, None, Some(1), density, 0, false, width, height);
     let text = buffer_to_text(&buffer);
     assert!(
@@ -524,20 +823,24 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
     insta::assert_snapshot!("pane_008_named_agent_badges", named_badges);
 }
 
-/// Scenario: Aggregate a dashboard containing one Claude Code session and one
-/// Codex session, then render its stats bar. Because multiple real agent types
-/// are active, the visible bar must include a compact per-type count breakdown.
+/// Scenario: Aggregate a busy mixed deck (14 Claude Code + 8 Codex sessions) and
+/// render its stats bar at 60 columns — the width the bar actually gets, since it
+/// draws into the last row of the left dashboard column whenever panes are open.
+/// The bar must spend that width on the status counts and the `tools` total, with
+/// no per-agent-type breakdown: the breakdown used to consume ~30 columns here and
+/// silently clip the `tools` total off the right edge.
 #[spec("dashboard/stats/001")]
 #[test]
-fn stats_001_mixed_agents_render_per_type_breakdown() {
+fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
     let mut state = AppState::default();
-    for (session_id, pane_id, agent_type) in [
-        ("mixed-claude", "pane-claude", AgentType::ClaudeCode),
-        ("mixed-codex", "pane-codex", AgentType::Codex),
-    ] {
-        state.register_pane(pane_id.to_string());
+    let panes = std::iter::repeat_n(AgentType::ClaudeCode, 14)
+        .chain(std::iter::repeat_n(AgentType::Codex, 8))
+        .enumerate();
+    for (i, agent_type) in panes {
+        let pane_id = format!("pane-{i:02}");
+        state.register_pane(pane_id.clone());
         state.apply_event(AgentEvent {
-            session_id: session_id.to_string(),
+            session_id: format!("mixed-{i:02}"),
             agent_type,
             event_type: EventType::SessionStart,
             tool_name: None,
@@ -546,7 +849,7 @@ fn stats_001_mixed_agents_render_per_type_breakdown() {
             timestamp: chrono::Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
-            pane_id: Some(pane_id.to_string()),
+            pane_id: Some(pane_id.clone()),
             agent_id: Some(format!("agent-{pane_id}")),
             agent_version: None,
             schema_version: None,
@@ -555,11 +858,21 @@ fn stats_001_mixed_agents_render_per_type_breakdown() {
     }
 
     let stats = state.aggregate_stats();
-    let buffer = render_stats_bar_to_buffer(&stats, None, 160, 1);
+    assert_eq!(
+        stats.active, 22,
+        "all 22 mixed-agent sessions count as active"
+    );
+
+    let buffer = render_stats_bar_to_buffer(&stats, None, 60, 1);
     let rendered = buffer_to_text(&buffer);
     assert!(
-        rendered.contains("1 ClaudeCode") && rendered.contains("1 Codex"),
-        "a mixed-agent dashboard must show per-agent-type counts in its stats bar:\n{rendered}"
+        rendered.contains("22 active") && rendered.contains("tools"),
+        "a narrow stats bar must still fit the active count AND the tools total:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("ClaudeCode") && !rendered.contains("Codex"),
+        "the stats bar must not spend its width on a per-agent-type breakdown \
+         (every card already carries a registry-colored type badge):\n{rendered}"
     );
 }
 
@@ -596,7 +909,7 @@ fn pane_009_history_only_card_marks_and_dims_input_affordance() {
     let history = session_from_event("resume-01", "resume-pane", "history-only");
     let width = 80;
     let density = CardDensityKind::Normal;
-    let card_height = density.rendered_height((width as usize).saturating_sub(2) >= 60);
+    let card_height = density.rendered_height();
     let buffer = render_dashboard_cards_to_buffer(
         &[(&live, None), (&history, None)],
         None,
@@ -636,8 +949,8 @@ fn pane_009_history_only_card_marks_and_dims_input_affordance() {
 
 /// Build a live (non-placeholder) session fixture carrying `status`. Used to
 /// drive the deck-card border through `render_card_to_buffer` for every status
-/// role. `last_activity = now` keeps any rendered elapsed at `0s ago` (mirrors
-/// `pane_004`); these tests inspect only the border color, never the body.
+/// role. Its current activity time keeps the compact border value small; these
+/// tests inspect only the border color, never the body.
 fn palette_session(status: SessionStatus) -> SessionState {
     let now = chrono::Utc::now();
     SessionState {
@@ -669,15 +982,14 @@ fn border_style_at_mid(buffer: &ratatui::buffer::Buffer) -> (Color, Modifier) {
 }
 
 /// Render a single deck card for a live agent in `status` (not selected, not
-/// focused) and return its resolved border `(fg, modifier)`. 80 cells wide ⇒
-/// the wide layout; height comes from the density tier so geometry tracks the
-/// production layout module.
+/// focused) and return its resolved border `(fg, modifier)`. The 80-cell width
+/// leaves the border title ample room; height comes from the density tier so
+/// geometry tracks the production layout module.
 fn card_border_at_mid(status: SessionStatus) -> (Color, Modifier) {
     let session = palette_session(status);
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
-    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
-    let height = density.rendered_height(wide);
+    let height = density.rendered_height();
     let buffer = render_card_to_buffer(
         &session,
         Some("example-agent"),
@@ -702,7 +1014,16 @@ fn card_border_at_mid(status: SessionStatus) -> (Color, Modifier) {
 /// encodes STATUS — the SAME role the deck card uses (`src/terminal_widget.rs`
 /// resolves it from the centralized [`palette`]). With `status = None` the
 /// widget keeps the legacy focus-only border (focused → Cyan, else dimmed).
-fn pane_border_at_mid(status: Option<SessionStatus>, focused: bool) -> (Color, Modifier) {
+///
+/// Issue #88 follow-up: `input_active` is the `UiMode::PaneInput` bit. The Cyan
+/// `focused` accent now requires it, so `focused=true, input_active=false`
+/// (command mode) falls through to the status role and thickens the border
+/// instead — read the glyph with [`border_glyph_at_mid`] to see that.
+fn render_pane_border_buffer(
+    status: Option<SessionStatus>,
+    focused: bool,
+    input_active: bool,
+) -> ratatui::buffer::Buffer {
     let area = Rect {
         x: 0,
         y: 0,
@@ -716,13 +1037,32 @@ fn pane_border_at_mid(status: Option<SessionStatus>, focused: bool) -> (Color, M
         Some(s) => format!("{s:?}"),
         None => "pane".to_string(),
     };
-    let mut widget = TerminalWidget::new(parser, title, focused);
+    let mut widget = TerminalWidget::new(parser, title, focused).with_input_active(input_active);
     if let Some(s) = status {
         widget = widget.with_status(s);
     }
     let mut buf = ratatui::buffer::Buffer::empty(area);
     widget.render(area, &mut buf);
-    border_style_at_mid(&buf)
+    buf
+}
+
+/// Resolved `(fg, modifier)` of an embedded pane's border. See
+/// [`render_pane_border_buffer`] for the fixture geometry.
+fn pane_border_at_mid(
+    status: Option<SessionStatus>,
+    focused: bool,
+    input_active: bool,
+) -> (Color, Modifier) {
+    border_style_at_mid(&render_pane_border_buffer(status, focused, input_active))
+}
+
+/// The border GLYPH at the same mid-height left-edge cell `border_style_at_mid`
+/// samples. `BorderType::Plain` paints `│` there and `BorderType::Thick` paints
+/// `┃`, so this is how a test tells the two border weights apart — the channel
+/// that carries focus once colour is reserved for liveness (issue #88 follow-up).
+fn border_glyph_at_mid(buffer: &ratatui::buffer::Buffer) -> String {
+    let y = buffer.area().height / 2;
+    buffer[(0, y)].symbol().to_string()
 }
 
 /// The six status roles in the centralized palette and the named-ANSI color each
@@ -791,7 +1131,7 @@ fn palette_001_deck_card_border_is_status_role() {
 fn palette_002_pane_border_matches_deck_status_color() {
     for (status, role) in status_role_colors() {
         let card_fg = card_border_at_mid(status.clone()).0;
-        let pane_fg = pane_border_at_mid(Some(status.clone()), false).0;
+        let pane_fg = pane_border_at_mid(Some(status.clone()), false, true).0;
         assert_eq!(
             pane_fg, card_fg,
             "embedded pane border for {status:?} must match the deck card's status color \
@@ -804,26 +1144,28 @@ fn palette_002_pane_border_matches_deck_status_color() {
     }
 }
 
-/// Scenario: Render a SELECTED deck card and assert its border is the dedicated
-/// `selected` accent role — Color::Magenta + Modifier::BOLD — plus the `▸ `
-/// title marker, and that this color is NOT a status color (≠ green) and NOT
-/// the focused accent (≠ cyan). This pins the Option-A rule that selection is
-/// conveyed by a non-status accent that never collides with the palette.
+/// Scenario: Render a SELECTED deck card in **command mode** (`UiMode::Normal`)
+/// and assert its border is the dedicated `selected` accent role —
+/// Color::Magenta + Modifier::BOLD — plus the `▸ ` title marker, and that this
+/// color is NOT a status color (≠ green) and NOT the focused accent (≠ cyan).
+/// This pins the Option-A rule that selection is conveyed by a non-status accent
+/// that never collides with the palette, at the full strength command mode gets
+/// (PRD #341 M4 de-emphasises the same accent in PaneInput — `mode/deck/001`).
 #[spec("theme/palette/003")]
 #[test]
 fn palette_003_selected_card_border_is_magenta_bold_marker() {
     let session = palette_session(SessionStatus::Working);
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
-    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
-    let height = density.rendered_height(wide);
-    let buffer = render_card_to_buffer(
+    let height = density.rendered_height();
+    let buffer = render_card_for_mode_to_buffer(
         &session,
         Some("example-agent"),
         Some(1),
         density,
         0,    // animation tick
         true, // SELECTED
+        UiMode::Normal,
         width,
         height,
     );
@@ -853,19 +1195,21 @@ fn palette_003_selected_card_border_is_magenta_bold_marker() {
     );
 }
 
-/// Scenario: Render a FOCUSED embedded pane and assert its border is the
-/// dedicated `focused` accent role — Color::Cyan — and that this color is
-/// distinct from every status role (green/blue/yellow/red/dark-gray) and from
-/// the `selected` accent (magenta). This pins the Option-A split that keeps
-/// focus on Cyan while selection moves to Magenta, so status/selection/focus
-/// are provably distinct. Then render a pane that is focused AND carries a real
-/// `Working` status and assert its border is still Cyan (the focused accent),
-/// NOT Green (the Working status color) — locking the precedence invariant that
-/// focus OVERRIDES a present status color.
+/// Scenario: Render a FOCUSED, LIVE (`UiMode::PaneInput`) embedded pane and
+/// assert its border is the dedicated `focused` accent role — Color::Cyan — and
+/// that this color is distinct from every status role
+/// (green/blue/yellow/red/dark-gray) and from the `selected` accent (magenta).
+/// This pins the Option-A split that keeps focus on Cyan while selection moves
+/// to Magenta, so status/selection/focus are provably distinct. Then render a
+/// pane that is focused AND live AND carries a real `Working` status and assert
+/// its border is still Cyan (the focused accent), NOT Green (the Working status
+/// color) — locking the precedence invariant that focus OVERRIDES a present
+/// status color while the pane is accepting input. (The command-mode half of
+/// that precedence — focused but NOT live — is `theme/palette/005`.)
 #[spec("theme/palette/004")]
 #[test]
 fn palette_004_focused_pane_border_is_cyan_distinct() {
-    let (fg, _modifier) = pane_border_at_mid(None, true);
+    let (fg, _modifier) = pane_border_at_mid(None, true, true);
     assert_eq!(
         fg,
         Color::Cyan,
@@ -892,7 +1236,7 @@ fn palette_004_focused_pane_border_is_cyan_distinct() {
     // accent (Cyan), never the Working/Green status color — locking Option A's
     // "focused overrides status" rule in the unified border precedence.
     let (focused_with_status_fg, _modifier) =
-        pane_border_at_mid(Some(SessionStatus::Working), true);
+        pane_border_at_mid(Some(SessionStatus::Working), true, true);
     assert_eq!(
         focused_with_status_fg,
         Color::Cyan,
@@ -905,6 +1249,80 @@ fn palette_004_focused_pane_border_is_cyan_distinct() {
         "focus must OVERRIDE a present status: the border must not fall back to the \
          Working-status Green when the pane is focused"
     );
+}
+
+/// Scenario: Render the SAME focused embedded pane twice — once live
+/// (`UiMode::PaneInput`, keystrokes reach it) and once in command mode
+/// (`Ctrl+D` pressed, keys drive the deck) — and assert the two are visually
+/// distinguishable. Live keeps the Cyan `focused` accent on a thin `│` border;
+/// command mode drops the accent to the agent's own `Working`/Green status color
+/// and thickens the border to `┃`, so colour reports whether keystrokes land
+/// here while thickness still reports which pane is focused.
+#[spec("theme/palette/005")]
+#[test]
+fn palette_005_command_mode_focused_pane_drops_cyan_accent() {
+    let working = Some(SessionStatus::Working);
+
+    // Live: unchanged from palette_004 — Cyan accent, thin border.
+    let live = render_pane_border_buffer(working.clone(), true, true);
+    let (live_fg, _) = border_style_at_mid(&live);
+    assert_eq!(
+        live_fg,
+        Color::Cyan,
+        "a focused pane that is ACCEPTING INPUT must keep the `focused` accent (Cyan), \
+         got {live_fg:?}"
+    );
+
+    // Command mode: the accent is withheld, so the border reports what the
+    // agent is DOING instead of falsely advertising "type here".
+    let parked = render_pane_border_buffer(working.clone(), true, false);
+    let (parked_fg, _) = border_style_at_mid(&parked);
+    assert_eq!(
+        parked_fg,
+        Color::Green,
+        "a focused pane in COMMAND MODE must fall through to its agent's status role \
+         (Working=Green), got {parked_fg:?}"
+    );
+    assert_ne!(
+        parked_fg,
+        Color::Cyan,
+        "command mode must NOT render the `focused` accent — that cyan border is the \
+         signal that keystrokes reach the pane, and in command mode they do not"
+    );
+
+    // The two modes must be tellable apart at all — the whole point of the
+    // change. A regression that reinstates the accent unconditionally trips here
+    // even if the assertions above are somehow satisfied.
+    assert_ne!(
+        live_fg, parked_fg,
+        "live and command mode must resolve to DIFFERENT border colors, both were {live_fg:?}"
+    );
+
+    // FOCUS SURVIVES: thickness takes over the job colour just gave up, so a
+    // multi-pane mode tab still shows which pane `Ctrl+D` / `Enter` returns to.
+    let live_glyph = border_glyph_at_mid(&live);
+    let parked_glyph = border_glyph_at_mid(&parked);
+    assert_eq!(
+        live_glyph, "│",
+        "a live focused pane keeps the thin (Plain) border, got {live_glyph:?}"
+    );
+    assert_eq!(
+        parked_glyph, "┃",
+        "a focused pane in command mode must thicken its border so focus stays legible \
+         once the cyan accent is gone, got {parked_glyph:?}"
+    );
+
+    // An UNFOCUSED pane must not thicken in either mode — thickness means
+    // "focused", so it has to stay exclusive to the focused pane.
+    for input_active in [true, false] {
+        let unfocused = render_pane_border_buffer(working.clone(), false, input_active);
+        let glyph = border_glyph_at_mid(&unfocused);
+        assert_eq!(
+            glyph, "│",
+            "an unfocused pane must keep the thin border (input_active={input_active}), \
+             got {glyph:?}"
+        );
+    }
 }
 
 /// Extract the source region of the top-level function whose signature contains
@@ -1095,8 +1513,8 @@ fn pane_005_highlight_follows_selected_session_id() {
     // point the selection at the 2nd, so a regression that ignored the
     // stable id (highlighting card 0) would visibly diff the snapshot.
     //
-    // `last_activity = now` keeps every `Last: Xs ago` line at `0s ago`
-    // so calendar drift can't churn the snapshot (mirrors pane_004).
+    // All sessions share one current activity time, keeping their compact
+    // bottom-border elapsed values identical in the snapshot.
     let now = chrono::Utc::now();
     let make = |sid: &str, pane: &str, name: &str, cwd: &str| SessionState {
         session_id: sid.to_string(),
@@ -1135,8 +1553,8 @@ fn pane_005_highlight_follows_selected_session_id() {
     let mut tab = Tab::Dashboard {
         selected_session_id: Some("sess-beta".to_string()),
     };
-    let selected_index =
-        sync_and_derive_selection(&mut tab, None, &filtered).expect("dashboard derives an index");
+    let selected_index = sync_and_derive_selection(&mut tab, None, &filtered, None)
+        .expect("dashboard derives an index");
     assert_eq!(
         selected_index, 1,
         "selection must follow the stable session id to the 2nd card"
@@ -1167,9 +1585,9 @@ fn pane_005_highlight_follows_selected_session_id() {
 /// blank inside the border are reserved-but-unused — exactly what
 /// `dashboard/density/004` asserts must not happen.
 ///
-/// `last_activity = now` keeps the inline `Last: Xs ago` text at `0s ago`
-/// (mirrors `pane_004`); these tests only inspect blank/non-blank rows, so the
-/// elapsed value never affects the assertion.
+/// `last_activity = now` keeps the compact bottom-border elapsed value small;
+/// these tests inspect only blank/non-blank rows, so its exact value is
+/// irrelevant.
 fn filled_session() -> SessionState {
     let now = chrono::Utc::now();
     let mut events: VecDeque<AgentEvent> = VecDeque::new();
@@ -1270,7 +1688,7 @@ fn trailing_blank_inner_rows(buffer: &ratatui::buffer::Buffer) -> usize {
 /// own `rendered_height`, then assert the card has zero trailing blank rows —
 /// the row directly above the bottom border carries rendered content on every
 /// tier. This locks in PRD #147's content-derived `card_height`: the reserved
-/// height equals the lines `render_session_card` actually emits (wide 5/8/10),
+/// height equals the lines `render_session_card` actually emits (5/8/10),
 /// so no row is reserved-but-empty. Before #147 the heights were hardcoded
 /// larger than the content (Compact 7 rows for 3 content lines, Normal 9 for 6,
 /// Spacious 11 for 8), which would trip this assertion as trailing blank rows.
@@ -1279,18 +1697,17 @@ fn trailing_blank_inner_rows(buffer: &ratatui::buffer::Buffer) -> usize {
 fn density_004_no_trailing_blank_rows() {
     // PRD #147 M2: reserved card height must equal rendered content height, so
     // a card shows no empty rows below its content at any tier. The fixture
-    // fills every tier to capacity (3 prompts + 3 tools); we render at the
-    // width-80 "wide" branch (inline stats row) at the tier's declared
-    // `rendered_height`, then count trailing blank inner rows — which must be 0.
+    // fills every tier to capacity (3 prompts + 3 tools); we render at width 80
+    // with the stats in the bottom border at the tier's declared height, then
+    // count trailing blank inner rows — which must be 0.
     let session = filled_session();
     let width: u16 = 80;
-    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
     for (density, label) in [
         (CardDensityKind::Compact, "Compact"),
         (CardDensityKind::Normal, "Normal"),
         (CardDensityKind::Spacious, "Spacious"),
     ] {
-        let height = density.rendered_height(wide);
+        let height = density.rendered_height();
         let buffer = render_card_to_buffer(
             &session,
             Some("example-coder"),
@@ -1317,14 +1734,14 @@ fn density_004_no_trailing_blank_rows() {
 /// in `avail`, falling back to Compact. Mirrors `src/ui.rs::choose_density` so
 /// the orchestration capacity test tracks the same selection the renderer uses
 /// without depending on the private function.
-fn pick_density(n_decks: usize, cols: usize, avail: u16, wide: bool) -> CardDensityKind {
+fn pick_density(n_decks: usize, cols: usize, avail: u16) -> CardDensityKind {
     let rows = n_decks.div_ceil(cols.max(1)) as u16;
     for density in [
         CardDensityKind::Spacious,
         CardDensityKind::Normal,
         CardDensityKind::Compact,
     ] {
-        if rows * density.rendered_height(wide) <= avail {
+        if rows * density.rendered_height() <= avail {
             return density;
         }
     }
@@ -1351,16 +1768,13 @@ fn layout_001_seven_decks_fit_single_column() {
     // `rendered_height` seam, then confirm it with a real card render.
 
     // Card-area rows available for cards (production: dashboard_area.height - 2,
-    // i.e. a ~50-row card column). WIDE = single orchestration column rendered
-    // wide enough (inner width >= 60) to show the inline stats row — the branch
-    // PRD #147's capacity example is worked through.
+    // i.e. a ~50-row card column).
     const AVAILABLE: u16 = 48;
     const COLS: usize = 1;
-    const WIDE: bool = true;
     const DECKS: usize = 7;
 
-    let density = pick_density(DECKS, COLS, AVAILABLE, WIDE);
-    let card_height = density.rendered_height(WIDE);
+    let density = pick_density(DECKS, COLS, AVAILABLE);
+    let card_height = density.rendered_height();
     let visible_rows = (AVAILABLE / card_height).max(1) as usize;
 
     // (1) Capacity: all 7 decks must fit in the single column with no scrolling.
@@ -1394,8 +1808,8 @@ fn layout_001_seven_decks_fit_single_column() {
     //     capacity must still engage scrolling — the fix right-sizes the cards,
     //     it does not remove scrolling for genuinely too-many decks.
     const MANY: usize = 20;
-    let many_density = pick_density(MANY, COLS, AVAILABLE, WIDE);
-    let many_visible = (AVAILABLE / many_density.rendered_height(WIDE)).max(1) as usize;
+    let many_density = pick_density(MANY, COLS, AVAILABLE);
+    let many_visible = (AVAILABLE / many_density.rendered_height()).max(1) as usize;
     assert!(
         many_visible < MANY,
         "with {MANY} decks scrolling must still engage (only {many_visible} fit)"

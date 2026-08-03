@@ -34,9 +34,9 @@ use spec::spec;
 /// confirms the cwd) → form (Enter past Mode, Enter past the default Name, type
 /// the command, Enter submits). The leading Ctrl+D guarantees we drive the
 /// global Ctrl+N from Normal mode even when a previously spawned pane left us in
-/// PaneInput (a no-op when already Normal).
+/// PaneInput (and resumes the focused pane when already in Normal mode).
 fn spawn_plain_pane(deck: &TuiDeck, command: &str) {
-    deck.send_keys(b"\x04"); // Ctrl+D → Normal mode (no-op if already Normal)
+    deck.send_keys(b"\x04"); // Ctrl+D toggles between PaneInput and Normal
     deck.send_keys(b"\x0e"); // Ctrl+N → directory picker
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space → confirm current dir → new-pane form
@@ -99,12 +99,11 @@ fn save_001_new_pane_state_change_writes_snapshot() {
 /// Scenario: Launch the deck with `DOT_AGENT_DECK_SESSION` redirected to a
 /// test-owned path, create two `sleep 600` dashboard panes, detach to Normal
 /// mode and arm the dashboard selection (`j` → `▸`), then DELETE any snapshot
-/// already on disk and close the selected pane with Ctrl+W. Closing a pane is a
-/// detach path that must flush a fresh snapshot reflecting the (still non-empty)
-/// workspace — so a new `session.toml` containing a surviving `sleep 600` pane
-/// must reappear, without quitting. RED today: Ctrl+W tears the pane down but
-/// writes no snapshot (only clean teardown does), so the deleted file never
-/// comes back.
+/// already on disk, request the selected pane's close with Ctrl+W, and accept
+/// the confirmation with Down+Enter. Closing a pane is a detach path that must flush a
+/// fresh snapshot reflecting the (still non-empty) workspace — so a new
+/// `session.toml` containing a surviving `sleep 600` pane must reappear, without
+/// quitting.
 #[spec("session/save/002")]
 #[test]
 fn save_002_detach_path_writes_snapshot() {
@@ -137,9 +136,12 @@ fn save_002_detach_path_writes_snapshot() {
     // a stale earlier write.
     let _ = std::fs::remove_file(&session_file);
 
-    // Detach path: close the selected pane with Ctrl+W. One card remains, so
-    // the workspace is still non-empty.
-    deck.send_keys(b"\x17"); // Ctrl+W → CloseSelected
+    // Detach path: request the selected pane's close, then deliberately accept
+    // the safety confirmation. One card remains, so the workspace is non-empty.
+    deck.send_keys(b"\x17"); // Ctrl+W → arm close confirmation
+    deck.wait_for_string("Close selected pane?");
+    deck.send_keys(b"\x1b[B"); // Down → select Close
+    deck.send_keys(b"\r"); // Enter → confirm close selected pane
     deck.wait_for_string("1 session(s)"); // close took effect
 
     // The detach must have flushed a fresh snapshot reflecting the surviving

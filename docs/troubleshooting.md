@@ -5,48 +5,24 @@ title: Troubleshooting
 
 # Troubleshooting
 
-## Shift+Enter Not Working in Ghostty Terminal
+## Shift+Enter Submits Instead of Inserting a Newline
 
-When running Claude Code or other AI coding agents inside dot-agent-deck with the **Ghostty terminal emulator**, Shift+Enter may not create newlines in chat inputs as expected.
+Inside an embedded agent pane, **Shift+Enter** inserts a newline into the agent's draft and plain **Enter** submits it — the same behavior you get running the agent directly. This works with **no terminal configuration** on any terminal that implements the enhanced ("kitty") keyboard protocol, which the deck negotiates for you at startup.
 
-### Why This Happens
+### What Used to Cause This
 
-Ghostty intercepts Shift+Enter for its own terminal features when applications enable mouse capture mode. This prevents the keystroke from reaching the embedded application.
+The break was never in your terminal emulator. It was two dot-agent-deck defects that compounded, both now fixed:
 
-### Solution
+- The deck never asked the terminal for the enhanced keyboard protocol, so a terminal that *could* encode Shift+Enter distinctly stayed in legacy mode and delivered a bare carriage return — the SHIFT modifier was gone before any deck code ran.
+- The deck's pane-input encoder dropped the SHIFT modifier even when it did arrive, mapping Enter to `\r` unconditionally. Shift+Enter and plain Enter were literally the same byte on the wire, so every agent read both as "submit".
 
-Add the following line to your Ghostty configuration file:
+Earlier versions of this page blamed Ghostty for intercepting the keystroke and prescribed adding `keybind = shift+enter=csi:13;2u` to the Ghostty config. That attribution was wrong, and the keybind could not have been the fix on its own — it made the modifier arrive, and the deck then discarded it. If you already have that line in `~/Library/Application Support/com.mitchellh.ghostty/config`, you can leave it: it still works and does no harm, it is simply no longer necessary.
 
-**Location:** `~/Library/Application Support/com.mitchellh.ghostty/config`
+### If It Still Submits
 
-```
-keybind = shift+enter=csi:13;2u
-```
-
-This uses the CSI u format (modern keyboard protocol) to send Shift+Enter with the SHIFT modifier preserved.
-
-### How to Apply
-
-1. Edit the Ghostty config file:
-   ```bash
-   nano ~/Library/Application\ Support/com.mitchellh.ghostty/config
-   ```
-
-2. Add the keybind line (you can add it anywhere in the file)
-
-3. Restart Ghostty or reload its configuration
-
-4. Test in dot-agent-deck: Shift+Enter should now create newlines in chat applications
-
-### Verification
-
-After applying the fix:
-- Regular **Enter** should submit messages
-- **Shift+Enter** should create newlines without submitting
-
-### Note
-
-This configuration only affects Ghostty. Other terminal emulators (iTerm2, Alacritty, Warp, etc.) typically work without additional configuration.
+- **You are running the deck inside tmux.** tmux reports no keyboard-enhancement support, so the deck skips the negotiation there and Shift+Enter falls back to its previous behavior. Either run the deck outside tmux, or have tmux pass extended keys through with `set -s extended-keys always` and `set -s extended-keys-format csi-u`.
+- **Your terminal does not implement the enhanced keyboard protocol.** Bind the keystroke to the CSI u encoding yourself if your terminal supports custom keybinds — in Ghostty that is the `keybind = shift+enter=csi:13;2u` line above. The deck forwards the modifier faithfully either way.
+- **You are on an older dot-agent-deck.** Upgrade; no configuration change is needed after that.
 
 ## Hooks
 
@@ -163,6 +139,37 @@ See [Installation › Recycling the local daemon](installation.md#recycling-the-
 ### Why this happens
 
 On every launch, the TUI performs a build-version handshake with the daemon. When the binary versions differ, the resolution depends only on whether managed agents are running. With **no agents running**, the older daemon is restarted **silently** — there is nothing to lose. With **agents running** and an interactive terminal, the TUI prompts you: the prompt **names the live agents** and warns that restarting stops them, then offers a single-keystroke choice — press **S** to restart onto the new version, or any other key to **keep the current daemon** and stay attached to it with your agents intact. Keeping the current daemon is what leaves you on the older shape. When the TUI is not attached to a terminal (CI, pipes) and agents are running, it prints the recovery hint to stderr and exits non-zero instead of prompting.
+
+## A pane says "disconnected" and ignores what you type
+
+A pane whose title ends in `— disconnected` is no longer connected to an agent. Its last output stays on screen so you can read what happened, but the pane cannot accept input again — typing into it reports that it is disconnected rather than sending anything. Close the pane and start a new one; there is nothing to recover in place.
+
+The deck reaches this state only after it has already tried to reconnect and failed. When an agent goes away — a crash, an external `kill`, or a restart that never comes back — the deck looks the agent up again and re-attaches, which is what makes a normal respawn invisible to you. It gives up in two cases, and the status message tells you which:
+
+- **"Agent exited on every restart"** — the agent was found and re-attached to repeatedly, but produced no output each time. Usually the agent itself fails immediately on startup: check its command and working directory, and try running that command directly in a shell.
+- **"Agent is no longer running"** — no agent claimed the pane within the retry window, so the daemon no longer has one. Expected if you stopped it deliberately or the daemon restarted underneath the pane.
+
+If a pane disconnects and neither cause fits — the agent looks healthy, or it keeps happening — that is worth reporting. Re-run with logging on and attach the excerpt:
+
+```bash
+DOT_AGENT_DECK_LOG=1 dot-agent-deck
+```
+
+Search the log for `giving up on this pane`. The `reason` field on that line (`empty-sessions` or `no-live-agent`) identifies which path was taken, and the surrounding lines show the reconnect attempts that preceded it — that is the detail needed to tell a genuine bug from an agent that simply died.
+
+## An agent on a remote says an image or file "does not exist"
+
+You are connected to a [remote environment](remote-environments.md), you drag a screenshot onto your terminal window (or paste one with `Ctrl+V` / `Cmd+V`), and the agent replies that the file is not there.
+
+Nothing is broken. The agent runs on the **remote**, but your terminal — and the file — are on your **laptop**. Dragging inserts a laptop path, which is meaningless from the remote's point of view; pasting reads the remote's clipboard, which has no screenshot on it. Plain `ssh remote` followed by `claude` fails the same way, and the same drag into a deck running locally works fine.
+
+Copy the file to the remote first, then reference its remote path:
+
+```bash
+scp ~/Desktop/screenshot.png my-vm:/tmp/
+```
+
+See [Remote Environments › Getting files to the remote](remote-environments.md#getting-files-to-the-remote) for the full explanation and the ssh-config note.
 
 ## Enabling Debug Logs
 

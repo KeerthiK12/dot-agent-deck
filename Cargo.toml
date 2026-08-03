@@ -20,37 +20,79 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ratatui = "0.30"
-crossterm = "0.28"
+# PRD #227: EXACT pin. `ui::ctrl_c0_byte` documents crossterm 0.28.1's decoder
+# behavior down to `src/event/sys/unix/parse.rs` line numbers, because the deck's
+# Ctrl+<char> → C0 encoder has to be that decoder's exact inverse. Changing this
+# line is therefore a decoder change: re-verify those `parse.rs` references by
+# hand, and re-read `ctrl_c0_byte`'s contract, before bumping it. (The
+# `keyevent_ctrl_c0_matches_crossterm_decoder` round-trip test catches an
+# encoder/decoder mismatch under `cargo test-fast`, but not a stale line
+# reference.) NOTE: ratatui 0.30 pulls crossterm 0.29 in via `ratatui-crossterm`;
+# the two coexist because 0.28/0.29 are semver-incompatible, and this pin binds
+# only OUR direct dependency — the one `src/ui.rs` reads events from.
+crossterm = "=0.29.0"
 clap = { version = "4", features = ["derive"] }
-toml = "0.8"
+toml = "1.0"
 # PRD #20 §4.1.3: FORMAT-PRESERVING edits of the user's real `~/.codex/config.toml`
 # (scoped Codex hook trust). A serde round-trip through `toml` would reformat the
 # file and strip every comment; `toml_edit` (cargo's own crate) inserts/replaces
 # only the `hooks.state."<key>"` tables and leaves every other byte intact.
-toml_edit = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+toml_edit = "0.25"
+# reqwest 0.13 renamed 0.12's `rustls-tls` feature to `rustls`, which now also
+# brings its own root-certificate source (rustls-platform-verifier, i.e. the OS
+# trust store). Deliberately NOT naming a roots feature here: 0.13.1 offered
+# `webpki-roots`/`rustls-native-certs` and 0.13.4 removed both, so pinning one
+# breaks on the next patch bump. `rustls` is the one name stable across 0.13.
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
+  "json",
+] }
 semver = "1"
-portable-pty = "0.8"
+# EXACT pin, held back from 0.9 deliberately. 0.9.0 creates the Windows
+# pseudoconsole with `PSUEDOCONSOLE_INHERIT_CURSOR` (`src/win/psuedocon.rs`),
+# which makes conhost emit a DSR cursor-position query (`ESC[6n`) and withhold
+# the child's output until a terminal answers it. Nothing here answers, so every
+# Windows pane stalls — reproduced as `build-windows` red with a PTY snapshot of
+# exactly `"\u{1b}[6n"`.
+#
+# Answering it is the correct long-term fix, but the only seam available
+# (`pump_reader`) is shared by every agent on every platform, and a hardcoded
+# `ESC[1;1R` reply is truthful only at ConPTY startup — mid-session on Unix it
+# would be a wrong cursor position written into a live agent's stdin. That is not
+# a trade worth making for a platform that is not a release target (WSL2 runs the
+# Unix paths natively). Revisit together with native-Windows support; until then
+# 0.8.1 keeps the flag, and the whole problem, out of the tree.
+portable-pty = "=0.8.1"
 vt100 = "0.16"
-futures-util = "=0.3.32"
+futures-util = "=0.3.33"
 regex = "1"
 open = "5"
 unicode-width = "0.2"
-cron = "0.16.0"
+cron = "0.17.0"
+
+# Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
+# parser `src/version.rs` uses (`semver::Version::parse`), so the set of
+# versions the build script accepts is by construction the set the binary can
+# parse. A hand-rolled grammar drifted in both directions: it rejected valid
+# SemVer (`1.2.3+meta`, an over-`u64` numeric prerelease), which sent a
+# correctly-injected packager build down the `0.1.0` placeholder path and
+# revived the bug #250 exists to fix. Same version pin as the package dep.
+[build-dependencies]
+semver = "1"
 
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
-serial_test = "3"
+serial_test = "4"
 # PRD #201 `pi/live/002`: the injection-seeded orchestration e2e stages a
 # `session.toml` with an `OrchestrationSnapshot` by serializing a real
 # `config::SavedSession` — integration tests don't inherit the package deps, so
 # `toml` is listed here too (same version pin as the package dep). `libc` is now
 # Unix-only, declared under `[target.'cfg(unix)'.dev-dependencies]` below.
-toml = "0.8"
+toml = "1.0"
 # PRD #77 Decision 22: insta pinned to a specific version, not `latest`,
 # so a future patch release cannot silently reshape snapshot diffs.
-insta = { version = "=1.47.2", features = ["yaml"] }
+insta = { version = "=1.48.0", features = ["yaml"] }
 spec = { path = "xtask/spec" }
 # PRD #77 Decision 30 / M4: the L2 harness's recording dump also
 # regenerates the paired .md so local DOT_AGENT_DECK_RECORD=1 runs
@@ -69,12 +111,29 @@ libc = "0.2"
 # are declared here so the `#[cfg(windows)]` backends under `src/platform/`
 # have them available; the real implementations land in PRD #163.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_Security",
+    # PRD #163 M1: `ConvertSidToStringSidW`, used by
+    # `platform::paths::endpoint_user_suffix` to derive the per-user named-pipe
+    # segment from the process token's SID (the non-colliding uid analogue).
+    # Also where `SetNamedSecurityInfo` lives for the M4 dir ACLs.
+    "Win32_Security_Authorization",
     "Win32_System_JobObjects",
+    # PRD #163 M3: `GenerateConsoleCtrlEvent`/`CTRL_BREAK_EVENT`, the best-effort
+    # `killpg(SIGTERM)` stand-in `platform::proc` sends an agent's process group
+    # before the `TerminateJobObject` backstop.
+    "Win32_System_Console",
+    # PRD #163 M4: `CreateFileW`/`ReadFile`/`WriteFile` + `FILE_FLAG_OVERLAPPED`
+    # and the `SECURITY_SQOS_PRESENT` client flags — the wait-bounded synchronous
+    # named-pipe client that gives `ui::send_daemon_request_blocking` the
+    # read/write deadline Unix gets from `SO_RCVTIMEO`.
+    "Win32_Storage_FileSystem",
+    # PRD #163 M4: `OVERLAPPED` + `GetOverlappedResultEx`/`CancelIoEx`, the
+    # deadline mechanism for the above.
+    "Win32_System_IO",
 ] }
 # `%USERPROFILE%` / `%LOCALAPPDATA%` resolution for `src/platform/paths.rs`.
 dirs = "6"

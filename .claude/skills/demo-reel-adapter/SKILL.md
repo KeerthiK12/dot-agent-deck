@@ -98,6 +98,29 @@ The marker is a small trailing tag on the test's `##### <id> — <headline>` lin
 - **The marker never reaches the card.** `cargo xtask docs` copies the catalog headline (marker and all) verbatim into `test.md`'s H1, so the adapter strips a trailing ` [reel]` when lifting the title — the card shows clean text.
 - One `##### <id>` catalog line can back **several** recording dirs (two test functions sharing one catalog id); marking the single line makes all of them eligible.
 
+## Recording discipline for a `[reel]`-marked test
+
+Marking a test `[reel]` means its cast will be **published as video**, so the recording itself has to be publishable. Two constraints come from the asciinema format and the reel's frame, and neither is fixable downstream — the engine can only render what the cast contains. Both were learned the hard way on PRD #339, whose first reel ([`HYXKJokZ8JI`](https://youtu.be/HYXKJokZ8JI)) was unwatchable.
+
+### Never resize the terminal mid-recording
+
+An asciinema v2 cast stores **one** terminal size, in its header, and the format has **no resize event**. A recorder that is resized mid-session writes the **final** size — so every earlier, wider frame in the stream is replayed into a narrower grid and **hard-wraps into garbage**. PRD #339's cast declared 60 columns while its earlier frames addressed column 68, and the resulting clip was illegible.
+
+To demonstrate width-dependent behaviour, change the **app's own layout inside a fixed terminal** — open a pane, add cards, toggle the layout, narrow a card by adding a sibling — rather than changing the terminal. The app reflowing at a constant terminal size is both a valid demonstration and a recordable one. (The engine warns when a cast addresses a column beyond its header width, but by then the recording already has to be redone.)
+
+### Record at laptop-ish proportions, roughly 16:9
+
+The reel's canvas is a fixed landscape 16:9 frame and segments are **fit into it, never cropped**, so a portrait cast can only ever occupy a centre strip with black bars either side. Character cells are roughly **1:2.3**, so ~16:9 means about **4x as many columns as rows**:
+
+| Terminal grid | Rendered aspect | Covers (of a 1920x1080 frame) |
+| --- | --- | --- |
+| 60x50 | 0.52:1 | **29%** — a tall centre strip. PRD #339's first recording. |
+| 80x24 | 1.41:1 | 79% |
+| **68x16** | **1.77:1** | **99%** |
+| **200x50** | **1.70:1** | **95%** |
+
+Pick the grid for what the scenario needs to show, then keep the ratio near 4:1. The engine warns when a clip is more than 35% off the canvas aspect, naming the coverage it will get.
+
 ## Assembly rule (concern b)
 
 `assemble` is pure: given a list of recording-dir IDs it reads only `test.md` and `CATALOG.md` (no test-body parsing, no git, no network) and emits the manifest:

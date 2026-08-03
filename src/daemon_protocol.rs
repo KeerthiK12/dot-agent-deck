@@ -721,9 +721,10 @@ impl AttachResponse {
 /// the bind/accept readiness race that the old probe-and-retry pattern was
 /// papering over.
 pub fn bind_attach_listener(path: &Path) -> io::Result<IpcListener> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
+    // PRD #163 M4: only where the endpoint *is* a filesystem path. A `\\.\pipe\`
+    // name has no inode to go stale, and `remove_file` on one would fail rather
+    // than clean anything up — see `platform::ipc::remove_stale_endpoint`.
+    crate::platform::ipc::remove_stale_endpoint(path)?;
     // PRD #42 M2: `IpcListener::bind` does the umask-before-bind dance and the
     // defense-in-depth 0o600 restate that used to live here as a separate
     // `set_permissions` call, so the bound endpoint is owner-only unchanged.
@@ -1056,6 +1057,24 @@ async fn compute_write_and_submit_outcome(
     }
 }
 
+/// The orchestration bits of a `StartAgent`'s `TabMembership`, captured before
+/// the spawn moves `SpawnOptions` (PRD #93 round-5) and consumed afterwards to
+/// populate the daemon-side routing maps. A named struct rather than a tuple
+/// because PRD #140 added a fifth member and the positional form stopped being
+/// readable at the destructuring site.
+struct OrchestrationSpawnMeta {
+    /// The orchestration's resolved config name.
+    name: String,
+    /// This pane's role within the orchestration.
+    role_name: String,
+    /// Whether this pane is the orchestrator (start) role.
+    is_start_role: bool,
+    /// Round-11 auditor #C: the tab-wide cwd, the `NameCwd` disambiguator.
+    orchestration_cwd: Option<String>,
+    /// PRD #140: the per-tab instance token, when the client stamped one.
+    orchestration_id: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: IpcStream,
@@ -1241,20 +1260,24 @@ async fn handle_connection(
             // contract intact — pane_cwd_map gets StartAgent.cwd
             // per-pane, but pane_orchestration_map keys on the shared
             // orchestration cwd from the TabMembership.
-            let orchestration_meta: Option<(String, String, bool, Option<String>)> =
+            // PRD #140 M2.0: also pull the per-tab `orchestration_id` so the
+            // identity can key on it when present (see below).
+            let orchestration_meta: Option<OrchestrationSpawnMeta> =
                 tab_membership.as_ref().and_then(|tm| match tm {
                     TabMembership::Orchestration {
                         name,
                         role_name,
                         is_start_role,
                         orchestration_cwd,
+                        orchestration_id,
                         ..
-                    } if !role_name.is_empty() => Some((
-                        name.clone(),
-                        role_name.clone(),
-                        *is_start_role,
-                        orchestration_cwd.clone(),
-                    )),
+                    } if !role_name.is_empty() => Some(OrchestrationSpawnMeta {
+                        name: name.clone(),
+                        role_name: role_name.clone(),
+                        is_start_role: *is_start_role,
+                        orchestration_cwd: orchestration_cwd.clone(),
+                        orchestration_id: orchestration_id.clone(),
+                    }),
                     _ => None,
                 });
             let cwd_for_state = cwd.clone();
@@ -1297,7 +1320,13 @@ async fn handle_connection(
                     // dispatch.
                     if let (
                         Some(pane_id),
-                        Some((orch_name, role_name, is_start_role, orchestration_cwd)),
+                        Some(OrchestrationSpawnMeta {
+                            name: orch_name,
+                            role_name,
+                            is_start_role,
+                            orchestration_cwd,
+                            orchestration_id,
+                        }),
                     ) = (pane_id_env.as_deref(), orchestration_meta)
                     {
                         // Round-11 auditor #C: scope the orchestration
@@ -1318,12 +1347,31 @@ async fn handle_connection(
                         let orch_cwd = orchestration_cwd
                             .or_else(|| cwd_for_state.clone())
                             .unwrap_or_default();
+                        // PRD #140 M2.0: prefer the per-tab instance token
+                        // when the client stamped one. Two tabs of the same
+                        // orchestration in the same directory produce
+                        // identical `(name, cwd)` pairs, so the tuple alone
+                        // cannot tell their panes apart and delegate /
+                        // work-done cross-deliver between them (issue #140).
+                        // A client predating the token falls back to the
+                        // round-11 tuple — same routing behaviour as before,
+                        // so old and new clients coexist on one daemon.
+                        let identity = match orchestration_id {
+                            Some(id) => crate::state::OrchestrationIdentity::Instance {
+                                id,
+                                name: orch_name,
+                            },
+                            None => crate::state::OrchestrationIdentity::NameCwd {
+                                name: orch_name,
+                                cwd: orch_cwd,
+                            },
+                        };
                         let mut st = state.write().await;
                         st.register_pane(pane_id.to_string());
                         st.pane_role_map
                             .insert(pane_id.to_string(), role_name.clone());
                         st.pane_orchestration_map
-                            .insert(pane_id.to_string(), (orch_name, orch_cwd));
+                            .insert(pane_id.to_string(), identity);
                         if let Some(c) = cwd_for_state.clone() {
                             st.pane_cwd_map.insert(pane_id.to_string(), c);
                         }
@@ -1352,6 +1400,29 @@ async fn handle_connection(
             let dispatched_worktree = stopping_record
                 .as_ref()
                 .and_then(crate::issue_dispatch_run::worktree_of_record);
+            // PRD #126 M1 review (finding 1) / audit (finding 2): open the
+            // race-safe close transition BEFORE terminating the child. This
+            // atomically marks the pane closing and drops every outstanding
+            // delegation that touches it — as the worker AND as the
+            // orchestrator. Three defects close here: the old cancellation ran
+            // only AFTER `close_agent`, so a timer firing during the up-to-3s
+            // SIGTERM grace window injected the very nudge a deliberate close
+            // exists to suppress; it was keyed by worker pane only, so closing
+            // an ORCHESTRATOR left every worker's timer armed against a pane id
+            // a later, unrelated agent could inherit; and it left a window in
+            // which a concurrent `handle_delegate` (holding only the state read
+            // guard) could arm after the cancellation, leaving a record nothing
+            // would remove. Arming is refused while the mark is set.
+            if let Some(pane_id) = pane_id_env.as_deref() {
+                let dropped = registry.begin_pane_close(pane_id);
+                if !dropped.is_empty() {
+                    tracing::debug!(
+                        pane_id = %pane_id,
+                        dropped = dropped.len(),
+                        "StopAgent: dropped outstanding delegations touching the closing pane"
+                    );
+                }
+            }
             // PRD #92 F8 followup (auditor #1): `close_agent` runs the
             // synchronous SIGTERM-with-grace loop in
             // `terminate_child_with_grace_and_wait`, which calls
@@ -1383,8 +1454,17 @@ async fn handle_connection(
             };
             match close_outcome {
                 Ok(()) => {
-                    if let Some(pane_id) = pane_id_env {
-                        state.write().await.unregister_pane(&pane_id);
+                    if let Some(pane_id) = pane_id_env.as_deref() {
+                        // PRD #126: a deliberately closed worker owes nothing.
+                        // Without this, closing a stuck worker would still
+                        // nag the orchestrator when its timeout expired hours
+                        // later, pointing at a pane that no longer exists.
+                        // Order matters: take the state write guard and
+                        // unregister the pane first, then sweep once more and
+                        // only then clear the closing mark, so no interleaving
+                        // leaves a record behind.
+                        state.write().await.unregister_pane(pane_id);
+                        registry.finish_pane_close(pane_id, true);
                     }
                     // PRD #120 M2.4 + S1: if this agent was dispatched into a
                     // per-issue worktree, the tab close is its cleanup trigger.
@@ -1409,7 +1489,18 @@ async fn handle_connection(
                     }
                     write_resp(&mut stream, &AttachResponse::ok()).await?
                 }
-                Err(msg) => write_resp(&mut stream, &AttachResponse::err(msg)).await?,
+                Err(msg) => {
+                    // PRD #126: the close failed, so the agent is still live.
+                    // Roll the transition back by clearing the closing mark —
+                    // future delegates to this pane can arm again. The records
+                    // swept at `begin` are deliberately NOT restored: losing a
+                    // watch fails safe, resurrecting one could nag about a pane
+                    // the user explicitly asked to close.
+                    if let Some(pane_id) = pane_id_env.as_deref() {
+                        registry.finish_pane_close(pane_id, false);
+                    }
+                    write_resp(&mut stream, &AttachResponse::err(msg)).await?
+                }
             }
         }
         AttachRequest::SetAgentLabel {
@@ -2456,6 +2547,7 @@ mod tests {
                 is_start_role: false,
                 orchestration_cwd: None,
                 display_title: None,
+                orchestration_id: None,
             }),
             agent_type: None,
             seed: None,
@@ -2479,6 +2571,7 @@ mod tests {
                         is_start_role: false,
                         orchestration_cwd: None,
                         display_title: None,
+                        orchestration_id: None,
                     })
                 );
             }
@@ -2503,6 +2596,7 @@ mod tests {
                 is_start_role: false,
                 orchestration_cwd: None,
                 display_title: None,
+                orchestration_id: None,
             }),
             agent_type: None,
             rows: 0,

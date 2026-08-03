@@ -102,6 +102,8 @@ pub struct TuiDeckBuilder {
     credential_imports: Vec<CredentialImport>,
     keybindings_toml: Option<String>,
     claude_trust_paths: Vec<String>,
+    claude_trust_workdir: bool,
+    suppress_success_recording: bool,
 }
 
 impl TuiDeckBuilder {
@@ -176,10 +178,10 @@ impl TuiDeckBuilder {
         self
     }
 
-    /// Same shape as [`with_imported_claude_credentials`] but for
-    /// OpenCode (`~/.opencode/`, `~/.config/opencode/opencode.jsonc`).
-    /// The deck installs its own plugin into the tempdir HOME, so any
-    /// `~/.opencode/plugin/` directory on the host is NOT copied.
+    /// Same shape as [`with_imported_claude_credentials`] but for OpenCode.
+    /// Only `auth.json` is imported; the harness writes a minimal isolated
+    /// `opencode.json` and never copies host plugins, MCP commands, providers,
+    /// or other user configuration into a recorded real-agent run.
     pub fn with_imported_opencode_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::OpenCode);
         self
@@ -212,6 +214,28 @@ impl TuiDeckBuilder {
     /// `e2e_delegate_work_done_chain.rs::prepare_claude_home`.
     pub fn with_claude_project_trust(mut self, path: impl Into<String>) -> Self {
         self.claude_trust_paths.push(path.into());
+        self
+    }
+
+    /// Like [`with_claude_project_trust`](Self::with_claude_project_trust) but
+    /// for the per-test WORK DIR — the copied-fixture root the deck runs in and
+    /// the cwd of a `with_continue_session` pane. That path is the harness's
+    /// tempdir, minted inside `launch`, so a caller cannot name it in advance;
+    /// this flag defers the seeding until it exists. Both the raw and the
+    /// canonicalized form are trusted, because the agent's own `cwd` may come
+    /// back symlink-resolved and the trust key is matched verbatim.
+    pub fn with_claude_trust_workdir(mut self) -> Self {
+        self.claude_trust_workdir = true;
+        self
+    }
+
+    /// Keep this client out of the successful-run recording artifact even when
+    /// `DOT_AGENT_DECK_RECORD=1`. Multi-client scenarios use one primary deck
+    /// as the viewer-facing cast and secondary decks only as real control
+    /// surfaces; letting every client dump under the shared test-function name
+    /// would make the last drop nondeterministically overwrite the primary cast.
+    pub fn without_success_recording(mut self) -> Self {
+        self.suppress_success_recording = true;
         self
     }
 
@@ -267,8 +291,10 @@ pub struct TuiDeck {
     /// take_writer()` is single-shot (a 2nd call errors), so `send_keys` /
     /// `send_bytes` (and `click`/`scroll`, which call it 2×/1×) must share one
     /// stored writer rather than taking a fresh one per call. Behind a `Mutex`
-    /// so the write helpers can keep `&self`.
-    writer: Mutex<Box<dyn Write + Send>>,
+    /// so the write helpers can keep `&self`, and behind an `Arc` so the reader
+    /// thread can share it to answer the deck's terminal-capability queries
+    /// (see [`answer_terminal_queries`]).
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     parser: Arc<Mutex<vt100::Parser>>,
     last_byte_at: Arc<Mutex<Instant>>,
     cast_events: Arc<Mutex<Vec<CastEvent>>>,
@@ -294,6 +320,44 @@ pub struct TuiDeck {
     cols: u16,
     rows: u16,
     record_on_success: bool,
+    /// Exact secret values learned from imported auth files. Recording artifacts
+    /// are scrubbed immediately before they are written so an agent or provider
+    /// that echoes a credential cannot persist it in `full-stream.cast`.
+    recording_redactions: Vec<String>,
+}
+
+/// Observable terminal-cell styling from the outer vt100 screen driven by the
+/// real deck binary. L2 rendering tests use this to assert user-visible
+/// attributes such as DIM without reaching into production UI state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridCellStyle {
+    pub fgcolor: vt100::Color,
+    pub bgcolor: vt100::Color,
+    pub bold: bool,
+    pub dim: bool,
+    pub inverse: bool,
+}
+
+impl From<&vt100::Cell> for GridCellStyle {
+    fn from(cell: &vt100::Cell) -> Self {
+        Self {
+            fgcolor: cell.fgcolor(),
+            bgcolor: cell.bgcolor(),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            inverse: cell.inverse(),
+        }
+    }
+}
+
+/// Hardware-cursor state after the outer vt100 parser has consumed the real
+/// terminal stream, including the style of the cell beneath that cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalCursorSnapshot {
+    pub hidden: bool,
+    pub row: u16,
+    pub col: u16,
+    pub cell: Option<GridCellStyle>,
 }
 
 impl TuiDeck {
@@ -304,6 +368,10 @@ impl TuiDeck {
 
     /// Start a fluent builder for non-default deck launches.
     pub fn builder() -> TuiDeckBuilder {
+        // The L2 harness spawns the real binary, which lazy-spawns a daemon —
+        // both inherit this process's env. `init_test_env` covers the legacy
+        // tests; this covers every `TuiDeck`-driven one.
+        detach_from_any_live_deck();
         TuiDeckBuilder {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
@@ -312,6 +380,8 @@ impl TuiDeck {
             credential_imports: Vec::new(),
             keybindings_toml: None,
             claude_trust_paths: Vec::new(),
+            claude_trust_workdir: false,
+            suppress_success_recording: false,
         }
     }
 
@@ -395,27 +465,44 @@ impl TuiDeck {
         // (M3.1 reviewer Nit 3) so the test's harness frame doesn't
         // panic mid-suite — callers can choose whether to skip or
         // bubble up.
+        let mut recording_redactions = Vec::new();
         for kind in &builder.credential_imports {
             match kind {
                 CredentialImport::ClaudeCode => {
                     import_claude_credentials(&home).map_err(|e| e.to_string())?;
                 }
                 CredentialImport::OpenCode => {
-                    import_opencode_credentials(&home).map_err(|e| e.to_string())?;
+                    recording_redactions
+                        .extend(import_opencode_credentials(&home).map_err(|e| e.to_string())?);
                 }
                 CredentialImport::Codex => {
                     import_codex_credentials(&home).map_err(|e| e.to_string())?;
                 }
             }
         }
+        recording_redactions.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        recording_redactions.dedup();
 
         // Pre-trust folders for a daemon-spawned interactive `claude` so it
         // clears its first-run onboarding + per-folder trust gates without a
         // human keystroke. The `~/.claude.json` lands in the SAME per-test HOME
         // the daemon (and every agent it spawns) inherits.
-        if !builder.claude_trust_paths.is_empty() {
-            seed_claude_project_trust(&home, &builder.claude_trust_paths)
-                .map_err(|e| e.to_string())?;
+        let mut claude_trust_paths = builder.claude_trust_paths.clone();
+        if builder.claude_trust_workdir {
+            // The work dir only exists now, so `with_claude_trust_workdir`
+            // could not name it. Trust the raw path AND its canonical form —
+            // the agent reports its cwd symlink-resolved on some platforms and
+            // the trust key is matched verbatim.
+            claude_trust_paths.push(work.to_string_lossy().into_owned());
+            if let Ok(canon) = std::fs::canonicalize(&work) {
+                let canon = canon.to_string_lossy().into_owned();
+                if !claude_trust_paths.contains(&canon) {
+                    claude_trust_paths.push(canon);
+                }
+            }
+        }
+        if !claude_trust_paths.is_empty() {
+            seed_claude_project_trust(&home, &claude_trust_paths).map_err(|e| e.to_string())?;
         }
 
         // Write the saved-session file the deck auto-restores on startup
@@ -508,6 +595,22 @@ impl TuiDeck {
             // within 300s instead of leaking to PID 1 for hours/days. Idle
             // shutdown stays disabled (above) for determinism.
             ("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "300"),
+            // PRD #249 M3: the daemon reports a delegated worker that emits no
+            // event within a window (30s by default) as "possibly not
+            // delivered", writing a notice into the ORCHESTRATOR's pane. Most
+            // e2e delegate tests drive stand-in workers (`cat`, recorder
+            // scripts) that legitimately emit nothing, so the report would fire
+            // on every one of them and dirty panes that tests assert stay clean
+            // (`orchestration/delegate/001`). Pinned off here rather than via
+            // `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS=0`, which would also
+            // disable PRD #126's idle-worker detection that other tests
+            // exercise. A test that wants the report overrides it via
+            // `with_env`.
+            ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0"),
+            // PRD #249 M1: ordinary e2e scenarios do not pay the production
+            // post-respawn buffer. The two real readiness scenarios opt back in
+            // explicitly after this pin.
+            ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "0"),
         ];
         // PATH is required for the deck to spawn its own daemon
         // subcommand (it shells out via `current_exe`, but lookups like
@@ -560,10 +663,32 @@ impl TuiDeck {
         let reader_stop = Arc::new(AtomicBool::new(false));
         let cast_started_at = Instant::now();
 
+        // Take the PTY write side exactly once — `take_writer()` is
+        // single-shot, so the per-call `take_writer()` the write helpers used
+        // before panicked on their 2nd invocation (and dropped/closed the
+        // write side after the 1st). Stored for all writes, and shared with
+        // the reader thread so it can answer the deck's terminal-capability
+        // queries inline (PRD #227 M2, see `answer_terminal_queries`).
+        //
+        // Poisoning is accepted, not handled: every `lock()` on this mutex
+        // `unwrap()`s, so if a `send_bytes` on the test thread panics while
+        // holding it (a closed PTY write side is the realistic case), the mutex
+        // is poisoned and the reader thread's next `lock().unwrap()` panics too,
+        // killing the reader — capability queries stop being answered and the
+        // cast loses its tail. Deliberately left alone: the blast radius is one
+        // already-failing test process, and the test thread's own panic is the
+        // failure the developer sees. Recovering (`lock().unwrap_or_else(|e|
+        // e.into_inner())`) would keep a reader alive to write through a PTY that
+        // just proved unwritable, trading a clear failure for a confusing one.
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
+            pair.master.take_writer().expect("take PTY master writer"),
+        ));
+
         // Reader thread: pulls bytes off the PTY master, feeds the
-        // parser, updates `last_byte_at`, and appends to the cast log
+        // parser, updates `last_byte_at`, appends to the cast log
         // plus the byte-history buffer (M4.6 P1, for race-free
-        // `wait_for_strings_in_order`).
+        // `wait_for_strings_in_order`), and answers the deck's
+        // terminal-capability queries.
         let mut reader = pair.master.try_clone_reader().expect("clone PTY reader");
         let parser_for_reader = Arc::clone(&parser);
         let last_for_reader = Arc::clone(&last_byte_at);
@@ -571,10 +696,12 @@ impl TuiDeck {
         let history_for_reader = Arc::clone(&byte_history);
         let stop_for_reader = Arc::clone(&reader_stop);
         let start_for_reader = cast_started_at;
+        let writer_for_reader = Arc::clone(&writer);
         let reader_handle = std::thread::Builder::new()
             .name(format!("tui-deck-reader-{test_name}"))
             .spawn(move || {
                 let mut buf = [0u8; 4096];
+                let mut query_scan: Vec<u8> = Vec::new();
                 while !stop_for_reader.load(Ordering::Relaxed) {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
@@ -587,6 +714,11 @@ impl TuiDeck {
                                 data: chunk.to_vec(),
                             });
                             history_for_reader.lock().unwrap().extend_from_slice(chunk);
+                            answer_terminal_queries(
+                                chunk,
+                                &mut query_scan,
+                                &mut *writer_for_reader.lock().unwrap(),
+                            );
                         }
                         Err(e)
                             if e.kind() == std::io::ErrorKind::Interrupted
@@ -600,17 +732,12 @@ impl TuiDeck {
             })
             .expect("spawn reader thread");
 
-        let record_on_success = std::env::var_os("DOT_AGENT_DECK_RECORD").is_some();
-
-        // Take the PTY write side exactly once — `take_writer()` is
-        // single-shot, so the per-call `take_writer()` the write helpers used
-        // before panicked on their 2nd invocation (and dropped/closed the
-        // write side after the 1st). Store it for all writes.
-        let writer = pair.master.take_writer().expect("take PTY master writer");
+        let record_on_success = std::env::var_os("DOT_AGENT_DECK_RECORD").is_some()
+            && !builder.suppress_success_recording;
 
         Ok(TuiDeck {
             pty_master: pair.master,
-            writer: Mutex::new(writer),
+            writer,
             parser,
             last_byte_at,
             cast_events,
@@ -628,6 +755,7 @@ impl TuiDeck {
             cols: builder.cols,
             rows: builder.rows,
             record_on_success,
+            recording_redactions,
         })
     }
 
@@ -693,6 +821,30 @@ impl TuiDeck {
                 panic!(
                     "did not reach grid state {what:?} within {WAIT_TIMEOUT:?}.\nFinal grid:\n{grid}"
                 );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Wait for an observable grid state, then keep asserting that it remains
+    /// visible for `hold_for`. Recording-focused E2E scenarios use this for
+    /// deliberate demo beats without putting raw sleeps in test bodies.
+    pub fn wait_until_grid_then_hold(
+        &self,
+        what: &str,
+        hold_for: Duration,
+        pred: impl Fn(&str) -> bool,
+    ) {
+        self.wait_until_grid(what, |grid| pred(grid));
+        let deadline = Instant::now() + hold_for;
+        loop {
+            let grid = self.snapshot_grid();
+            assert!(
+                pred(&grid),
+                "grid state {what:?} changed during its {hold_for:?} demo hold.\nFinal grid:\n{grid}"
+            );
+            if Instant::now() >= deadline {
+                return;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -786,6 +938,57 @@ impl TuiDeck {
         }
     }
 
+    /// The deck's cumulative raw OUTPUT byte stream since launch, lossily
+    /// decoded — escape sequences included, exactly as written to the tty.
+    ///
+    /// [`wait_for_stream_string_within`](Self::wait_for_stream_string_within)
+    /// answers "did this ever appear"; this is for the questions a `contains`
+    /// cannot express — how MANY times a sequence appears, and in what ORDER
+    /// relative to another. PRD #227 M2 needs both: the terminal-mode push must
+    /// appear before its matching pop, and the pop must appear exactly once (a
+    /// double pop would discard a flag set another program on the terminal's
+    /// stack owns). Escape bytes survive the decode unharmed — `ESC` is 0x1b,
+    /// valid UTF-8 — so a needle like `"\x1b[>1u"` matches literally.
+    pub fn stream_text(&self) -> String {
+        String::from_utf8_lossy(&self.byte_history.lock().unwrap()).into_owned()
+    }
+
+    /// Wait for the deck PROCESS to exit and for every byte it wrote on the way
+    /// out to be drained into the rolling history, then report whether it exited
+    /// successfully (`Some(true)`) or with a failure status (`Some(false)`).
+    /// `None` means it was still alive when `timeout` elapsed.
+    ///
+    /// Required by any assertion that COUNTS or ORDERS bytes from the teardown
+    /// path. [`wait_for_stream_string_within`](Self::wait_for_stream_string_within)
+    /// returns the instant the FIRST match appears, which during a shutdown is
+    /// before the process is actually gone — so a duplicate emitted a moment
+    /// later (a second terminal-mode pop from an RAII `Drop`, say) lands after
+    /// the snapshot, and an "exactly once" assertion passes against an
+    /// implementation that in fact does it twice. Draining to exit first closes
+    /// that window; the exit status additionally proves the quit path returned
+    /// cleanly instead of dying on the way out.
+    pub fn wait_for_exit_within(&mut self, timeout: Duration) -> Option<bool> {
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break status,
+                // Unwaitable (already reaped elsewhere) — report it as "did not
+                // observe a clean exit" rather than inventing a status.
+                Err(_) => return None,
+                Ok(None) => {}
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // The writer is dead, so no NEW bytes can appear — but the reader thread
+        // may still be a poll cycle behind on what the PTY already buffered.
+        // Quiescence is the drain signal, and it is reached promptly now.
+        self.wait_until_quiescent();
+        Some(status.success())
+    }
+
     /// Like [`wait_for_string`] (scans the RECONSTRUCTED vt100 grid, so
     /// styled UI chrome — a bottom-bar affordance, a tab label, a card
     /// field — whose glyphs are written as separate styled runs is matched
@@ -802,6 +1005,35 @@ impl TuiDeck {
         let deadline = Instant::now() + timeout;
         loop {
             if self.snapshot_grid().contains(needle) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Like [`wait_for_grid_string_within`](Self::wait_for_grid_string_within)
+    /// but for a predicate over the whole rendered grid — for the cases a single
+    /// substring cannot express (a spatial relationship between two strings, a
+    /// count, an ordering).
+    ///
+    /// Returns `true` as soon as `pred` holds, `false` if `timeout` elapses.
+    /// Non-panicking on purpose: the caller re-checks the condition afterwards
+    /// so the failure diagnostic is its own detailed assertion rather than a
+    /// generic harness message. Prefer this over
+    /// [`wait_until_quiescent`](Self::wait_until_quiescent) whenever a LIVE
+    /// agent occupies a pane — an agent that animates a spinner never leaves the
+    /// deck's byte stream idle, so quiescence never arrives.
+    pub fn wait_for_grid_predicate_within(
+        &self,
+        timeout: Duration,
+        pred: impl Fn(&str) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if pred(&self.snapshot_grid()) {
                 return true;
             }
             if Instant::now() > deadline {
@@ -995,11 +1227,90 @@ impl TuiDeck {
         &self.fixture_path
     }
 
+    /// The deck's per-test `HOME` — the same one the lazily-spawned daemon and
+    /// every agent it spawns inherit. Tests that must seed HOME-relative agent
+    /// config for a directory only known AFTER launch (e.g. Claude's per-folder
+    /// trust for the tempdir fixture root, which
+    /// [`TuiDeckBuilder::with_claude_project_trust`] cannot know in advance)
+    /// write into it via [`seed_claude_trust_in_home`] before opening the pane.
+    pub fn home_dir(&self) -> &Path {
+        &self.home
+    }
+
     /// Return the parsed grid contents — used by `wait_for_string`
     /// internally and by tests that want to assert on full-screen
     /// state.
     pub fn snapshot_grid(&self) -> String {
         self.parser.lock().unwrap().screen().contents()
+    }
+
+    /// Return the real terminal's current hardware-cursor visibility, position,
+    /// and cell styling as parsed from the deck's PTY output.
+    pub fn terminal_cursor_snapshot(&self) -> TerminalCursorSnapshot {
+        let parser = self.parser.lock().unwrap();
+        let screen = parser.screen();
+        let (row, col) = screen.cursor_position();
+        TerminalCursorSnapshot {
+            hidden: screen.hide_cursor(),
+            row,
+            col,
+            cell: screen.cell(row, col).map(GridCellStyle::from),
+        }
+    }
+
+    /// Wait for the real terminal's hardware cursor visibility to match the
+    /// requested state. Live agent TUIs can repaint their prompt one frame
+    /// after their final output, so cursor assertions need the same bounded
+    /// observable-state wait as grid assertions.
+    pub fn wait_for_terminal_cursor_hidden_within(&self, hidden: bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.terminal_cursor_snapshot().hidden == hidden {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Return the styling at one cell of the real terminal grid.
+    pub fn grid_cell_style(&self, row: u16, col: u16) -> Option<GridCellStyle> {
+        self.parser
+            .lock()
+            .unwrap()
+            .screen()
+            .cell(row, col)
+            .map(GridCellStyle::from)
+    }
+
+    /// Locate visible ASCII text and return the style of each occupied cell.
+    /// The mode-indication L2 tests use unique ASCII sentinels, so one character
+    /// maps to one terminal cell and the returned vector aligns with `needle`.
+    pub fn visible_text_cell_styles(&self, needle: &str) -> Option<Vec<GridCellStyle>> {
+        assert!(
+            needle.is_ascii(),
+            "visible text style lookup requires ASCII"
+        );
+        let parser = self.parser.lock().unwrap();
+        let screen = parser.screen();
+        let grid = screen.contents();
+        for (row, line) in grid.lines().enumerate() {
+            let Some(byte_col) = line.find(needle) else {
+                continue;
+            };
+            let col = line[..byte_col].chars().count() as u16;
+            let styles = (0..needle.len() as u16)
+                .map(|offset| {
+                    screen
+                        .cell(row as u16, col + offset)
+                        .map(GridCellStyle::from)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(styles);
+        }
+        None
     }
 
     /// Write raw bytes to the deck's PTY master — the input side of the
@@ -1034,6 +1345,15 @@ impl TuiDeck {
         let cx = col + 1;
         let cy = row + 1;
         self.send_bytes(format!("\x1b[<{cb};{cx};{cy}M").as_bytes());
+    }
+
+    /// Send `count` mouse wheel notches at the given 0-based grid cell.
+    /// Keeps repeated input emission in the harness so E2E test bodies can
+    /// describe the intended interaction without fixed-count polling loops.
+    pub fn scroll_n(&self, col: u16, row: u16, down: bool, count: usize) {
+        for _ in 0..count {
+            self.scroll(col, row, down);
+        }
     }
 
     /// Locate the first occurrence of `needle` in the current rendered
@@ -1161,7 +1481,7 @@ impl TuiDeck {
         // half-written.
 
         // final-grid.txt
-        let grid = self.snapshot_grid();
+        let grid = redact_known_credentials_text(&self.snapshot_grid(), &self.recording_redactions);
         atomic_write(&dir.join("final-grid.txt"), grid.as_bytes())?;
 
         // final-grid.svg — minimal monospace render. Not pixel-perfect,
@@ -1179,7 +1499,8 @@ impl TuiDeck {
         let fixture_src = self.fixture_path.join(".dot-agent-deck.toml");
         if fixture_src.exists() {
             let bytes = std::fs::read(&fixture_src)?;
-            atomic_write(&dir.join("fixture.toml"), &bytes)?;
+            let redacted = redact_known_credentials_bytes(&bytes, &self.recording_redactions);
+            atomic_write(&dir.join("fixture.toml"), &redacted)?;
         }
         Ok(())
     }
@@ -1198,16 +1519,193 @@ impl TuiDeck {
         s.push_str(&header.to_string());
         s.push('\n');
         let events = self.cast_events.lock().unwrap();
-        for ev in events.iter() {
+        let redacted_events = redact_cast_events(&events, &self.recording_redactions);
+        for (ev, redacted) in events.iter().zip(redacted_events) {
             // Lossy UTF-8 decoding is what asciinema players expect:
             // raw bytes that are valid UTF-8 round-trip, invalid bytes
             // are replaced rather than dropped.
-            let data = String::from_utf8_lossy(&ev.data);
+            let data = String::from_utf8_lossy(&redacted);
             let line = serde_json::json!([ev.offset_secs, "o", data]);
             s.push_str(&line.to_string());
             s.push('\n');
         }
         s
+    }
+}
+
+const RECORDING_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED-CREDENTIAL]";
+
+/// Locate non-overlapping credential occurrences, preferring the longest value
+/// at a shared start. Matching bytes before JSON/asciinema encoding also catches
+/// secrets that contain characters the artifact format would escape.
+fn credential_redaction_ranges(data: &[u8], credentials: &[String]) -> Vec<(usize, usize)> {
+    let patterns: Vec<&[u8]> = credentials
+        .iter()
+        .map(String::as_bytes)
+        .filter(|value| !value.is_empty())
+        .collect();
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let matched = patterns
+            .iter()
+            .filter(|pattern| data[offset..].starts_with(pattern))
+            .max_by_key(|pattern| pattern.len());
+        if let Some(pattern) = matched {
+            ranges.push((offset, offset + pattern.len()));
+            offset += pattern.len();
+        } else {
+            offset += 1;
+        }
+    }
+    ranges
+}
+
+fn redact_known_credentials_bytes(data: &[u8], credentials: &[String]) -> Vec<u8> {
+    let ranges = credential_redaction_ranges(data, credentials);
+    if ranges.is_empty() {
+        return data.to_vec();
+    }
+    let mut redacted = Vec::with_capacity(data.len());
+    let mut copied = 0;
+    for (start, end) in ranges {
+        redacted.extend_from_slice(&data[copied..start]);
+        redacted.extend_from_slice(RECORDING_CREDENTIAL_REDACTION);
+        copied = end;
+    }
+    redacted.extend_from_slice(&data[copied..]);
+    redacted
+}
+
+fn redact_known_credentials_text(text: &str, credentials: &[String]) -> String {
+    String::from_utf8_lossy(&redact_known_credentials_bytes(
+        text.as_bytes(),
+        credentials,
+    ))
+    .into_owned()
+}
+
+/// Redact against the concatenated PTY stream, then project the result back onto
+/// the original timestamped events. A provider can split a token across two PTY
+/// reads, so redacting each event independently would leave that token intact in
+/// `full-stream.cast`.
+fn redact_cast_events(events: &[CastEvent], credentials: &[String]) -> Vec<Vec<u8>> {
+    let stream: Vec<u8> = events
+        .iter()
+        .flat_map(|event| event.data.iter().copied())
+        .collect();
+    let ranges = credential_redaction_ranges(&stream, credentials);
+    if ranges.is_empty() {
+        return events.iter().map(|event| event.data.clone()).collect();
+    }
+
+    let mut projected = Vec::with_capacity(events.len());
+    let mut event_start = 0;
+    let mut range_index = 0;
+    for event in events {
+        let event_end = event_start + event.data.len();
+        while range_index < ranges.len() && ranges[range_index].1 <= event_start {
+            range_index += 1;
+        }
+        let mut out = Vec::with_capacity(event.data.len());
+        let mut copied = event_start;
+        let mut index = range_index;
+        while index < ranges.len() && ranges[index].0 < event_end {
+            let (secret_start, secret_end) = ranges[index];
+            if copied < secret_start {
+                out.extend_from_slice(&stream[copied..secret_start.min(event_end)]);
+            }
+            if secret_start >= event_start {
+                out.extend_from_slice(RECORDING_CREDENTIAL_REDACTION);
+            }
+            copied = secret_end.min(event_end).max(copied);
+            index += 1;
+        }
+        if copied < event_end {
+            out.extend_from_slice(&stream[copied..event_end]);
+        }
+        projected.push(out);
+        event_start = event_end;
+    }
+    projected
+}
+
+// ---------------------------------------------------------------------------
+// Terminal-capability query answering (PRD #227 M2)
+// ---------------------------------------------------------------------------
+
+/// Query the deck emits to detect the enhanced (kitty) keyboard protocol:
+/// `ESC [ ? u` (report current progressive-enhancement flags). Written by
+/// `crossterm::terminal::supports_keyboard_enhancement()`.
+const QUERY_KITTY_FLAGS: &[u8] = b"\x1b[?u";
+/// The second half of that probe: `ESC [ c` (primary device attributes, DA1).
+const QUERY_DA1: &[u8] = b"\x1b[c";
+/// Reply to [`QUERY_KITTY_FLAGS`]: `CSI ? 1 u` — "the terminal currently has
+/// DISAMBIGUATE_ESCAPE_CODES set". crossterm treats ANY flags reply (even
+/// `0`) as "the protocol is supported", so this is what makes the deck's
+/// `supports_keyboard_enhancement()` return `Ok(true)` and push its flag.
+const REPLY_KITTY_FLAGS: &[u8] = b"\x1b[?1u";
+/// Reply to [`QUERY_DA1`]: a plain VT220-class DA1 response. crossterm parses
+/// any `CSI ? … c` as `PrimaryDeviceAttributes` without inspecting the
+/// attributes, and drains it from its queue right after the flags reply.
+const REPLY_DA1: &[u8] = b"\x1b[?62;22c";
+/// Longest query pattern above, in bytes — how much trailing context the
+/// scan buffer must retain so a query split across two PTY reads still
+/// matches.
+const LONGEST_QUERY_LEN: usize = 4;
+
+/// Answer the terminal-capability queries the deck writes to its tty, so its
+/// startup probe returns immediately instead of blocking.
+///
+/// PRD #227 M2 made the deck call
+/// `crossterm::terminal::supports_keyboard_enhancement()` at TUI startup. That
+/// writes `ESC[?u ESC[c` to the tty and then blocks for up to **2000 ms**
+/// waiting for a reply. A PTY that never answers costs every L2 test ~2 s of
+/// its 10 s [`WAIT_TIMEOUT`] budget before the first frame paints — and leaves
+/// the enhanced protocol disabled, so no e2e test could exercise the
+/// modifier-aware forwarding path the PRD is about. Answering both halves
+/// makes the probe return in milliseconds AND models a kitty-capable terminal,
+/// which is the configuration the fix targets.
+///
+/// `scan` carries state across calls: unmatched bytes are consumed, and up to
+/// `LONGEST_QUERY_LEN - 1` trailing bytes are retained so a query straddling
+/// two reads is still found. Retained bytes are always match-free (the scan
+/// below runs to exhaustion), so no query is ever answered twice.
+fn answer_terminal_queries(chunk: &[u8], scan: &mut Vec<u8>, writer: &mut dyn Write) {
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .filter(|_| !needle.is_empty())
+    }
+
+    scan.extend_from_slice(chunk);
+    let mut reply: Vec<u8> = Vec::new();
+    loop {
+        // Answer in the order the queries appear on the wire, so the deck's
+        // crossterm sees the flags reply before the DA1 terminator.
+        let hit = [
+            (
+                find(scan, QUERY_KITTY_FLAGS),
+                QUERY_KITTY_FLAGS,
+                REPLY_KITTY_FLAGS,
+            ),
+            (find(scan, QUERY_DA1), QUERY_DA1, REPLY_DA1),
+        ]
+        .into_iter()
+        .filter_map(|(pos, q, r)| pos.map(|p| (p, q.len(), r)))
+        .min_by_key(|(pos, _, _)| *pos);
+        let Some((pos, qlen, r)) = hit else { break };
+        reply.extend_from_slice(r);
+        scan.drain(..pos + qlen);
+    }
+    if scan.len() > LONGEST_QUERY_LEN - 1 {
+        let cut = scan.len() - (LONGEST_QUERY_LEN - 1);
+        scan.drain(..cut);
+    }
+    if !reply.is_empty() {
+        let _ = writer.write_all(&reply);
+        let _ = writer.flush();
     }
 }
 
@@ -1458,22 +1956,104 @@ fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 }
 
 /// PRD #77 Decision 26 runtime-skip helper: returns `Ok(())` when the
-/// host has the Claude Code CLI on PATH and a readable credentials
+/// host has the Claude Code CLI on PATH and a **usable** credentials
 /// file; `Err(reason)` with a stable user-facing message otherwise.
 /// Tests pair this with [`skip_unless!`].
+///
+/// PRD #126: mere existence of `~/.claude/.credentials.json` used to be
+/// enough, so a truncated, unparseable or fully expired credential set passed
+/// the check and the scenario then failed deep inside a PTY wait with a
+/// confusing timeout. The extra checks below are all **cheap and offline** —
+/// no probe request, unlike [`check_codex_available`], because the equivalent
+/// `claude -p` round trip costs real tokens on every e2e run. Expiry is
+/// treated the way Claude Code itself treats it: an expired access token is
+/// fine while a live refresh token can still renew it, so only the case where
+/// BOTH are spent is reported as unusable — see [`claude_oauth_usable`], which
+/// holds that half as a pure function so `tests/real_agent_preflight.rs` can
+/// assert every accepted and rejected credential shape.
 pub fn check_claude_available() -> Result<(), String> {
     if !cli_invocable("claude") {
         return Err("Claude Code CLI not installed (could not invoke `claude --version`)".into());
     }
-    let home = host_home();
-    let creds = home.join(".claude").join(".credentials.json");
-    if !creds.exists() {
-        // M3.1 auditor S1: surface the abstract path so the message
-        // doesn't leak whether the operator is on `/Users/<name>` vs
-        // `/root` vs `/home/<name>`.
+    // M3.1 auditor S1: every message below surfaces the abstract path so it
+    // doesn't leak whether the operator is on `/Users/<name>` vs `/root` vs
+    // `/home/<name>`.
+    const MISSING: &str = "Claude Code credentials not found at ~/.claude/.credentials.json — \
+                           log in with `claude login`";
+    let creds = host_home().join(".claude").join(".credentials.json");
+    // A symlink here would let a stray link outside the reviewed HOME decide
+    // the outcome; mirror `check_codex_available`'s regular-file requirement.
+    if !std::fs::symlink_metadata(&creds)
+        .map(|meta| meta.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return Err(MISSING.into());
+    }
+    let raw = std::fs::read_to_string(&creds).map_err(|_| MISSING.to_string())?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
+        "Claude Code credentials at ~/.claude/.credentials.json are not valid JSON — \
+         log in again with `claude login`"
+            .to_string()
+    })?;
+    let oauth = parsed.get("claudeAiOauth").ok_or(
+        "Claude Code credentials at ~/.claude/.credentials.json carry no `claudeAiOauth` \
+         entry — log in with `claude login`",
+    )?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    claude_oauth_usable(oauth, now_ms)
+}
+
+/// The credential-shape half of [`check_claude_available`], split out as a pure
+/// function of the `claudeAiOauth` object and the current epoch-millisecond
+/// clock so every shape below is covered by a test instead of by argument
+/// (`tests/real_agent_preflight.rs`).
+///
+/// PRD #126 audit follow-up: each expiry is bound to the presence of ITS OWN
+/// token. The first cut evaluated the two expiries independently of the two
+/// tokens, and because an ABSENT expiry means "no expiry information" (never
+/// "expired"), the missing half of an asymmetric credential set voted "live" for
+/// a token that was not there at all. So an expired sole access token with no
+/// refresh token passed, and so did an access-token-less set whose refresh token
+/// was already spent — precisely the "credentials look fine, then the real agent
+/// fails deep inside a PTY wait" case this check exists to catch.
+///
+/// Two deliberate decisions are preserved. An expired access token with a LIVE
+/// refresh token still passes, because Claude Code itself refreshes on that
+/// shape. And there is **no probe request**: revoked credentials and network
+/// failures remain an accepted false-positive class, since a live round trip
+/// would spend real tokens on every e2e run.
+pub fn claude_oauth_usable(oauth: &serde_json::Value, now_ms: i64) -> Result<(), String> {
+    let non_empty = |key: &str| {
+        oauth
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty())
+    };
+    if !non_empty("accessToken") && !non_empty("refreshToken") {
         return Err(
-            "Claude Code credentials not found at ~/.claude/.credentials.json — \
-             log in with `claude login`"
+            "Claude Code credentials at ~/.claude/.credentials.json carry no access or refresh \
+             token — log in with `claude login`"
+                .into(),
+        );
+    }
+    // Both timestamps are epoch MILLISECONDS. An absent field is treated as
+    // "no expiry information", never as expired.
+    let live = |key: &str| {
+        oauth
+            .get(key)
+            .and_then(|v| v.as_i64())
+            .is_none_or(|at| at > now_ms)
+    };
+    // A token is usable only if it is BOTH present and unexpired; an expiry
+    // alone says nothing about a token that does not exist.
+    let usable = |token_key: &str, expiry_key: &str| non_empty(token_key) && live(expiry_key);
+    if !usable("accessToken", "expiresAt") && !usable("refreshToken", "refreshTokenExpiresAt") {
+        return Err(
+            "Claude Code credentials at ~/.claude/.credentials.json are expired and cannot be \
+             refreshed — log in again with `claude login`"
                 .into(),
         );
     }
@@ -1508,8 +2088,43 @@ pub fn check_opencode_available() -> Result<(), String> {
     )
 }
 
-/// Cheap model used by Codex availability probes and real-agent e2e coverage.
-pub const CODEX_TEST_MODEL: &str = "gpt-5.1-codex-mini";
+/// Compiled-in default cheap model for Codex availability probes and real-agent
+/// e2e coverage. Correct for a ChatGPT-subscription (oauth) `~/.codex/auth.json`,
+/// which is what most dev boxes here log in with.
+const CODEX_TEST_MODEL_DEFAULT: &str = "gpt-5.1-codex-mini";
+
+/// Env var that overrides [`codex_test_model`] on a host whose Codex credentials
+/// cannot reach the default.
+pub const CODEX_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_CODEX_TEST_MODEL";
+
+/// Cheap model used by Codex availability probes and real-agent e2e coverage —
+/// [`CODEX_TEST_MODEL_DEFAULT`] unless `DOT_AGENT_DECK_CODEX_TEST_MODEL` is set
+/// to a non-empty value, which wins.
+///
+/// The override exists because the `codex-*` model family is served only to
+/// ChatGPT-subscription (oauth) credentials. With an **API-key**
+/// `~/.codex/auth.json`, `codex exec --model gpt-5.1-codex-mini` answers
+/// `404 Not Found: Model not found gpt-5.1-codex-mini` from
+/// `https://api.openai.com/v1/responses`, so [`check_codex_available`] fails its
+/// probe and every real-agent Codex test SKIPS — a silent no-coverage outcome
+/// that reads as a pass. Such a host exports e.g.
+/// `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5-nano` (an equally cheap model an API
+/// key *can* reach). The default is deliberately left alone so subscription-auth
+/// environments keep running codex-mini.
+///
+/// Single source of truth: [`check_codex_available`] probes the model this
+/// returns, so the availability gate and the model the tests actually launch can
+/// never disagree.
+pub fn codex_test_model() -> &'static str {
+    static MODEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODEL.get_or_init(|| {
+        std::env::var(CODEX_TEST_MODEL_ENV)
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| CODEX_TEST_MODEL_DEFAULT.to_string())
+    })
+}
 
 /// Runtime-skip helper for real Codex coverage. A version check alone is not
 /// enough: this verifies persisted auth and performs one minimal model request,
@@ -1555,7 +2170,7 @@ pub fn check_codex_available() -> Result<(), String> {
             "--sandbox",
             "read-only",
             "--model",
-            CODEX_TEST_MODEL,
+            codex_test_model(),
             "-c",
             "model_reasoning_effort=\"low\"",
             "--color",
@@ -1586,7 +2201,11 @@ pub fn check_codex_available() -> Result<(), String> {
         .any(|marker| lower.contains(marker))
     {
         return Err(format!(
-            "Codex could not reach model {CODEX_TEST_MODEL} with the current authentication"
+            "Codex could not reach model {} with the current authentication — if this host's \
+             ~/.codex/auth.json is an API key rather than a ChatGPT subscription, set {} to a \
+             model the key can reach (e.g. gpt-5-nano)",
+            codex_test_model(),
+            CODEX_TEST_MODEL_ENV,
         ));
     }
     Ok(())
@@ -1607,14 +2226,48 @@ fn cli_invocable(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// PRD #126: opt-in switch that turns every runtime skip into a hard failure.
+///
+/// A runtime skip prints `SKIP: …` and RETURNS NORMALLY, so nextest reports a
+/// skipped real-agent test as **passed**. A pre-PR `cargo test-e2e` can
+/// therefore read fully green while a `[reel]`-marked scenario asserted
+/// nothing at all — and the demo reel then ships with that clip silently
+/// missing. Set this to a truthy value on any run whose whole point is that
+/// the real-agent coverage actually executed (release gates, reel builds);
+/// leave it unset for ad-hoc runs on a machine without the credentials, where
+/// the permissive skip is the useful behavior.
+pub const REQUIRE_REAL_E2E_ENV: &str = "DOT_AGENT_DECK_REQUIRE_REAL_E2E";
+
+/// Whether [`REQUIRE_REAL_E2E_ENV`] is set to a truthy value. `0`, `false`,
+/// `no`, empty and unset all mean "permissive skips"; anything else opts in.
+#[allow(dead_code)]
+pub fn require_real_e2e() -> bool {
+    match std::env::var(REQUIRE_REAL_E2E_ENV) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// Body of the `skip_unless!` early-return: if `result` is `Err`,
 /// print `SKIP: <reason>` to stderr and indicate to the caller it
 /// should return. Pairs with the `skip_unless!` macro below.
+///
+/// Under [`REQUIRE_REAL_E2E_ENV`] the same `Err` **panics** instead, carrying
+/// the reason, so an unmet precondition is reported as a failure rather than
+/// disappearing into a green run.
 #[doc(hidden)]
 pub fn _skip_if_err(result: Result<(), String>) -> bool {
     match result {
         Ok(()) => false,
         Err(reason) => {
+            assert!(
+                !require_real_e2e(),
+                "{REQUIRE_REAL_E2E_ENV} is set, so this real-agent test must RUN, not skip: \
+                 {reason}"
+            );
             eprintln!("SKIP: {reason}");
             true
         }
@@ -1731,6 +2384,18 @@ fn seed_claude_project_trust(test_home: &Path, trust_paths: &[String]) -> std::i
     let bytes = serde_json::to_vec(&cfg)
         .map_err(|e| std::io::Error::other(format!("serialize .claude.json: {e}")))?;
     write_credential_file_atomic_0o600(&test_home.join(".claude.json"), &bytes)
+}
+
+/// Public wrapper over [`seed_claude_project_trust`] for tests whose trusted
+/// directory is only known AFTER the deck launched — the per-test tempdir
+/// fixture root, which [`TuiDeckBuilder::with_claude_project_trust`] (a
+/// pre-launch builder step) cannot name in advance. Call it with
+/// [`TuiDeck::home_dir`] BEFORE the pane that runs `claude` in `trust_paths` is
+/// spawned; claude reads `~/.claude.json` at agent start, so the seeding only
+/// has to beat the spawn, not the launch.
+#[allow(dead_code)]
+pub fn seed_claude_trust_in_home(home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
+    seed_claude_project_trust(home, trust_paths)
 }
 
 /// Strip the top-level `hooks` key from a Claude Code settings.json.
@@ -1867,10 +2532,8 @@ fn read_credential_file_no_symlink(
         .map_err(|e| std::io::Error::other(format!("read {redacted_display}: {e}")))
 }
 
-/// Validate that a source path is a regular file (not a symlink),
-/// without reading it. Used by paths where we want to surface
-/// symlink-rejection before delegating the actual copy/read to a
-/// caller.
+/// Validate that a source path is a regular file (not a symlink) without
+/// reading it. Claude settings use this before their JSONC sanitization pass.
 fn require_regular_file_no_symlink(
     real_path: &Path,
     redacted_display: &str,
@@ -1903,6 +2566,41 @@ fn require_regular_dir_no_symlink(real_path: &Path, redacted_display: &str) -> s
         return Err(std::io::Error::other(format!(
             "refusing to import {redacted_display}: expected a regular directory"
         )));
+    }
+    Ok(())
+}
+
+/// Validate every directory between `source_home` and a credential leaf with
+/// `symlink_metadata`, in order, before opening the leaf. Checking only
+/// `auth.json` is insufficient: `~/.local/share/opencode` itself may be a
+/// symlink, in which case leaf metadata has already followed the source root.
+fn require_nonsymlink_credential_ancestors(
+    source_home: &Path,
+    credential_path: &Path,
+    redacted_display: &str,
+) -> std::io::Result<()> {
+    let relative = credential_path.strip_prefix(source_home).map_err(|_| {
+        std::io::Error::other(format!(
+            "refusing to import {redacted_display}: path is outside the source HOME"
+        ))
+    })?;
+    let Some(parent) = relative.parent() else {
+        return Ok(());
+    };
+    let mut current = source_home.to_path_buf();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::other(format!(
+                "refusing to import {redacted_display}: a source directory ancestor is a symlink"
+            )));
+        }
+        if !metadata.file_type().is_dir() {
+            return Err(std::io::Error::other(format!(
+                "refusing to import {redacted_display}: a source ancestor is not a directory"
+            )));
+        }
     }
     Ok(())
 }
@@ -1949,76 +2647,136 @@ fn write_credential_file_atomic_0o600(dst: &Path, bytes: &[u8]) -> std::io::Resu
     Ok(())
 }
 
-/// Copy the host user's OpenCode credentials into the per-test
-/// tempdir HOME. Mirrors [`import_claude_credentials`] — copies the
-/// auth state but NOT any `plugin/` directory (the deck installs its
-/// own OpenCode plugin pointing at the per-test paths). M3.1
-/// auditor S2 + S3: atomic 0o600 creation for `auth.json`, and
-/// source-path symlinks are refused with a redacted error.
-///
-/// This helper is currently dead code (no `chain-smoke/opencode/*`
-/// test calls it — see PRD § Discovered Issues `di-001`). Kept so
-/// the OpenCode chain-smoke test can be added without harness
-/// changes once the deck install-path bug is fixed.
-fn import_opencode_credentials(test_home: &Path) -> std::io::Result<()> {
-    let mut imported_any = false;
+fn collect_credential_values(value: &serde_json::Value, key: Option<&str>, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (child_key, child) in map {
+                collect_credential_values(child, Some(child_key), out);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                collect_credential_values(child, key, out);
+            }
+        }
+        serde_json::Value::String(value) => {
+            let key = key.unwrap_or_default().to_ascii_lowercase();
+            let sensitive_key = key == "key"
+                || key == "access"
+                || key == "refresh"
+                || key.contains("token")
+                || key.contains("secret")
+                || key.contains("password")
+                || key.contains("authorization")
+                || key.contains("api_key")
+                || key.contains("apikey");
+            if !value.is_empty() && (sensitive_key || value.len() >= 16) {
+                out.push(value.clone());
+            }
+        }
+        _ => {}
+    }
+}
 
-    let source_roots = [
-        host_home().join(".local").join("share").join("opencode"),
-        host_home().join(".opencode"),
+fn opencode_recording_redactions(
+    bytes: &[u8],
+    redacted_display: &str,
+) -> std::io::Result<Vec<String>> {
+    let auth: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        std::io::Error::other(format!(
+            "refusing to import {redacted_display}: auth file is not valid JSON: {error}"
+        ))
+    })?;
+    let mut values = Vec::new();
+    collect_credential_values(&auth, None, &mut values);
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values.dedup();
+    Ok(values)
+}
+
+const MINIMAL_OPENCODE_CONFIG: &str = "{}\n";
+
+/// Copy only the host user's OpenCode `auth.json` credentials into the per-test
+/// HOME and synthesize a minimal config. Host `opencode.json(c)`, plugins, MCP
+/// commands and provider configuration are deliberately never imported: `--auto`
+/// may execute them, and the PTY stream is persisted as a recording artifact.
+/// Every source ancestor plus the auth leaf is checked without following
+/// symlinks; destination credentials are atomically created with mode 0o600.
+fn import_opencode_credentials_from(
+    source_home: &Path,
+    test_home: &Path,
+) -> std::io::Result<Vec<String>> {
+    let mut imported_auth = false;
+    let mut recording_redactions = Vec::new();
+    let credentials = [
+        (
+            source_home
+                .join(".local")
+                .join("share")
+                .join("opencode")
+                .join("auth.json"),
+            test_home
+                .join(".local")
+                .join("share")
+                .join("opencode")
+                .join("auth.json"),
+            "~/.local/share/opencode/auth.json",
+        ),
+        (
+            source_home.join(".opencode").join("auth.json"),
+            test_home.join(".opencode").join("auth.json"),
+            "~/.opencode/auth.json",
+        ),
+        (
+            source_home
+                .join(".config")
+                .join("opencode")
+                .join("auth.json"),
+            test_home.join(".config").join("opencode").join("auth.json"),
+            "~/.config/opencode/auth.json",
+        ),
     ];
-    let redacted_roots = ["~/.local/share/opencode", "~/.opencode"];
-    for (src, redacted) in source_roots.iter().zip(redacted_roots.iter()) {
-        // Stat with symlink_metadata so a symlinked root is refused
-        // rather than silently followed.
-        let Ok(meta) = std::fs::symlink_metadata(src) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::other(format!(
-                "refusing to import {redacted}: expected a regular directory, found a symlink"
-            )));
+    for (src, dst, redacted) in credentials {
+        match require_nonsymlink_credential_ancestors(source_home, &src, redacted) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
         }
-        if !meta.file_type().is_dir() {
-            continue;
+        match std::fs::symlink_metadata(&src) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
         }
-        let rel = src
-            .strip_prefix(host_home())
-            .expect("HOME-relative source path");
-        let dst = test_home.join(rel);
-        copy_dir_excluding_plugin_subdir(src, &dst)?;
-        // Re-stamp auth.json with the strict mode atomically — the
-        // dir-copy walks regular files via fs::copy which inherits
-        // host mode bits.
-        let dst_auth = dst.join("auth.json");
-        if dst_auth.is_file() {
-            let bytes = std::fs::read(&dst_auth)?;
-            write_credential_file_atomic_0o600(&dst_auth, &bytes)?;
-        }
-        imported_any = true;
+        let bytes = read_credential_file_no_symlink(
+            &src,
+            &format!("OpenCode credentials not found at {redacted}"),
+            redacted,
+        )?;
+        std::fs::create_dir_all(dst.parent().expect("OpenCode auth path has a parent"))?;
+        write_credential_file_atomic_0o600(&dst, &bytes)?;
+        recording_redactions.extend(opencode_recording_redactions(&bytes, redacted)?);
+        imported_auth = true;
     }
 
-    // ~/.config/opencode/opencode.jsonc is the user-editable config.
-    let src_cfg = host_home()
-        .join(".config")
-        .join("opencode")
-        .join("opencode.jsonc");
-    if src_cfg.exists() {
-        require_regular_file_no_symlink(&src_cfg, "~/.config/opencode/opencode.jsonc")?;
-        let dst_cfg_dir = test_home.join(".config").join("opencode");
-        std::fs::create_dir_all(&dst_cfg_dir)?;
-        std::fs::copy(&src_cfg, dst_cfg_dir.join("opencode.jsonc"))?;
-        imported_any = true;
-    }
-
-    if !imported_any {
+    if !imported_auth {
         return Err(std::io::Error::other(
-            "OpenCode credentials not found under ~/.local/share/opencode or ~/.opencode — \
-             log in with `opencode auth login`"
+            "OpenCode credentials not found at ~/.local/share/opencode/auth.json, \
+             ~/.opencode/auth.json, or ~/.config/opencode/auth.json — log in with \
+             `opencode auth login`"
                 .to_string(),
         ));
     }
-    Ok(())
+    let dst_cfg_dir = test_home.join(".config").join("opencode");
+    std::fs::create_dir_all(&dst_cfg_dir)?;
+    std::fs::write(dst_cfg_dir.join("opencode.json"), MINIMAL_OPENCODE_CONFIG)?;
+
+    recording_redactions.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    recording_redactions.dedup();
+    Ok(recording_redactions)
+}
+
+fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
+    import_opencode_credentials_from(&host_home(), test_home)
 }
 
 /// Copy only Codex's authentication state into the isolated test HOME and seed
@@ -2045,34 +2803,6 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
         })?)
     );
     write_credential_file_atomic_0o600(&dst.join("config.toml"), config.as_bytes())
-}
-
-/// Like `copy_dir_recursively` but skips any top-level `plugin/`
-/// child — the deck auto-installs its own OpenCode plugin into the
-/// tempdir HOME and we do NOT want the host's plugin firing too.
-fn copy_dir_excluding_plugin_subdir(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if ty.is_dir() {
-            if entry.file_name() == "plugin" {
-                continue;
-            }
-            copy_dir_recursively(&from, &to)?;
-        } else if ty.is_file() {
-            std::fs::copy(&from, &to)?;
-        } else {
-            return Err(std::io::Error::other(format!(
-                "OpenCode credential entry {} is not a regular file or directory \
-                 (symlinks/sockets/FIFOs are not supported)",
-                from.display()
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Write a minimal `session.toml` containing exactly one pane that
@@ -2187,7 +2917,60 @@ static LOCK_DIR_GUARD: OnceLock<tempfile::TempDir> = OnceLock::new();
 /// per-binary lock-dir tempdir on first call; subsequent calls are
 /// no-ops.
 #[allow(dead_code)]
+/// Endpoint env vars that point a process at a *specific* deck's daemon.
+const DECK_ENDPOINT_VARS: [&str; 4] = [
+    "DOT_AGENT_DECK_SOCKET",
+    "DOT_AGENT_DECK_ATTACH_SOCKET",
+    "DOT_AGENT_DECK_PANE_ID",
+    "DOT_AGENT_DECK_AGENT_ID",
+];
+
+/// Detach this test process from any real deck before it can spawn anything.
+///
+/// Running the suite from inside a deck pane means the shell carries that pane's
+/// `DOT_AGENT_DECK_SOCKET` / `_PANE_ID`. Anything a test spawns inherits them
+/// unless every spawn site overrides them, and then its hooks post into the
+/// developer's LIVE deck: a card appears for a fixture pane id and vanishes
+/// again. Observed repeatedly in the wild — a real `deck.log` shows 48 such
+/// events across `worker-pane`, `codex-trust-test-pane`,
+/// `pane-live-transition`, `pane-stream-postlock` and
+/// `pane-rebound-before-delivery`.
+///
+/// `ff5170d` scrubs these in `agent_pty::spawn`, which is necessary but not
+/// sufficient: four of those five ids leaked from a tree that already had that
+/// fix, via other spawn paths (harness-launched binaries, hook-posting helpers).
+/// Removing the vars from the test process itself covers every spawn path at
+/// once, including ones added later, because there is nothing left to inherit.
+///
+/// Tests that need an endpoint set it explicitly per-child (`Command::env`), so
+/// removing the ambient value changes nothing for them.
+fn detach_from_any_live_deck() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let leaked: Vec<&str> = DECK_ENDPOINT_VARS
+            .into_iter()
+            .filter(|v| std::env::var_os(v).is_some())
+            .collect();
+        if !leaked.is_empty() {
+            // Loud on purpose: the run is now safe, but the contributor should
+            // know their shell was pointed at a live deck.
+            eprintln!(
+                "note: detaching this test process from a live deck — cleared {}. \
+                 Tests set endpoints per-child; the inherited values would have \
+                 sent fixture hook events into your running dashboard.",
+                leaked.join(", ")
+            );
+        }
+        for var in DECK_ENDPOINT_VARS {
+            // SAFETY: called before the harness spawns any thread or child, via
+            // a `OnceLock` so it happens exactly once per test process.
+            unsafe { std::env::remove_var(var) };
+        }
+    });
+}
+
 pub fn init_test_env() {
+    detach_from_any_live_deck();
     LOCK_DIR_GUARD.get_or_init(|| {
         tempfile::Builder::new()
             .prefix("dot-agent-deck-test-lock-")
@@ -2371,6 +3154,20 @@ pub fn spawn_daemon_serve_with_env(
     // 5000ms stays comfortably above spawn/005's 2s "not yet delivered" window
     // and below every 10s delivery window. A test may override via `extra_env`.
     env.push(("DOT_AGENT_DECK_SESSION_START_WAIT_MS".into(), "5000".into()));
+    // PRD #249 M3: same pin as the TuiDeck harness above — the silent-worker
+    // report would fire on every stand-in worker that emits no events and write
+    // a notice into an orchestrator pane. Off by default here; a test that wants
+    // the report sets it in `extra_env`, which is layered after this.
+    env.push((
+        "DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS".into(),
+        "0".into(),
+    ));
+    // PRD #249 M1: same zero pin as `TuiDeck`; targeted scenarios layer a
+    // non-zero value through `extra_env` after this baseline.
+    env.push((
+        "DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS".into(),
+        "0".into(),
+    ));
     for (k, v) in extra_env {
         env.push(((*k).to_string(), (*v).to_string()));
     }
@@ -3014,6 +3811,217 @@ pub fn agent_records_on(socket: &Path) -> Vec<dot_agent_deck::agent_pty::AgentRe
     }
 }
 
+/// One-shot read of a daemon-side pane's PTY scrollback via
+/// `AttachRequest::Snapshot`, over `socket`. The daemon replies `RESP ok`, then
+/// (when the ring is non-empty) a single `STREAM_OUT` frame carrying the whole
+/// snapshot, then `STREAM_END` — so unlike `AttachStream` this never subscribes
+/// to live bytes and returns as soon as the ring has been drained.
+///
+/// Returns the raw bytes exactly as the agent wrote them (escape sequences
+/// included); pair with [`terminal_search_key`] to search them wrap-insensitively.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn pane_snapshot_on(socket: &Path, agent_id: &str) -> Vec<u8> {
+    use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_STREAM_END, KIND_STREAM_OUT};
+    use std::io::{Read, Write};
+
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
+        return Vec::new();
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    let req = dot_agent_deck::daemon_protocol::AttachRequest::Snapshot {
+        id: agent_id.to_string(),
+    };
+    let payload = serde_json::to_vec(&req).expect("serialize Snapshot");
+    let mut header = [0u8; 5];
+    header[0] = KIND_REQ;
+    header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    if stream.write_all(&header).is_err() || stream.write_all(&payload).is_err() {
+        return Vec::new();
+    }
+    let _ = stream.flush();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out: Vec<u8> = Vec::new();
+    while Instant::now() < deadline {
+        let mut fh = [0u8; 5];
+        match stream.read_exact(&mut fh) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        let kind = fh[0];
+        let len = u32::from_be_bytes([fh[1], fh[2], fh[3], fh[4]]) as usize;
+        let mut body = vec![0u8; len];
+        if len > 0 && read_exact_with_deadline(&mut stream, &mut body, deadline).is_err() {
+            break;
+        }
+        match kind {
+            KIND_STREAM_OUT => out.extend_from_slice(&body),
+            KIND_STREAM_END => break,
+            _ => continue,
+        }
+    }
+    out
+}
+
+/// Remove ANSI/VT control sequences from a raw PTY byte stream, leaving the
+/// printable text (and its line breaks) behind.
+///
+/// Handles the four families a full-screen agent TUI emits: CSI (`ESC [ … final`),
+/// OSC (`ESC ] … BEL | ST`), the string families DCS/SOS/PM/APC (`ESC P|X|^|_ … ST`),
+/// and plain two-byte escapes (charset selection, `ESC =`, …). Without this a
+/// naive substring search over the raw bytes can miss text that a redraw split
+/// with a colour reset, and a naive "drop the punctuation" pass would splice the
+/// escape's own digits INTO the word.
+#[allow(dead_code)]
+pub fn strip_ansi(bytes: &[u8]) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let Some(&kind) = bytes.get(i) else { break };
+        match kind {
+            b'[' => {
+                i += 1;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b']' | b'P' | b'X' | b'^' | b'_' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Collapse terminal text to a WRAP-INSENSITIVE search key: strip the escape
+/// sequences, then keep only `[A-Za-z0-9._/-]`.
+///
+/// An agent TUI renders inside a bordered box and hard-wraps long lines, so a
+/// pointer like `.dot-agent-deck/worker-task-coder.md` can reach the scrollback
+/// as `…worker-task-cod` / newline / `│ er.md`. Dropping every space, newline
+/// and box-drawing glyph rejoins it, while the kept set is narrow enough that a
+/// path- or sentence-shaped needle stays distinctive. Apply to BOTH the haystack
+/// and the needle (see [`search_key`]).
+#[allow(dead_code)]
+pub fn terminal_search_key(bytes: &[u8]) -> String {
+    search_key(&strip_ansi(bytes))
+}
+
+/// The [`terminal_search_key`] normalization for an already-decoded string —
+/// used on the needle side so both sides of the comparison agree.
+#[allow(dead_code)]
+pub fn search_key(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        .collect()
+}
+
+/// A daemon-side pane's scrollback, collapsed to a [`terminal_search_key`].
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn pane_search_key_on(socket: &Path, agent_id: &str) -> String {
+    terminal_search_key(&pane_snapshot_on(socket, agent_id))
+}
+
+/// Poll a daemon-side pane's scrollback until `needle` appears in it
+/// (wrap-insensitively), or `timeout` elapses. Decision 21: the polling lives
+/// here, never in an `e2e_*.rs` body. The interval is deliberately coarse — each
+/// round pulls the pane's whole scrollback ring across the attach socket.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn wait_for_pane_text_on(
+    socket: &Path,
+    agent_id: &str,
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    let key = search_key(needle);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if pane_search_key_on(socket, agent_id).contains(&key) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(750));
+    }
+}
+
+/// Block until every listed agent's scrollback has stopped growing for `quiet`
+/// AND has been producing output for at least `min_alive` — i.e. each
+/// interactive agent has finished painting its UI and is waiting for input.
+/// Returns whether every pane settled before `timeout` (a `false` is worth
+/// logging, not necessarily fataling: a still-busy agent may still accept
+/// injected input).
+///
+/// Mirrors `e2e_delegate_work_done_chain::wait_until_worker_ready`, but reads
+/// the panes through the daemon's attach socket so it works for agents the test
+/// did not spawn itself. The `min_alive` floor matters: a TUI agent can pause
+/// briefly mid-init before its input is interactive, and bytes injected during
+/// that lull are dropped.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn wait_until_panes_settled(
+    socket: &Path,
+    agent_ids: &[String],
+    quiet: Duration,
+    min_alive: Duration,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut last_len: HashMap<&str, usize> = HashMap::new();
+    let mut stable_since: HashMap<&str, Instant> = HashMap::new();
+    let mut first_output: HashMap<&str, Instant> = HashMap::new();
+    loop {
+        let mut all_ready = true;
+        for id in agent_ids {
+            let id = id.as_str();
+            let len = pane_snapshot_on(socket, id).len();
+            if len > 0 {
+                first_output.entry(id).or_insert_with(Instant::now);
+            }
+            if last_len.get(id).copied() != Some(len) {
+                last_len.insert(id, len);
+                stable_since.insert(id, Instant::now());
+            }
+            all_ready &= first_output
+                .get(id)
+                .is_some_and(|f| f.elapsed() >= min_alive)
+                && stable_since.get(id).is_some_and(|s| s.elapsed() >= quiet);
+        }
+        if all_ready {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// Poll `ListAgents` until an agent whose `display_name` equals `name` is
 /// present (`want_present = true`) or absent (`want_present = false`), or the
 /// timeout elapses. Returns whether the desired condition held.
@@ -3134,6 +4142,92 @@ pub fn wait_for_path(path: &Path, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     path.exists()
+}
+
+/// Human description of what `path` holds *right now* — missing, unreadable,
+/// or its exact contents. Used by the content-polling waiters below so a
+/// timeout says whether the file never appeared, appeared empty, or simply
+/// carried the wrong text.
+#[allow(dead_code)]
+fn describe_file(path: &Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => format!("{} contains {contents:?}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("{} does not exist", path.display())
+        }
+        Err(e) => format!("{} is unreadable: {e}", path.display()),
+    }
+}
+
+/// Bounded poll until `path` is readable AND `matches` accepts its contents.
+/// `Ok(())` on match; on timeout, `Err(`[`describe_file`]`)`.
+///
+/// Prefer this over [`wait_for_path`] + an immediate `read_to_string` whenever
+/// the assertion is about the file's CONTENTS. An agent that writes a sentinel
+/// with a shell redirect — `printf 'X' > sentinel.txt` — has the shell CREATE
+/// the file before `printf` writes into it, so a reader that waits only for
+/// EXISTENCE can win the race and observe an empty string (PRD #225; this is
+/// exactly how `orchestration/delegate/009` failed in-suite while passing in
+/// isolation). Polling the content closes that window.
+#[allow(dead_code)]
+fn wait_for_file_matching(
+    path: &Path,
+    timeout: Duration,
+    matches: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && matches(&contents)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(describe_file(path));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Bounded poll until `path`'s TRIMMED contents equal `expected` exactly.
+/// See [`wait_for_file_matching`] for why content — not existence — is polled.
+#[allow(dead_code)]
+pub fn wait_for_file_trimmed_eq(
+    path: &Path,
+    expected: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_for_file_matching(path, timeout, |contents| contents.trim() == expected)
+}
+
+/// Bounded poll until `path`'s contents contain `needle`. The bounded,
+/// non-panicking sibling of [`wait_for_file_contains`] (which is pinned to the
+/// harness-wide [`WAIT_TIMEOUT`]); see [`wait_for_file_matching`] for why
+/// content — not existence — is polled.
+#[allow(dead_code)]
+pub fn wait_for_file_containing(
+    path: &Path,
+    needle: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_for_file_matching(path, timeout, |contents| contents.contains(needle))
+}
+
+/// Bounded poll until `path` holds at least `want` COMPLETE — i.e.
+/// newline-terminated — lines. For PATH recorder shims that append one line per
+/// exec (`printf '…\n' >> "$RECORD"`), which is how the launch-shape tests
+/// observe what was actually launched.
+///
+/// Counts newline terminators rather than [`str::lines`] deliberately:
+/// `lines()` also counts a half-written trailing line, so a reader using it can
+/// return the instant the shell has created the file and still read an
+/// incomplete record. That is the same race [`wait_for_file_matching`]
+/// documents, one level up.
+#[allow(dead_code)]
+pub fn wait_for_file_lines(path: &Path, want: usize, timeout: Duration) -> Result<(), String> {
+    wait_for_file_matching(path, timeout, |contents| {
+        contents.matches('\n').count() >= want
+    })
 }
 
 /// Blocking `read_exact` bounded by a wall-clock `deadline`, tolerating the
@@ -3372,6 +4466,36 @@ pub async fn wait_for_path_async(path: &Path, timeout: Duration) -> bool {
     }
 }
 
+/// Poll a spawned agent's PTY snapshot until the *rendered* screen contains
+/// `needle`, returning `(found, rendered_screen)`. The raw PTY byte stream is
+/// replayed through a `vt100` grid first, so a streamed/redrawn reply (an agent
+/// prints token-by-token with cursor moves) is matched on its final rendered
+/// state rather than on raw, escape-interleaved bytes. Ported from
+/// `e2e_delegate_work_done_chain.rs::wait_for_rendered_text` so the poll lives
+/// in `common` (Decision 21).
+#[allow(dead_code)]
+pub async fn wait_for_rendered_agent_text(
+    registry: &dot_agent_deck::agent_pty::AgentPtyRegistry,
+    agent_id: &str,
+    needle: &str,
+    timeout: Duration,
+) -> (bool, String) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let snap = registry.snapshot(agent_id).unwrap_or_default();
+        let mut parser = vt100::Parser::new(40, 120, 0);
+        parser.process(&snap);
+        let screen = parser.screen().contents();
+        if screen.contains(needle) {
+            return (true, screen);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return (false, screen);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// A background collector of an in-process daemon's re-broadcast `AgentEvent`s.
 /// Subscribe (via [`start`](Self::start)) BEFORE spawning the agent whose events
 /// you want, so its first status report can't be missed. Drop aborts the reader.
@@ -3445,6 +4569,35 @@ impl BroadcastEventLog {
 #[cfg(test)]
 mod harness_unit_tests {
     use super::*;
+
+    /// The whole probe arriving in one PTY read (the common case) is answered
+    /// with the flags reply first, then DA1 — the order crossterm expects.
+    #[test]
+    fn answer_terminal_queries_replies_to_a_single_chunk_probe() {
+        let mut scan = Vec::new();
+        let mut out: Vec<u8> = Vec::new();
+        answer_terminal_queries(b"\x1b[?u\x1b[c", &mut scan, &mut out);
+        assert_eq!(out, b"\x1b[?1u\x1b[?62;22c".to_vec());
+    }
+
+    /// A probe split across two reads must still be answered exactly once —
+    /// the scan buffer retains just enough trailing context to complete the
+    /// match, and retained bytes are guaranteed match-free so nothing is
+    /// answered twice.
+    #[test]
+    fn answer_terminal_queries_handles_a_split_probe_without_duplicating() {
+        let mut scan = Vec::new();
+        let mut out: Vec<u8> = Vec::new();
+        answer_terminal_queries(b"noise\x1b[?", &mut scan, &mut out);
+        assert!(out.is_empty(), "no complete query yet, got {out:?}");
+        answer_terminal_queries(b"u\x1b[c more", &mut scan, &mut out);
+        assert_eq!(out, b"\x1b[?1u\x1b[?62;22c".to_vec());
+
+        // Ordinary follow-up output must not re-trigger a reply.
+        let before = out.len();
+        answer_terminal_queries(b"plain output\r\n", &mut scan, &mut out);
+        assert_eq!(out.len(), before, "a second reply leaked: {out:?}");
+    }
 
     #[test]
     fn strip_jsonc_comments_drops_line_and_block_comments() {
@@ -3632,5 +4785,122 @@ mod harness_unit_tests {
         );
         assert_eq!(matched, 2);
         assert!(!terminal);
+    }
+
+    /// Scenario: Import a synthetic OpenCode auth file while a hostile host config
+    /// sits beside it. Only auth is copied, a minimal isolated config is created,
+    /// and the imported token is registered for recording redaction.
+    #[test]
+    fn opencode_import_is_auth_only_and_synthesizes_minimal_config() {
+        let source = tempfile::tempdir().expect("source HOME");
+        let target = tempfile::tempdir().expect("target HOME");
+        let source_auth = source.path().join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(source_auth.parent().unwrap()).expect("source auth dir");
+        std::fs::write(
+            &source_auth,
+            r#"{"openrouter":{"type":"api","key":"test-secret-token-249"}}"#,
+        )
+        .expect("source auth");
+        let source_config = source.path().join(".config/opencode/opencode.jsonc");
+        std::fs::create_dir_all(source_config.parent().unwrap()).expect("source config dir");
+        std::fs::write(
+            &source_config,
+            r#"{"plugin":["host-plugin"],"mcp":{"host":{"command":"leak-secret"}}}"#,
+        )
+        .expect("host config");
+
+        let redactions = import_opencode_credentials_from(source.path(), target.path())
+            .expect("isolated OpenCode import");
+        let imported_auth = target.path().join(".local/share/opencode/auth.json");
+        assert_eq!(
+            std::fs::read_to_string(imported_auth).unwrap(),
+            r#"{"openrouter":{"type":"api","key":"test-secret-token-249"}}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.path().join(".config/opencode/opencode.json")).unwrap(),
+            MINIMAL_OPENCODE_CONFIG
+        );
+        assert!(
+            !target
+                .path()
+                .join(".config/opencode/opencode.jsonc")
+                .exists(),
+            "the host OpenCode config must never enter the isolated HOME"
+        );
+        assert_eq!(redactions, vec!["test-secret-token-249"]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(target.path().join(".local/share/opencode/auth.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "imported auth mode must stay private");
+        }
+    }
+
+    /// Scenario: Point an OpenCode data root at an external directory through a
+    /// symlink and attempt credential import. The importer must reject the root
+    /// before reading its otherwise-regular auth leaf.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_import_rejects_a_symlinked_source_root() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::tempdir().expect("source HOME");
+        let target = tempfile::tempdir().expect("target HOME");
+        let external = tempfile::tempdir().expect("external OpenCode root");
+        std::fs::write(
+            external.path().join("auth.json"),
+            r#"{"openrouter":{"key":"must-not-be-imported"}}"#,
+        )
+        .expect("external auth");
+        std::fs::create_dir_all(source.path().join(".local/share")).expect("source parents");
+        symlink(external.path(), source.path().join(".local/share/opencode"))
+            .expect("symlink OpenCode root");
+
+        let error = import_opencode_credentials_from(source.path(), target.path())
+            .expect_err("a symlinked OpenCode root must be refused")
+            .to_string();
+        assert!(
+            error.contains("source directory ancestor is a symlink")
+                && error.contains("~/.local/share/opencode/auth.json")
+                && !error.contains(source.path().to_string_lossy().as_ref()),
+            "the refusal must identify the redacted source without exposing HOME: {error}"
+        );
+    }
+
+    /// Scenario: Split a known credential across adjacent PTY recording chunks.
+    /// Artifact redaction must match across the chunk boundary while preserving
+    /// the two timestamped cast events.
+    #[test]
+    fn recording_redaction_catches_credentials_split_across_events() {
+        let events = vec![
+            CastEvent {
+                offset_secs: 0.1,
+                data: b"prefix token-".to_vec(),
+            },
+            CastEvent {
+                offset_secs: 0.2,
+                data: b"secret-249 suffix".to_vec(),
+            },
+        ];
+        let redacted = redact_cast_events(&events, &["token-secret-249".to_string()]);
+        assert_eq!(redacted.len(), events.len());
+        let joined: Vec<u8> = redacted.into_iter().flatten().collect();
+        assert!(
+            joined
+                .windows(RECORDING_CREDENTIAL_REDACTION.len())
+                .any(|window| window == RECORDING_CREDENTIAL_REDACTION)
+        );
+        assert!(
+            !joined
+                .windows(b"token-secret-249".len())
+                .any(|window| window == b"token-secret-249"),
+            "the split credential survived recording redaction: {:?}",
+            String::from_utf8_lossy(&joined)
+        );
     }
 }

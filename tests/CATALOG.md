@@ -30,14 +30,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/pane/002 — Closing a pane via `Ctrl+w` removes its card from the dashboard.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** card count decreases by one; the focused card index stays within bounds.
+- **Asserts:** Ctrl+W opens the close confirmation; navigating from default Cancel to Close and confirming removes the card, and the focused card index stays within bounds.
 - **Does not assert:** which card receives focus next (`dashboard/selection/*` covers selection-after-close).
 - **Platform coverage:** mac+linux.
 
 ##### dashboard/pane/003 — The dashboard pane (tab 0) is never closable.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** `Ctrl+w` from the dashboard tab with no card selected is a no-op (no panic, dashboard still rendered, tab count unchanged).
+- **Asserts:** `Ctrl+w` from the dashboard tab with no card selected is a no-op: neither the pane-scoped nor tab-scoped confirmation opens, no panic occurs, the dashboard remains rendered, and the tab count is unchanged.
 - **Does not assert:** any status-line text.
 - **Platform coverage:** mac+linux.
 
@@ -52,14 +52,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L1 (ratatui `TestBackend` + `insta`).
 - **Agent:** none.
 - **Asserts:** with three session cards and a `Tab::Dashboard` whose `selected_session_id` points at the second card (`sess-beta`), `ui::sync_and_derive_selection` derives index 1 (not 0); the rendered snapshot shows the `▸` selection marker and highlighted border on the second card while the first and third stay unselected.
-- **Does not assert:** keyboard-driven selection movement (`dashboard/selection/*`); absolute-time clocks (`Last:` is rendered against a fixed test clock).
+- **Does not assert:** keyboard-driven selection movement (`dashboard/selection/*`); elapsed-time rollover behavior (the fixture uses one current instant for all three cards).
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/pane/006 — Card row shows `Dir:` (working directory basename), `Last:` (elapsed since last activity), `Tools:` (tool count), `Prmt:` (latest user prompts).
-- **Layer:** L1.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`).
 - **Agent:** none.
-- **Asserts:** rendered card snapshot has all four labels in order with the supplied fixture data.
-- **Does not assert:** absolute-time clocks (`Last:` is rendered against a fixed test clock).
+- **Asserts:** an over-long working-directory basename renders with all four fields retained; `Dir:` owns the full inner content width and truncates with an ellipsis immediately before the right border, while `Last:` / `Tools:` live in the bottom border. A second 14-column render proves a newline in `abc\ndef` costs no terminal cell, so all six visible prompt cells render as `abcdef` without an ellipsis.
+- **Does not assert:** the card-stats degradation thresholds (covered by `dashboard/card-stats/002` and `/004`); elapsed-time rollovers beyond the fixture's stable one-hour display.
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/pane/007 — A Pi pane's card renders the Pi agent-type identity (PRD #201 M2.2).
@@ -85,11 +85,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 #### dashboard/stats
 
-##### dashboard/stats/001 — Mixed-agent dashboards show a per-agent-type count breakdown in the stats bar (PRD #20, review finding 10).
+##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
 - **Layer:** L1 (in-process `AppState::aggregate_stats` + ratatui `TestBackend` stats render).
-- **Agent:** none (one synthetic Claude Code session and one synthetic Codex session).
-- **Asserts:** when more than one real agent type is active, the rendered stats bar visibly contains `1 ClaudeCode` and `1 Codex` alongside the aggregate status totals.
-- **Does not assert:** single-agent-type suppression or exact badge colors.
+- **Agent:** none (22 synthetic sessions: 14 Claude Code + 8 Codex).
+- **Asserts:** rendered at 60 columns — the width the bar gets from the left dashboard column when panes are open — the bar still shows `22 active` and the `tools` total, and contains no `ClaudeCode` / `Codex` per-type segments. The breakdown (PRD #20, review finding 10) cost ~30 columns at this width and silently clipped the `tools` total off the right edge; the type information stays on the cards, which each carry a registry-colored badge.
+- **Does not assert:** priority-ordered truncation for bars too narrow even for the status counts, or exact badge colors.
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/density
@@ -121,6 +121,43 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** a fully-populated session card (3 prompts + 3 tools) rendered at each tier's own `rendered_height` in an 80-column wide viewport has zero blank inner rows between its last content line and the bottom border on Compact, Normal, and Spacious — reserved card height equals rendered content height.
 - **Does not assert:** the exact `card_height` value per tier (covered by `card_height_001_content_derived_values`); the mid-card blank separator line on Normal/Spacious (intentional content, not a trailing row).
 - **Platform coverage:** mac+linux+windows.
+
+#### dashboard/card-stats
+
+##### dashboard/card-stats/001 — A wide card renders its full Last/Tools stats at the bottom-right border.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`).
+- **Agent:** none (synthetic Thinking-session fixture).
+- **Asserts:** a comfortably wide live card right-aligns `Last: 1h  Tools: 14` in its bottom border, and neither counter appears on an inner content row; the complete character buffer is snapshotted. A wide placeholder `No agent` card also retains its full Last/Tools counters in the bottom border.
+- **Does not assert:** narrow-width degradation (covered by `/002` and `/004`); border title colors.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/card-stats/002 — A 20-column card degrades its stats label without damaging border corners.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`).
+- **Agent:** none (synthetic Thinking-session fixture).
+- **Asserts:** with 18 usable bottom-border cells, the card selects `1h · 14 tools`, preserves both bottom corner glyphs, and renders no dedicated stats content row; the complete character buffer is snapshotted.
+- **Does not assert:** widths below the shortest form or the complete transition sweep (covered by `/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/card-stats/003 — Crossing the former 60-column breakpoint is structurally inert.
+- **Layer:** L1 (ratatui `TestBackend`, comparative buffer inspection).
+- **Agent:** none (the same synthetic session rendered on both sides of the old breakpoint).
+- **Asserts:** real Normal-density card renders with 59 and 61 inner columns expose the same `Dir:` / `Prmt:` / `Last:` / `Tools:` labels and keep those labels on the same rows.
+- **Does not assert:** production density selection, because the available L1 render seams require the caller to supply a density; exact horizontal truncation or full-buffer equality, since changing width legitimately changes available text cells.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/card-stats/004 — The stats-label degradation ladder transitions at exact display widths.
+- **Layer:** L1 pure-data unit test over the hidden-public label selector.
+- **Agent:** none.
+- **Asserts:** the reference input selects no label below 9 cells, `2m · 14` from 9, `2m · 14 tools` from 15, and `Last: 2m  Tools: 14` from 21 onward, with both sides of the exact transitions pinned. Property sweeps over `1h 5m`/1234, a six-digit tool count, empty elapsed text, and Unicode/combining text prove every result fits its display-column budget and is the first, widest fitting form.
+- **Does not assert:** ratatui title placement or styling (covered by `/001` and `/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/card-stats/005 — A real interactive Haiku card keeps its height while opening its pane narrows the card and degrades the bottom-border counters. [reel]
+- **Layer:** L2 PTY-attached (the real `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, with recording enabled for a `full-stream.cast`).
+- **Agent:** REAL interactive Claude Code on `claude-haiku-4-5-20251001`, with onboarding/project trust seeded and `--allowedTools Bash`; no `-p`. A second real client on the observer's daemon performs the ordinary Ctrl+N flow and types the prefix-only prompt after Claude's native editor becomes ready; the recorded client observes the live card and later attaches that same daemon pane on demand.
+- **Asserts:** the sentinel response and native Thinking/Working/Idle plus Bash hook prove the genuine spawn → agent → work path; at one fixed 68×16 recording size, the unattached card shows a nonzero, right-aligned full `Last: … Tools: …` label only in its bottom border, then attaching the real pane narrows the dashboard and selects the shorter `… · … tools` rung while preserving `└`/`┘`, the tool count, the `Dir:`/`Prmt:`/`Bash` row offsets, and card height.
+- **Does not assert:** exact Claude prose beyond the discovered sentinel filename; exact elapsed-time text; multiple cards or density changes caused by terminal height.
+- **Platform coverage:** mac+linux.
 
 #### dashboard/selection
 
@@ -204,7 +241,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/selection/012 — An inactive selection makes the close-pane action a no-op (no fall back to card 0).
 - **Layer:** L1 (in-process `dispatch_action(Action::CloseSelected)`).
 - **Agent:** none (3 synthetic dashboard cards with pane ids).
-- **Asserts:** with `selected_index = None` (inactive, nothing armed), dispatching `Action::CloseSelected` issues no `close_pane` call and removes no session — it does NOT close card 0. Encodes the PRD invariant (inactive = nothing armed) alongside `dashboard/pane/003`.
+- **Asserts:** with `selected_index = None` (inactive, nothing armed), dispatching `Action::CloseSelected` opens no confirmation, issues no `close_pane` call, and removes no session — it does NOT arm or close card 0. Encodes the PRD invariant (inactive = nothing armed) alongside `dashboard/pane/003`.
 - **Does not assert:** the active-selection close behaviour, or mode/orchestration whole-tab teardown.
 - **Platform coverage:** mac+linux+windows.
 
@@ -232,7 +269,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/selection/016 — The inactive-selection close no-op (012) does NOT suppress closing an active Mode/Orchestration tab via Ctrl+W.
 - **Layer:** L1 (in-process `dispatch_action(Action::CloseSelected)` against a recording `PaneController`).
 - **Agent:** none (a real Mode tab, then a real Orchestration tab; no dashboard cards armed).
-- **Asserts:** with a Mode tab active and `selected_index == None`, dispatching `Action::CloseSelected` closes that tab (tab count drops back to the lone Dashboard); the same holds for an active Orchestration tab. Bounds the `dashboard/selection/012` no-op gate: the inactive-selection guard suppresses closing an unarmed dashboard CARD, but a Mode/Orchestration TAB still closes via Ctrl+W. Regression for the PR #151 e2e failure `e2e_render_contract::layout_002` (keyboard Ctrl+W stopped closing a Mode tab because the close routed through the inactive-selection gate).
+- **Asserts:** with a Mode tab active and `selected_index == None`, dispatching `Action::CloseSelected` opens confirmation and `ConfirmCloseSelected` closes that tab (tab count drops back to the lone Dashboard); the same holds for an active Orchestration tab. Bounds the `dashboard/selection/012` no-op gate: the inactive-selection guard suppresses an unarmed dashboard CARD, but an active Mode/Orchestration TAB remains a valid confirmation target. Regression for the PR #151 e2e failure `e2e_render_contract::layout_002`.
 - **Does not assert:** the per-pane PTY teardown / role-pane stop (covered by the L2 `tabs/mode/002`, `tabs/orchestration/002`); the dashboard-card close no-op itself (covered by `dashboard/selection/012`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -256,6 +293,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** open the orchestration, detach to Normal mode, arm a role with `j` (a `▸` marker appears), round-trip Orchestration → Dashboard → Orchestration (the `▸` clears), then press Enter — the `▸` selection marker must reappear on the restored role. This is the real-binary repro of the PR #151 manual-test regression the L1 mocks missed (they never run the real reconcile + focus-restore on an orchestration tab): pre-fix the role pane is already focused on return, so Enter is not a focus transition and the highlight never repaints (the final wait times out).
 - **Does not assert:** which role index is restored; the cyan controller focus border; the Dashboard's own Enter-paint (already worked via the reconcile transition and is covered at L1 by `dashboard/selection/017`).
 - **Platform coverage:** mac+linux.
+
+##### dashboard/selection/020 — Enter on a live card whose pane is not wired locally attaches it on demand instead of deleting the card.
+- **Layer:** L1 (`dispatch_action(Action::Focus, …)` against a mock controller whose `focus_pane` fails until `try_hydrate_pane` attaches the pane).
+- **Agent:** none.
+- **Asserts:** Enter attempts the on-demand attach exactly once, the session survives, and the deck enters `PaneInput`. Pre-fix the failed `focus_pane` was read as "stale card" and the LIVE session was removed — only the digit-jump path (`dashboard/selection/003`) carried the PRD #127 guard.
+- **Does not assert:** the real `list_agents`/attach round-trip behind `EmbeddedPaneController::hydrate_pane` (L2 territory); which tab the card belongs to.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/selection/021 — Enter still removes a card whose pane the daemon genuinely does not have.
+- **Layer:** L1 (same harness, mock reports the pane is not attachable).
+- **Agent:** none.
+- **Asserts:** the attach is still attempted, the session is removed, and the deck does not enter `PaneInput` — the fix must not turn a genuinely dead card into an undeletable one.
+- **Does not assert:** the status-message wording.
+- **Platform coverage:** mac+linux+windows.
 
 #### dashboard/filter
 
@@ -315,7 +366,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/help/002 — Help overlay content matches the committed snapshot.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** `insta` file snapshot of the overlay buffer.
+- **Asserts:** `insta` file snapshot of the overlay buffer; the Ctrl+D row describes a bidirectional command-mode / pane-input toggle rather than the one-way destination `Command mode (dashboard)`.
 - **Does not assert:** dynamic content (none today).
 - **Platform coverage:** mac+linux+windows.
 
@@ -427,6 +478,64 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** stdout classification or socket transport (covered by `codex/wrap/001`).
 - **Platform coverage:** mac+linux+windows.
 
+##### status/agent-event/005 — A respawned agent whose first event is NOT a `SessionStart` still retires the previous card, so one pane keeps one card.
+- **Layer:** L1 (two `SyntheticAgent` generations on one pane, applied through `AppState::apply_event`).
+- **Agent:** synthetic Pi identity (the only shipped agent with no `SessionStart`).
+- **Asserts:** after a `clear = true` respawn mints a new `agent_id`, the outgoing generation's card is retired by the incoming generation's first `agent-event` (`Thinking`), leaving exactly one session on the pane, carrying the new `agent_id`.
+- **Does not assert:** repeated respawns after the initial spawn-time placeholder → first-respawn transition (`status/supersede/005` covers the stable producer id reused by later generations); the orchestration deck's rendering of the duplicate (the unreachable-highlight consequence is pinned by the `sync_and_derive_selection` unit tests in `src/tab.rs`); the Pi extension's own state mapping (TS unit tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/agent-event/006 — A delayed event from the OUTGOING agent does not retire the incoming agent's live card.
+- **Layer:** L1 (out-of-order `AgentEvent` timestamps applied through `AppState::apply_event`).
+- **Agent:** synthetic Pi identity.
+- **Asserts:** once the incoming generation has established its card, an older-timestamped event from the previous `agent_id` leaves that live card intact — the monotonicity guard that makes retiring on a non-`SessionStart` event safe.
+- **Does not assert:** that the stale event is dropped entirely (it may still surface its own card; what must hold is that the LIVE card survives).
+- **Platform coverage:** mac+linux+windows.
+
+#### status/supersede
+
+##### status/supersede/001 — A real scheduler agent supersedes its friendly `No agent` placeholder without creating a duplicate card or losing the task name.
+- **Layer:** L1 (in-process scheduler placeholder and real `SessionStart` events applied through `AppState::apply_event`).
+- **Agent:** none (synthetic ClaudeCode identity for the real hook).
+- **Asserts:** a `Some(agent_id)` real session replaces the same-pane `None` placeholder even when its producer timestamp is older, leaving exactly one live card that inherits the placeholder's friendly display name.
+- **Does not assert:** the rendered card grid or daemon hook transport (`scheduler/live/004` covers the PTY-attached surface).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/002 — Replacing a session identity on an armed pane leaves the close-confirm target vanished rather than retargeting the replacement.
+- **Layer:** L1 (in-process state replacement through `AppState::apply_event`).
+- **Agent:** none (synthetic ClaudeCode generations).
+- **Asserts:** after a different-agent `SessionStart` takes over the same pane, the armed session id is absent, the replacement id remains, and only one card owns the pane, which makes stable-id close resolution return vanished.
+- **Does not assert:** modal rendering or actual close dispatch (`prompt/close-confirm/005` covers the PTY-attached behavior).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/003 — A delayed outgoing `SessionEnd` cannot erase the live replacement card from its pane.
+- **Layer:** L1 (in-process terminal event applied through `AppState::apply_event`).
+- **Agent:** none (synthetic ClaudeCode generations).
+- **Asserts:** after live agent B establishes a card, a newer-stamped `SessionEnd` from outgoing agent A on the same pane leaves B's card present instead of leaving the live pane with zero cards.
+- **Does not assert:** daemon hook transport, placeholder restoration for the ending session, or rendered card layout.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/004 — Reordered same-session activity cannot weaken the outgoing-straggler guard.
+- **Layer:** L1 (in-process reordered events applied through `AppState::apply_event`).
+- **Agent:** none (synthetic Pi generations).
+- **Asserts:** live agent B established at T=30 survives an outgoing agent A straggler at T=20 even after B's delayed same-session event at T=10 is delivered between them.
+- **Does not assert:** daemon socket task scheduling or that the outgoing straggler is dropped entirely; only the live card's survival is required.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/005 — A repeated Pi respawn refreshes the card identity carried under the pane-derived stable producer session id.
+- **Layer:** L1 (successive in-process Pi generations applied through `AppState::apply_event`).
+- **Agent:** none (synthetic Pi generations using the production `{pane_id}-session` construction).
+- **Asserts:** after Pi agent 2 establishes the stable card and Pi agent 3 reports through the same producer session id, exactly one card remains and carries agent 3's identity.
+- **Does not assert:** close-target retargeting across stable-key generations. Close confirmation arms on the session id alone (`CloseTarget::Session`) and resolves it by direct key lookup; because Pi reuses `{pane_id}-session` across respawns, that target remains resolvable after a generation change and confirmation can act on whichever generation currently occupies the pane. This behavior predates #284 and is neither introduced nor worsened by it: before the fix the key resolved to a stale corpse entry, after it resolves to the live replacement, and in both cases it maps to the pane's current card. The #284 identity refresh is a prerequisite for fixing this properly by arming on the generation (session id plus agent id), because the refreshed `agent_id` can now expose a generation change that the pre-fix stale `pi-agent-2` identity would have concealed. That fix belongs at the arm/resolve seam (`CloseTarget` / `resolve_close_plan`), while `prompt/close-confirm/005` remains the close-flow proof. This test also does not assert the initial spawn-time placeholder → first-respawn transition (`status/agent-event/005`), socket transport, or rendered card history.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/007 — A Pi card that already exists inherits the friendly name when its newer status retires the scheduler placeholder.
+- **Layer:** L1 (out-of-order scheduler placeholder and Pi events applied through `AppState::apply_event`).
+- **Agent:** none (synthetic scheduler placeholder and Pi identity).
+- **Asserts:** an older first Pi frame initially coexists with the friendly scheduler placeholder, then a newer Pi status retires it and leaves one Pi card carrying `morning-digest`.
+- **Does not assert:** scheduler dispatch, daemon socket delivery, or rendered card layout.
+- **Platform coverage:** mac+linux+windows.
+
 ### Agent protocol
 
 #### protocol/live-target
@@ -477,6 +586,50 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none.
 - **Asserts:** keystroke produces no protocol traffic and leaves card status unchanged.
 - **Does not assert:** any beep or visual ack.
+- **Platform coverage:** mac+linux.
+
+#### prompt/close-confirm
+
+##### prompt/close-confirm/001 — Command-mode Ctrl+W opens a Cancel-default close confirmation.
+- **Layer:** L1 (in-process key mapper + close-confirm state + ratatui `TestBackend`).
+- **Agent:** none.
+- **Asserts:** Ctrl+W resolves `CloseSelected`, an available target opens the confirmation, both pane- and tab-scoped states render their exact blast-radius sentence/description without copy leakage, and `Cancel` remains selected by default.
+- **Does not assert:** daemon teardown after confirmation (covered by `lifecycle/stop/*` and `dashboard/pane/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/close-confirm/002 — Cancel preserves the target while explicit confirmation authorizes one close.
+- **Layer:** L2 (real-binary PTY plus real daemon registry).
+- **Agent:** none (continued `cat` pane).
+- **Asserts:** production Ctrl+W on a plain dashboard pane opens the pane-scoped `Close selected pane?` Cancel-default modal; Enter on Cancel preserves the rendered card and daemon agent record; a fresh Ctrl+W followed by Down+Enter removes both.
+- **Does not assert:** StopAgent error classification (covered by `lifecycle/stop/005`–`008`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/close-confirm/003 — The `[Close]` button and Ctrl+W share the same confirmation action path.
+- **Layer:** L2 (real-binary PTY; production button render, SGR mouse decoding, and keyboard dispatch).
+- **Agent:** none (continued `cat` pane).
+- **Asserts:** clicking the live `[Close Ctrl+W]` button opens the same rendered pane-scoped Cancel-default modal as Ctrl+W, and neither path tears down the daemon agent before explicit confirmation.
+- **Does not assert:** tab-strip `×` dispatch (covered by `mouse/tabstrip/002`–`003`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/close-confirm/004 — Input queued behind the arming mouse event cannot confirm an unseen modal.
+- **Layer:** L2 (real-binary PTY; one raw burst through production SGR mouse + keyboard event decoding).
+- **Agent:** none (continued `cat` pane).
+- **Asserts:** a single burst containing the real Close-button click followed by Down+Enter opens the modal with Cancel still selected and leaves the daemon agent alive; only a fresh post-render Down+Enter closes it.
+- **Does not assert:** terminal-driver event chunking beyond the one-write burst used by the regression.
+- **Platform coverage:** mac+linux.
+
+##### prompt/close-confirm/005 — A vanished armed session closes nothing and never retargets its replacement.
+- **Layer:** L2 (real-binary PTY plus a synthetic replacement SessionStart delivered through the real daemon hook socket).
+- **Agent:** none (continued `cat` pane; the hook gives the same pane a distinct replacement agent/session identity in rendered state).
+- **Asserts:** after Ctrl+W arms the original session identity, a different-agent SessionStart replaces it on the same pane; confirming surfaces `Nothing closed`, retains the card, and leaves the daemon agent alive rather than closing the replacement.
+- **Does not assert:** tab identity binding (covered independently by `mouse/tabstrip/003`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/close-confirm/006 — A dashboard Session target that belongs to a Mode tab uses whole-tab copy and teardown.
+- **Layer:** L2 (real-binary PTY against a protocol-faithful scripted daemon).
+- **Agent:** none (a hydrated Mode agent pane rendered as a dashboard card plus one persistent side pane).
+- **Asserts:** arming Ctrl+W from the selected dashboard card renders `Close this tab and all its panes?`, never the pane sentence; confirming sends stops for both daemon panes and removes the tab only after the registry is empty.
+- **Does not assert:** internal `CloseTarget`/`ClosePlan` variants; the rendered promise and observable blast radius are the contract.
 - **Platform coverage:** mac+linux.
 
 #### prompt/pane-input
@@ -619,6 +772,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** synthetic Codex live and history-only events bound by agent identity to pane-less `/bin/sh` targets.
 - **Asserts:** pre-lock history-only sends return `history-only` without bytes, a live-to-history transition while waiting for the writer is rejected after the lock, and a live pane-less target still receives its guarded prompt.
 - **Does not assert:** visible TUI feedback for the returned result.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/021 — Ctrl+W performs real shell word deletion without closing the pane.
+- **Layer:** L2 (PTY-attached real binary and a real interactive Bash/readline pane).
+- **Agent:** none (the shell is the genuine user surface under test, not an agent stand-in).
+- **Asserts:** after typing two words, Ctrl+W deletes the previous word, the replacement word is what the submitted command visibly prints, and both the rendered pane and daemon agent record still exist.
+- **Does not assert:** close confirmation from command mode (covered by `prompt/close-confirm/*`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/022 — Ctrl+W while editing a real interactive Claude Haiku prompt does not tear down the pane.
+- **Layer:** L2 (PTY-attached real binary, runtime-skipped when Claude CLI/credentials are unavailable; flaky-tolerant pre-PR tier).
+- **Agent:** REAL interactive Claude Code on `claude-haiku-4-5-20251001`, with onboarding/project trust seeded and `--allowedTools Bash Read`; no `-p`.
+- **Asserts:** after the real Claude pane registers under its temp-directory-prefixed display name and the genuine interactive prompt renders, typing two sentinel words and pressing Ctrl+W visibly deletes the final word, proving the keystroke reached Claude; returning to command mode leaves the pane visible and the same daemon-side agent record present.
+- **Does not assert:** an LLM response (the safety invariant and native prompt-edit behavior are proven without submitting a model turn).
 - **Platform coverage:** mac+linux.
 
 #### prompt/quit
@@ -1071,6 +1238,23 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact sanitization output beyond "no raw control bytes survive into the rendered grid" (the pure-data `validate_tab_membership_*` tests pin the per-field policy).
 - **Platform coverage:** mac+linux.
 
+#### embed/key-forwarding
+
+##### embed/key-forwarding/001 — Shift+Enter typed into a focused embedded agent pane inserts a NEWLINE into the agent's draft instead of SUBMITTING it (PRD #227).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness). Mirrors the `scheduler/dispatch/013` reference harness: imported Claude credentials, project-trust pre-seeded into the per-test HOME (`with_claude_trust_workdir`) so the first-run onboarding/trust gates clear with no keystroke, and `--allowedTools Bash` so no permission prompt can block the pane.
+- **Agent:** REAL interactive `claude` pinned to Haiku (`claude --model claude-haiku-4-5-20251001 --allowedTools Bash`, NO `-p`). A stand-in cannot cover this case: `cat` has no draft, so it cannot distinguish "inserted a newline" from "submitted" — which is the entire behavior under test.
+- **Asserts:** that the deck pushed the enhanced keyboard protocol at startup (`ESC[>1u` in its output stream), so the forwarding behavior below is measured with M2 actually in effect. Then: with the restored pane auto-focused, typing a first draft line, injecting `ESC[13;2u` (the CSI-u encoding of Shift+Enter a kitty-capable terminal emits) into the DECK's PTY, and typing a second line leaves the draft as TWO lines of ONE input box — the second marker renders on the row IMMEDIATELY BELOW the first, and both rows are bracketed by the prompt editor's own horizontal rules. Adjacency is simultaneously the newline proof and the no-submission proof (a submitted first line would have been repainted into the transcript far above the box before the second line was typed); the rule bracketing is what scopes the two markers to the input box, so a submitted draft the agent repainted into the transcript as two consecutive rows cannot satisfy it vacuously. Independently: the uniquely-named sentinel `shiftnl-7f3c.txt` that the first line's directive would create if submitted does NOT exist in the pane cwd, and after a deliberate plain Enter it DOES appear — a gating positive control, without which the absence could hold for the wrong reason (a slow agent, or one that declined the tool call).
+- **Does not assert:** which encoding the user's outer terminal emits for a physical Shift+Enter (the keypress is injected already CSI-u-encoded); the push/pop lifecycle itself, which is `embed/key-forwarding/002`.
+- **Cost:** the draft assertions submit nothing (zero LLM tokens); only the positive control spends one short Haiku turn.
+- **Platform coverage:** mac+linux (pre-PR e2e tier; flaky-tolerant, run once, not looped).
+
+##### embed/key-forwarding/002 — The deck pushes the enhanced (kitty) keyboard protocol at TUI startup and pops it on clean exit, so Shift+Enter reaches the deck with no user-side terminal configuration and no keyboard mode leaks into the user's shell (PRD #227 M2).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness). Asserts on the deck's raw OUTPUT byte stream (`stream_text`) rather than the rendered grid, because the escape sequences under test are consumed by the vt100 parser and never paint a cell.
+- **Agent:** none — the behavior is the deck's own terminal negotiation, so this is fully deterministic and spends zero LLM tokens. The harness's `answer_terminal_queries` replies to the `ESC[?u` / `ESC[c` capability probe, which is what makes `supports_keyboard_enhancement()` return true and the gated push fire, modelling the kitty-capable terminal the fix targets.
+- **Asserts:** `ESC[>1u` (crossterm's `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`) appears once the dashboard is up; after a clean exit via Ctrl+C twice, the matching `ESC[<1u` pop appears, after the push, exactly once. The multiplicity check pins the pop's idempotence — both the normal teardown and the RAII guard's `Drop` run on a clean exit, and a second pop would discard a flag set another program on the terminal's stack owns.
+- **Does not assert:** the pop on a `?`-error return or a panic unwind from inside the event loop (both need a real terminal whose I/O fails, so the guard mechanism is covered by the L1 `ui::tests::keyboard_enhancement_*` tests instead); that a real terminal honors the pushed mode.
+- **Platform coverage:** mac+linux.
+
 ### Hook delivery
 
 #### hooks/delivery
@@ -1195,6 +1379,111 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** stdout content (loose contains-check).
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/stop/005 — Closing an already-stopped daemon agent completes local teardown.
+- **Layer:** L1 (real `EmbeddedPaneController` against a synthetic Unix-socket daemon).
+- **Agent:** none (synthetic StartAgent / AttachStream; both StopAgent attempts return exact `Agent agent-1 not found`, and ListAgents reports the stable pane slot empty).
+- **Asserts:** `close_pane` performs both stale-id attempts, enters the real ListAgents slot-resolution path, returns success for the proven-empty slot, removes the pane, does not re-insert the ghost card, and emits no unverified-close warning.
+- **Does not assert:** the dashboard confirmation UI (`prompt/close-confirm/*`); daemon process termination (the synthetic daemon reports the agent already absent).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/006 — A genuine StopAgent failure still retains the pane and surfaces the error.
+- **Layer:** L1 (real `EmbeddedPaneController` against a synthetic Unix-socket daemon).
+- **Agent:** none (synthetic StartAgent / AttachStream; StopAgent returns a non-NotFound server error).
+- **Asserts:** `close_pane` returns the daemon error, re-inserts the pane for retry, and does not apply the NotFound-only retry/classification to other failures.
+- **Does not assert:** the timeout arm (the existing retain-and-surface implementation remains unchanged); dashboard status-message layout.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/007 — Unrelated errors containing `not found` retain the live pane and surface the error.
+- **Layer:** L1 (real `EmbeddedPaneController` against a synthetic Unix-socket daemon).
+- **Agent:** none (synthetic StartAgent / AttachStream; StopAgent returns `pane not found`, `session not found`, another agent's exact NotFound, or a wrapped requested-agent NotFound).
+- **Asserts:** every non-exact/non-id-scoped message returns an error containing the daemon reason, re-inserts the pane, sends only one StopAgent request, and never enters ListAgents slot resolution.
+- **Does not assert:** presentation of the surfaced message in the TUI status row.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/008 — A replacement agent occupying the pane slot is stopped before local teardown.
+- **Layer:** L1 (real `EmbeddedPaneController` against a synthetic Unix-socket daemon).
+- **Agent:** none (both stale `agent-1` StopAgent attempts return exact NotFound; ListAgents reports `agent-2` with the same `pane_id_env`; stopping `agent-2` succeeds).
+- **Asserts:** the request sequence is `agent-1`, `agent-1`, `agent-2`; replacement discovery uses ListAgents; only then does `close_pane` succeed and remove the pane; no unverified-close warning is emitted.
+- **Does not assert:** the asynchronous real-agent respawn mechanism that creates the replacement.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/009 — A replacement appearing near the respawn worst case is stopped before local teardown.
+- **Layer:** L1 (real `EmbeddedPaneController` against a timing-controlled synthetic Unix-socket daemon).
+- **Agent:** none (the initial AttachStream ends to put pane I/O into reattachment; both stale-id StopAgent attempts return exact NotFound; ListAgents reports the stable slot empty for 4.8 seconds before exposing `agent-2`).
+- **Asserts:** close keeps polling through the documented slow-respawn window, sends StopAgent to the late replacement, removes the pane only after that stop succeeds, and emits no unverified-close warning.
+- **Does not assert:** a real agent process's SIGTERM/startup timing; the synthetic delay deterministically represents that handover gap.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/010 — A ListAgents error completes close with one unattended-agent warning.
+- **Layer:** L1 (real `EmbeddedPaneController` against a synthetic Unix-socket daemon).
+- **Agent:** none (both StopAgent attempts return exact NotFound; ListAgents returns `registry unavailable`).
+- **Asserts:** close returns success and removes the pane instead of restoring the ghost card; exactly one drainable warning says the pane was closed, daemon verification failed, and an agent may still be running unattended.
+- **Does not assert:** rendering the queued warning on the TUI status line.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/011 — A ListAgents timeout completes close with one unattended-agent warning.
+- **Layer:** L1 (real `EmbeddedPaneController` against a synthetic Unix-socket daemon).
+- **Agent:** none (both StopAgent attempts return exact NotFound; ListAgents accepts the request but never replies).
+- **Asserts:** close returns success after the bounded lookup timeout and removes the pane instead of restoring the ghost card; exactly one drainable warning says the pane was closed, verification timed out, and an agent may still be running unattended.
+- **Does not assert:** rendering the queued warning on the TUI status line.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/012 — A chained pane-slot handover stops the last owner before teardown.
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon).
+- **Agent:** none (both stale `agent-1` StopAgent attempts return exact NotFound; ListAgents reports replacement B; stopping B returns exact NotFound after replacement C takes the slot; stopping C succeeds).
+- **Asserts:** close sends StopAgent to C, returns success, removes the pane only after the final owner is stopped, and emits no unverified-close warning.
+- **Does not assert:** an exact number of stop requests; the guard pins the last owner being stopped so alternative depth-handling implementations remain valid.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/013 — Immediate unresolvable pane-slot churn is round-bounded and announced.
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon, with a 13-second test-side hang ceiling).
+- **Agent:** none (every replacement StopAgent returns exact NotFound after handing the stable pane slot to a fresh synthetic agent).
+- **Asserts:** immediate churn returns well before the total budget through the three-replacement round cap, removes the pane, and queues exactly one drainable warning saying the slot kept changing owners, the close could not be verified, and an agent may still be running unattended.
+- **Does not assert:** rendering the queued warning on the TUI status line; the wall-clock budget path (covered by `lifecycle/stop/014`).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/014 — Slow unresolvable pane-slot churn is wall-clock-bounded and announced.
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful timing-controlled synthetic Unix-socket daemon, with a 13-second test-side hang ceiling).
+- **Agent:** none (each replacement StopAgent takes four seconds before returning exact NotFound and handing the stable pane slot to another synthetic agent).
+- **Asserts:** the total budget ends resolution after two delayed replacement stops and before the three-round cap, close returns success and removes the pane, and exactly one drainable slot-churn/unattended-agent warning is queued.
+- **Does not assert:** rendering the queued warning on the TUI status line; real process stop latency.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/015 — A genuine replacement-agent stop failure retains the pane and surfaces the error.
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon).
+- **Agent:** none (the stale original agent returns exact NotFound, ListAgents reports replacement B, and B's StopAgent returns a permission-denied server error).
+- **Asserts:** close reaches B, surfaces its daemon error, retains the pane for retry, and emits no unverified-close warning instead of absorbing the failure into slot churn.
+- **Does not assert:** presentation of the surfaced error in the TUI status row; the replacement timeout arm (covered by `lifecycle/stop/016`).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/016 — A replacement-agent stop timeout retains the pane and surfaces the timeout.
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon, with a seven-second test-side hang ceiling).
+- **Agent:** none (the stale original agent returns exact NotFound, ListAgents reports replacement B, and B's StopAgent never replies).
+- **Asserts:** close reaches B, exercises the real five-second stop timeout, surfaces the timeout, retains the pane for retry, and emits no unverified-close warning instead of absorbing the timeout into slot churn.
+- **Does not assert:** presentation of the surfaced error in the TUI status row; OS-level process termination.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/017 — A partially failed tab close stays visible and succeeds on retry.
+- **Layer:** L2 (real-binary PTY against a protocol-faithful scripted daemon).
+- **Agent:** none (a hydrated Mode tab with one agent pane and one persistent side pane; the side pane's first StopAgent is denied and its retry succeeds).
+- **Asserts:** the first confirmed whole-tab close removes the successful pane, retains the failed pane and its tab/`×`, and renders that the tab was kept; after switching into the retained tab, a second confirmed close removes the failed pane, daemon record, and tab.
+- **Does not assert:** an exact count of `close_pane` calls; the observable retry outcome is the contract.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/018 — Already-gone and unverified-success panes do not block whole-tab removal.
+- **Layer:** L2 (real-binary PTY against a protocol-faithful scripted daemon).
+- **Agent:** none (two hydrated one-pane Mode tabs: exact id-scoped NotFound with an empty slot, then exact NotFound whose ListAgents verification fails).
+- **Asserts:** both outcomes remove the tab; the proven-gone close renders no unattended-agent warning, while DoneUnverified renders exactly one such warning on the live status line.
+- **Does not assert:** warning expiry timing or terminal styling.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/019 — A six-pane tab closes concurrently while preserving pane order in its outcome.
+- **Layer:** L1 (in-process `TabManager` with a delay-scripted `PaneController`).
+- **Agent:** none (six hydrated orchestration role panes with staggered 150–400 ms synthetic close delays).
+- **Asserts:** the close completes below a 1.0-second wall-clock ceiling versus a 1.65-second sequential sum, reports closed pane ids in original role order rather than completion order, and removes the clean tab.
+- **Does not assert:** production daemon/RPC latency; the synthetic delays isolate fan-out semantics.
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/restart
 
 ##### lifecycle/restart/001 — `daemon restart` reuses the next-launch lazy-spawn — a subsequent `dot-agent-deck` launch comes up against a fresh daemon process.
@@ -1234,6 +1523,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (the daemon runs under a short-lived intermediate `sh` parent the test can kill without killing itself).
 - **Asserts:** after SIGKILLing the intermediate parent, the daemon process terminates within a few seconds, even though idle shutdown is disabled so only the orphan watchdog can end it.
 - **Does not assert:** the max-lifetime backstop (`DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, covered by the daemon pure-data unit tests) or production daemons (the watchdog is OFF unless the env var is set).
+- **Platform coverage:** mac+linux.
+
+#### lifecycle/version
+
+##### lifecycle/version/001 — A build environment that pre-sets `DAD_VERSION` / `DAD_BUILD_ID` produces a binary that reports those values, and changing either one invalidates the cached build (issue #250).
+- **Layer:** L2 (three real `cargo build`s into one shared scratch `CARGO_TARGET_DIR`, pinned to the rustc host target and capped at half the machine's cores, then plain subprocess runs of each produced binary — no PTY).
+- **Agent:** none.
+- **Asserts:** with `DAD_VERSION=42.7.13` / `DAD_BUILD_ID=42.7.13-ginjected0` pre-set only in the *build* environment, the produced binary's `--version` reports `42.7.13` (not the `0.1.0` `CARGO_PKG_VERSION` placeholder, and not the checkout's git tag) and `daemon hello` advertises both injected values as `daemon_version` / `build_version`; then that changing **only** `DAD_VERSION` (to `58.1.2`) and afterwards **only** `DAD_BUILD_ID` (to `58.1.2-ginjected1`) is each picked up by the next build in the same target dir — the one-at-a-time change is what pins each `cargo:rerun-if-env-changed` directive individually.
+- **Does not assert:** the full fallback order *below* an injection — an absent or invalid `DAD_VERSION` falling through to git and then to the `CARGO_PKG_VERSION` placeholder — nor the build-script directive-injection rejection (both are pure-data unit tests in `tests/build_version.rs`); the `cargo:warning` text on the placeholder path; that a git-less checkout degrades correctly (would need a second cold build).
 - **Platform coverage:** mac+linux.
 
 #### lifecycle/handshake
@@ -1401,7 +1699,7 @@ note).
 ##### render/layout/002 — Reactive pane recreation/replace leaves no scrambled fragments — the replacement pane renders cleanly.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** after a pane is recreated/replaced in place (open a second pane, close the first), the rendered grid contains the surviving pane's content and no leftover fragment of the removed pane at a stale position.
+- **Asserts:** after a pane is recreated/replaced in place (open a Mode tab, return to command mode, request its close with Ctrl+W, observe the tab-scoped confirmation, then choose Close with Down+Enter), the rendered grid contains the surviving Dashboard and no leftover fragment of the removed pane at a stale position.
 - **Does not assert:** the exact recreation trigger internals; per-cell colours.
 - **Platform coverage:** mac+linux.
 - **M1 status (PRD #84):** **Flag / invariant-check.** Pane open/close and reactive recreation (`src/ui.rs:1510`, `:2147` areas) currently resize the affected PTYs on the spot, so any scramble is transient. Invariant guard on "no stale fragment after replace". GREEN target at M4/M5.
@@ -1458,6 +1756,13 @@ without depending on the config struct API.
 - **Does not assert:** that the old `?` still opens help (the action was remapped, not added), help-overlay content beyond one anchor line.
 - **Platform coverage:** mac+linux.
 
+##### keybindings/remap/003 — Existing `[global] close_pane` remaps survive mode-gated dispatch.
+- **Layer:** L1 (TOML parse + in-process production key mapper).
+- **Agent:** none.
+- **Asserts:** `[global] close_pane = "Ctrl+x"` parses without warnings, the custom chord requests close in command mode, and the same chord remains ordinary `0x18` PTY input in PaneInput.
+- **Does not assert:** filesystem loading of `keybindings.toml` (covered by `keybindings/remap/001`); arbitrary per-mode config syntax (out of scope).
+- **Platform coverage:** mac+linux+windows.
+
 #### keybindings/safety
 
 ##### keybindings/safety/001 — `Ctrl+C` always opens the quit modal, even when another action is bound to `Ctrl+C`.
@@ -1473,6 +1778,20 @@ without depending on the config struct API.
 - **Asserts:** with a `keybindings.toml` that binds both `[dashboard] move_left = "Ctrl+C"` and `move_right = "Ctrl+C"`, pressing `Ctrl+C` still opens the quit/detach modal ("Quit dot-agent-deck?"). Complements safety/001 by covering the Normal-mode tab-cycle dispatch path: `Ctrl+C` is never routed through the configurable `move_left`/`move_right` matching, so it can't be turned into a tab switch. `Ctrl+C` is non-overridable. Regression guard for the `!is_ctrl_c` gate on that dispatch path.
 - **Does not assert:** tab-switch behaviour for non-`Ctrl+C` `move_left`/`move_right` bindings, conflict-resolution warning wording.
 - **Platform coverage:** mac+linux.
+
+##### keybindings/safety/003 — Ctrl+W is PTY input in PaneInput and a close request in command mode.
+- **Layer:** L1 (in-process production key mapper).
+- **Agent:** none.
+- **Asserts:** the same default Ctrl+W chord yields `ForwardToPane([0x17])` in `UiMode::PaneInput` and `CloseSelected` in `UiMode::Normal`; both halves live in one regression test.
+- **Does not assert:** readline's visible editing result or pane survival through the real binary (covered by `prompt/pane-input/021`).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/safety/004 — Mode-gating Close does not scope the other global commands.
+- **Layer:** L1 (in-process production key mapper).
+- **Agent:** none.
+- **Asserts:** Dashboard, NewPane, and ToggleLayout still resolve from PaneInput; only ClosePane falls through to PTY input.
+- **Does not assert:** each action's downstream UI mutation (covered by its feature-specific tests).
+- **Platform coverage:** mac+linux+windows.
 
 #### keybindings/unbind
 
@@ -1497,24 +1816,31 @@ without depending on the config struct API.
 ##### keybindings/help/001 — The help overlay is generated from the active keybinding config and shows remapped keys.
 - **Layer:** L1 (ratatui `TestBackend` + `insta` file snapshot).
 - **Agent:** none.
-- **Asserts:** rendered against a `KeybindingConfig` that remaps `toggle_layout` → `Alt+Shift+l` and `help` → `F1`, the help-overlay buffer shows those custom notations (the snapshot — and a substring guard on `Alt+Shift+l` / `F1`) rather than the defaults, proving the overlay is generated from the active config, not hardcoded strings. The defaults-content guard lives separately at `dashboard/help/002` and stays untouched.
+- **Asserts:** rendered against a `KeybindingConfig` that remaps `toggle_layout` → `Alt+Shift+l` and `help` → `F1`, the help-overlay buffer shows those custom notations and describes Ctrl+D as a command-mode / pane-input toggle, proving the overlay is generated from the active config while retaining the corrected semantics. The default-config content guard lives at `dashboard/help/002`.
 - **Does not assert:** the overlay's exact column layout or footer wording beyond what the committed snapshot pins; behaviour with the *default* config (that is `dashboard/help/002`'s job).
 - **Platform coverage:** mac+linux+windows.
 
 #### keybindings/hints
 
 ##### keybindings/hints/001 — The hints bar is generated from the active keybinding config and shows remapped keys.
-- **Layer:** L1 (ratatui `TestBackend` + `insta` file snapshot).
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, through the same production `render_bottom_bar` path the app draws).
 - **Agent:** none.
-- **Asserts:** rendered against a `KeybindingConfig` that remaps `toggle_layout` → `Alt+Shift+l`, the hints-bar buffer shows the custom layout-toggle notation (the snapshot — and a substring guard on `Alt+Shift+l`) rather than the default `Ctrl+t`, proving the hints bar is generated from the active config.
-- **Does not assert:** the full set of actions shown in the bar or their order beyond what the committed snapshot pins; truncation behaviour at narrow widths.
+- **Asserts:** rendered in command mode against a config that remaps `toggle_layout` → `Alt+Shift+l`, the live button bar shows `[Toggle Layout Alt+Shift+L]` and `[Back to Pane Ctrl+D]`; the snapshot pins the complete production bar.
+- **Does not assert:** truncation behaviour at narrow widths.
 - **Platform coverage:** mac+linux+windows.
 
 ##### keybindings/hints/002 — An unbound action is rendered as `(unbound)` in the hints bar, never as a bare `: <label>`.
-- **Layer:** L1 (ratatui `TestBackend`; asserts on buffer text, no `insta` snapshot).
+- **Layer:** L1 (ratatui `TestBackend`, through the production button-bar renderer; asserts on buffer text, no snapshot).
 - **Agent:** none.
-- **Asserts:** rendered against a default `KeybindingConfig` with `new_pane` unbound (empty notation), the hints-bar text substitutes `(unbound)` for the empty key (matching the help overlay) and renders `(unbound): new`; it never emits a bare `: new` with an empty key column (no leading `: <label>` and no mid-string `  : <label>`). Greptile P2 regression guard.
+- **Asserts:** with `new_pane` unbound, the live bar renders `[New Pane (unbound)]` and never `[New Pane ]` with a blank shortcut.
 - **Does not assert:** the exact placeholder wording beyond `(unbound)`, behaviour of other simultaneously-unbound actions, snapshot of the full bar.
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/hints/003 — The hints bar reflects Close's mode scope and makes command-mode exit discoverable.
+- **Layer:** L1 (ratatui `TestBackend`, rendered through `render_button_bar_for_mode_to_buffer`, which calls the live `render_bottom_bar` path).
+- **Agent:** none.
+- **Asserts:** command mode shows enabled `[Back to Pane Ctrl+D]` and `[Close Ctrl+W]`; Help shows `[Command Mode Ctrl+D]` and a DIM Close whose Ctrl+W mapping is inert; PaneInput shows only `[Command Mode Ctrl+D]` and no Close button.
+- **Does not assert:** narrow-width wrapping or mouse hit-testing of the disabled button.
 - **Platform coverage:** mac+linux+windows.
 
 #### keybindings/buttons
@@ -1624,6 +1950,71 @@ without depending on the config struct API.
 - **Does not assert:** the orchestrator pane's error-line rendering (L2 `orchestration/delegate/004`); the daemon-side log entry.
 - **Platform coverage:** mac+linux.
 
+##### orchestration/delegate/007 — A wrapped native-hook agent ignores its fork-time card-surfacing `SessionStart` for delegate readiness (PRD #225 M1).
+- **Layer:** fast synthetic real-binary-subprocess integration (a real `dot-agent-deck wrap` child + in-process daemon hook socket + real `handle_delegate` + managed PTY; no vt100 attach, no LLM, no `e2e` feature gate).
+- **Agent:** synthetic Codex executable backed by `cat`; the real `dot-agent-deck wrap` emits the early wrapper event and the test later injects the genuine native Codex event.
+- **Asserts:** after a `clear = true` respawn, the task pointer is absent from the replacement PTY while only the wrapper's fork-time `SessionStart` has arrived; after the matching native `SessionStart`, the pointer is delivered promptly.
+- **Does not assert:** real Codex boot timing or task execution (covered by the real-agent `orchestration/delegate/009`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/008 — A hookless wrapper-like agent still treats its sole fork-time `SessionStart` as ready (PRD #225 M1 guard).
+- **Layer:** fast synthetic PTY integration (real `handle_delegate` + managed PTY + daemon broadcast; no socket or LLM).
+- **Agent:** hookless future-wrapper stand-in represented by the neutral registry identity because no shipped hookless Wrapper agent exists yet.
+- **Asserts:** a marked wrapper-fork `SessionStart` releases prompt delivery within two seconds — well inside the 30 s `SESSION_START_WAIT_TIMEOUT` fallback, so a pass cannot be the fallback firing — when the agent has no native hook installer and will emit no later readiness event.
+- **Does not assert:** a concrete Gemini registry entry or wrapper classifier; those do not exist yet.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/009 — A `clear = true` delegate to a REAL wrapped Codex worker delivers the prompt and the worker acts on it — the user-visible end of PRD #225 (M5). [reel]
+- **Layer:** L2 PTY-attached REAL-agent (the real `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness — records a `full-stream.cast`; pre-PR e2e tier per CLAUDE.md rule 5, flaky-tolerant, never in CI).
+- **Agent:** a REAL interactive cheap-model Codex (`common::codex_test_model()`, no `-p`, no stand-in) as the `clear = true` `coder` role, wrapped from its first spawn because the role command's basename resolves to Codex; the `orchestrator` role is a deterministic script that invokes the genuine `dot-agent-deck delegate --to coder` CLI over the same hook socket a real orchestrator agent uses (the defect is entirely on the worker side, so a second LLM would add a flaky link without covering another line of the fix).
+- **Asserts:** opening the orchestration through the normal Ctrl+N new-pane form surfaces the `coder` role card live; jumping into the worker's role pane shows the REAL Codex TUI up (its header names the pinned model) BEFORE anything is delegated — the readiness precondition, taken on the user-visible surface because codex-cli 0.145.0 posts its native `SessionStart` only when the first turn starts, so gating on that event would deadlock on the delegate that causes it; after the delegate the worker's card visibly enters `Thinking`, the daemon broadcasts the worker's GENUINE native Codex `SessionStart` (no wrapper-fork origin marker, so it is Codex itself and not the wrapper's fork-time card-surfacing event) plus a `Thinking` whose `user_prompt` is the injected `worker-task-coder.md` pointer — a field only Codex's native `UserPromptSubmit` hook sets, the wrapper's line classifier always leaves it `None` — so the pointer was submitted INSIDE the agent rather than echoed away by the launcher's line discipline; and the respawned worker creates the uniquely named sentinel `prd225-codex-delegate-6f21ba.txt` with the requested contents. Pre-fix the wrapper's fork-time event released the readiness gate seconds before the Codex TUI existed, the prompt was lost, and no sentinel ever appeared.
+- **Does not assert:** the work-done leg (logged as a soft observation; hard-covered by `codex/worker/001`); the launch-shape half of PRD #225 (`codex/spawn/007` for the hook-learned badge, `codex/spawn/008` for the respawn wrap decision); the hookless-wrapper guard (`orchestration/delegate/008`).
+- **Platform coverage:** mac+linux (unix-only — writes an executable role script).
+
+##### orchestration/delegate/010 — An observed replacement `SessionStart` starts, but does not bypass, the delegate readiness buffer (PRD #249 M1).
+- **Layer:** fast synthetic PTY integration (real `handle_delegate` + `clear = true` respawn + in-process daemon hook socket; no LLM and no `e2e` feature gate).
+- **Agent:** synthetic hook-emitting worker backed by `cat`.
+- **Asserts:** with `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=1000`, the task pointer is absent 350 ms after the replacement agent's matching `SessionStart` and appears after the configured buffer elapses.
+- **Does not assert:** real-agent startup timing or timeout-fallback behavior (covered by `orchestration/delegate/011` and `/012`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/011 — The timeout fallback waits the delegate readiness buffer even when no `SessionStart` arrives (PRD #249 M1).
+- **Layer:** fast synthetic PTY integration (real `handle_delegate` + `clear = true` respawn + daemon broadcast, with Tokio's clock paused to cross the production timeout instantly; no socket, LLM, or `e2e` feature gate).
+- **Agent:** hookless `cat` stand-in that never emits `SessionStart`.
+- **Asserts:** after the 30-second fallback expires in virtual time, the pointer remains absent both immediately and 998 ms into the additional 1000 ms readiness buffer, then is delivered after the clock advances to 1001 ms; `1` and whitespace-padded `1` both perform a real wait instead of collapsing to `sleep(0)`; and an integer above `u64::MAX` stays held past the 1000 ms default and releases at the 30 s cap.
+- **Does not assert:** the observed-`SessionStart` branch or whether a real hookless agent is interactive at fallback time.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/012 — A slow-readiness toggle proves the delegate buffer prevents lost payload and submit bytes (PRD #249 M4).
+- **Layer:** fast synthetic real-binary-subprocess integration (real `handle_delegate`, respawn, hook socket, managed PTY, and Python raw-mode readiness stub; no LLM and no `e2e` feature gate).
+- **Agent:** deterministic slow-readiness stand-in that discards PTY input for 650 ms after `SessionStart`, then echoes accepted bytes in raw mode.
+- **Asserts:** changing only `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` loses the pointer at `0`, while `1000` delivers the pointer and its trailing submit CR after the measured input-readiness window.
+- **Does not assert:** a real Claude or OpenCode timing distribution; the deterministic stub pins the race that real-agent timing cannot reproduce reliably.
+- **Platform coverage:** mac+linux (unix-only — Python `termios` raw-mode stub).
+
+##### orchestration/delegate/013 — A worker that receives a delegate and then emits no event produces a visible orchestrator notice (PRD #249 M3).
+- **Layer:** fast synthetic PTY integration (real `handle_delegate`, managed worker and orchestrator PTYs, and shortened worker-response window; no LLM and no `e2e` feature gate).
+- **Agent:** silent `cat` worker plus a raw no-echo orchestrator observer.
+- **Asserts:** the worker first receives the task pointer, then its lack of any agent event produces an LF-terminated fixed daemon-authored notice in the orchestrator pane describing the missing event. The pane notice deliberately carries no role name or other project-controlled interpolation.
+- **Does not assert:** tracing output from the companion `warn!`, an actual agent response, whether every supported agent treats bare LF as inert, or recovery after the notice.
+- **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
+
+##### orchestration/delegate/014 — A `clear = true` delegate reaches a REAL interactive Claude worker and the worker visibly acts on it (PRD #249 M4 real-agent happy path). [reel]
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness; flaky-tolerant pre-PR e2e tier, runtime-skipped when the Claude CLI or credentials are unavailable). Imported Claude credentials plus project trust clear onboarding without a keystroke, and the production delegate CLI drives the daemon through its real socket.
+- **Agent:** REAL interactive Claude Code pinned to Haiku (`claude-haiku-4-5-20251001`, `--allowedTools Bash Read Write`, no `-p`) as the `clear = true` `coder` role; the deterministic orchestrator role only invokes the same `dot-agent-deck delegate` CLI a real orchestrator uses. `Write` is allowed so the task file's `## When done` footer (#303) does not park the worker on an approval prompt after the sentinel is created — the sentinel itself is written with Bash.
+- **Asserts:** the worker's real prompt editor is visibly ready before delegation; after the delegate respawns it, the role card visibly traverses Thinking → Working with Bash, its native `UserPromptSubmit` hook carries the injected `worker-task-coder.md` pointer (submission rather than PTY echo), and it creates `prd249-claude-respawn-4d37c1.txt` with exact known contents. This proves the happy path against a current real agent; the deterministic `/012` stand-in pins the race itself.
+- **Does not assert:** the exact agent response, the measured readiness threshold (covered by `/012`), the timeout-fallback branch (covered by `/011`), or work-done delivery.
+- **Platform coverage:** mac+linux (unix-only PTY/UDS; local real-agent tier).
+- **Cost note:** one short Haiku worker turn.
+
+##### orchestration/delegate/015 — Post-fix `clear = true` delivery reaches a REAL interactive OpenCode worker and the worker visibly acts on it. [reel]
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness; flaky-tolerant pre-PR e2e tier, runtime-skipped when the OpenCode CLI or credentials are unavailable). Imported OpenCode credentials and `--auto` prevent a permission prompt from blocking the pane; a test-only forwarding env can set the production readiness buffer to zero for the explicit pre-fix observation run.
+- **Agent:** REAL interactive OpenCode pinned to the cheap mini model `openrouter/openai/gpt-4o-mini` (no `opencode run`, no stand-in) as the `clear = true` `coder` role; the deterministic orchestrator role invokes the genuine delegate CLI.
+- **Asserts:** the OpenCode TUI is visibly ready before delegation; after the delegate respawns it, the role card visibly traverses Thinking → Working with its shell tool, the OpenCode plugin's native `session.prompt` event carries the injected `worker-task-coder.md` pointer, and it creates `prd249-opencode-respawn-8a62f4.txt` with exact known contents.
+- **Does not assert:** exact model phrasing, a universal OpenCode startup-time distribution from one host, the deterministic race (covered by `/012`), or work-done delivery.
+- **Platform coverage:** mac+linux (unix-only PTY/UDS; local real-agent tier).
+- **Cost note:** one short GPT-4o-mini worker turn per observation.
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
@@ -1631,6 +2022,15 @@ without depending on the config struct API.
 - **Agent:** none (stub role commands; orchestration_config carries `name = "dot-agent-deck"` with a `coder` role at `clear = true`).
 - **Asserts:** when the new-pane form's Name field defaults to the worktree basename (`dot-agent-deck-prd-113-foo`) while the config name is `dot-agent-deck`, every role pane's `TabMembership::Orchestration.name` (the IDENTITY the daemon's `lookup_orchestration_role` compares) equals the canonical config name `dot-agent-deck` — so the role resolves and `clear = true` respawn fires — while the tab TITLE (`Tab::Orchestration.name`) still shows the basename. Pre-fix the PRD #107 SpawnPane override copies the basename into `orch_config.name`, so the identity is the basename and the lookup misses.
 - **Does not assert:** the daemon-side `pane_orchestration_map` recording or the live delegate respawn (L2 path); the on-disk config reload inside `lookup_orchestration_role`.
+- **Platform coverage:** mac+linux+windows.
+
+#### orchestration/guard
+
+##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
+- **Layer:** L1 (in-process `TestBackend` via `render_new_pane_orchestration_guard_to_buffer`; no PTY, no subprocess).
+- **Agent:** none (the render seam supplies synthetic live-daemon orchestration cwd records).
+- **Asserts:** an orchestration selected for a cwd matching an existing live orchestration renders a warning containing `.dot-agent-deck` and `worktree` while retaining `[Submit]`; the same form for a fresh cwd renders neither warning substring.
+- **Does not assert:** exact warning copy or styling; daemon `list_agents` transport; worktree creation; blocking spawn behavior (the warning is informational).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/layout
@@ -1641,6 +2041,24 @@ without depending on the config struct API.
 - **Asserts:** in the ~34%-width single-column orchestration card area at a typical ~48-row card height, the renderer's `visible_rows = available / card_height` fits all 7 decks with no scrolling and the 7th deck actually renders in the visible slice; a much larger deck count (20) still engages scrolling, so right-sizing the card height does not remove the scroll fallback.
 - **Does not assert:** the full orchestration-tab frame (tab bar, side panes, stats bar); the `ORCHESTRATION_LEFT_PERCENT` width split or `grid_columns` thresholds (out of scope per PRD #147).
 - **Platform coverage:** mac+linux+windows.
+
+#### orchestration/route
+
+##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1). [reel]
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness — records a `full-stream.cast`, so it is demo-reel-eligible per PRD #180). Both tabs are opened through the PRODUCTION new-pane flow (`Ctrl+N` → picker → Space → Right → Enter → Enter) against the deck's own cwd, so their `(name, cwd)` identities are byte-identical and only the per-tab `orchestration_id` (PRD #140 M1.2, echoed back through `StartAgent` → daemon registry → `ListAgents`) tells them apart. Each delegate is issued by a REAL orchestrator agent that shells `dot-agent-deck delegate` after the production `WriteAndSubmit` RPC types the directive into its pane; each work-done is issued by the REAL worker agent from its task-file footer. Per-pane observation is the daemon's own `AttachRequest::Snapshot`, normalized wrap-insensitively (escape sequences stripped, then everything but `[A-Za-z0-9._/-]` dropped) so a pointer hard-wrapped inside a narrow role card still matches. The freshly-built binary's dir is prepended to the deck → daemon → agents PATH; Claude project-trust for the per-test tempdir cwd is seeded into the deck's HOME after launch (the cwd does not exist before it), so the six panes clear their first-run gates with no keystroke.
+- **Fixture:** `tests/fixtures/orchestration-route` — one `[[orchestrations]] name = "route-iso"` with THREE roles (`orchestrator` start + `coder` + `reviewer`), all REAL interactive Haiku `claude` (`--allowedTools Bash Read Write`, no `-p`), workers at `clear = false` so their agent ids and scrollback stay stable across the delegate. Three roles rather than two because `.dot-agent-deck/worker-task-{role}.md` / `work-done-{role}.md` are keyed by ROLE within a cwd (PRD #140 keeps that layer explicitly out of scope), so two same-cwd tabs sharing a role name share those files: driving tab A through `coder` and tab B through `reviewer` makes every no-cross-delivery check a presence/absence question about a pane that would otherwise have received NOTHING, and makes the two work-done feedback strings role-qualified and thus distinguishable inside one orchestrator pane — no occurrence-counting in a redrawing agent TUI.
+- **Agent:** REAL Claude Code (Haiku, `claude-haiku-4-5-20251001`) ×6 interactive role panes across the two tabs; four short turns actually run (two orchestrators delegate, two workers create one file each). Flaky-tolerant pre-PR tier (real LLM) — run once, not looped (rule 4/5). Runtime-skipped (Decision 26) when the `claude` CLI/credentials are absent.
+- **Asserts:** the second open of the same orchestration in the same directory renders PRD #140 M4.0's non-blocking same-cwd warning pointing at `/worktree-prd` (the M4.0 surface, live in the real form rather than through the L1 render seam); the daemon reports two orchestration tabs with DISTINCT `orchestration_id`s and three role panes each; then, with a task started in EACH tab CONCURRENTLY (the issue's own repro, and the state in which the pre-#140 `HashSet`-ordered work-done lookup was most non-deterministic), tab A's delegate pointer `worker-task-coder.md` lands in tab A's `coder` pane and NEVER in tab B's identically-named `coder` pane; tab A's coder really does its own task (uniquely-named sentinel `route_alpha_5f3c.txt` plus the daemon-written `.dot-agent-deck/work-done-coder.md`); its work-done feedback (`Worker coder has completed their task`) reaches tab A's orchestrator pane and NEVER tab B's; and symmetrically for tab B → `reviewer` (`worker-task-reviewer.md`, `route_beta_9d21.txt`, `work-done-reviewer.md`, `Worker reviewer has completed their task`), with a final sweep re-checking all four absences after both chains have run.
+- **Does not assert:** WHICH pane wrote a shared coordination file — `worker-task-{role}.md` / `work-done-{role}.md` are role-and-cwd keyed by design (PRD #140 "Deferred: full same-directory isolation"), so the routing proof is the per-pane delegate/work-done delivery, not the file contents; the hydration round trip of two same-`(name, cwd)` tabs across a detach/reattach (M3.1, covered by the `partition_hydrated_panes` unit tests); the `NameCwd` older-client fallback (M5.2, the cross-version manual test); the exact task text each orchestrator forwards (only the literal sentinel filename has to survive LLM phrasing); the deterministic routing decision itself (mutation-checked unit tests on `delegate_targets` / `orchestrator_for_worker` in `src/state.rs`).
+- **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
+- **Cost note:** four short interactive Haiku turns (two delegates, two one-file tasks) — well under Decision 23's <$0.05/run bound.
+
+##### orchestration/route/002 — Detach/reattach of two same-`(name, cwd)` orchestration tabs rebuilds TWO distinct tabs, each keeping its own routing group, while a token-less (pre-#140) pair still rebuilds as ONE (PRD #140 M3.1).
+- **Layer:** L1/synthetic (warm in-process daemon + real attach socket, no PTY-attached binary and no LLM). Drives the production reattach chain end to end: `start_agent` stores `TabMembership` on the daemon's `AgentRecord` → `EmbeddedPaneController::hydrate_from_daemon` reads it back through `ListAgents` + `validate_tab_membership` → `partition_hydrated_panes` buckets by `OrchestrationIdentity` → `resolve_orch_config_for_hydration` / `OrchestrationConfig::synthesize_from_bucket_metadata` → `TabManager::open_orchestration_tab_with_existing_role_panes`. Synthetic is the right tier because the claim is about a hydration round trip, not about agent behaviour; the real-agent two-tab case is `orchestration/route/001`, which never detaches.
+- **Agent:** none (six `sh -c 'sleep 30'` stand-ins: `orchestrator` + `coder` for each of tab A, tab B, and a token-less legacy pair, all sharing one orchestration name and one cwd).
+- **Asserts:** every pane round-trips its own `orchestration_id` through the daemon echo; the partition yields THREE buckets (tab A, tab B, legacy) rather than one merged bucket, each holding exactly its own two panes; the two tokened buckets' `OrchestrationIdentity`s differ while the token-less bucket falls back to `NameCwd { name, cwd }`; rebuilding every bucket produces three orchestration tabs with each pane owned by exactly one tab; and (PRD #140 review) a dead role slot in each tokened tab mints a DISTINCT synthetic dead-slot id with its own placeholder card — pre-fix the `(cwd, orchestration_name)`-keyed id aliased across the two partitioned tabs onto one shared card — while the legacy identity keeps the pre-review byte format.
+- **Does not assert:** live delegate/work-done routing across the reattach (that is `orchestration/route/001` and the `src/state.rs` routing unit tests); PTY attach or scrollback replay of the rebuilt panes; the same-cwd spawn warning (`orchestration/guard/001`); the on-disk snapshot restore branch.
+- **Platform coverage:** linux+mac (the suite is `#![cfg(unix)]` — the mock attach servers bind Unix-domain sockets; Windows port tracked by #164).
 
 ### Session restore
 
@@ -1836,7 +2254,7 @@ These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept con
 ##### session/save/002 — Triggering a detach path (Ctrl+W close-pane) flushes a fresh snapshot reflecting the workspace, without quitting.
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path).
 - **Agent:** none (panes run `sleep 600`; no LLM).
-- **Asserts:** with two dashboard panes present and any prior snapshot removed, closing a pane with Ctrl+W writes a fresh `session.toml` that still reflects the (non-empty) workspace — proving the detach path flushes the snapshot mid-session, not only at clean quit.
+- **Asserts:** with two dashboard panes present and any prior snapshot removed, requesting a pane close with Ctrl+W and choosing Close with Down+Enter writes a fresh `session.toml` that still reflects the (non-empty) workspace — proving the detach path flushes the snapshot mid-session, not only at clean quit.
 - **Does not assert:** which specific pane survives the close; the coalescing/debounce window (`session/save/003`).
 - **Platform coverage:** mac+linux.
 
@@ -2002,6 +2420,20 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** synthetic custom launcher explicitly declared as Codex.
 - **Asserts:** a command whose basename is not `codex` still executes exactly through `dot-agent-deck wrap --agent codex -- ...` when the caller supplies `AgentType::Codex`, and the live registry records that pane as Codex.
 - **Does not assert:** command-string inference (covered by the detection matrix) or real Codex behavior.
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/007 — A hook-learned Codex badge does not mutate a non-inferable pane's launch shape on respawn (PRD #225 M1).
+- **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` + hook-path `set_agent_type` + `respawn_agent_for_pane`, with PATH recorder stubs).
+- **Agent:** synthetic `devbox run codex-big` launcher whose basename intentionally does not infer an agent type.
+- **Asserts:** the initial and replacement exec records are byte-identical `devbox run codex-big` lines even after the registry badge upgrades from `None` to `Some(Codex)`; no `dot-agent-deck wrap` line appears on respawn.
+- **Does not assert:** daemon hook-socket ingestion of the badge (covered by `hooks/delivery/007`); an EDITED role command's effect on the wrap decision (`codex/spawn/008`); real Codex behavior.
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/008 — A respawn's wrap decision follows the command it is actually launching, so an explicit Codex identity can never wrap a different agent (PRD #225 review finding 1).
+- **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` + two `respawn_agent_for_pane` calls, with PATH recorder stubs for `devbox`, `claude`, and `dot-agent-deck`).
+- **Agent:** synthetic `devbox run codex-big` launcher spawned with an explicit `AgentType::Codex` identity, then respawned once with that same command and once with the role command edited to `claude --model haiku`.
+- **Asserts:** the unchanged respawn relaunches byte-identically as `dot-agent-deck wrap --agent codex -- devbox run codex-big` (the frozen identity is the only thing that knows this launcher is Codex); the edited respawn executes a bare `claude --model haiku` and never `wrap --agent codex -- claude …`; and the pane badge follows the newly launched command (`ClaudeCode`) instead of still advertising the replaced agent. Both halves are load-bearing — replaying the frozen identity verbatim wraps Claude as Codex, and dropping it flips the unchanged pane to bare.
+- **Does not assert:** the hook-learned badge path (`codex/spawn/007`); a launcher whose command implies no type AND whose underlying agent changed (`devbox run codex-big` → `devbox run claude-big`), which keeps its creation-time identity by documented design.
 - **Platform coverage:** mac+linux.
 
 #### codex/hooks
@@ -2177,6 +2609,13 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** the exact column widths; click behavior; which button lands on which row; the exact ceded row count (pinned by `render/layout/004`); the full-label rendering at roomy widths (covered by `mouse/buttonbar/001` / `005`).
 - **Platform coverage:** mac+linux+windows.
 
+##### mouse/buttonbar/007 — The dimmed Close button is inert outside command mode.
+- **Layer:** L2 (real-binary PTY with production button rendering and SGR mouse hit-testing).
+- **Agent:** none (continued `cat` pane).
+- **Asserts:** Help mode still visibly renders `[Close Ctrl+W]`; clicking it arms neither the pane-scoped nor tab-scoped close confirmation; Help's own `[Close]` then dismisses the overlay normally; the daemon agent remains alive.
+- **Does not assert:** the DIM cell modifier itself (covered through the live buffer path by `keybindings/hints/003`).
+- **Platform coverage:** mac+linux.
+
 #### mouse/tabstrip
 
 ##### mouse/tabstrip/001 — Clicking a tab header switches to that tab.
@@ -2189,9 +2628,16 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/tabstrip/002 — Mode/Orchestration tabs carry a clickable `[×]` close affordance (Dashboard has none); clicking it closes the tab.
 - **Layer:** L1 (glyph presence/absence) + L2 (click-to-close).
 - **Agent:** none.
-- **Asserts:** the strip renders exactly one `×` per closeable tab and none for the Dashboard; clicking a Mode tab's `[×]` closes it (Ctrl+W teardown semantics).
+- **Asserts:** the strip renders exactly one `×` per closeable tab and none for the Dashboard; clicking a Mode tab's `[×]` leaves the tab intact behind the tab-scoped `Close this tab and all its panes?` Cancel-default confirmation, and Down+Enter then closes it.
 - **Does not assert:** which tab gets focus after close.
 - **Platform coverage:** mac+linux (L1 half: +windows).
+
+##### mouse/tabstrip/003 — An inactive tab's `×` binds confirmation to that stable tab while modal navigation is suppressed.
+- **Layer:** L2 (real-binary PTY with two distinct synthetic Mode tabs and production SGR mouse/key dispatch).
+- **Agent:** none (the `alpha` and `beta` fixture modes run long-lived side panes with unique rendered sentinel text).
+- **Asserts:** with `BETA_TAB_SENTINEL` active, clicking the inactive alpha tab's `×` arms alpha with tab-scoped copy; Ctrl+PageUp and Ctrl+PageDown leave beta rendered; confirmation removes alpha while beta and its single remaining `×` survive.
+- **Does not assert:** dashboard-session identity replacement (covered by `prompt/close-confirm/005`).
+- **Platform coverage:** mac+linux.
 
 #### mouse/dashboard
 
@@ -2293,11 +2739,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### theme/guard
 
-##### theme/guard/001 — No absolute background on any cheaply-seamable surface; selection is cued by the Magenta+BOLD border, not an absolute fill.
+##### theme/guard/001 — No absolute background on any cheaply-seamable surface; command-mode selection is cued by the Magenta+BOLD border, not an absolute fill.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none.
-- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states, (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card is distinguished from the unselected one by a terminal-relative cue (the `▸ ` title prefix and a `Color::Magenta`+BOLD border — the dedicated PRD #155 `selected` accent role, which never reuses a status color or the `focused` cyan) rather than an absolute `selected_bg` fill.
-- **Does not assert:** named-ANSI accents/status colors; the `render_frame` canvas/tab-bar fills (not cheaply reachable through a render seam — guarded by `theme/guard/002`).
+- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states **in command mode** (`UiMode::Normal`), (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card is distinguished from the unselected one by a terminal-relative cue (the `▸ ` title prefix and a `Color::Magenta`+BOLD border — the dedicated PRD #155 `selected` accent role, which never reuses a status color or the `focused` cyan) rather than an absolute `selected_bg` fill.
+- **Does not assert:** named-ANSI accents/status colors; the `render_frame` canvas/tab-bar fills (not cheaply reachable through a render seam — guarded by `theme/guard/002`); the PaneInput de-emphasis of the same accent (PRD #341 M4 — covered by `mode/deck/001`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/guard/002 — `src/ui.rs` carries no forbidden absolute-background patterns (source lint).
@@ -2330,20 +2776,160 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** pane content/title rendering; the focused/selected pane accents (covered by `theme/palette/004` / `theme/guard/001`).
 - **Platform coverage:** mac+linux+windows.
 
-##### theme/palette/003 — Selected deck-card border is the dedicated `selected` accent (Magenta+BOLD+marker), never a status/focus color.
+##### theme/palette/003 — Selected deck-card border in command mode is the dedicated `selected` accent (Magenta+BOLD+marker), never a status/focus color.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none (one selected live session fixture).
-- **Asserts:** rendering a selected deck card resolves its border to `Color::Magenta` + `Modifier::BOLD` with a `▸ ` title marker, and that this color is neither the working-status green nor the focused-pane cyan — the `selected` role never collides with the status palette or the `focused` accent.
-- **Does not assert:** the status badge (still shows status independent of selection); the absolute-background guard (covered by `theme/guard/001`).
+- **Asserts:** rendering a selected deck card **in command mode** (`UiMode::Normal`) resolves its border to `Color::Magenta` + `Modifier::BOLD` with a `▸ ` title marker, and that this color is neither the working-status green nor the focused-pane cyan — the `selected` role never collides with the status palette or the `focused` accent.
+- **Does not assert:** the status badge (still shows status independent of selection); the absolute-background guard (covered by `theme/guard/001`); the de-emphasised PaneInput strength of the same accent (PRD #341 M4 — covered by `mode/deck/001`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/palette/004 — Focused-pane border is the dedicated `focused` accent (Cyan), distinct from every status and from `selected`.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none (one focused `TerminalWidget`).
 - **Asserts:** rendering a focused embedded pane resolves its border to `Color::Cyan`, and that this color is distinct from every status role (green/blue/yellow/red/dark-gray) and from the `selected` accent (magenta) — focus stays Cyan while selection moves to Magenta, so status/selection/focus are provably distinct (PRD #155 success criterion #3). Also asserts the PRECEDENCE invariant: a pane that is focused AND carries a present `Working` status still renders the focused accent (Cyan), never the Working/Green status color — focus OVERRIDES a present status in the unified border precedence (Option A).
-- **Does not assert:** unfocused-pane status coloring (covered by `theme/palette/002`); pane content rendering.
+- **Does not assert:** unfocused-pane status coloring (covered by `theme/palette/002`); pane content rendering; the command-mode half of the focus precedence (covered by `theme/palette/005`).
 - **Platform coverage:** mac+linux+windows.
 
+##### theme/palette/005 — A focused pane in command mode drops the Cyan accent for its status color and thickens its border.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
+- **Agent:** none (one `TerminalWidget` rendered twice, live vs. command mode).
+- **Asserts:** rendering the SAME focused pane with `input_active=true` (`UiMode::PaneInput`) vs. `input_active=false` (command mode) produces visually distinguishable borders — live resolves to `Color::Cyan` on a thin `│` (`BorderType::Plain`) border, command mode falls through to the agent's status role (`Working`=`Color::Green`) on a thick `┃` (`BorderType::Thick`) border — and that the two colors differ, so colour encodes whether keystrokes reach the pane while thickness still encodes which pane is focused. Also asserts an UNFOCUSED pane keeps the thin border in BOTH modes, so thickness stays exclusive to the focused pane.
+- **Does not assert:** that the inner area / PTY size is unaffected by the border weight (`BorderType` never feeds `Block::inner`, and the PRD #84 invariant-3 contract assert covers a regression there); the bottom-bar and hint-string mode cues (covered by the PRD #241 M4 button-bar specs); the status-less focused pane's dim fallback.
+- **Platform coverage:** mac+linux+windows.
+
+
+### Mode indication (PRD #341)
+
+#### mode/cursor
+
+##### mode/cursor/001 — The painted terminal cursor appears only while pane input is active.
+- **Layer:** L1 (in-process `TerminalWidget` rendered into a `ratatui::buffer::Buffer`; no PTY, no subprocess).
+- **Agent:** none (one focused vt100 fixture rendered twice).
+- **Asserts:** with `input_active=true`, the known cursor cell retains today's exact black-on-`LightGreen` bold block styling; with `input_active=false`, the same cell is styled identically to its neighbouring non-cursor cells and carries no cursor modifier, so command mode renders no painted cursor of any kind.
+- **Does not assert:** the terminal emulator's own cursor (covered by `mode/cursor/002`); pane-border mode styling (covered by `theme/palette/005`).
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/cursor/002 — The terminal emulator cursor is hidden in command mode.
+- **Layer:** L1 (ratatui `TestBackend` frame rendering through the production focused-pane path; no PTY subprocess).
+- **Agent:** none (one in-memory focused pane fixture).
+- **Asserts:** the same focused-pane frame requests a visible terminal cursor in `UiMode::PaneInput` and no terminal cursor in `UiMode::Normal`, proving command mode skips `Frame::set_cursor_position`.
+- **Does not assert:** painted cursor-cell styling (covered by `mode/cursor/001`); cursor shape; unfocused panes; modal input cursors outside the terminal-pane path.
+- **Platform coverage:** mac+linux+windows.
+
+#### mode/chip
+
+##### mode/chip/001 — The bottom bar persistently names the current mode.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, rendered through `render_button_bar_for_mode_to_buffer` and the live `render_bottom_bar` path).
+- **Agent:** none.
+- **Asserts:** command mode begins with ` COMMAND ` and PaneInput begins with ` TYPING `; both chips use `Modifier::REVERSED | Modifier::BOLD`, carry no `Color::Rgb`, and the snapshot pins the complete production bar in both modes.
+- **Does not assert:** behavior after clicking the adjacent destination button; narrow-width wrapping; banner or pane-dimming behavior.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/chip/002 — The current-mode chip is universal and coexists with the destination button.
+- **Layer:** L1 (ratatui `TestBackend` through the production global-only and context-rich bottom-bar paths).
+- **Agent:** none.
+- **Asserts:** Dashboard, Mode, and Orchestration contexts place the chip at the same left-edge position; command mode shows ` COMMAND ` with `[Back to Pane Ctrl+D]`, while PaneInput shows ` TYPING ` with `[Command Mode Ctrl+D]`, so the current-state label never replaces the destination affordance.
+- **Does not assert:** click dispatch for the destination button; exact spacing after the chip; context-specific buttons after the universal prefix.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/chip/003 — Narrow mode chips disappear symmetrically without changing the bar's row budget.
+- **Layer:** L1 (ratatui `TestBackend` through the production bottom-bar renderer; no PTY or subprocess).
+- **Agent:** none.
+- **Asserts:** across every width 0–24, ` COMMAND ` is present if and only if ` TYPING ` is present, both are absent below the shared 10-column threshold and present at or above it, and Normal/PaneInput/Filter/Rename rendering never panics; the command bar's reserved and rendered rows remain 11/5/3/2/1 at widths 19/40/80/120/200.
+- **Does not assert:** click dispatch, exact button placement within each wrapped row, or full-frame card geometry (covered by `render/layout/004`).
+- **Platform coverage:** mac+linux+windows.
+
+#### mode/banner
+
+##### mode/banner/001 — A fresh command-mode entry dims only the focused pane and centres the full block banner without erasing agent output.
+- **Layer:** L1 (in-process production focused-pane renderer through a `TestBackend`-backed buffer seam plus `insta` style-aware capture).
+- **Agent:** none (one synthetic vt100 pane rendered focused in command mode and PaneInput, then unfocused in command mode).
+- **Asserts:** a roomy focused command pane selects the full block-letter tier, centres its REVERSED block region and `Ctrl+D to type` subtitle, retains readable underlying agent output, and applies DIM throughout the inner area except where the banner overlays it; the same focused PaneInput pane and an unfocused command pane have neither banner nor DIM, and no rendered cell uses `Color::Rgb`.
+- **Does not assert:** timed decay or input-driven collapse (covered by `mode/banner/003`); narrow fallback geometry (covered by `mode/banner/002` and `/004`); terminal-specific visual support for DIM or the live binary path (M6 L2 scope).
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/banner/002 — The narrow-pane fallback ladder is pure, monotonic, safe, and always fits.
+- **Layer:** unit/L1 (pure `command_banner_tier(width, height)` width/height sweep; no renderer, PTY, or subprocess).
+- **Agent:** none.
+- **Asserts:** all five tiers own a reachable size band in the documented order; 0×0, 1×1, very-wide/one-row, and very-tall/three-column areas safely omit; every selected tier reports rendered dimensions within the available inner area; increasing either dimension never selects a lower tier.
+- **Does not assert:** glyph shapes, centring, modifiers, or clipping in the actual buffer (covered by `mode/banner/001` and `/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/banner/003 — Banner decay is deterministic, asymmetric for bound versus unbound keys, and re-arms on every entry.
+- **Layer:** L1 state-machine unit using an injected `Instant`; no sleep, PTY, or subprocess.
+- **Agent:** none.
+- **Asserts:** the named TTL is 2.5 seconds; fresh entry is expanded until the TTL and collapsed at expiry; a command-mode Action and a bottom-bar click collapse early; an unbound printable holds the banner before decay and re-asserts it with a fresh clock after collapse; leaving hides/clears it and re-entry expands it again.
+- **Does not assert:** command keybinding resolution itself; rendering or persistent DIM (covered by `mode/banner/001` and `/004`); wall-clock scheduling in the 16ms live loop.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/banner/004 — Every degraded and collapsed banner state stays inside the focused pane.
+- **Layer:** L1 (production pane render seam under `catch_unwind` at tier-boundary sizes plus `insta` text/style capture).
+- **Agent:** none (synthetic vt100 content in small-but-valid focused panes).
+- **Asserts:** nonempty 0×0, 1×1, 2×2, 1×40, and 40×1 pane renders do not panic and return the exact requested buffer size; all three release-exposed controller seam paths resolve a single axis just above `PTY_RESIZE_DIM_MAX` to the safe 24×80 parser fallback; tiers 2–4 render their exact block-COMMAND, full reversed line, and reversed word fallbacks entirely inside the inner area; tier 5 omits safely; all valid bordered sizes retain DIM and avoid `Color::Rgb`; after decay the pane stays dim/readable with no banner while the bottom bar still carries the persistent ` COMMAND ` chip.
+- **Does not assert:** the full tier-1 banner (covered by `mode/banner/001`); the transition rules that produce Collapsed (covered by `mode/banner/003`); M6 PTY/real-agent behavior.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/banner/005 — Same-drain mode edges preserve the command banner's real key semantics.
+- **Layer:** L1 (in-process production `handle_key_event` burst observer with no render between keys; no PTY or subprocess).
+- **Agent:** none (one inert focused pane).
+- **Asserts:** a queued double-`Ctrl+D` burst traverses Normal → PaneInput → Normal and re-expands the banner; `Ctrl+D` then bound `Ctrl+T` from PaneInput lands Normal → Normal and stays Collapsed; single bound `Ctrl+T`, bound-then-unbound-printable, and single PaneInput exit control rows retain their distinct Collapsed/Expanded outcomes, with the before-burst visibility pinned for every case.
+- **Does not assert:** mouse bursts, wall-clock TTL expiry (covered by `mode/banner/003`), or rendered banner geometry.
+- **Platform coverage:** mac+linux+windows.
+
+#### mode/deck
+
+##### mode/deck/001 — The selected deck-card accent is full-strength only in command mode.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, colour-and-modifier-aware card capture through the production renderer).
+- **Agent:** none (one synthetic selected Working session rendered in both modes).
+- **Asserts:** command mode remains byte-identical to the legacy selected-card rendering and carries Magenta+BOLD+`▸ `; PaneInput keeps `▸ ` but has a different, de-emphasised border style where BOLD is absent and/or DIM is present; neither rendering contains `Color::Rgb`; the snapshot pins both styled cards.
+- **Does not assert:** unselected-card styling; focused terminal-pane styling; a single mandated de-emphasis recipe beyond the property that it drops BOLD and/or adds DIM.
+- **Platform coverage:** mac+linux+windows.
+
+#### mode/scroll
+
+##### mode/scroll/001 — Focused agent-pane wheel routing obeys the full mode × child-mouse matrix.
+- **Layer:** L1 (in-process synthetic pane with real vt100 scrollback and a recording child-input channel; no PTY subprocess).
+- **Agent:** none (one in-memory focused pane with synthetic history).
+- **Asserts:** PaneInput forwards a wheel report only when the child has mouse reporting enabled and otherwise moves dot-agent-deck scrollback; command mode moves dot-agent-deck scrollback for both child-mouse states and emits no mouse-protocol bytes, explicitly pinning the Normal+mouse-enabled safety cell.
+- **Does not assert:** wheel-down direction (the same production route receives a direction parameter); side-pane hit-testing, which already works in every mode; real terminal mouse-report decoding.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/scroll/002 — PageUp/PageDown provide a remappable command-mode keyboard equivalent for focused agent-pane scrollback.
+- **Layer:** L1 (in-process production keybinding resolution plus synthetic focused-pane scroll observation).
+- **Agent:** none (one in-memory focused pane with synthetic history).
+- **Asserts:** the default PageUp/PageDown bindings move focused-agent scrollback away from/toward live output in `UiMode::Normal` without writing to the child; `[dashboard] scroll_pane_up` and `scroll_pane_down` remaps parse without warnings, disable the old defaults, and move scrollback on their replacement chords.
+- **Does not assert:** PaneInput key forwarding; help-overlay or bottom-bar discoverability; filesystem loading of `keybindings.toml`.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/scroll/003 — PaneInput snaps newly targeted panes back to live output without disabling deliberate scrolling.
+- **Layer:** L1 (in-process two-frame reconcile through two real synthetic vt100 panes; no PTY subprocess).
+- **Agent:** none (two in-memory panes with synthetic history and production focus changes).
+- **Asserts:** command-mode scrollback is nonzero before entering PaneInput and zero afterward; an unchanged PaneInput target deliberately retains its offset; moving PaneInput focus snaps only the newly targeted second pane while leaving the first at live output; an unchanged command-mode target deliberately retains its offset. Every case pins both pre- and post-reconcile offsets for both panes.
+- **Does not assert:** hardware-cursor rendering after the reset (covered by `mode/live/002`); key dispatch for entering PaneInput; real-agent output.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/scroll/004 — PaneInput without a focused pane settles in command mode exactly once.
+- **Layer:** L1 (in-process two-frame production scrollback reconcile plus command-banner edge observer with injected `Instant`s; no PTY or subprocess).
+- **Agent:** none (a controller with no panes).
+- **Asserts:** a no-focus PaneInput frame lands in Normal with an Expanded banner, remains Normal on the next frame, and reports Collapsed exactly at the TTL so the entry instant was not re-stamped; equal frame instants remain Expanded, and an already-Normal initial mode produces the identical idempotent result.
+- **Does not assert:** how focus vanished, focus replacement policy when another pane exists, rendered banner geometry, or real-agent behavior.
+- **Platform coverage:** mac+linux+windows.
+
+#### mode/live
+
+##### mode/live/001 — A real PTY-attached deck keeps the persistent mode chip after the command banner collapses.
+- **Layer:** L2 PTY (the real `dot-agent-deck` binary in the isolated `TuiDeck` harness, asserted on the rendered vt100 grid and terminal attributes).
+- **Agent:** none (synthetic `printf; sleep` stand-in pane).
+- **Asserts:** Ctrl+D enters command mode with readable DIM pane content, the expanded banner, and the left-anchored ` COMMAND ` chip; the bound `j` action collapses the banner without removing the chip or content; Ctrl+D returns to a banner-free ` TYPING ` chip.
+- **Does not assert:** a genuine agent boot or agent response; real-agent cursor and scroll behavior (covered by `mode/live/002`); exact block-glyph shapes or subtitle position.
+- **Platform coverage:** mac+linux.
+
+##### mode/live/002 — A real interactive Haiku agent visibly traverses typing, command-mode reading and scrollback, then typing again. [reel]
+- **Layer:** L2 PTY (the real `dot-agent-deck` binary in the isolated `TuiDeck` harness, asserted on the rendered vt100 grid and terminal attributes; flaky-tolerant pre-PR real-agent tier).
+- **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`, `--ax-screen-reader`, `--allowedTools Bash Read`, no `-p`), with isolated imported credentials plus onboarding/project trust seeded in the per-test HOME; the supported accessibility renderer keeps genuine interactive output in terminal scrollback instead of repainting it out of the vt100 history.
+- **Asserts:** the live prompt accepts typed keystrokes and exposes both cursor channels with ` TYPING `; the submitted prefix-glob directive makes Haiku inspect and visibly list a uniquely named fixture sentinel; Ctrl+D hides the hardware cursor and removes the painted block while retaining readable DIM output, the expanded banner, and ` COMMAND `; wheel-up reveals older real-agent filename output through deck scrollback rather than the child mouse path; Ctrl+D restores the cursor treatment and ` TYPING `.
+- **Does not assert:** exact model prose, tool-call wording, response timing, pixel-level DIM appearance, light-versus-dark terminal rendering, or command-mode indication on all three tab types (covered at L1 by the mode suites and manually validated across tabs).
+- **Platform coverage:** mac+linux.
 
 ### Scheduled tasks (PRD #127)
 
@@ -2610,6 +3196,20 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the whitespace-only variant of the fallback (the same code path); the mode-locked form's render (covered by `scheduler/form/001`).
 - **Platform coverage:** mac+linux.
 
+##### scheduler/manager/016 — Wheel input over the Scheduled Tasks dialog does not scroll a mode-tab side pane behind the modal (issue #142).
+- **Layer:** L2 (real TUI in a PTY; opens a synthetic `scroll` mode tab whose persistent right-hand side pane is filled with deterministic scrollback, then sends precise SGR wheel reports over the overlapping manager dialog).
+- **Agent:** none (the mode side pane runs a synthetic shell command; no LLM is invoked).
+- **Asserts:** after the side pane is scrolled into history and the manager is opened over it, wheel-down must first move the manager selection from `alpha` to `bravo`, then wheel-up must move it back to `alpha`, while the exposed side-pane marker sequence remains unchanged; the modal consumes the wheel events instead of leaking them to the pane behind it.
+- **Does not assert:** focused dashboard-pane wheel behavior; child-app mouse forwarding; the manager list viewport behavior (covered by `scheduler/manager/017`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/manager/017 — Wheel input over a windowed Scheduled Tasks list moves its selection and derived viewport (issue #142).
+- **Layer:** L2 (real TUI in a constrained-height PTY; a fixture global `schedules.toml` contains 30 distinct tasks, more than the manager can render at once, and the first visible task row supplies the coordinate for precise SGR wheel reports over the list viewport).
+- **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`).
+- **Asserts:** the first row starts selected and `wheel-task-13` starts below the viewport; twelve wheel-down reports over the list move the `▶` marker to `wheel-task-13`, which drags the selection-derived viewport until that initially hidden row is visible.
+- **Does not assert:** an independent list scroll offset (none exists); wheel-up wrapping at the first row; background side-pane isolation (covered by `scheduler/manager/016`).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/form
 
 ##### scheduler/form/001 — The new-pane form mode-locked to schedule renders ONLY Dir + Command (no Mode cycler, no Name field) and titles itself ` New Schedule ` (Add) / ` Edit Schedule ` (Edit) (PRD #170 unified Add/Edit flow).
@@ -2659,6 +3259,106 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** the shimmed `stub-issue-authoring` authoring agent (records the gated-delivered seed).
 - **Asserts:** opening the new-pane form (Ctrl+n → Space confirms the dir) and cycling the Mode field to the `schedule: issues` option (waited on via the selection-dependent ` … — schedule: issues mode ` title), then submitting via `[Submit]`, spawns the seeded authoring agent whose recorded seed contains the issue-dispatch guidance `schedule add --repo` AND `max_per_run` — neither present in the plain `schedule` seed (which calls `schedule add --name`). RED today: no `schedule: issues` option exists, so cycling never lands on it and the `schedule: issues mode` title wait times out.
 - **Does not assert:** the flag-gated visibility of the option in the cycler (covered by `prompt/new-pane/010`); the CLI write the agent ultimately performs (covered by `scheduler/cli/004`); the full seed-prompt text (loose substring on the issue-dispatch-specific tokens); the plain `schedule` seed (covered by `scheduler/form/002`).
+- **Platform coverage:** mac+linux.
+
+#### scheduler/idle-worker
+
+##### scheduler/idle-worker/001 — A delegated worker that never sends work-done produces a self-describing idle prompt in the orchestrator pane.
+- **Layer:** fast integration (in-process daemon state + real PTY registry; `cat` stand-ins).
+- **Agent:** none (synthetic `cat` panes; the orchestrator is raw/no-echo so one daemon submission appears once in the snapshot).
+- **Asserts:** after the test-only millisecond timeout, the orchestrator PTY contains one line carrying both the daemon-provenance clause (`has not responded with work-done (dot-agent-deck daemon report, not a message from a person or an agent)`) and the target role wrapped in `[UNTRUSTED-ROLE-LABEL: … :END-UNTRUSTED-ROLE-LABEL]`.
+- **Does not assert:** emoji, elapsed-time wording, or notification-channel behavior.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/002 — Work-done arriving before the timeout cancels that delegation's idle prompt.
+- **Layer:** fast integration (real `handle_delegate` + `handle_work_done`).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** a parallel silent control delegation proves the detector fires, while the responsive worker's role never appears on an idle-prompt line after its work-done and timeout window.
+- **Does not assert:** work-done summary-file contents or the completion-feedback wording.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/003 — A zero worker-response timeout DISABLES the detector — from the config key and from the millisecond seam alike — rather than firing immediately (PRD #126 M1 audit finding 4).
+- **Layer:** fast integration (three delegations against one harness whose project config sets `worker_response_timeout_minutes = 0`, re-pointing the millisecond seam between them).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** with the seam at a positive value the detector fires (positive control, and proof the seam overrides a config that would have disabled it); re-pointing the same harness's seam to `0` produces no prompt; unsetting the seam so the config's own `0` is consulted produces no prompt either; exactly one prompt exists at the end.
+- **Does not assert:** that a *file* `0` is decisive against a file positive value — no config value below one minute exists, so that comparison is unobservable behaviorally and is covered at resolution level by `scheduler/idle-worker/007`.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/004 — An outstanding delegation produces only one idle prompt and never re-nags.
+- **Layer:** fast integration (in-process daemon state + raw/no-echo orchestrator PTY).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** the first idle prompt appears, then the ASCII idle needle still occurs exactly once after another timeout window.
+- **Does not assert:** behavior after a later re-delegation (covered by `scheduler/idle-worker/005`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/005 — Re-delegating to the same worker pane replaces the first timer without a premature or duplicate prompt.
+- **Layer:** fast integration (real repeated `handle_delegate` calls against one worker pane).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** no prompt appears after delegation one's old deadline but before delegation two's deadline; delegation two then produces exactly one role-bearing idle prompt.
+- **Does not assert:** concurrent delegation to different worker panes.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/006 — Closing a delegated worker through StopAgent cancels its outstanding idle timer.
+- **Layer:** fast integration with an in-process attach server and the real StopAgent request.
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** a silent control worker proves the detector fires, while the stopped worker never appears on an idle-prompt line after the timeout.
+- **Does not assert:** worktree cleanup or TUI close-key behavior.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/007 — The worker-response timeout resolves env-over-file-over-default, prefers the orchestration cwd, defaults to 120 minutes, and REJECTS an out-of-range value in favour of the default instead of clamping it.
+- **Layer:** fast unit-level (calls the real `worker_response_timeout` resolver directly against purpose-built config directories; no PTY).
+- **Agent:** none.
+- **Asserts:** an absent key (and a cwd with no config file at all) resolves to 120 minutes; the orchestration cwd's value wins over the worker cwd's and the worker cwd is the fallback when the orchestration cwd has no config; a `20000`-minute file value resolves to the 120-minute DEFAULT, not to the 10080-minute ceiling; an in-range millisecond seam overrides the file; a below-floor (`50`) and an above-ceiling (`604800001`) seam value are both ignored so resolution continues to the file/default rather than clamping; `0` from either source resolves to `None` (detector disabled); the `1`-minute and `10080`-minute bounds themselves are honored.
+- **Does not assert:** the delegate-time behavior of a disabled detector (covered by `scheduler/idle-worker/003`); non-integer or negative TOML values (rejected earlier, at parse time).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/008 — After the ORCHESTRATOR pane closes, an unrelated agent that inherits its pane id receives nothing — the dead orchestration's idle prompt is never auto-submitted into a stranger's session (PRD #126 M1 review finding 1 / audit finding 2).
+- **Layer:** fast integration with an in-process attach server, the real StopAgent request, and a second raw/no-echo `cat` spawned onto the freed `pane_id_env`.
+- **Agent:** none (`cat` stand-ins; the successor is raw/no-echo so any submitted byte is directly observable in its scrollback).
+- **Asserts:** the successor's own readiness marker is present (so absence of anything else is meaningful) while its PTY carries zero occurrences of the daemon clause and no fragment of the dead orchestration's role name, after two full timeout windows during which the successor owned the pane.
+- **Does not assert:** which of the two layered guards refused — the record sweep over orchestrator-side records at `begin_pane_close`, or the `write_and_submit_guarded` agent-id gate. Both must be removed before a stray submit appears on THIS (StopAgent) path, because the sweep drops the record before any timer can wake; the identity gate on its own is isolated by `scheduler/idle-worker/014`, which reaches the same pane-reuse state through an orchestrator exit that runs no sweep at all.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/009 — A timer whose deadline falls inside a pane's SIGTERM grace window does not fire the nudge that the deliberate close exists to suppress (PRD #126 M1 review finding 1).
+- **Layer:** fast integration with an in-process attach server and the real StopAgent request against a worker that IGNORES SIGTERM, so `close_agent` spends its full three-second grace with the pane marked closing.
+- **Agent:** none (`cat` for the control; `trap '' TERM; exec cat` under a pinned `/bin/sh` for the TERM-resistant worker).
+- **Asserts:** first, as a precondition, that the close window genuinely bracketed the detector deadline (close started before it and finished after it), so the test cannot pass for the wrong reason; then that a parallel silent control produced a prompt while the closing worker produced none.
+- **Does not assert:** SIGKILL escalation timing, or the close outcome for a worker that exits promptly on SIGTERM (covered by `scheduler/idle-worker/006`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/010 — A delegate that lands while a pane is mid-close is refused arming, so the close cannot be raced into leaving a record behind it (PRD #126 M1 review finding 1).
+- **Layer:** fast integration; a SIGTERM-ignoring worker holds the close transition open for three seconds and the test barriers on `is_pane_closing` before delegating, then re-asserts the mark is still set after the delegate returns.
+- **Agent:** none (`cat` for the control; `trap '' TERM; exec cat` for the closing worker).
+- **Asserts:** the delegate provably landed inside the close transition, and after the timeout the control has a prompt while the closing worker has none.
+- **Does not assert:** the registry-level `arm_outstanding_delegation` → `None` contract in isolation (covered by the in-`src` unit test `begin_pane_close_cancels_records_targeting_the_closing_orchestrator`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/011 — A silent delegated worker's idle prompt is visible in a PTY-attached orchestration pane.
+- **Layer:** L2 PTY (real `dot-agent-deck` binary and lazy daemon, rendered through the vt100 `TuiDeck` harness).
+- **Agent:** none (the `orch-deck` fixture uses live `cat` stand-ins; synthetic Delegate injected over the real hook socket, so this entry is intentionally not reel-marked).
+- **Asserts:** after opening the two-role orchestration with a tiny daemon timeout, the rendered surface visibly carries the daemon-provenance clause AND the worker role wrapped in `[UNTRUSTED-ROLE-LABEL: … :END-UNTRUSTED-ROLE-LABEL]`, matched wrap-tolerantly (whitespace squeezed from grid and needle alike) because the prompt is one long line broken across rows at the pane's wrap column.
+- **Does not assert:** real-LLM reaction, notification delivery, emoji, or exact elapsed-time wording.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/012 — A real interactive Haiku orchestrator delegates to a silent worker and visibly receives the daemon's idle nudge. [reel]
+- **Layer:** L2 PTY (real `dot-agent-deck` binary and lazy daemon, with the restored orchestration rendered through the vt100 `TuiDeck` harness). Flaky-tolerant pre-PR tier; run once, not looped.
+- **Agent:** REAL interactive Claude Code orchestrator pinned to Haiku (`claude-haiku-4-5-20251001`, `--allowedTools Bash`, no `-p`) plus a long-lived `cat` worker that intentionally never sends work-done. Runtime-skipped when the Claude CLI or credentials are unavailable — set `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` to turn that skip into a hard failure on a run that must genuinely exercise the agent.
+- **Asserts:** the real orchestrator follows a directive to run the genuine `dot-agent-deck delegate` CLI at least once (proved by the daemon-created `worker-task-worker.md`), then the daemon-authored nudge appears visibly on the attached orchestration grid after the test-only timeout, carrying BOTH the self-identifying report clause (`… (dot-agent-deck daemon report, not a message from a person or an agent)`) and the worker role wrapped in `[UNTRUSTED-ROLE-LABEL: … :END-UNTRUSTED-ROLE-LABEL]` — two anchors a narrating model has no reason to emit verbatim, unlike the bare `has not responded` this used to match.
+- **Does not assert:** that the orchestrator delegated EXACTLY once. The daemon overwrites `worker-task-worker.md` on every delegate and nothing counts invocations, so the file's existence proves "at least one delegate reached the daemon" and no more. Also not asserted: the model's exact acknowledgement, notification-channel delivery, emoji, or exact elapsed-time wording.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/013 — A late work-done from a superseded delegation retires THAT delegation, leaving the re-delegated worker's own watch armed and still able to fire — while a second completion does retire what the first left armed (PRD #126 M1 review finding 6).
+- **Layer:** fast integration (two `handle_delegate` calls against each of two worker panes on one clock, then real `handle_work_done` calls — one for the reported worker, two for the control).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** after the late completion, delegation two's idle prompt still appears; it appears on delegation TWO's clock (no earlier than its own deadline, not the older delegation's); the second worker — twice delegated and twice completed — produces NO prompt, which is what distinguishes a real oldest-first retirement from a `work-done` that retired nothing at all (the surviving watch alone cannot tell them apart); and exactly one prompt exists across all four delegations.
+- **Does not assert:** the two accepted residuals recorded in the PRD — an out-of-order completion crediting the wrong delegation, and a consumed-then-re-delegated record being retired by a late completion. Both are documented limitations, not fixed behavior. Also not asserted: the `DelegationRetirement` variant returned to `handle_work_done` (observed only through the resulting prompt/no-prompt behavior).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/014 — After the orchestrator's process ends ON ITS OWN — no StopAgent, so no close transition and no record sweep — an unrelated agent inheriting its pane id still receives nothing; the `write_and_submit_guarded` agent-id gate is the only guard in play (PRD #126 M1 audit finding 2).
+- **Layer:** fast integration; the orchestrator stub is a polling shell that exits when the test drops a flag file in its cwd (a genuine process exit, not a signalled close), after which a raw/no-echo `cat` takes the freed `pane_id_env`. No attach server, so no `StopAgent` exists in this test at all.
+- **Agent:** none (`cat` worker stand-in; the successor is raw/no-echo so any submitted byte is directly observable in its scrollback).
+- **Asserts:** two preconditions that stop it passing for the wrong reason — the orchestrator pane is NOT in a close transition after the exit (so the close-time sweep is provably not what suppresses the prompt), and the successor owned the pane before the delegation's deadline (so a stray timer had a live target to mis-deliver to) — then that after two further timeout windows the successor's PTY carries its own readiness marker, zero occurrences of the daemon clause, and no fragment of the dead orchestration's role name.
+- **Does not assert:** the pane-reuse-after-`StopAgent` path (covered by `scheduler/idle-worker/008`); the orchestration-membership half of the delivery revalidation (the successor is spawned without `tab_membership`, so that check legitimately abstains and the agent-id gate is what refuses).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live
@@ -2740,6 +3440,6 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 | `dot-agent-deck watch` CLI subcommand ([docs/workspace-modes.md#dot-agent-deck-watch](../docs/workspace-modes.md)) | Non-TUI subcommand; an L2 test would only exercise its output formatting against a real shell — low value compared to the deck-rendering surface. |
 | `dot-agent-deck config get` / `config set` ([docs/configuration.md](../docs/configuration.md)) | Non-TUI; the underlying config field reflection is covered by pure-data tests (`*_get_set_field`, `*_get_set_fields`). |
 | `dot-agent-deck hooks install` / `uninstall` CLI commands ([docs/troubleshooting.md#hooks](../docs/troubleshooting.md)) | Auto-install path is catalogued as `hooks/install/001`–`003`; the explicit subcommand variants share the same install/uninstall code. A targeted L2 test will be added only if a divergence appears. |
-| Ghostty-specific Shift+Enter terminal config ([docs/troubleshooting.md#shift-enter-not-working-in-ghostty-terminal](../docs/troubleshooting.md)) | Outer-terminal config; no deck-side surface to test. |
+| Ghostty-specific Shift+Enter terminal config ([docs/troubleshooting.md#shiftenter-submits-instead-of-inserting-a-newline](../docs/troubleshooting.md)) | **No longer a skip** — PRD #227 showed the break was deck-side (`keyevent_to_bytes` collapsed `Enter + SHIFT` to a bare CR), so there IS a deck-side surface: it is now covered by `embed/key-forwarding/001`. Only the outer-terminal *configuration* itself (what a user types into `ghostty/config`) remains untestable here. |
 | Mode-tab card jump via `Enter` (broken per docs note → [#68](https://github.com/vfarcic/dot-agent-deck/issues/68)) | Documented as broken. The catalog will gain an entry once the bug is closed; until then leaving it uncovered avoids pinning the broken behavior. |
 | `--continue` "dashboard-first landing" detail ([docs/session-management.md#resuming-sessions](../docs/session-management.md)) | Implicit consequence of `session/restore/001`; not separately worth a catalog ID. Reconsider if the landing-tab logic ever has its own surface. |

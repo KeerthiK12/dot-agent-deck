@@ -79,7 +79,7 @@ Two distinct user actions; very different consequences.
 
 | Action | What happens | When to use |
 |---|---|---|
-| **Stop** (`Ctrl+W` on a remote pane) | Sends `StopAgent` to the daemon over the local-on-remote socket; the daemon kills the PTY and removes the agent from the registry. | You're done with the agent; want it gone. |
+| **Stop** (`Ctrl+W` from command mode, then **Close**) | Sends `StopAgent` to the daemon over the local-on-remote socket; the daemon kills the PTY and removes the agent from the registry. If the daemon reports the agent is already gone, the card is removed anyway rather than wedging on an error you can never clear. | You're done with the agent; want it gone. |
 | **Detach** (Ctrl+C in dashboard, then "Detach" in the dialog) | The TUI sends an explicit `KIND_DETACH` frame to the daemon on its Unix socket, then exits. The daemon records a clean detach and keeps the agents running. The ssh session ends when the TUI exits. | You want to step away and come back later, and want the daemon's logs to show a voluntary detach. |
 | **Quit** (Ctrl+C in dashboard, then "Quit") | The TUI exits without sending a detach frame. The daemon observes EOF on its socket and treats it the same as detach — agents stay alive. The ssh session ends when the TUI exits. | You're done for the day; don't need the explicit signal. |
 | **Sleep / network drop** (no action) | SSH keepalive detects the dead connection within ~45s and ssh exits; `connect` then re-probes and **reconnects automatically** to the still-running agents, so the session resumes in place. The daemon and agents never stopped. See [Surviving sleep/wake](#surviving-sleepwake). | Implicit; happens automatically when the laptop sleeps or the network drops. |
@@ -184,11 +184,46 @@ Agents emit hook events (delegate, work-done, etc.) by piping JSON to `dot-agent
 
 `dot-agent-deck hooks install` is run automatically by `remote add` and writes the agent-side hook configuration. If you provision agents on the remote out-of-band (manually editing `~/.claude/settings.json`, for example), run `hooks install` over ssh after the agent is installed so its hook payloads reach the daemon.
 
+## Getting files to the remote
+
+Everything except your terminal runs on the remote (see [Lifecycle model](#lifecycle-model)), so anything you want an agent to read — a screenshot, a log, a PDF — has to exist on the remote's filesystem. Your laptop's filesystem is not visible from over there.
+
+This matters most for images, because two of the three ways Claude Code accepts an image are machine-local by nature:
+
+| Method | Works over ssh? |
+|---|---|
+| Paste from the clipboard (`Ctrl+V`, or `Cmd+V` in iTerm2 on macOS) | **No** — reads the clipboard of the machine the agent runs on, which is the remote. Your screenshot is on your laptop's clipboard. |
+| Drag and drop onto the terminal window | **No**, and it fails misleadingly — see below. |
+| A file path — "Analyze this image: /path/to/image.png" | **Yes.** A plain filesystem read, so it crosses the network boundary fine. |
+
+**Drag and drop is a trap here.** The drop target is your terminal emulator, running on your *laptop*, so it inserts a **laptop** path. That path is then meaningless to an agent running on the remote. It looks like it worked right up until the agent reports a file that does not exist.
+
+None of this is specific to the deck. Plain `ssh remote` followed by `claude` behaves identically, and dragging an image into a deck running locally works fine. The deck has no clipboard-read and no image handling — nothing is intercepting your paste; the file simply is not on the machine the agent runs on.
+
+### Copy the file over, then reference its path
+
+Copy the file to the remote first, then give the agent the remote path:
+
+```bash
+scp ~/Desktop/screenshot.png my-vm:/tmp/
+```
+
+Then, in the agent pane:
+
+```
+look at /tmp/screenshot.png and tell me what's wrong
+```
+
+If the remote has a `Host` block in your `~/.ssh/config`, that `scp` needs no flags — `connect` does not pass `-F` or otherwise override ssh's configuration, so your ssh config applies to the deck exactly as it does to any other ssh invocation. If you registered the remote with `--port` or `--key`, pass the same values to `scp` (`-P` for the port, `-i` for the key) unless your ssh config already carries them.
+
+It is two steps and a second terminal, which is worse than pasting. It works on any terminal and any OS.
+
 ## Limitations in v1
 
 - **One transport.** v1 ships ssh only. The daemon protocol is transport-agnostic and a Kubernetes transport is being designed in [PRD #81](https://github.com/vfarcic/dot-agent-deck/issues/81).
 - **No multi-user host isolation.** A remote is assumed to be a single user's host. Sharing one host between multiple unrelated users (each with their own credentials) is not supported in v1.
-- **No bidirectional file sync.** Project files live on the remote; sync via git. The deck does not bundle mutagen/syncthing/sshfs.
+- **No bidirectional file sync.** Project files live on the remote; sync via git. The deck does not bundle mutagen/syncthing/sshfs. Moving a one-off file across — a screenshot you want an agent to look at, say — is covered in [Getting files to the remote](#getting-files-to-the-remote).
+- **No laptop-to-remote clipboard or file transfer.** Pasting an image into an agent pane over ssh does not work, and there is no built-in transfer command. Copy the file over with `scp` and reference its path.
 
 ## See also
 

@@ -91,8 +91,17 @@ The screenshot lands at `/tmp/dad-screenshot.txt` (override with
 
 ...
 
-Ctrl+n: new  Ctrl+w: close  Ctrl+t: layout  Ctrl+d: dashboard (1-9 ? /)  Ctrl+c: quit
+[Back to Pane Ctrl+D] [New Pane Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?] [Quit Ctrl+C] [Filter /]
+[Rename r] [Generate g] [Scheduled Tasks s]
 ```
+
+The bottom rows are the persistent button bar (it replaced the old
+`Ctrl+n: new  Ctrl+w: close …` status-bar legend), and it is
+mode-aware: the capture above is command mode, so the first button
+reads `[Back to Pane Ctrl+D]` and `[Close Ctrl+W]` is live. Inside a
+pane the first reads `[Command Mode Ctrl+D]` and `[Close Ctrl+W]` is
+dimmed, because `Ctrl+W` closes only from command mode. On a narrow
+terminal the bar wraps to more rows rather than dropping buttons.
 
 `No active sessions` is the signal that the sandbox is isolated — a
 non-isolated run would render whatever sessions your real daemon

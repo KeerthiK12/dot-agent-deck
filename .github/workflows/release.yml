@@ -24,29 +24,101 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       changelog: ${{ steps.changelog.outputs.changelog }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Extract version
         id: version
+        # Every GitHub-context value a `run:` script in this workflow consumes
+        # is bound through `env:` and referenced as a quoted shell variable. A
+        # `${{ … }}` expression is substituted as *raw text* before bash parses
+        # the line, so a crafted `workflow_dispatch` input — or a tag name,
+        # which may legally contain quotes, `;` and `$(…)` — would otherwise
+        # execute as shell code in a pipeline that holds `contents`/`packages`
+        # write and, downstream, the Homebrew/Scoop publishing tokens. Bound
+        # through `env:` the value is only ever data.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
+          # Pin the collation for the whole step: the SemVer gate below matches
+          # with bash's `=~`, whose bracket expressions are resolved against the
+          # active locale rather than against ASCII (see the note at the pattern).
+          # Pinned here rather than at the pattern so nothing added to this step
+          # later can reintroduce a locale-dependent comparison.
+          export LC_ALL=C
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          # Validate BEFORE writing to GITHUB_OUTPUT so a malformed or hostile
+          # value fails fast in `prepare` instead of fanning out to every
+          # consumer — the changelog script, the changelog commit message, the
+          # release tag, the `task` publish steps and the docs workflow all read
+          # this one output.
+          #
+          # SemVer 2.0.0 transcribed into POSIX ERE (bash's `=~` has no
+          # non-capturing groups), assembled from named pieces because the
+          # character classes have to be spelled out and the one-line form would
+          # be unreadable.
+          #
+          # WHY THE CLASSES ARE ENUMERATED AND NOT RANGES: a bracket *range* in
+          # an ERE is interpreted through the active locale's collation, so
+          # `[0-9]` and `[a-zA-Z]` are not ASCII-only. Under `en_US.UTF-8` this
+          # step accepted `1.2.3-é` and the full-width `１.２.３` and wrote them
+          # to GITHUB_OUTPUT, while the identical step under `C` rejected them —
+          # a gate whose verdict depended on the runner's locale. Such values are
+          # shell-inert, but `semver::Version::parse` in `build.rs` rejects them,
+          # so `DAD_VERSION` would have been silently ignored and the version
+          # fallen back to an older git tag or the `0.1.0` placeholder while the
+          # artifact was published under the requested tag: precisely the issue
+          # #250 bug this gate exists to prevent. Belt and braces — `LC_ALL=C`
+          # above already fixes the collation, and these enumerations mean the
+          # same thing in any locale — so neither defence alone is load-bearing
+          # and a reader does not have to guess which one is.
+          d='[0123456789]'
+          nz='[123456789]'
+          # `-` last inside a bracket expression is a literal, never a range end.
+          alpha='[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-]'
+          alnum='[0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-]'
+          # The `{0,18}` bound on the three core fields keeps this gate at least
+          # as strict as `build.rs`, whose `semver::Version::parse` stores each
+          # field in a `u64`: an unbounded digit run would accept a 20-digit core
+          # that the build script then rejects, silently falling `DAD_VERSION`
+          # back to git so the artifact misreports its own version.
+          core="(0|${nz}${d}{0,18})"
+          ident="(0|${nz}${d}*|${d}*${alpha}${alnum}*)"
+          # `[.]`/`[+]` rather than `\.`/`\+`: a single-character bracket
+          # expression carries no range semantics and no backslash to survive
+          # quoting. The pattern is anchored and built only from
+          # digit/letter/`.`/`-`/`+` characters, so a value carrying a newline or
+          # any control character cannot match — which is also what keeps the
+          # single-line `version=` output well-formed.
+          semver_re="^${core}[.]${core}[.]${core}(-${ident}([.]${ident})*)?([+]${alnum}+([.]${alnum}+)*)?"'$'
+          if [[ ! "$VERSION" =~ $semver_re ]]; then
+            # `%q` escapes the rejected value, so it cannot start a line with
+            # `::` and forge a workflow command, nor span multiple lines.
+            printf 'Rejected version (escaped): %q\n' "$VERSION" >&2
+            echo "::error::Refusing to release: version is not valid SemVer. Expected X.Y.Z with no leading 'v', optionally -prerelease and +build. The escaped value is in this step's log."
+            exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - name: Assemble changelog
         id: changelog
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           chmod +x scripts/assemble-changelog.sh
-          CHANGELOG=$(scripts/assemble-changelog.sh "${{ steps.version.outputs.version }}")
+          CHANGELOG=$(scripts/assemble-changelog.sh "$VERSION")
           {
             echo "changelog<<CHANGELOG_EOF"
             echo "$CHANGELOG"
             echo "CHANGELOG_EOF"
           } >> "$GITHUB_OUTPUT"
       - name: Commit changelog updates
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -59,7 +131,7 @@ jobs:
           git pull --rebase --autostash origin main
           git stash pop || true
           git add CHANGELOG.md changelog.d/
-          git diff --cached --quiet || git commit -m "docs: update changelog for v${{ steps.version.outputs.version }}"
+          git diff --cached --quiet || git commit -m "docs: update changelog for v$VERSION"
           git push origin main
 
   build:
@@ -89,7 +161,7 @@ jobs:
             binary_ext: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
@@ -102,18 +174,130 @@ jobs:
         if: matrix.use_cross
         run: cargo install cross --locked
       - name: Build
+        # Issue #250: bake the version being released into the binary rather than
+        # letting `build.rs` re-derive it from the checkout.
+        #
+        # On a TAG PUSH this changes nothing: `prepare` computes
+        # `${GITHUB_REF_NAME#v}`, which is exactly what
+        # `git describe --tags --abbrev=0` already resolved to in the tagged
+        # checkout, and `build.rs` strips the same `v` prefix. Same value, same
+        # artifact.
+        #
+        # On `workflow_dispatch` the checkout is `main` and the new tag does not
+        # exist yet, so `git describe` returns the *previous* release and the
+        # binary published as vX.Y.Z claimed to be the version before it. The
+        # injection is the only thing that can fix that, because the version is
+        # only known to the `prepare` job.
+        #
+        # An empty value degrades safely: `build.rs` treats blank as "not
+        # injected" and falls back to git, i.e. today's behavior.
+        env:
+          DAD_VERSION: ${{ needs.prepare.outputs.version }}
+          # `cross` runs cargo inside a container and forwards only the
+          # `CARGO_*` / `CROSS_*` host variables by default, so DAD_VERSION has
+          # to be named explicitly. This env var is cross's equivalent of
+          # `build.env.passthrough` in a `Cross.toml` (whitespace-separated
+          # list) and is inert for the plain `cargo build` targets.
+          #
+          # MEASURED, not assumed (cross 0.2.5, the version `cargo install cross
+          # --locked` resolves to today): with this set, the build script inside
+          # the aarch64 container observes DAD_VERSION and resolves
+          # `source=INJECTED`; with it unset the variable is absent inside the
+          # container and the script falls back to the checkout's git tag. That
+          # fallback is exactly issue #250's failure — a `workflow_dispatch`
+          # release would publish the ARM64 artifact under the new tag while the
+          # binary reported the previous one.
+          CROSS_BUILD_ENV_PASSTHROUGH: DAD_VERSION
+          # Second, independent channel for the same value, because the line
+          # above is the only thing standing between a dispatch release and a
+          # mislabeled ARM64 binary, and `cargo install cross --locked` is NOT
+          # version-pinned — a future cross release could rename or retire its
+          # passthrough allowlist and this leg would go quiet rather than fail.
+          # `CROSS_CONTAINER_OPTS` is appended to cross's `docker run` argv, so
+          # `-e DAD_VERSION` forwards the host value through docker itself,
+          # below cross's own config layer. Measured to be sufficient ON ITS OWN
+          # with the passthrough allowlist removed, and to combine with it
+          # without a duplicate-argument error. Both degrade safely: with
+          # DAD_VERSION empty or unset, `docker run -e` sets nothing (or an
+          # empty string, which `build.rs` treats as "not injected") and the
+          # build falls back to git exactly as it does today.
+          CROSS_CONTAINER_OPTS: -e DAD_VERSION
+          # `matrix.*` values are static literals in this file, so these two are
+          # defense in depth rather than a live hole — bound anyway so that every
+          # `run:` script in this workflow is uniformly free of `${{ … }}` and a
+          # future matrix entry cannot silently reintroduce the pattern.
+          MATRIX_USE_CROSS: ${{ matrix.use_cross }}
+          MATRIX_TARGET: ${{ matrix.target }}
         run: |
-          if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+          if [ "$MATRIX_USE_CROSS" = "true" ]; then
+            cross build --release --target "$MATRIX_TARGET"
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --target "$MATRIX_TARGET"
           fi
-      - name: Package
+      # Issue #250 is "an artifact published under one version while reporting
+      # another", so the release path asserts that it did not just do that.
+      #
+      # WHY THIS EXISTS EVEN THOUGH THE TWO ENV CHANNELS ABOVE ARE BOTH MEASURED
+      # TO WORK: both are *preventive*, and both live on the far side of the
+      # container boundary — if forwarding ever breaks, whatever depended on
+      # forwarding breaks with it, silently. A strictness flag baked into
+      # `build.rs` would have exactly that defect: it would have to be forwarded
+      # too. This check runs on the HOST, against the finished artifact, so it
+      # cannot be defeated by the failure it is looking for.
+      #
+      # SCOPED TO THE CROSS LEG on purpose. The native legs get DAD_VERSION
+      # straight from this job's `env:` block with no boundary to lose it at;
+      # the container is the only place the value travels between environments.
+      #
+      # `build.rs` deliberately keeps falling back (env -> git -> placeholder)
+      # rather than failing, and that stays: its audience is packagers, Nix,
+      # `cargo install --git` and dev checkouts, where no version is injected
+      # and a hard failure would break every such build. The release job is the
+      # one caller that knows exactly which version it is publishing, so it is
+      # the right place — and the only correct place — to turn a silent fallback
+      # into a failed release.
+      - name: Verify the released version is baked into the artifact
+        if: matrix.use_cross
+        env:
+          DAD_VERSION: ${{ needs.prepare.outputs.version }}
+          MATRIX_TARGET: ${{ matrix.target }}
+          MATRIX_BINARY_EXT: ${{ matrix.binary_ext }}
         run: |
-          BINARY_NAME="dot-agent-deck-${{ matrix.artifact_suffix }}${{ matrix.binary_ext }}"
-          cp "target/${{ matrix.target }}/release/dot-agent-deck${{ matrix.binary_ext }}" "$BINARY_NAME"
+          set -euo pipefail
+          BIN="target/${MATRIX_TARGET}/release/dot-agent-deck${MATRIX_BINARY_EXT}"
+          # An empty needle would make `grep -F` match anything, so the vacuous
+          # pass is rejected explicitly rather than relying on `prepare`'s
+          # SemVer gate to have made it impossible.
+          if [ -z "$DAD_VERSION" ]; then
+            echo "::error::Refusing to publish: the prepared release version is empty, so the artifact cannot be verified."
+            exit 1
+          fi
+          # Checked separately so a build that produced no binary reports that,
+          # rather than being blamed on the injection below.
+          if [ ! -f "$BIN" ]; then
+            echo "::error::Refusing to publish: expected ${MATRIX_TARGET} binary at ${BIN}, but it does not exist."
+            exit 1
+          fi
+          # `env!("DAD_VERSION")` is a &'static str reached at runtime, so the
+          # exact version is in the binary's rodata (measured: 6 occurrences in
+          # a real aarch64 artifact). When injection is lost the value is a
+          # different string entirely and the count is 0 — verified by building
+          # this crate for aarch64 both ways.
+          if ! grep -a -q -F -- "$DAD_VERSION" "$BIN"; then
+            echo "::error::${MATRIX_TARGET} artifact does not contain the version being released (${DAD_VERSION}). The injected DAD_VERSION did not reach the build script inside the cross container, so this binary reports a different version than the tag it would be published under (issue #250). Refusing to publish it."
+            exit 1
+          fi
+          echo "OK: ${MATRIX_TARGET} artifact reports ${DAD_VERSION}"
+      - name: Package
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+          MATRIX_ARTIFACT_SUFFIX: ${{ matrix.artifact_suffix }}
+          MATRIX_BINARY_EXT: ${{ matrix.binary_ext }}
+        run: |
+          BINARY_NAME="dot-agent-deck-${MATRIX_ARTIFACT_SUFFIX}${MATRIX_BINARY_EXT}"
+          cp "target/${MATRIX_TARGET}/release/dot-agent-deck${MATRIX_BINARY_EXT}" "$BINARY_NAME"
           echo "BINARY_NAME=$BINARY_NAME" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dot-agent-deck-${{ matrix.artifact_suffix }}
           path: ${{ env.BINARY_NAME }}
@@ -122,11 +306,11 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: arduino/setup-task@v2
+      - uses: actions/checkout@v7
+      - uses: arduino/setup-task@v3.0.0
         with:
           version: 3.x
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -143,8 +327,9 @@ jobs:
         # discriminator works for both tag-push and workflow_dispatch triggers:
         # on workflow_dispatch GITHUB_REF_NAME is the branch ('main'), which
         # would mask any pre-release input and wrongly publish to stable.
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
           if [[ "${VERSION}" == *"-"* ]]; then
             echo "name=dot-agent-deck-beta" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
@@ -153,7 +338,7 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
           name: v${{ needs.prepare.outputs.version }}
@@ -163,18 +348,32 @@ jobs:
             dist/dot-agent-deck-*
             dist/checksums.txt
           fail_on_unmatched_files: true
+      # These four steps are the ones that hold the publishing tokens, so they
+      # are the highest-value sink for an injected value: bind both the version
+      # and the channel name through `env:` and pass each `task` variable as a
+      # single quoted argv element.
       - name: Generate Homebrew formula
-        run: task homebrew-formula VERSION=v${{ needs.prepare.outputs.version }} NAME=${{ steps.channel.outputs.name }}
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          CHANNEL_NAME: ${{ steps.channel.outputs.name }}
+        run: task homebrew-formula "VERSION=v$RELEASE_VERSION" "NAME=$CHANNEL_NAME"
       - name: Publish Homebrew formula
-        run: task homebrew-publish VERSION=v${{ needs.prepare.outputs.version }} NAME=${{ steps.channel.outputs.name }}
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          CHANNEL_NAME: ${{ steps.channel.outputs.name }}
+        run: task homebrew-publish "VERSION=v$RELEASE_VERSION" "NAME=$CHANNEL_NAME"
       - name: Generate Scoop manifest
-        run: task scoop-manifest VERSION=v${{ needs.prepare.outputs.version }} NAME=${{ steps.channel.outputs.name }}
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          CHANNEL_NAME: ${{ steps.channel.outputs.name }}
+        run: task scoop-manifest "VERSION=v$RELEASE_VERSION" "NAME=$CHANNEL_NAME"
       - name: Publish Scoop manifest
-        run: task scoop-publish VERSION=v${{ needs.prepare.outputs.version }} NAME=${{ steps.channel.outputs.name }}
         env:
           SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          CHANNEL_NAME: ${{ steps.channel.outputs.name }}
+        run: task scoop-publish "VERSION=v$RELEASE_VERSION" "NAME=$CHANNEL_NAME"
 
   docs:
     needs: [prepare, finalize]

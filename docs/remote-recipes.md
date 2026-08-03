@@ -166,6 +166,76 @@ Any always-on Linux box on your network works — a homelab server, a Raspberry 
 
 mDNS (`hostname.local`) is convenient on a home LAN. For routed access from outside the LAN, set up a tunnel (Tailscale, ZeroTier, or a port-forwarded ssh) before running `remote add`.
 
+## Reaching networks only your laptop can see
+
+Sometimes the remote is *less* connected than your laptop: the laptop holds a corporate VPN that grants access to internal git and private registries, and the VM — on your home LAN, or in a restricted-egress segment — cannot reach them. Agents spawn fine and then the first `git clone` fails.
+
+`connect` runs plain `ssh` and does not pass `-F` or otherwise override your ssh configuration, so a `Host` block in `~/.ssh/config` applies to the deck exactly as it does to any other ssh invocation. You can lend the VM your laptop's network access with a reverse tunnel, with no deck-side configuration at all.
+
+> **Status.** The tunnel mechanism below is verified end to end (a service reachable only from the laptop's loopback, fetched from a remote through the tunnel). It has **not** been validated against a real corporate VPN — whether your internal git host is reachable this way depends on your network and your IT policy. See [issue #97](https://github.com/vfarcic/dot-agent-deck/issues/97).
+
+**Prerequisite on the remote.** Its sshd must permit TCP forwarding — `AllowTcpForwarding yes`, which is the OpenSSH default but is disabled in some distributions' packages (Alpine's, for one) and by most hardening baselines. Check with `sshd -T | grep allowtcpforwarding`. If it is off, every forward fails with `remote port forwarding failed for listen port N`, which looks identical to a port collision. Note that `sshd_config` takes the *first* value it finds for a keyword, so appending `AllowTcpForwarding yes` to the end of the file does nothing if the key is already set above — rewrite the existing line.
+
+### Reverse SOCKS proxy (recommended)
+
+Covers HTTPS git, private package registries, and internal APIs in one rule, and preserves hostnames end to end. On the **laptop**, in `~/.ssh/config`:
+
+```
+Host deck-vm.example
+    RemoteForward 1080
+    ExitOnForwardFailure yes
+```
+
+`RemoteForward` with a port and **no destination** is reverse dynamic forwarding: ssh opens a SOCKS proxy on the VM's loopback at port 1080 and forwards whatever it requests out through your laptop. Requires OpenSSH 7.6 or newer on the laptop. Then on the **VM**:
+
+```bash
+git config --global http.proxy socks5h://127.0.0.1:1080
+```
+
+Use `socks5h`, not `socks5` — the `h` sends hostname resolution through the proxy, so the name is resolved at your laptop (the VM has no DNS for it) and TLS still sees the real hostname, so certificate validation and SNI work normally.
+
+### Single host over ssh
+
+Simpler when you only need one git host and it speaks the ssh protocol. On the **laptop**:
+
+```
+Host deck-vm.example
+    RemoteForward 2222 git.company.com:22
+    ExitOnForwardFailure yes
+```
+
+On the **VM**, give the tunnel a name so host-key checking stays meaningful:
+
+```
+Host company-git
+    HostName 127.0.0.1
+    Port 2222
+    User git
+    HostKeyAlias git.company.com
+```
+
+Then `git clone company-git:team/repo.git`. `HostKeyAlias` records the real host's key under its real name in `known_hosts`, instead of filing it under `[127.0.0.1]:2222` where it would collide with any other host you tunnel to that port.
+
+> **`DynamicForward` is the wrong direction.** `DynamicForward` (and `ssh -D`) opens a SOCKS listener on *your laptop* that egresses via the remote — useful for reaching the remote's network from the laptop, which is the opposite of the problem here. Use `RemoteForward <port>` with no destination.
+
+### Authentication
+
+The tunnel carries packets, not credentials. A reachable git endpoint still needs to authenticate, and the options are not equally good:
+
+- **A deck-specific deploy key on the VM, registered with your git host — recommended.** Scoped to the repositories it needs, revocable on its own, and it leaves an audit trail distinct from your personal account. Usually needs a request to whoever administers the git host.
+- **A PAT in the VM's environment.** Works for HTTPS-only flows, but the token is now durable on a machine that may be less protected than your laptop.
+- **`ForwardAgent yes` — avoid.** It is the least effort and the worst trade: every agent on the VM can use your laptop's ssh-agent for as long as you are connected, with no per-agent scoping and no way to revoke one agent's access short of disconnecting.
+
+### Limits worth knowing before you rely on this
+
+**The tunnel lives and dies with the ssh session; your agents do not.** Agents survive detach by design — their access to laptop-tunneled resources does not. An agent that pushes while you are disconnected fails; one that clones, pulls, or fetches from a private registry blocks on bytes that will never arrive. Reads in particular are not deferrable. If a task needs the tunnel mid-flight, stay connected. On reconnect the forward comes back up with the new session.
+
+**The `Host` block applies to every ssh the deck makes to that host** — the version probe, `remote add`, `remote upgrade`, and each automatic reconnect attempt, not just `connect`. Mostly harmless, but it interacts badly with `ExitOnForwardFailure yes`: if a previous session's listener is still held on the remote, the next connection fails to bind and exits, and the deck reports it as an unreachable host. Two mitigations, and you want both: set `ClientAliveInterval 15` / `ClientAliveCountMax 3` in the remote's `sshd_config` so it reaps dead sessions on roughly the same ~45s budget the deck's client-side keepalive uses (sshd's default is to never probe, so a listener orphaned by a laptop sleeping can linger for a long time), and do not run two `connect` sessions to the same remote with the same forward port.
+
+**Forward ports are per-remote, not per-laptop.** Two laptops connecting to the same VM with the same `RemoteForward 1080` will collide — the second one's forward fails to bind. Give each laptop its own port.
+
+**Three options the deck sets explicitly override your config.** `connect` passes `ConnectTimeout`, `ServerAliveInterval`, and `ServerAliveCountMax` on the command line, and ssh gives command-line `-o` precedence over the config file, so setting those in your `Host` block has no effect. Forwarding options are untouched.
+
 ## What to watch for
 
 If `remote add` fails, the deck distinguishes three failure classes; see [Remote Environments → Failure modes](remote-environments.md#failure-modes) for what each one means and how to recover.

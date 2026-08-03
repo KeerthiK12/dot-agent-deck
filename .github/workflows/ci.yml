@@ -4,6 +4,18 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
+  # Also verify main AFTER a merge. Without this, CI only ever saw proposed
+  # changes, so a broken main stayed invisible until some later PR inherited the
+  # break and failed for reasons that had nothing to do with it. That is exactly
+  # what happened on 2026-07-29: #269 merged with all three build jobs red, and
+  # main was unbuildable for about a day while every subsequent PR failed at the
+  # first cargo step.
+  #
+  # This matters more, not less, with Renovate automerging non-major bumps: those
+  # land without a human looking, so the post-merge check is what turns "main is
+  # broken" from a discovery into a notification.
+  push:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -12,20 +24,124 @@ concurrency:
 
 permissions:
   contents: read
+  # `changes` reads the PR's file list to decide whether the Rust jobs have
+  # anything to inspect.
+  pull-requests: read
 
 jobs:
+  # Renovate automerges devbox digest/pin/patch/minor bumps (renovate.json), and
+  # those PRs touch nothing but devbox.json / devbox.lock. No Rust job can
+  # observe such a change — every one of them installs its toolchain directly via
+  # dtolnay/rust-toolchain and taiki-e/install-action, never through devbox — so
+  # they burn ~4 minutes across three runners to re-prove a tree that did not
+  # move. This gate skips them for that one case and leaves the `devbox` job,
+  # which is the only check that can actually see the diff.
+  #
+  # Same reasoning as the path filter on aarch64-crossbuild-check.yml: run the
+  # expensive leg exactly when the thing it guards changed.
+  #
+  # Scoped to Renovate on purpose. A HUMAN PR touching only devbox files still
+  # gets the full matrix — the cost is trivial at that frequency, and the author
+  # may well be mid-way through a change that grows beyond devbox on the next
+  # push.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      devbox_only: ${{ steps.detect.outputs.devbox_only }}
+    steps:
+      - id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+
+          # Anything that is not a Renovate PR gets the full matrix. On `push` to
+          # main and on workflow_dispatch there is no pull_request payload, so
+          # PR_AUTHOR is empty and we exit here — which is what keeps the
+          # post-merge verification described above intact. That matters most for
+          # exactly these PRs: they land unreviewed, so the push-to-main run is
+          # the first time the Rust jobs ever see the merged result.
+          if [ "${PR_AUTHOR:-}" != "renovate[bot]" ]; then
+            echo "author='${PR_AUTHOR:-}' is not Renovate -> full CI"
+            echo "devbox_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # `|| true` so a transient API failure falls into the fail-safe below
+          # rather than aborting under `set -e`. A failed `changes` job would
+          # skip every Rust job via `needs`, which is the one outcome worth
+          # engineering against here.
+          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' || true)
+          echo "changed files:"
+          echo "$files"
+
+          # Fail safe: an empty list means the API told us nothing useful. Run
+          # everything rather than read that as "nothing to test".
+          if [ -z "$files" ]; then
+            echo "no files reported -> full CI"
+            echo "devbox_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          while IFS= read -r f; do
+            case "$f" in
+              devbox.json | devbox.lock) ;;
+              *)
+                echo "'$f' is outside devbox -> full CI"
+                echo "devbox_only=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+          done <<< "$files"
+
+          echo "devbox files only -> skipping the Rust jobs"
+          echo "devbox_only=true" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5 # v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2 # v2
+      - uses: taiki-e/install-action@nextest
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo build --release
-      - run: cargo test
+      # `cargo nextest run`, NOT `cargo test` — the same runner as the
+      # `cargo test-fast` local gate, and as build-macos/build-windows which
+      # already use it. `cargo test` runs the whole tier in ONE process with
+      # parallel threads; nextest gives each test its own process.
+      #
+      # That difference produced real flakes. On 2026-07-30, two different
+      # timing-sensitive tests failed here and nowhere else:
+      # `delegate_injects_single_line_pointer_and_keeps_footer_in_task_file`
+      # (waiting on a PTY write; task file came back empty) and
+      # `login_shell::tests::captures_path_despite_large_stdout_banner`
+      # (subprocess plus a large stdout drain). Both passed on re-run with no
+      # code change, both passed on macOS and Windows in the SAME runs, and
+      # `cargo nextest run` passed 1343/1343 locally throughout — the three jobs
+      # were a natural experiment and only the `cargo test` one flaked.
+      #
+      # Aligning the runners also makes a CI failure reproducible locally, which
+      # neither of those was, and makes "green locally" mean the same thing as
+      # "green in CI".
+      - run: cargo nextest run
+      # CLAUDE.md rule 7 has always SAID this runs in CI ("CI's linkage-check
+      # rule 7 fails the build if the Scenario comment is missing or the
+      # generator fails"), and the build-macos/build-windows comment says these
+      # steps "stay on the Linux job" — but no such step existed, so nothing
+      # enforced either claim. Added 2026-07-30 after a revert removed two
+      # `#[spec]`-annotated tests and left their tests/CATALOG.md entries
+      # orphaned: linkage-check was failing on main and no gate noticed, because
+      # it only ever ran when somebody invoked it by hand.
+      - run: cargo xtask linkage-check
 
   # PRD #42 M8 — native Windows (x86_64-pc-windows-msvc) compile + clippy +
   # unit-test gate, running parallel to the Linux `build` job so a Windows-only
@@ -41,9 +157,11 @@ jobs:
   # a Windows VM is tracked by #164 (M10). aarch64-pc-windows-msvc is #164 (M9),
   # not M8.
   build-windows:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -73,9 +191,11 @@ jobs:
   # Unix at the source level and compile to empty crates), macOS *is* unix, so
   # `cargo nextest run` runs the same test-fast tier as the Linux `build` job.
   build-macos:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -88,11 +208,52 @@ jobs:
       - run: cargo clippy -- -D warnings
       - run: cargo nextest run
 
+  # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5 # v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2 # v2
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+
+  # devbox.json / devbox.lock had NO CI coverage until this job. Every other job
+  # installs its toolchain directly (dtolnay/rust-toolchain, taiki-e/install-action,
+  # cargo install), so a Renovate devbox bump went green on all five checks
+  # without a single one of them resolving the lock or running a pinned tool.
+  # That is not a hypothetical gap: Renovate automerges devbox digest/pin/patch/
+  # minor, so those bumps land unreviewed against checks structurally incapable
+  # of seeing them. #338 (vals 0.44.5 -> 0.45.0, which carried an upstream
+  # optional-provider build-tag refactor) was green on all five while nothing had
+  # executed `vals` at all — and `vals` is what resolves every secret in
+  # .env.vals.yaml for the devbox shell.
+  #
+  # DELIBERATELY NOT the version source for the build jobs. Those use
+  # dtolnay/rust-toolchain@stable on purpose: they answer "does this still
+  # compile on CURRENT stable", which is also what release.yml ships with,
+  # whereas devbox pins rustc 1.97.0 for a reproducible contributor shell.
+  # Routing CI through devbox would trade the upstream-breakage signal for a pin,
+  # and build-windows could not follow anyway — Nix has no native Windows
+  # support, and that job exists to exercise the MSVC toolchain.
+  #
+  # SCOPE: x86_64-linux only. The aarch64-darwin entries in devbox.lock stay
+  # unvalidated; add a macos-latest leg if that gap starts to bite.
+  devbox:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jetify-com/devbox-install-action@v0.15.0
+        with:
+          # Caches the whole Nix store keyed on devbox.json. Worth it: the
+          # `path:gcloud#google-cloud-sdk` flake pulls nixpkgs-unstable and
+          # builds the SDK, which dominates a cold run.
+          enable-cache: true
+      # A FILE, not an inline `bash -c '…'`: devbox flattens its trailing args
+      # into one string and re-parses them through a shell, so a quoted
+      # multi-line argument is destroyed before bash sees it. That is what broke
+      # the first version of this job on main (devbox 0.17.5, `invalid version
+      # 'set'`). See the header of the script for the detail.
+      - run: devbox run -- bash scripts/devbox-smoke.sh

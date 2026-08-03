@@ -81,6 +81,63 @@ impl CloseTabOutcome {
     }
 }
 
+/// PRD #241: close every pane of a multi-pane tab **concurrently** and report
+/// the per-pane results in `pane_ids` order.
+///
+/// [`PaneController::close_pane`] is synchronous but far from cheap: the
+/// stream-backed controller blocks on a `stop-agent` RPC, and its documented
+/// worst case is two `CTRL_W_STOP_TIMEOUT` rounds plus the bounded
+/// slot-owner chase — ~22.65 s for a *single* pane. Closing a six-role
+/// orchestration tab one pane after another therefore had a worst case of six
+/// times that (~2 min 16 s) with the render thread blocked throughout. Because
+/// the closes are independent — separate panes, separate agents, separate
+/// connections — running them on one scoped thread each collapses the tab's
+/// worst case back down to a single pane's: the slowest close, not the sum.
+///
+/// Two deliberate properties:
+///
+/// * **Results are collected in input order**, never completion order, so
+///   [`CloseTabOutcome::closed`] / `failed` stay deterministic and a caller can
+///   still zip them against positional structures (an orchestration tab's
+///   `role_pane_ids`).
+/// * **A panicking close is a failure, not a silent success.** `join` errors
+///   are recorded in `failed`, which keeps the "retain the tab on any
+///   non-success" rule in [`crate::tab::TabManager::close_tab`] honest.
+///
+/// A zero- or one-pane list skips the threading entirely and runs inline.
+pub fn close_panes_concurrently(
+    controller: &dyn PaneController,
+    pane_ids: &[String],
+) -> CloseTabOutcome {
+    let mut outcome = CloseTabOutcome::default();
+    match pane_ids {
+        [] => {}
+        [only] => outcome.record(only.clone(), controller.close_pane(only)),
+        many => {
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = many
+                    .iter()
+                    .map(|id| scope.spawn(move || controller.close_pane(id)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            Err(PaneError::CommandFailed(
+                                "close panicked while tearing down the tab".to_string(),
+                            ))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for (id, result) in many.iter().zip(results) {
+                outcome.record(id.clone(), result);
+            }
+        }
+    }
+    outcome
+}
+
 /// Outcome of a [`PaneController::rename_pane`] call.
 ///
 /// M2.11 fixup 5 — the rename path now returns what the controller
@@ -236,6 +293,26 @@ pub trait PaneController: Send + Sync {
     /// `focus_pane` call.
     fn focused_pane_id(&self) -> Option<String> {
         None
+    }
+    /// Attach a daemon-side pane to this controller on demand, returning
+    /// whether the pane is wired afterwards.
+    ///
+    /// A card can be backed by a LIVE daemon agent and still have no local
+    /// pane — a `SessionStart` surfaced over the broadcast that never went
+    /// through startup hydration. `focus_pane` reports those as
+    /// `CommandFailed`, which the focus call sites otherwise read as "stale
+    /// card, delete it". They call this first and retry, so the delete path is
+    /// reached only by genuinely dead cards.
+    ///
+    /// Exists as a trait method rather than a
+    /// `downcast_ref::<EmbeddedPaneController>()` at each call site so the
+    /// behaviour is reachable from a mock: a downcast silently no-ops for every
+    /// controller except the concrete production one, which made the retry
+    /// impossible to cover in a fast-tier test. The default returns `false`
+    /// ("nothing to attach"), preserving the old behaviour for render-only
+    /// fixtures and local-PTY mocks.
+    fn try_hydrate_pane(&self, _pane_id: &str) -> bool {
+        false
     }
     /// PRD #76 M2.15 fixup pass 2 G1 — legacy single-call entry point.
     /// The default impl routes through `create_pane_with_options` with

@@ -180,3 +180,91 @@ fn agent_event_004_codex_wrapper_lifecycle_drives_one_card() {
         );
     }
 }
+
+/// Scenario: A `clear = true` delegate respawns a Pi worker, so the daemon
+/// mints a fresh `agent_id` while the pane keeps its spawn-time card. The
+/// respawned agent's FIRST frame is an ordinary `running` lifecycle event —
+/// Pi has no `SessionStart` to send — and it must still retire the outgoing
+/// generation's card, leaving the pane with exactly one card carrying the new
+/// agent id instead of two stacked on the same pane.
+#[spec("status/agent-event/005")]
+#[test]
+fn agent_event_005_respawn_without_session_start_retires_the_previous_card() {
+    // The spawn-time card: a distinct session id (the placeholder the pane was
+    // born with), tagged with the FIRST generation's agent id.
+    let mut outgoing = SyntheticAgent::new(AgentType::Pi, PI_PANE).with_agent_id(PI_AGENT_ID);
+    outgoing.session_id = "pi-spawn-placeholder".to_string();
+
+    // The respawned worker: same pane, NEW agent id, and the pane-derived
+    // session id the `agent-event` subcommand actually emits.
+    let incoming = SyntheticAgent::new(AgentType::Pi, PI_PANE).with_agent_id("pi-agent-2");
+
+    let mut state = AppState::default();
+    state.register_pane(PI_PANE.to_string());
+
+    state.apply_event(outgoing.agent_event(EventType::Idle));
+    assert_eq!(
+        state.sessions.len(),
+        1,
+        "precondition: the pane starts with exactly one card"
+    );
+
+    // Pi's first post-respawn frame. Not a SessionStart — that is the whole
+    // point: the retire path must key on the changed agent id, not the event
+    // type, or Pi accumulates a second permanent card on the same pane.
+    state.apply_event(incoming.agent_event(EventType::Thinking));
+
+    assert_eq!(
+        state.sessions.len(),
+        1,
+        "a respawn must leave ONE card on the pane — the stale generation was not retired, \
+         which is what stacks two Pi cards in an orchestration deck"
+    );
+    let (_, session) = state
+        .sessions
+        .iter()
+        .next()
+        .expect("exactly one session remains");
+    assert_eq!(
+        session.agent_id.as_deref(),
+        Some("pi-agent-2"),
+        "the surviving card must be the LIVE generation, not the retired one"
+    );
+}
+
+/// Scenario: The incoming agent has already established its card, then a
+/// straggler frame from the OUTGOING agent arrives late, stamped earlier than
+/// the live card's last activity. Assert the live card survives — retiring on
+/// any agent-id change is only safe because an older event may not evict a
+/// newer generation.
+#[spec("status/agent-event/006")]
+#[test]
+fn agent_event_006_delayed_event_from_the_outgoing_agent_keeps_the_live_card() {
+    let outgoing = SyntheticAgent::new(AgentType::Pi, PI_PANE).with_agent_id(PI_AGENT_ID);
+    let mut incoming = SyntheticAgent::new(AgentType::Pi, PI_PANE).with_agent_id("pi-agent-2");
+    incoming.session_id = "pi-live-session".to_string();
+
+    let mut state = AppState::default();
+    state.register_pane(PI_PANE.to_string());
+
+    // The live generation establishes its card "now".
+    let mut live = incoming.agent_event(EventType::Thinking);
+    live.timestamp = chrono::Utc::now();
+    state.apply_event(live);
+
+    // A straggler from the dead generation, emitted BEFORE the live card's
+    // last activity but delivered after it.
+    let mut delayed = outgoing.agent_event(EventType::Idle);
+    delayed.timestamp = chrono::Utc::now() - chrono::Duration::seconds(30);
+    state.apply_event(delayed);
+
+    let live_still_there = state
+        .sessions
+        .values()
+        .any(|s| s.agent_id.as_deref() == Some("pi-agent-2"));
+    assert!(
+        live_still_there,
+        "a delayed frame from the outgoing agent retired the LIVE card — the retire path \
+         must ignore events older than the session they would replace"
+    );
+}

@@ -127,19 +127,17 @@ watch = false
 The tab bar appears at the top when more than one tab is open. To cycle between tabs:
 
 - **`Ctrl+PageDown`** / **`Ctrl+PageUp`** — work from anywhere, including while typing in an agent pane.
-- **`Tab`** / **`Shift+Tab`** (or `Left`/`Right` arrow keys, `h`/`l`) — only after pressing `Ctrl+d` to leave the pane and enter command mode. Otherwise the keystroke is sent to the agent.
+- **`Tab`** / **`Shift+Tab`** (or `Left`/`Right` arrow keys, `h`/`l`) — only in command mode; press `Ctrl+d` first, otherwise the keystroke is sent to the agent.
 
 See [Keyboard Shortcuts](keyboard-shortcuts.md) for all keybindings.
 
 ### Closing a Mode Tab
 
-Press `Ctrl+w` on a mode tab to tear down the entire workspace — the agent and all side panes are stopped. The dashboard tab cannot be closed.
+From command mode, press `Ctrl+w` on a mode tab and choose **Close** in the confirmation to tear down the entire workspace — the agent and all side panes are stopped. The dashboard tab cannot be closed.
 
 ### Jumping to a Mode Tab from the Dashboard
 
-From command mode (press `Ctrl+d` first if you're typing in a pane), press the card number (`1`–`9`) of the mode-tab agent to jump to it. The dashboard automatically switches to the mode tab and focuses the agent pane.
-
-> **Note:** The in-app help also lists `Enter` on a selected card as a way to jump, but card selection (`j`/`k`/`Up`/`Down`) is currently broken — see [#68](https://github.com/vfarcic/dot-agent-deck/issues/68). Use `1`–`9` instead.
+From command mode, press the card number (`1`–`9`) of the mode-tab agent, or select its card with `j`/`k` and press `Enter`. The dashboard switches to the mode tab and focuses the agent pane.
 
 ## Side Pane Interaction
 
@@ -147,13 +145,21 @@ Side panes in a mode tab support focus, selection, and direct interaction.
 
 ### Focus & Navigation
 
-A cyan border highlights the currently focused pane. Use `j`/`k` (or `Down`/`Up`) to cycle focus through all panes — agent and side panes — in a continuous loop. Press `Esc` to jump focus back to the agent pane. You can also click any pane to focus it.
+A **thicker border** (`┃` rather than `│`) marks the currently focused pane. Use `j`/`k` (or `Down`/`Up`) to cycle focus through all panes — agent and side panes — in a continuous loop. Press `Esc` to jump focus back to the agent pane. You can also click any pane to focus it.
 
-### PaneInput Mode
+The focused pane's border **turns cyan only while you are typing into it**. In command mode every border — focused pane included — shows its agent's status color instead: green for working, blue for thinking, yellow for waiting on you, red for an error, gray for idle. So the border's *weight* tells you which pane `Enter` / `Ctrl+d` will drop you into, and its *color* tells you whether your keystrokes are reaching it yet.
 
-Press `Enter` on a selected side pane to enter PaneInput mode — this lets you type directly into the pane's shell (run commands, send input, interact with running processes). `Ctrl+c` sends SIGINT to the pane's process. Press `Ctrl+d` to exit PaneInput mode and return to Normal mode.
+The border is not the only signal: a chip at the left of the bottom bar names the current mode — ` COMMAND ` or ` TYPING ` — in the same place on every tab, the focused pane carries a cursor only while you are typing into it, and entering command mode dims that pane and briefly overlays a `COMMAND MODE · Ctrl+D to type` banner. See [Which mode you're in](keyboard-shortcuts.md#which-mode-youre-in).
 
-If no side pane is selected, `Enter` focuses the agent pane instead.
+### Reading a Pane in Command Mode
+
+Command mode is the safe resting state — the one mode in which a stray keystroke cannot reach an agent — and you can read in it. Pane content stays fully readable (dimmed, never blanked), and the focused agent pane scrolls there, by wheel and by `PageUp` / `PageDown`, just as side panes do in any mode. The wheel is never forwarded to the agent's mouse protocol in command mode, so a full-screen TUI running in the pane cannot scroll under you while you read.
+
+### Typing Into a Pane
+
+Press `Enter` on a selected side pane to type directly into the pane's shell — run commands, send input, interact with running processes. `Ctrl+c` sends SIGINT to the pane's process, and `Ctrl+d` returns you to command mode. If no side pane is selected, `Enter` focuses the agent pane instead.
+
+This is the mode the bottom-bar chip calls ` TYPING `, and the only one in which the focused pane shows a cursor. `PageUp` / `PageDown` belong to the program running in the pane here — they are sent through to it rather than scrolling the deck's view.
 
 ## Scaffolding
 
@@ -178,7 +184,7 @@ From the dashboard, press `g` on an agent's card to open a dialog with three opt
 - **No** — dismisses the dialog; the hint stays on the card.
 - **Never** — suppresses the hint permanently for this directory.
 
-After the agent creates the file, press `Ctrl+w` to close the current pane, then `Ctrl+n` to create a new one and select your mode.
+After the agent creates the file, press `Ctrl+d` to leave the pane, `Ctrl+w` and **Close** to close it, then `Ctrl+n` to create a new one and select your mode.
 
 To disable the hint globally: `dot-agent-deck config set auto_config_prompt false`.
 

@@ -82,29 +82,33 @@ const MOD_KEY: &str = "Ctrl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardDensity {
-    Compact,  // wide 5 / narrow 6 rows: 1 prompt, 1 tool
-    Normal,   // wide 8 / narrow 9 rows: 1 prompt, 3 tools
-    Spacious, // wide 10 / narrow 11 rows: 3 prompts, 3 tools
+    Compact,  // 5 rows: 1 prompt, 1 tool
+    Normal,   // 8 rows: 1 prompt, 3 tools
+    Spacious, // 10 rows: 3 prompts, 3 tools
 }
 
 impl CardDensity {
     /// Card height in rows, derived from the exact lines `render_session_card`
     /// emits so reserved height never drifts from rendered content:
-    ///   Dir (1) + prompts + [narrow: inline stats line] + [non-compact: blank
-    ///   separator] + tools, plus 2 rows for the top/bottom border.
+    ///   Dir (1) + prompts + [non-compact: blank separator] + tools, plus 2
+    ///   rows for the top/bottom border.
     ///
-    /// Resulting heights — wide: Compact 5, Normal 8, Spacious 10;
-    /// narrow: 6 / 9 / 11.
-    fn card_height(self, wide: bool) -> u16 {
+    /// Resulting heights: Compact 5, Normal 8, Spacious 10.
+    ///
+    /// Height is a function of density ALONE — PRD #339 moved the `Last` /
+    /// `Tools` counters onto the bottom border, deleting the card-width axis
+    /// that used to add a stats row (and a sixth height) to narrow cards. Any
+    /// future line `render_session_card` gains must be added here in the same
+    /// change, or cards overlap / leave a blank tail row.
+    fn card_height(self) -> u16 {
         let prompts = self.max_prompts() as u16;
         let tools = self.max_tools() as u16;
-        let stats_line = if wide { 0 } else { 1 };
         let separator = if matches!(self, CardDensity::Compact) {
             0
         } else {
             1
         };
-        (1 + prompts + stats_line + separator + tools) + 2 // +2 top/bottom border
+        (1 + prompts + separator + tools) + 2 // +2 top/bottom border
     }
 
     fn max_tools(self) -> usize {
@@ -122,19 +126,14 @@ impl CardDensity {
     }
 }
 
-fn choose_density(
-    total_cards: usize,
-    cols: usize,
-    available_height: u16,
-    wide: bool,
-) -> CardDensity {
+fn choose_density(total_cards: usize, cols: usize, available_height: u16) -> CardDensity {
     let total_card_rows = total_cards.div_ceil(cols);
     for density in [
         CardDensity::Spacious,
         CardDensity::Normal,
         CardDensity::Compact,
     ] {
-        let needed = total_card_rows as u16 * density.card_height(wide);
+        let needed = total_card_rows as u16 * density.card_height();
         if needed <= available_height {
             return density;
         }
@@ -167,8 +166,15 @@ pub(crate) fn clamp_scroll_offset(
 // UI state types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum UiMode {
+/// Which input layer currently owns the keyboard. PRD #241 made this public:
+/// key resolution is no longer mode-independent (`ClosePane` resolves only in
+/// command mode), so the L1 seams that prove the gating —
+/// [`key_action_for_mode`] and [`render_hints_bar_for_mode_to_buffer`] — take
+/// the mode as an argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiMode {
+    /// Command mode: the dashboard/tab keyboard owns the keys. This is the
+    /// ONLY mode in which the destructive `ClosePane` chord resolves.
     Normal,
     Filter,
     Help,
@@ -192,6 +198,12 @@ enum UiMode {
     /// next-fire) with add/edit (seeded authoring agent), delete-with-confirm
     /// (definition only), and run-now actions.
     ScheduledTasks,
+    /// PRD #241 M3: the close confirmation dialog. Armed by
+    /// [`Action::CloseSelected`] (from the `Ctrl+W` chord *or* the `[Close]`
+    /// button) whenever there is something to close; only an explicit Close
+    /// selection emits [`Action::ConfirmCloseSelected`] and performs the
+    /// teardown. The selection index lives in `UiState::close_confirm`.
+    CloseConfirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,6 +665,21 @@ fn build_issue_dispatch_authoring_seed(working_dir: &std::path::Path) -> String 
     )
 }
 
+/// The default read/write deadline on the sync one-shot daemon queries below.
+/// Sized for a request whose ANSWER the user is waiting on (the manager
+/// dialog's run-now): better to stall than to report a wrong result.
+const DAEMON_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// PRD #140 review: the deadline for a query whose answer is only an
+/// INFORMATIONAL HINT — currently just [`live_orchestration_cwds`], which runs
+/// on the `Ctrl+n` form-open key path. A local unix-socket round-trip against a
+/// healthy daemon completes in well under a millisecond, so 250 ms is orders of
+/// magnitude of headroom while capping the worst case (wedged daemon, socket
+/// file present but nothing draining it) at a quarter second instead of
+/// [`DAEMON_REQUEST_TIMEOUT`]'s five. Blowing the deadline fails OPEN — the form
+/// opens with no warning rather than freezing.
+const DAEMON_HINT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Send a one-shot `AttachRequest` to the local daemon over the attach socket
 /// and read the single `AttachResponse`, synchronously (no tokio runtime — the
 /// TUI key path is sync). Used by the manager dialog's run-now and the
@@ -661,12 +688,22 @@ fn build_issue_dispatch_authoring_seed(working_dir: &std::path::Path) -> String 
 fn send_daemon_request_blocking(
     req: &crate::daemon_protocol::AttachRequest,
 ) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
+    send_daemon_request_blocking_with_timeout(req, DAEMON_REQUEST_TIMEOUT)
+}
+
+/// [`send_daemon_request_blocking`] with an explicit read/write deadline, so a
+/// best-effort caller on an interactive key path can bound its own worst case
+/// independently of the default (see [`DAEMON_HINT_TIMEOUT`]).
+fn send_daemon_request_blocking_with_timeout(
+    req: &crate::daemon_protocol::AttachRequest,
+    timeout: std::time::Duration,
+) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
     use crate::daemon_protocol::{KIND_REQ, KIND_RESP};
     use std::io::{Read, Write};
 
     let path = config::attach_socket_path();
     let mut stream = crate::platform::ipc::IpcClient::connect(&path)?;
-    stream.set_timeouts(std::time::Duration::from_secs(5))?;
+    stream.set_timeouts(timeout)?;
 
     let payload = serde_json::to_vec(req).map_err(std::io::Error::other)?;
     let mut header = [0u8; 5];
@@ -719,6 +756,98 @@ fn live_schedule_names() -> HashSet<String> {
             .collect(),
         Err(_) => HashSet::new(),
     }
+}
+
+/// PRD #140 M4.0: the non-blocking warning shown in the new-pane form when the
+/// picked directory ALREADY hosts a live orchestration. Two orchestrations in
+/// one directory are legal — the daemon routes them as separate groups since
+/// M2.0 — but they still share the two resources the daemon can't partition:
+/// the `.dot-agent-deck/*-{role}.md` coordination files (one file per role, so a
+/// second orchestration's orchestrator writes over the first's brief) and the
+/// working tree itself (both sets of workers edit the same checkout).
+/// `/worktree-prd` is the isolated alternative.
+///
+/// Every line is kept inside the form's 52-column base inner width so the copy
+/// survives un-clipped even on a narrow terminal; the render also grows the
+/// modal to fit it (see [`render_new_pane_form`]).
+const SAME_CWD_ORCHESTRATION_WARNING: [&str; 3] = [
+    "  ! This directory already runs an orchestration.",
+    "    Both share .dot-agent-deck/*-{role}.md files",
+    "    and one working tree; /worktree-prd isolates.",
+];
+
+/// PRD #140 M4.0: the shared warning DECISION — does `form_cwd` collide with
+/// any directory the daemon reports as hosting a live orchestration? The single
+/// code path behind both the L1 seam
+/// ([`render_new_pane_orchestration_guard_to_buffer`]) and the interactive
+/// `Ctrl+n` flow, so the test and the real form can't drift apart.
+///
+/// Compared as [`Path`]s rather than strings so a trailing separator
+/// (`/work/proj/` vs `/work/proj`) doesn't read as a fresh directory.
+///
+/// PRD #140 review: the raw compare alone missed a whole class of same-directory
+/// collision — a symlinked or otherwise non-canonical ALIAS of a live
+/// orchestration's directory (`~/link-to-proj` vs `/work/proj`, `/work/proj/../proj`,
+/// a macOS `/tmp` → `/private/tmp` path) is the same tree with the same
+/// `.dot-agent-deck/*-{role}.md` files, yet compared unequal and silently
+/// skipped the warning. So a miss on the raw compare escalates to a BEST-EFFORT
+/// [`std::fs::canonicalize`] of both sides. Failing OPEN is deliberate: any
+/// canonicalisation error (path gone, permission denied, a synthetic path from
+/// the L1 render seam) just keeps the raw verdict, never panics, and never
+/// blocks the form. The result is cached once per form open by
+/// [`NewPaneFormState::with_live_orchestration_cwds`] — the warning decision is
+/// read every frame, and the filesystem must not be.
+fn live_orchestration_in_same_cwd(form_cwd: &Path, live_orchestration_cwds: &[String]) -> bool {
+    if live_orchestration_cwds
+        .iter()
+        .any(|c| Path::new(c) == form_cwd)
+    {
+        return true;
+    }
+    let Ok(form_canonical) = std::fs::canonicalize(form_cwd) else {
+        return false;
+    };
+    live_orchestration_cwds
+        .iter()
+        .any(|c| std::fs::canonicalize(c).is_ok_and(|live| live == form_canonical))
+}
+
+/// PRD #140 M4.0: directories that currently host a live orchestration, derived
+/// from the daemon's `ListAgents` — the same one-shot socket query
+/// [`live_schedule_names`] uses at dialog-open time, and the same records the
+/// hydration path buckets. A down daemon degrades to "no live orchestrations"
+/// (no warning), which is the right failure direction for an informational hint.
+///
+/// Only `TabMembership::Orchestration` panes contribute, and only via the
+/// tab-wide `orchestration_cwd` (never the per-pane cwd, which round-9 #2 let
+/// diverge into sub-directories). Duplicates are dropped so N role panes of one
+/// orchestration don't inflate the list.
+///
+/// PRD #140 review: time-boxed at [`DAEMON_HINT_TIMEOUT`] rather than the
+/// default five seconds. This runs SYNCHRONOUSLY on the `Ctrl+n` key path, so a
+/// wedged daemon (socket file present, nothing draining it) used to freeze
+/// form-open for the whole default deadline. The warning is a best-effort hint,
+/// never a correctness gate — routing does not consult it — so a slow or down
+/// daemon fails open to "no live orchestrations" and the form opens instantly.
+fn live_orchestration_cwds() -> Vec<String> {
+    let Ok(resp) = send_daemon_request_blocking_with_timeout(
+        &crate::daemon_protocol::AttachRequest::ListAgents,
+        DAEMON_HINT_TIMEOUT,
+    ) else {
+        return Vec::new();
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    resp.agent_records
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| match r.tab_membership {
+            Some(TabMembership::Orchestration {
+                orchestration_cwd, ..
+            }) => orchestration_cwd,
+            _ => None,
+        })
+        .filter(|cwd| seen.insert(cwd.clone()))
+        .collect()
 }
 
 /// PRD #80 M8: which new-pane-form field is focused. Public because it rides
@@ -802,6 +931,20 @@ struct NewPaneFormState {
     /// row's values and calls `schedule update`) and the ` Edit Schedule ` title.
     /// Only ever `Some` when `schedule_locked` is `true`.
     schedule_existing: Option<config::ScheduledTask>,
+    /// PRD #140 M4.0: whether this form's directory already hosts one of the
+    /// live orchestrations the daemon reported (see [`live_orchestration_cwds`]),
+    /// decided ONCE by [`live_orchestration_in_same_cwd`] when the form opens.
+    /// Drives the non-blocking same-cwd warning via
+    /// [`NewPaneFormState::same_cwd_orchestration_warning`].
+    ///
+    /// Stored as the decided verdict rather than the raw cwd list because the
+    /// decision now canonicalises paths (PRD #140 review): `self.dir` is fixed
+    /// for the form's lifetime and the daemon snapshot is taken once, so the
+    /// answer is constant — and the render path, which asks every frame, must not
+    /// touch the filesystem. `false` (the default) means "nothing known" → no
+    /// warning, so every other form construction site renders byte-for-byte as
+    /// before.
+    live_orchestration_in_same_cwd: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -885,7 +1028,34 @@ impl NewPaneFormState {
             // PRD #170: the ordinary `Ctrl+n` form is never locked.
             schedule_locked: false,
             schedule_existing: None,
+            // PRD #140 M4.0: the caller attaches the daemon's live-orchestration
+            // cwds via `with_live_orchestration_cwds`; unattached means no
+            // warning.
+            live_orchestration_in_same_cwd: false,
         }
+    }
+
+    /// PRD #140 M4.0: attach the daemon's live-orchestration directories to the
+    /// form so a same-cwd selection renders the non-blocking shared-resource
+    /// warning. Kept a separate builder step (rather than a 6th `new` parameter)
+    /// so the many existing construction sites — and the daemon-free L1 seams —
+    /// stay untouched.
+    ///
+    /// The collision verdict is decided HERE, once, and cached: the comparison
+    /// canonicalises paths (PRD #140 review) and the render path asks for it
+    /// every frame.
+    fn with_live_orchestration_cwds(mut self, cwds: Vec<String>) -> Self {
+        self.live_orchestration_in_same_cwd = live_orchestration_in_same_cwd(&self.dir, &cwds);
+        self
+    }
+
+    /// PRD #140 M4.0: whether the form should render
+    /// [`SAME_CWD_ORCHESTRATION_WARNING`] — an orchestration is selected AND its
+    /// directory already hosts a live one. Selecting "No mode", a plain mode, or
+    /// either authoring option never warns: the shared-resource risk is specific
+    /// to a second orchestration's role files and workers.
+    fn same_cwd_orchestration_warning(&self) -> bool {
+        self.selected_orchestration().is_some() && self.live_orchestration_in_same_cwd
     }
 
     /// PRD #170 (unify): build the new-pane form MODE-LOCKED to schedule
@@ -943,6 +1113,9 @@ impl NewPaneFormState {
             focused: FormField::Command,
             schedule_locked: true,
             schedule_existing: existing,
+            // PRD #140 M4.0: the locked schedule form can't select an
+            // orchestration, so the same-cwd warning never applies to it.
+            live_orchestration_in_same_cwd: false,
         };
         // Lock the selection onto the built-in schedule option (index 1 with no
         // modes/orchestrations) so the existing schedule spawn branch fires.
@@ -1203,6 +1376,18 @@ impl NewPaneFormState {
 /// transient info messages don't linger past their usefulness.
 const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// PRD #341 M3 (Decision 2) — how long the big `COMMAND MODE` banner stays up
+/// after entering command mode before it decays to the persistent bottom-bar
+/// chip.
+///
+/// The banner announces the *transition*; once the user has oriented, holding it
+/// up is just occlusion over a pane they are trying to read. 2.5s is long enough
+/// to register without being in the way (the PRD's 1s starting guess was judged
+/// too short to reliably notice), and it collapses early on any bound key
+/// anyway — see [`CommandBannerState`]. Lives next to [`STATUS_MESSAGE_TTL`]
+/// because it is the same kind of knob: one named place to tune a decay.
+pub const COMMAND_BANNER_TTL: std::time::Duration = std::time::Duration::from_millis(2500);
+
 /// PRD #76 M2.20 — minimum gap between the last forwarded keystroke and an
 /// Enter keystroke that follows it on the human-typing path. Agent TUIs like
 /// claude treat a CR fused to preceding bytes as newline-in-input, not submit;
@@ -1392,6 +1577,13 @@ struct UiState {
     /// focused on return). Without this, switching away and back re-armed the
     /// highlight a tab switch had cleared (violating SC1).
     last_focused_pane_id: Option<String>,
+    /// PRD #341 M6: which pane the user was typing into as of the previous
+    /// [`reconcile_pane_input_scrollback`] frame — `Some(pane_id)` while `mode ==
+    /// PaneInput` with a focused pane, `None` otherwise. A change in this value is
+    /// the "you are now typing into THIS pane" edge that snaps the pane back to
+    /// live output, so a pane scrolled in command mode can't be resumed into a
+    /// cursorless view of stale history.
+    last_pane_input_target: Option<String>,
     /// PRD #113 design revision (2026-06-13): the last *active* selection of the
     /// CURRENTLY-ACTIVE deck, remembered across tab switches so Enter can RESTORE
     /// it when the deck is inactive (no live highlight) instead of jumping to
@@ -1420,6 +1612,16 @@ struct UiState {
     columns: usize,
     scroll_offset: usize,
     status_message: Option<(String, std::time::Instant)>,
+    /// PRD #341 M3 — the decay state of the big `COMMAND MODE` banner drawn over
+    /// the focused pane. Modelled on `status_message`'s `Option<(_, Instant)>`
+    /// pattern: an entry instant plus a latch, expired against
+    /// [`COMMAND_BANNER_TTL`] by the render pass rather than by a timer.
+    ///
+    /// This is the ONE copy of that state. The render path reads it through
+    /// [`CommandBannerState::visibility`] each frame and the input paths feed it
+    /// [`CommandBannerSignal`]s, so the L1 seam and the running app cannot
+    /// disagree about when the banner is up.
+    command_banner: CommandBannerState,
     dir_picker: Option<DirPickerState>,
     /// PRD #170 (unify): why `dir_picker` is open — selects which form
     /// [`transition_after_dir_pick`] builds when the directory is confirmed.
@@ -1533,6 +1735,24 @@ struct UiState {
     /// PRD #92 F1 widened this from 2 to 3 options; Detach remains the
     /// default so the existing muscle memory does not become destructive.
     quit_confirm_selected: usize,
+    /// PRD #241 M3: selected option in the close-confirmation modal
+    /// (0=Cancel, 1=Close). Only meaningful when `mode == CloseConfirm`; it is
+    /// re-seeded to the Cancel default every time the dialog is armed.
+    close_confirm: CloseConfirmState,
+    /// PRD #241 review F1: the stable identity the open confirmation is bound
+    /// to, captured when the dialog was armed. `Action::ConfirmCloseSelected`
+    /// closes THIS and only this — never whatever happens to be selected by the
+    /// time the user answers. Cleared on every exit from the dialog.
+    close_confirm_target: Option<CloseTarget>,
+    /// PRD #241 review F5: has the armed close confirmation been drawn yet?
+    ///
+    /// The run loop drains a whole input burst before re-rendering, so without
+    /// this the keystroke queued behind the `Ctrl+W` (or behind the `[Close]` /
+    /// tab-strip `×` click) that armed the dialog would be delivered to a modal
+    /// the user has never seen. While it is `false`, `run_tui` discards pending
+    /// input and re-renders instead of reading; `render_overlays` sets it the
+    /// first time the dialog actually reaches the screen.
+    close_confirm_displayed: bool,
     /// PRD #92 F1: selected option in the secondary Stop-confirmation
     /// dialog (0=No, 1=Yes). Defaults to No — the safer default for the
     /// destructive choice. Only meaningful when `mode == StopConfirm`.
@@ -1690,6 +1910,7 @@ impl UiState {
             // first-launch UX is unchanged.
             selected_index: Some(0),
             last_focused_pane_id: None,
+            last_pane_input_target: None,
             // PRD #113 revision: defaults to card 0 so first-launch Enter (before
             // anything has been selected) targets the first card, unchanged.
             last_active_selection: Some(0),
@@ -1703,6 +1924,7 @@ impl UiState {
             columns: 1,
             scroll_offset: 0,
             status_message: None,
+            command_banner: CommandBannerState::default(),
             dir_picker: None,
             dir_picker_intent: DirPickerIntent::NewPane,
             new_pane_form: None,
@@ -1727,6 +1949,9 @@ impl UiState {
             config_gen_target: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
+            close_confirm: CloseConfirmState::default(),
+            close_confirm_target: None,
+            close_confirm_displayed: false,
             stop_confirm_selected: 0,
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
@@ -2091,25 +2316,103 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     }
 
     // 3. Delegation protocol.
+    //
+    // Issue #303: the task text reaches this CLI through YOUR shell, so
+    // `--task "…"` is rewritten before argv is built — backticks and `$(…)` are
+    // executed, `$VAR` substituted, an unescaped `"` ends the argument, a `\`
+    // removes itself — while the delegation still reports success. The file form
+    // is therefore the unconditional default here, with the reason stated inline
+    // (an orchestrator that does not know WHY drifts back to `--task`).
+    //
+    // The audit of the first cut (auditor finding 1) showed that protecting only
+    // the final `--task-file` read is not enough: an `echo "…"` expands the
+    // content BEFORE it reaches disk, and an unquoted path can itself carry
+    // command substitution or `..` traversal. Hence the four creation rules, and
+    // the persistence/secrets note (#329's advice half).
+    //
+    // Round 3 then deleted the shell fallback that round 2 had recommended. A
+    // quoted `<<'EOF'` delimiter disables expansion inside the heredoc, but a
+    // task line that is exactly `EOF` terminates it and Bash parses and executes
+    // every line after it — and task files are exactly where untrusted text
+    // (issue bodies, code, another agent's brief) lands. "Use a fresh
+    // unpredictable delimiter and check the payload for it" is a rule an agent
+    // must get right on every single input, with silent command execution as the
+    // failure mode, so the only recommendation left is a non-shell file writer.
+    //
+    // Round 4 restored the *inline* fallback — not the shell one. Round 3's
+    // premise, "every agent in this system has a file-writing tool", confused
+    // having a tool with being authorized to use it: the e2e gate then caught a
+    // real Haiku worker launched with `--allowedTools Bash Read` calling `Write`
+    // and parking forever on the approval prompt. Guidance that depends on an
+    // unguaranteed permission produces exactly the silent stall #303 is about,
+    // so all three branches (file / short plain inline / say you cannot) are now
+    // stated outright rather than left to inference.
     content.push_str("\n## Delegation protocol\n\n");
     content.push_str(
-        "To delegate work to an agent, use `delegate` with one command per agent:\n\
+        "To delegate work to an agent, use `delegate` with one command per agent. \
+         Pass the task as a **file** — `--task-file` is the default, not an escape hatch:\n\n\
          ```bash\n\
-         dot-agent-deck delegate --to <role-name> --task \"Task description with context, file paths, and constraints.\"\n\
+         dot-agent-deck delegate --to <role-name> --task-file '.dot-agent-deck/<task-slug>.md'\n\
          ```\n\n\
-         To delegate to multiple agents in parallel, make **one call per agent** so each gets its own task:\n\
+         Four rules for producing that file. The last two are about the *path*, not the \
+         contents:\n\n\
+         - Write it with your **file-writing tool**. Do not construct it with shell redirection \
+         or a heredoc: a line of the task text can terminate the heredoc, and everything after \
+         that line is then executed as shell commands.\n\
+         - Invent a **fresh slug** for `<task-slug>` from `[a-z0-9][a-z0-9-]*` only, at most 40 \
+         characters. Never build it out of an issue title, a branch name, or any other text you \
+         did not write yourself.\n\
+         - No `/`, no `\\` and no `..` in the slug — the file goes directly in \
+         `.dot-agent-deck/`.\n\
+         - **Single-quote the whole path** in every command you run.\n\n\
+         Task and summary files persist on disk after the handoff. Keep credentials, customer \
+         data and other secrets out of them, pick a path that does not already exist, and delete \
+         exactly that path once the handoff has succeeded.\n\n\
+         **If you have no file-writing tool, or it is not authorized and invoking it would stop \
+         you at an approval prompt, do not wait there — skip the file and use the inline form \
+         below.** Never substitute shell redirection or a heredoc for the missing tool.\n\n\
+         `--task \"…\"` is the fallback for exactly that case, and is safe only when the whole \
+         task is **a single line of plain text with no backticks, no `$`, no `\"`, no `\\` and no \
+         `!`**:\n\n\
          ```bash\n\
-         dot-agent-deck delegate --to coder --task \"Implement the login endpoint...\"\n\
-         dot-agent-deck delegate --to reviewer --task \"Review the auth module...\"\n\
+         dot-agent-deck delegate --to <role-name> --task \"Short plain task description.\"\n\
          ```\n\n\
-         If all agents should receive the **exact same task**, you may combine them in one call:\n\
+         Why the allowlist is that narrow: everything after `--task` is processed by **your own \
+         shell** before dot-agent-deck receives it. Backticks and `$(…)` are executed and \
+         replaced by their output — usually empty — `$VAR` becomes its value or nothing, a \
+         balanced inner `\"` is removed and changes how the rest of the argument is quoted, a \
+         `\\` before `$`, a backtick, `\"` or `\\` removes itself, and a `\\` at the end of a \
+         line removes itself *and* the newline. `!` is excluded because a Bash with history \
+         expansion on rewrites it before argv is built. An unmatched `\"` aborts the command \
+         outright; everything else is dropped silently while the delegation still reports \
+         success, so the worker acts on a task with pieces missing and nobody sees an error. \
+         `--task-file` is read from disk verbatim, so none of this applies to it.\n\n\
+         If a task will not fit that one plain line and you cannot write a file, say so plainly \
+         to the user and ask for the file-writing tool to be authorized, rather than improvising \
+         a way around the allowlist.\n\n\
+         To delegate to multiple agents in parallel, make **one call per agent** so each gets its own task:\n\n\
          ```bash\n\
-         dot-agent-deck delegate --to <role1> --to <role2> --task \"Same task for all.\"\n\
+         dot-agent-deck delegate --to coder --task-file '.dot-agent-deck/login-endpoint-coder.md'\n\
+         dot-agent-deck delegate --to reviewer --task-file '.dot-agent-deck/login-endpoint-reviewer.md'\n\
          ```\n\n\
-         When all work is complete and you are satisfied with the results:\n\
+         If all agents should receive the **exact same task**, you may combine them in one call:\n\n\
          ```bash\n\
-         dot-agent-deck work-done --done --task \"Final summary of what was accomplished.\"\n\
-         ```\n",
+         dot-agent-deck delegate --to <role1> --to <role2> --task-file '.dot-agent-deck/<task-slug>.md'\n\
+         ```\n\n\
+         When all work is complete and you are satisfied with the results:\n\n\
+         ```bash\n\
+         dot-agent-deck work-done --done --task-file '.dot-agent-deck/final-summary-<summary-slug>.md'\n\
+         ```\n\
+         (or `dot-agent-deck work-done --done --task \"Final summary.\"` when that summary really is \
+         one plain line). The same four rules apply to that file: `<summary-slug>` is a fresh slug \
+         you invent, the path must not already exist before you write it, and you delete exactly \
+         that path once the command has exited successfully.\n\n\
+         **Shell safety and context length are two different problems.** Writing long context to \
+         `.dot-agent-deck/<task-slug>.md` and *referencing that path inside* `--task \"…\"` keeps the \
+         task description short, but the description itself still goes through your shell. Passing \
+         the file with `--task-file` is what keeps the shell out of the text. One file solves both \
+         at once: write the full task to `.dot-agent-deck/<task-slug>.md` and hand it over with \
+         `--task-file`.\n",
     );
 
     // 4. Important guidelines.
@@ -2164,7 +2467,7 @@ fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Optio
 /// matching the same `(cwd, mode_name)` are flagged as drift by the
 /// partition (only the first survives; the rest are dropped to dashboard).
 #[derive(Debug, Clone)]
-pub(crate) struct ModeHydrationBucket {
+pub struct ModeHydrationBucket {
     pub cwd: String,
     pub mode_name: String,
     pub agent_pane_id: String,
@@ -2182,7 +2485,7 @@ pub(crate) struct ModeHydrationBucket {
 /// minimal `OrchestrationConfig` when the local project config file is
 /// absent (laptop TUI reconnecting to a remote daemon).
 #[derive(Debug, Clone)]
-pub(crate) struct OrchestrationHydrationBucket {
+pub struct OrchestrationHydrationBucket {
     pub cwd: String,
     pub orchestration_name: String,
     /// PRD #107 follow-up: the user-typed tab title echoed back by the
@@ -2191,7 +2494,39 @@ pub(crate) struct OrchestrationHydrationBucket {
     /// the rebuilt tab's TITLE so detach/reattach preserves the entered name;
     /// `None` falls back to the canonical resolved name.
     pub display_title: Option<String>,
+    /// PRD #140 M3.0: the per-tab instance token this bucket was keyed on —
+    /// `TabMembership::Orchestration.orchestration_id`, echoed back by the
+    /// daemon on every surviving role pane of the tab. `None` is a token-less
+    /// (pre-#140) client, in which case the bucket was keyed on the legacy
+    /// `(name, cwd)` tuple. Retained on the bucket (rather than consumed and
+    /// dropped by the partition) so the rebuild can re-derive the SAME
+    /// [`crate::state::OrchestrationIdentity`] the key used — see
+    /// [`Self::identity`].
+    pub orchestration_id: Option<String>,
     pub role_slots: Vec<OrchestrationRoleSlot>,
+}
+
+impl OrchestrationHydrationBucket {
+    /// The [`crate::state::OrchestrationIdentity`] this bucket was keyed on in
+    /// [`partition_hydrated_panes`] — i.e. the routing group the daemon
+    /// considers these role panes to share.
+    ///
+    /// PRD #140 review: the rebuild needs the identity, not just
+    /// `(cwd, orchestration_name)`, because two same-`(name, cwd)` tabs are two
+    /// buckets and anything derived per-bucket must be namespaced per-identity
+    /// or it aliases across them (see [`dead_slot_pane_id`]).
+    pub fn identity(&self) -> crate::state::OrchestrationIdentity {
+        match &self.orchestration_id {
+            Some(id) => crate::state::OrchestrationIdentity::Instance {
+                id: id.clone(),
+                name: self.orchestration_name.clone(),
+            },
+            None => crate::state::OrchestrationIdentity::NameCwd {
+                name: self.orchestration_name.clone(),
+                cwd: self.cwd.clone(),
+            },
+        }
+    }
 }
 
 /// One occupied role slot inside an [`OrchestrationHydrationBucket`].
@@ -2200,7 +2535,7 @@ pub(crate) struct OrchestrationHydrationBucket {
 /// minimal `OrchestrationConfig` even when the local project config
 /// file is missing (PRD #111).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OrchestrationRoleSlot {
+pub struct OrchestrationRoleSlot {
     pub role_index: usize,
     pub pane_id: String,
     pub role_name: String,
@@ -2226,7 +2561,7 @@ pub(crate) struct OrchestrationRoleSlot {
 /// The hydration call site decides which `tracing::info!` line to
 /// emit *before* calling this helper so the "config absent" vs
 /// "config drift" distinction (auditor nit) stays observable.
-pub(crate) fn resolve_orch_config_for_hydration(
+pub fn resolve_orch_config_for_hydration(
     local: Option<crate::project_config::OrchestrationConfig>,
     bucket: &OrchestrationHydrationBucket,
 ) -> crate::project_config::OrchestrationConfig {
@@ -2260,7 +2595,7 @@ pub(crate) fn resolve_orch_config_for_hydration(
 /// duplicate `(cwd, mode_name)` claim, but the variant shape leaves
 /// room for future reasons without breaking call sites.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HydrationRejection {
+pub enum HydrationRejection {
     /// More than one hydrated pane claimed `Mode { name }` for the same
     /// `cwd`. The first claimant won the bucket; this is the i-th
     /// duplicate that got dropped to the dashboard instead.
@@ -2286,7 +2621,7 @@ pub(crate) enum HydrationRejection {
 /// logging each rejection at the hydration site (M2.12 fixup reviewer
 /// #3).
 #[derive(Debug, Clone, Default)]
-pub(crate) struct HydrationPartition {
+pub struct HydrationPartition {
     pub dashboard_pane_ids: Vec<String>,
     pub mode_buckets: Vec<ModeHydrationBucket>,
     pub orchestration_buckets: Vec<OrchestrationHydrationBucket>,
@@ -2305,16 +2640,19 @@ pub(crate) struct HydrationPartition {
 ///   duplicates from the same pairing are logged and dropped to the
 ///   dashboard so a buggy daemon can't double-build a single mode tab.
 /// - `Some(Orchestration { name, role_index })` → orchestration bucket
-///   keyed by `(cwd, orch_name)`, collecting `(role_index, pane_id)`.
-///   The bucket may be sparse (a role can be missing if its agent died
-///   before the TUI reattached); the dispatcher expands this to a
-///   `Vec<Option<String>>` of full role-count length.
+///   keyed by the same [`crate::state::OrchestrationIdentity`] the daemon
+///   routes on (PRD #140 M3.0): a per-tab `orchestration_id` token keys
+///   `Instance { id, name }`, and its absence falls back to the legacy
+///   `NameCwd { name, cwd }` tuple. Each bucket collects
+///   `(role_index, pane_id)` and may be sparse (a role can be missing if
+///   its agent died before the TUI reattached); the dispatcher expands
+///   this to a `Vec<Option<String>>` of full role-count length.
 ///
 /// Ordering is stable: dashboard panes preserve input order, mode and
 /// orchestration buckets preserve the order in which their (cwd, name)
 /// pairing was first seen so the user's mental "which tab opened first"
 /// model survives reconnect (TabManager appends in iteration order).
-pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition {
+pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition {
     use std::collections::HashSet;
 
     let mut out = HydrationPartition::default();
@@ -2322,7 +2660,10 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
     // this partition pass. Index into `out.mode_buckets` /
     // `out.orchestration_buckets` keyed by `(cwd, name)`.
     let mut mode_keys: HashSet<(String, String)> = HashSet::new();
-    let mut orch_index: std::collections::HashMap<(String, String), usize> =
+    // PRD #140 M3.0: orchestration buckets are keyed by the SAME identity the
+    // daemon routes delegate / work-done on, so a reattach reconstructs exactly
+    // the tabs the daemon considers distinct routing groups.
+    let mut orch_index: std::collections::HashMap<crate::state::OrchestrationIdentity, usize> =
         std::collections::HashMap::new();
 
     for h in hydrated {
@@ -2360,6 +2701,11 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                 is_start_role,
                 orchestration_cwd,
                 display_title,
+                // PRD #140 M3.0: the per-tab instance token IS part of the
+                // hydration bucket key (see `key` below) so two
+                // same-`(name, cwd)` tabs rebuild as two tabs instead of
+                // merging into one and orphaning half the panes.
+                orchestration_id,
             }) => {
                 // Round-12 reviewer #1: bucket by `(orchestration_cwd,
                 // name)` — the same identity tuple the daemon uses for
@@ -2389,7 +2735,27 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                         cwd.clone()
                     }
                 };
-                let key = (bucket_cwd.clone(), name.clone());
+                // PRD #140 M3.0: mirror the daemon's `pane_orchestration_map`
+                // construct site (`daemon_protocol.rs` StartAgent) exactly — a
+                // stamped `orchestration_id` keys the tab by INSTANCE, and only
+                // its absence falls back to the legacy `(name, cwd)` tuple. Two
+                // tabs of the same orchestration in the same directory carry
+                // byte-identical `(name, cwd)` pairs, so without the token they
+                // merged into one bucket on reattach and half the role panes were
+                // orphaned to the dashboard. Mixed variants are never equal
+                // (derived `PartialEq`), which is the right answer here too: a
+                // tokened and a token-less pane came from different clients and
+                // there is no evidence they shared a tab.
+                let key = match orchestration_id {
+                    Some(id) => crate::state::OrchestrationIdentity::Instance {
+                        id: id.clone(),
+                        name: name.clone(),
+                    },
+                    None => crate::state::OrchestrationIdentity::NameCwd {
+                        name: name.clone(),
+                        cwd: bucket_cwd.clone(),
+                    },
+                };
                 let idx = match orch_index.get(&key) {
                     Some(i) => *i,
                     None => {
@@ -2400,6 +2766,10 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                                 cwd: bucket_cwd,
                                 orchestration_name: name.clone(),
                                 display_title: display_title.clone(),
+                                // Retained so the rebuild can re-derive this
+                                // bucket's `key` verbatim — see
+                                // `OrchestrationHydrationBucket::identity`.
+                                orchestration_id: orchestration_id.clone(),
                                 role_slots: Vec::new(),
                             });
                         i
@@ -2429,7 +2799,7 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
 /// Build the synthetic dead-slot pane id used to keep a role visible on
 /// the orchestration tab even when no live daemon agent backs it. The
 /// `__dead-slot__-` prefix is reserved for this synthesis and namespaced
-/// by `(cwd, orchestration_name, role_index)` so distinct dead slots
+/// by `(orchestration identity, role_index)` so distinct dead slots
 /// never collide and a later reconnect produces the same id (idempotent
 /// across reconnects).
 ///
@@ -2440,19 +2810,43 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
 /// placeholder session sitting on the synthetic id satisfies the
 /// `pane_id ∈ role_pane_ids` filter in [`render_frame`].
 ///
+/// PRD #140 review: the namespace is the SAME
+/// [`crate::state::OrchestrationIdentity`] the hydration bucket is keyed on and
+/// the daemon routes on — not the bare `(cwd, orchestration_name)` tuple. Once
+/// M3.0 partitioned two same-`(name, cwd)` tabs into two buckets, a tuple-keyed
+/// id aliased across them: both tabs minted the identical
+/// `__dead-slot__-…-{role_index}` string for a role that had died in each, so
+/// the two tabs' distinct dead roles shared ONE `AppState.sessions` placeholder
+/// card (the second `insert_placeholder_session` overwrote the first, and the
+/// surviving card rendered in both tabs' card grids). Keying on the identity
+/// means the `Instance` token partitions the ids exactly as it partitions the
+/// routing groups; a token-less (`NameCwd`) bucket keeps the pre-review byte
+/// format, so legacy reconnects reproduce the same ids as before.
+///
 /// Follow-up to 0d5e651 (auditor finding #4): the variable-width
-/// components are length-prefixed so distinct (cwd,
-/// orchestration_name, role_index) tuples can never collide. The
-/// previous `-`-separated form was ambiguous whenever cwd or
-/// orchestration_name contained hyphens: e.g. (cwd="/a", name="b-c",
+/// components are length-prefixed so distinct identities can never
+/// collide. The previous `-`-separated form was ambiguous whenever cwd
+/// or orchestration_name contained hyphens: e.g. (cwd="/a", name="b-c",
 /// idx=1) and (cwd="/a-b", name="c", idx=1) both produced
 /// `__dead-slot__-/a-b-c-1`.
-pub fn dead_slot_pane_id(cwd: &str, orchestration_name: &str, role_index: usize) -> String {
-    format!(
-        "{DEAD_SLOT_PREFIX}{cwd_len}-{cwd}-{name_len}-{orchestration_name}-{role_index}",
-        cwd_len = cwd.len(),
-        name_len = orchestration_name.len(),
-    )
+pub fn dead_slot_pane_id(
+    identity: &crate::state::OrchestrationIdentity,
+    role_index: usize,
+) -> String {
+    match identity {
+        // The `i-` discriminator can never be confused with the `NameCwd` arm
+        // below, whose first component is always a decimal length.
+        crate::state::OrchestrationIdentity::Instance { id, name } => format!(
+            "{DEAD_SLOT_PREFIX}i-{id_len}-{id}-{name_len}-{name}-{role_index}",
+            id_len = id.len(),
+            name_len = name.len(),
+        ),
+        crate::state::OrchestrationIdentity::NameCwd { name, cwd } => format!(
+            "{DEAD_SLOT_PREFIX}{cwd_len}-{cwd}-{name_len}-{name}-{role_index}",
+            cwd_len = cwd.len(),
+            name_len = name.len(),
+        ),
+    }
 }
 
 /// Reserved prefix for synthetic dead-slot pane ids produced by
@@ -2486,13 +2880,12 @@ pub fn is_dead_slot_pane_id(pane_id: &str) -> bool {
 /// tab-open call returned `Err` — there was no rollback path.
 pub fn assign_synthetic_dead_slot_ids(
     role_pane_ids: &mut [Option<String>],
-    cwd: &str,
-    orchestration_name: &str,
+    identity: &crate::state::OrchestrationIdentity,
 ) -> Vec<String> {
     let mut assigned = Vec::new();
     for (role_index, slot) in role_pane_ids.iter_mut().enumerate() {
         if slot.is_none() {
-            let synthetic = dead_slot_pane_id(cwd, orchestration_name, role_index);
+            let synthetic = dead_slot_pane_id(identity, role_index);
             assigned.push(synthetic.clone());
             *slot = Some(synthetic);
         }
@@ -2525,11 +2918,11 @@ pub fn assign_synthetic_dead_slot_ids(
 /// they exercise the synthetic-id + placeholder shape together.
 pub fn fill_dead_slots_with_placeholders(
     role_pane_ids: &mut [Option<String>],
+    identity: &crate::state::OrchestrationIdentity,
     cwd: &str,
-    orchestration_name: &str,
     state: &mut AppState,
 ) {
-    let assigned = assign_synthetic_dead_slot_ids(role_pane_ids, cwd, orchestration_name);
+    let assigned = assign_synthetic_dead_slot_ids(role_pane_ids, identity);
     for synthetic in assigned {
         state.insert_placeholder_session(synthetic, Some(cwd.to_string()), None, None);
     }
@@ -3067,6 +3460,14 @@ fn surface_one_orchestration(
         cwd: surface.cwd.clone(),
         orchestration_name: surface.name.clone(),
         display_title: surface.display_title.clone(),
+        // PRD #140 review: the daemon's `OrchestrationSurface` broadcast carries
+        // no per-tab token, so this path's identity is the legacy `(name, cwd)`
+        // tuple — byte-identical dead-slot ids to before. Safe here because the
+        // only producer (PRD #120 issue dispatch) gives every dispatched
+        // orchestration its own git worktree, hence its own cwd; two surfaces
+        // never share a directory. If that ever changes, plumb the token onto
+        // `OrchestrationSurface` (additive serde field) and set it here.
+        orchestration_id: None,
         role_slots: surface
             .roles
             .iter()
@@ -3130,8 +3531,7 @@ fn surface_one_orchestration(
 
     // Fill any missing slot with a synthetic dead-slot id so every role keeps a
     // card (parity with the reconnect path — a fresh spawn normally has none).
-    let dead_slot_ids =
-        assign_synthetic_dead_slot_ids(&mut role_pane_ids, &surface.cwd, &surface.name);
+    let dead_slot_ids = assign_synthetic_dead_slot_ids(&mut role_pane_ids, &bucket.identity());
 
     // Build the tab WITHOUT yanking the user off their current tab: the open
     // call activates the new tab, so restore the prior active index afterward.
@@ -3268,7 +3668,18 @@ pub enum Action {
     NewPane,
     /// PRD #80: close the selected pane — or the entire mode/orchestration tab
     /// it belongs to (Ctrl+W).
+    ///
+    /// PRD #241 M3: this is now a *request*, not the teardown itself. Both
+    /// doors that produce it — the `close_pane` chord and the `[Close]` button
+    /// — arm the confirmation dialog (see [`close_confirmation_for_action`]);
+    /// only [`Action::ConfirmCloseSelected`] destroys anything. Putting the
+    /// modal on the action rather than the key is what keeps the two doors
+    /// from drifting apart.
     CloseSelected,
+    /// PRD #241 M3: the user explicitly picked **Close** in the confirmation
+    /// dialog. This is the only action that performs the destructive
+    /// close-pane / close-tab teardown.
+    ConfirmCloseSelected,
     /// PRD #80: toggle the embedded-pane layout between stacked and tiled
     /// (Ctrl+T).
     ToggleLayout,
@@ -3455,23 +3866,158 @@ pub enum Action {
     ScheduleDelete(String),
 }
 
+/// Kitty/xterm modifier parameter for a CSI sequence: `1 + bitmask`, where
+/// shift=1, alt=2, ctrl=4. So Shift → 2, Alt → 3, Ctrl → 5, Ctrl+Shift → 6.
+fn csi_modifier_param(mods: KeyModifiers) -> u8 {
+    let mut bits = 0u8;
+    if mods.contains(KeyModifiers::SHIFT) {
+        bits |= 1;
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        bits |= 2;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        bits |= 4;
+    }
+    1 + bits
+}
+
+/// PRD #227: the C0 control byte a `Ctrl+<char>` keypress must forward to an
+/// embedded pane, or `None` when the character has no control-byte meaning (the
+/// caller then forwards the literal character, which is right for `Ctrl+1`,
+/// `Ctrl+,`, …).
+///
+/// This table exists because M2 moves the Ctrl translation out of the *terminal*
+/// and into *us*. In legacy mode the terminal collapsed the chord to its control
+/// byte before crossterm ever saw it (`Ctrl+[` arrived as `KeyCode::Esc`,
+/// `Ctrl+4` as `Char('4') + CONTROL` because crossterm re-derives that from the
+/// `0x1c` byte). With `DISAMBIGUATE_ESCAPE_CODES` active the terminal instead
+/// reports the *key* plus the modifier (`CSI 91;5u` → `Char('[') + CONTROL`), so
+/// producing the byte is now our job. Anything missing here does not merely fail
+/// to improve — it REGRESSES from the legacy behavior to a literal character.
+/// That is how the `Ctrl+[` bug came back as `Ctrl+3`/`Ctrl+8`: the fix
+/// enumerated aliases one at a time.
+///
+/// So this is written as RULES, not as an alias list:
+///
+/// * `@ A–Z [ \ ] ^ _` and Space — the ASCII caret rule, `byte = ch & 0x1f`.
+///   Space (0x20) masks to 0x00 by the same arithmetic, which is exactly why
+///   `Ctrl+Space` and `Ctrl+@` agree on NUL.
+/// * `a–z` — the same rule after upcasing, giving 0x01..=0x1a.
+/// * `2`–`8` — xterm's digit aliases: NUL, ESC, FS, GS, RS, US, DEL. `4`–`7` are
+///   also the *only* form crossterm's legacy parser produces for `0x1c..=0x1f`
+///   (`crossterm-0.28.1/src/event/sys/unix/parse.rs:110-113`), so they matter in
+///   legacy mode too, not just under M2.
+/// * `?` → DEL and `/` → US — xterm's two punctuation aliases that the caret
+///   rule cannot produce (`?` masks to 0x1f, `/` to 0x0f).
+///
+/// Deliberately NOT mapped: `` Ctrl+` ``. Its ASCII value (0x60) is outside
+/// xterm's Ctrl-translation range and no supported terminal collapses it to NUL,
+/// so there is no legacy byte to preserve — mapping it would invent behavior
+/// rather than restore it.
+///
+/// # The decoder half — RE-VERIFY ON A CROSSTERM UPGRADE
+///
+/// This table is only correct if crossterm decodes the way it is described
+/// above. Two things hold that down:
+///
+/// 1. `keyevent_ctrl_c0_matches_crossterm_decoder` round-trips every byte below
+///    through the REAL decoder — it puts a PTY on fd 0 so crossterm's
+///    `pub(crate)` `parse_event` runs on genuine terminal input — and so fails
+///    the moment the encoder stops being the decoder's inverse. It needs the
+///    process to itself (crossterm 0.28's raw-mode flag and its lazily-built
+///    event reader are PROCESS-global), so it runs under `cargo test-fast` /
+///    `cargo nextest` and skips under a plain `cargo test`.
+/// 2. `Cargo.toml` pins the direct dependency to `=0.28.1`, so the decoder
+///    cannot change without a deliberate edit to that line.
+///
+/// The hand-read decoder tables stay recorded here because they are the *why*
+/// behind the rules above, and because (1) proves agreement without explaining
+/// it. Read out of `crossterm-0.28.1/src/event/sys/unix/parse.rs`; legacy single
+/// bytes, in `parse_event`'s match order (earlier arms shadow later ones):
+///
+/// * `:35-91` — `0x1b` opens an escape sequence; alone, with no further input
+///   pending, it is `KeyCode::Esc`.
+/// * `:92-94` — `0x0d` is `Enter`.
+/// * `:95-101` — `0x0a` is `Enter` ONLY when raw mode is OFF (upstream issue
+///   #371). In raw mode — which is the only mode the deck forwards keys in — it
+///   falls through to the arm below and arrives as `Char('j') + CONTROL`.
+/// * `:102` — `0x09` is `Tab`, with NO `CONTROL` modifier.
+/// * `:103-105` — `0x7f` is `Backspace`, with NO `CONTROL` modifier.
+/// * `:106-109` — `0x01..=0x1a` is `Char(b - 0x01 + b'a') + CONTROL`.
+/// * `:110-113` — `0x1c..=0x1f` is `Char(b - 0x1c + b'4') + CONTROL`. There is
+///   no other legacy form for these four, which is why `4`–`7` are aliases.
+/// * `:114-117` — `0x00` is `Char(' ') + CONTROL`.
+///
+/// CSI-u (`parse_csi_u_encoded_key_code`, `:497`): the codepoint becomes
+/// `KeyCode::Char` verbatim (`:540-566`, with the same `Esc` / `Enter` / `Tab` /
+/// `Backspace` special cases as the legacy path), and the `;<n>` parameter goes
+/// through `parse_modifiers` (`:303`), which is `n.saturating_sub(1)` read as a
+/// bitmask — 1 SHIFT, 2 ALT, 4 CONTROL. So `CSI 91;5u` is `Char('[') + CONTROL`:
+/// under M2 every alias above arrives as its literal character plus `CONTROL`,
+/// which is the whole reason this function has to exist.
+///
+/// `keyevent_ctrl_c0_controls` and
+/// `ctrl_c0_byte_maps_exactly_the_documented_alias_set` pin the ENCODER against
+/// that reading, exhaustively over all 128 ASCII characters, with no PTY needed;
+/// `keyevent_ctrl_c0_matches_crossterm_decoder` pins the reading itself against
+/// the shipped decoder. What none of them can do is keep the LINE REFERENCES
+/// above accurate: relaxing the `=0.28.1` pin in `Cargo.toml` means re-checking
+/// every one of them by hand, even when the round-trip test stays green.
+fn ctrl_c0_byte(c: char) -> Option<u8> {
+    match c {
+        // `a`–`z` / `A`–`Z` → 0x01..=0x1a via the caret rule on the upcased char.
+        'a'..='z' | 'A'..='Z' => Some(c.to_ascii_uppercase() as u8 & 0x1f),
+        // The caret rule proper: `@`→NUL, `[`→ESC, `\`→FS, `]`→GS, `^`→RS,
+        // `_`→US, and Space→NUL.
+        '@' | '[' | '\\' | ']' | '^' | '_' | ' ' => Some(c as u8 & 0x1f),
+        // xterm's digit aliases. `3`..`7` are contiguous with ESC..US.
+        '2' => Some(0x00),
+        '3'..='7' => Some(c as u8 - b'3' + 0x1b),
+        '8' | '?' => Some(0x7f),
+        '/' => Some(0x1f),
+        _ => None,
+    }
+}
+
 /// Convert a crossterm `KeyEvent` into the byte sequence expected by a terminal PTY.
 fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     // Alt modifier: wrap the base key bytes with an ESC prefix.
     let has_alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Ctrl+letter → control codes 0x01–0x1a (Alt adds ESC prefix)
+    // Ctrl+<key> → the C0 control byte (Alt adds ESC prefix). See
+    // [`ctrl_c0_byte`] for why the whole alias table lives behind one rule-based
+    // function instead of a list of match arms here.
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && let KeyCode::Char(c) = key.code
+        && let Some(b) = ctrl_c0_byte(c)
     {
-        let c = c.to_ascii_lowercase();
-        if c.is_ascii_lowercase() {
-            let ctrl = vec![c as u8 - b'a' + 1];
-            return Some(if has_alt {
-                [vec![0x1b], ctrl].concat()
-            } else {
-                ctrl
-            });
+        return Some(if has_alt { vec![0x1b, b] } else { vec![b] });
+    }
+
+    // PRD #227: modifier-aware encoding for keys whose legacy byte form cannot
+    // carry a modifier at all — the deck used to forward Shift+Enter as a bare
+    // `\r`, i.e. literally the same bytes as a plain Enter, so the agent
+    // submitted instead of inserting a newline.
+    //
+    // Only SHIFT/CONTROL open this path. ALT on its own keeps its historical
+    // ESC-prefix form (Alt+Enter → `ESC\r`), because a genuine Alt+Enter is
+    // meaningful to some agents; when ALT accompanies SHIFT/CONTROL it is folded
+    // into the modifier bitmask rather than dropped.
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        let m = csi_modifier_param(key.modifiers);
+        match key.code {
+            // CSI-u: `ESC[13;2u` is the only newline encoding verified to work
+            // across all supported agents (pi, claude, opencode, codex). It also
+            // carries no `\r`, so the submit-debounce correctly ignores it.
+            KeyCode::Enter => return Some(format!("\x1b[13;{m}u").into_bytes()),
+            // Legacy CSI-with-modifier form for arrows (Shift+Up → `ESC[1;2A`).
+            KeyCode::Up => return Some(format!("\x1b[1;{m}A").into_bytes()),
+            KeyCode::Down => return Some(format!("\x1b[1;{m}B").into_bytes()),
+            KeyCode::Right => return Some(format!("\x1b[1;{m}C").into_bytes()),
+            KeyCode::Left => return Some(format!("\x1b[1;{m}D").into_bytes()),
+            _ => {}
         }
     }
 
@@ -3579,19 +4125,82 @@ fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offse
     trimmed.to_string()
 }
 
-/// Copy text to the system clipboard using the OSC 52 escape sequence.
-/// Writes directly to `/dev/tty` to bypass ratatui's buffered terminal output.
-fn copy_to_clipboard_osc52(text: &str) {
-    use std::io::Write;
+/// Build the OSC 52 "set clipboard" escape sequence carrying `text`.
+///
+/// Split out of [`copy_to_clipboard_osc52`] so the *bytes* are constructed in
+/// exactly one place and are therefore identical on every platform — PRD #163
+/// M5 varies only the write target (`/dev/tty` vs `CONOUT$`), never the
+/// sequence — and so the construction is unit-testable without a terminal.
+fn osc52_clipboard_sequence(text: &str) -> String {
     let encoded = base64_encode(text.as_bytes());
     // Use ST (\x1b\\) terminator — more widely supported than BEL (\x07) in raw mode.
-    let seq = format!("\x1b]52;c;{encoded}\x1b\\");
-    // Write to /dev/tty directly so the escape sequence reaches the outer terminal
-    // even when ratatui has captured stdout.
-    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+    format!("\x1b]52;c;{encoded}\x1b\\")
+}
+
+/// Copy text to the system clipboard using the OSC 52 escape sequence.
+/// Writes directly to the controlling terminal to bypass ratatui's buffered
+/// terminal output.
+fn copy_to_clipboard_osc52(text: &str) {
+    use std::io::Write;
+    let seq = osc52_clipboard_sequence(text);
+    // Write to the controlling terminal directly so the escape sequence reaches
+    // the outer terminal even when ratatui has captured stdout. That is
+    // `/dev/tty` on Unix and the `CONOUT$` console pseudo-file on Windows
+    // (PRD #163 M5) — the one place the platform seam is an inline `cfg`
+    // rather than a `platform::` submodule, because only the open target
+    // differs, not the mechanism.
+    #[cfg(unix)]
+    let terminal = std::fs::OpenOptions::new().write(true).open("/dev/tty");
+    #[cfg(windows)]
+    let terminal = open_console_output();
+    if let Ok(mut tty) = terminal {
         let _ = tty.write_all(seq.as_bytes());
         let _ = tty.flush();
     }
+}
+
+/// Open the console's active screen buffer (`CONOUT$`) for writing — the
+/// Windows counterpart of Unix's `/dev/tty` for [`copy_to_clipboard_osc52`].
+///
+/// `CreateFileW` is called directly instead of going through
+/// `std::fs::OpenOptions`, which normalizes a bare relative path like
+/// `CONOUT$` into a `\\?\`-verbatim absolute path. The verbatim namespace
+/// bypasses the Win32 parser's special-casing of the reserved console names,
+/// so the open would land on a nonexistent file in the current directory
+/// instead of the console.
+#[cfg(windows)]
+fn open_console_output() -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = "CONOUT$".encode_utf16().chain(std::iter::once(0)).collect();
+
+    // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call;
+    // the null security-attributes and template-file arguments are the
+    // documented "defaults" form. `OPEN_EXISTING` is required for a console
+    // device (it is never created). The returned handle is owned by us and
+    // closed exactly once, by the `OwnedHandle` the returned `File` takes over.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a valid, non-null, exclusively-owned handle from the
+    // successful `CreateFileW` above and is not used again after this point.
+    let owned = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
+    Ok(std::fs::File::from(owned))
 }
 
 /// Minimal base64 encoder (no external dependency needed).
@@ -3654,6 +4263,314 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
         Action::ForwardToPane(bytes)
     } else {
         Action::Continue
+    }
+}
+
+/// PRD #241 M3: the close-confirmation dialog's whole state — which option is
+/// highlighted, and how much the confirmed close would destroy. Index 0 is
+/// **Cancel** and it is the [`Default`], following the same reasoning as the
+/// quit dialog's Detach default: `Ctrl+W` is already in people's fingers, so the
+/// muscle memory must not become destructive.
+///
+/// Deliberately holds no *identity* of what is being closed: that lives in
+/// [`UiState::close_confirm_target`] as a [`CloseTarget`]. See its docs for why
+/// the two are separate. `scope` is not identity — it is the one bit of the
+/// resolved close the dialog has to be able to say out loud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CloseConfirmState {
+    /// 0 = Cancel (default), 1 = Close.
+    pub selected: usize,
+    /// What the confirmed close will actually tear down, decided by
+    /// [`resolve_close_plan`] — the same function the confirmed close itself
+    /// branches on. Defaults to [`CloseScope::Pane`], the narrower claim.
+    pub scope: CloseScope,
+}
+
+/// PRD #241 fact-check follow-up: how much a confirmed close destroys, and
+/// therefore which words the dialog is allowed to use.
+///
+/// The dialog used to read `Close selected pane?` for every target, which is a
+/// lie on a Mode or Orchestration tab: that close takes the whole tab and every
+/// pane in it. Crucially the lie was NOT fixable by branching on
+/// [`CloseTarget`], because `CloseTarget::Session` does not mean "one card" —
+/// the confirmed close resolves the armed session, discovers its pane belongs to
+/// a Mode/Orchestration tab, and closes that entire tab. Only a plain dashboard
+/// pane reaches the one-pane branch. So the wording is derived from
+/// [`resolve_close_plan`], the single function the teardown itself branches on,
+/// and the two cannot disagree without the close changing shape.
+///
+/// Deliberately carries no pane COUNT. A number here would have to be recomputed
+/// against a moving world (reactive pools grow and shrink, roles die into dead
+/// slots), and a confidently wrong "3 panes" is worse than no number at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseScope {
+    /// Exactly one plain dashboard pane and its card.
+    #[default]
+    Pane,
+    /// A whole Mode / Orchestration tab: every pane it owns.
+    Tab,
+}
+
+/// PRD #241 review F1: the STABLE identity of whatever a close confirmation was
+/// armed against.
+///
+/// The first cut of the dialog stored only the dashboard's selection index and
+/// re-derived the victim at confirm time. That inverts the PRD's whole thesis:
+/// `Ctrl+PgUp` / `Ctrl+PgDn`, a mouse click, or any reactive re-index still
+/// landed while the modal was up, so the user could read "Close selected pane?",
+/// say yes, and lose a *different* tab or card. Capturing identity at ARM time —
+/// the same stable-selection discipline `Tab::Dashboard::selected_session_id`
+/// already uses — means the answer applies to the thing the user pointed at, and
+/// to nothing else.
+///
+/// If the captured target has disappeared by the time the user confirms, the
+/// close does nothing and says so. There is deliberately no fallback to "the
+/// current selection": a confirmation that retargets is worse than no
+/// confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseTarget {
+    /// A Mode / Orchestration tab, keyed by its [`TabId`] (stable across
+    /// tab-strip reordering and index shifts, unlike the position).
+    Tab(TabId),
+    /// A dashboard card, keyed by its session id (stable across filtering,
+    /// sorting, and list churn, unlike `selected_index`).
+    Session(String),
+}
+
+/// PRD #241 review F1: resolve a [`TabId`] back to its current position, or
+/// `None` if that tab is gone.
+fn tab_index_for_id(tab_manager: &TabManager, id: TabId) -> Option<usize> {
+    tab_manager
+        .tabs()
+        .iter()
+        .position(|t| tab_id_of(t) == Some(id))
+}
+
+/// The stable id of a closable tab. `Tab::Dashboard` has none — it is never
+/// closable, which is exactly the invariant `dashboard/pane/003` pins.
+fn tab_id_of(tab: &Tab) -> Option<TabId> {
+    match tab {
+        Tab::Mode { id, .. } | Tab::Orchestration { id, .. } => Some(*id),
+        Tab::Dashboard { .. } => None,
+    }
+}
+
+/// The dialog's options, in render/selection order. Index 0 is the
+/// non-destructive default. Only the confirm option's description changes with
+/// the scope — Cancel means the same thing either way.
+fn close_confirm_options(scope: CloseScope) -> [(&'static str, &'static str); 2] {
+    match scope {
+        CloseScope::Pane => [
+            ("Cancel", "keep it open"),
+            ("Close", "stop the agent and remove it"),
+        ],
+        CloseScope::Tab => [
+            ("Cancel", "keep it open"),
+            ("Close", "stop all agents and remove the tab"),
+        ],
+    }
+}
+
+/// The dialog's question, phrased for what the close will actually take.
+fn close_confirm_header(scope: CloseScope) -> &'static str {
+    match scope {
+        CloseScope::Pane => "  Close selected pane?",
+        CloseScope::Tab => "  Close this tab and all its panes?",
+    }
+}
+
+/// How many options the dialog offers — the same for every scope, so the key
+/// handler does not need to know which one is on screen.
+const CLOSE_CONFIRM_OPTION_COUNT: usize = 2;
+
+/// PRD #241 M3: decide whether a dispatched action needs the close
+/// confirmation, and seed the dialog when it does.
+///
+/// The gate lives on the ACTION rather than on the key because
+/// [`Action::CloseSelected`] has two doors — the `close_pane` chord and the
+/// persistent `[Close]` button — and both must confirm. `has_target` is the
+/// caller's answer to "is anything actually armed?": an active
+/// Mode/Orchestration tab, or a selected dashboard card with a live pane. With
+/// nothing armed the close stays the pre-existing no-op and no modal opens, so
+/// an unarmed dashboard can never be talked into closing card 0.
+pub fn close_confirmation_for_action(
+    action: &Action,
+    has_target: bool,
+) -> Option<CloseConfirmState> {
+    match action {
+        Action::CloseSelected if has_target => Some(CloseConfirmState::default()),
+        _ => None,
+    }
+}
+
+/// PRD #241 M3 + review F1/F4: raise the close confirmation, bound to `target`.
+///
+/// The ONE place the modal is armed, so every door into a destructive close —
+/// the `close_pane` chord, the `[Close]` button, and the tab strip's `×` —
+/// enters through the identical transition: Cancel selected, the target's
+/// stable identity recorded, and the "not drawn yet" flag reset so no
+/// already-queued keystroke can answer a dialog the user has not seen (F5).
+/// `scope` comes from [`resolve_close_plan`] against `target` — the SAME
+/// function `Action::ConfirmCloseSelected` branches on — so the sentence the
+/// user reads and the teardown they authorise are decided once. It is frozen
+/// here with the target for the same reason the target itself is frozen: the
+/// dialog describes what was armed, never what happens to be selected later.
+fn arm_close_confirmation(
+    ui: &mut UiState,
+    prompt: CloseConfirmState,
+    target: CloseTarget,
+    scope: CloseScope,
+) {
+    ui.close_confirm = CloseConfirmState { scope, ..prompt };
+    ui.close_confirm_target = Some(target);
+    ui.close_confirm_displayed = false;
+    ui.mode = UiMode::CloseConfirm;
+}
+
+/// PRD #241: **the** decision of what a confirmed close will destroy.
+///
+/// One function, two consumers that must never disagree: the confirmation
+/// dialog's wording (via [`CloseScope`], captured at arm time) and the confirmed
+/// teardown in `Action::ConfirmCloseSelected`, which matches directly on the
+/// returned plan. Before this existed the dialog inferred its copy from the
+/// [`CloseTarget`] variant, which is not the same question — a
+/// `CloseTarget::Session` whose pane belongs to a Mode/Orchestration tab closes
+/// that whole tab, so "Session" never implied "one pane".
+///
+/// `None` means a confirmed close would do nothing: the armed tab or session is
+/// gone. The caller says so rather than retargeting.
+fn resolve_close_plan(
+    target: &CloseTarget,
+    tab_manager: &TabManager,
+    snapshot: &AppState,
+) -> Option<ClosePlan> {
+    match target {
+        // PR #151 (e2e layout_002 regression): a Mode/Orchestration TAB is a
+        // close target in its own right, independent of the dashboard selection
+        // (which is `None` while such a tab is active). PRD #241 review F1:
+        // resolve the ARMED tab's id back to its current index rather than
+        // closing `active_index()`, so switching tabs under the open dialog
+        // cannot redirect the teardown. (selection_016)
+        CloseTarget::Tab(id) => {
+            tab_index_for_id(tab_manager, *id).map(|index| ClosePlan::Tab { index })
+        }
+        // PRD #113 finding 2: on the Dashboard the destructive close needs a
+        // session that still exists AND still owns a pane. Nothing armed means
+        // no card-0 fallback (that fallback is reserved for Enter/Focus), so an
+        // unarmed dashboard can never silently close card 0.
+        CloseTarget::Session(sid) => {
+            let pane_id = snapshot.sessions.get(sid)?.pane_id.clone()?;
+            // The armed card may be the face of a pane that lives inside a
+            // Mode/Orchestration tab. Closing it closes the tab — every pane in
+            // it — which is exactly why the dialog cannot read the target
+            // variant and call it a day.
+            match tab_manager
+                .tab_index_for_agent_pane(&pane_id)
+                .or_else(|| tab_manager.tab_index_for_pane(&pane_id))
+            {
+                Some(index) => Some(ClosePlan::Tab { index }),
+                None => Some(ClosePlan::Pane {
+                    session_id: sid.clone(),
+                    pane_id,
+                }),
+            }
+        }
+    }
+}
+
+/// PRD #241: the resolved shape of a confirmed close — see
+/// [`resolve_close_plan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClosePlan {
+    /// Tear down the Mode/Orchestration tab at this index and every pane it
+    /// owns.
+    Tab { index: usize },
+    /// Tear down exactly one plain dashboard pane and drop its card.
+    Pane { session_id: String, pane_id: String },
+}
+
+impl ClosePlan {
+    /// How much this plan destroys, in the terms the dialog speaks.
+    fn scope(&self) -> CloseScope {
+        match self {
+            ClosePlan::Tab { .. } => CloseScope::Tab,
+            ClosePlan::Pane { .. } => CloseScope::Pane,
+        }
+    }
+}
+
+/// PRD #241 M3: what would a close act on right now — and nothing, if nothing?
+///
+/// Mirrors — deliberately, arm for arm — the branch structure of the confirmed
+/// close in `dispatch_action`, so the dialog can never be raised for a close
+/// that would then turn out to be a no-op:
+///
+/// * an active Mode/Orchestration tab is closable regardless of the dashboard
+///   selection (PR #151 / `dashboard/selection/016`), and
+/// * otherwise the dashboard needs a REAL active selection whose session owns a
+///   pane (PRD #113 finding 2 / `dashboard/selection/012` — no card-0
+///   fallback).
+///
+/// PRD #241 review F1: it returns the target's stable identity rather than a
+/// bare "yes", so the confirmation can be *bound* to it. See [`CloseTarget`].
+fn resolve_close_target(
+    ui: &UiState,
+    tab_manager: &TabManager,
+    snapshot: &AppState,
+    filtered: &[(&String, &SessionState)],
+) -> Option<CloseTarget> {
+    if let Some(id) = tab_id_of(tab_manager.active_tab()) {
+        return Some(CloseTarget::Tab(id));
+    }
+    ui.selected_index
+        .and_then(|i| filtered.get(i))
+        .filter(|(id, _)| {
+            snapshot
+                .sessions
+                .get(*id)
+                .is_some_and(|session| session.pane_id.is_some())
+        })
+        .map(|(id, _)| CloseTarget::Session((*id).clone()))
+}
+
+/// PRD #241 M3: key handling for the close confirmation, modelled on
+/// [`handle_quit_confirm_key`]. Up/Down (or k/j) move the highlight, Enter
+/// commits the highlighted option, and Esc cancels. Only an explicit **Close**
+/// selection returns [`Action::ConfirmCloseSelected`]; everything else that
+/// leaves the dialog returns [`Action::DismissModal`], which is a pure
+/// return-to-Normal.
+///
+/// PRD #241 review F5: there is deliberately **no `y` shortcut**. An earlier
+/// cut had one, and a single keypress that destroys a pane is exactly the input
+/// most likely to already be sitting in the event queue when the dialog opens —
+/// the run loop drains a whole input burst without re-rendering, so a `y` typed
+/// before the prompt existed could answer it. `y` was this implementation's own
+/// addition, not a PRD requirement (the PRD's risk row only asks that confirm be
+/// a single keypress, which Enter is). With Cancel as the default selection, the
+/// worst a stray queued keystroke can now do is *dismiss* the dialog. The
+/// arm-time input drain in `run_tui` closes the same hole from the other side;
+/// this is the half that holds even if that one is bypassed.
+pub fn handle_close_confirm_key(state: &mut CloseConfirmState, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.selected = state.selected.saturating_sub(1);
+            Action::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if state.selected + 1 < CLOSE_CONFIRM_OPTION_COUNT {
+                state.selected += 1;
+            }
+            Action::Continue
+        }
+        KeyCode::Enter => {
+            if state.selected == 1 {
+                Action::ConfirmCloseSelected
+            } else {
+                Action::DismissModal
+            }
+        }
+        KeyCode::Esc => Action::DismissModal,
+        _ => Action::Continue,
     }
 }
 
@@ -3839,26 +4756,131 @@ fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
     }
 }
 
-fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
+/// Truncate `input` so its rendered width — including the trailing `…` when one
+/// is added — is at most `max_width` **terminal columns**.
+///
+/// Every caller's budget is a slice of a rectangle's width (`inner.width - 6`
+/// for the card's `Dir:` and `Prmt:` lines), so the budget is measured in cells,
+/// not scalar values. Counting `char`s instead under-counts wide characters — a
+/// four-scalar CJK basename is eight columns, so a six-cell budget accepted it
+/// unchanged and ratatui then bare-clipped it at the right edge with no `…`,
+/// violating PRD #339's "always ellipsizes" criterion — and over-counts
+/// zero-width ones, replacing a fitting combining sequence with a lone `…`.
+///
+/// Mirrors `tab_layout::truncate_to_cap`: accumulate `UnicodeWidthChar` per
+/// character and stop before the first one that would overflow. The `…` column
+/// is reserved **only** when the input actually overflows, so a string that
+/// exactly fills the budget is returned whole. For single-width input (all
+/// ASCII text on a card) this is identical, character for character, to the
+/// former char-count implementation.
+///
+/// Known limitation: iteration is per `char`, so a grapheme *cluster* — an emoji
+/// ZWJ sequence, or a base character followed by combining marks — can still be
+/// split at the cut point. Measuring clusters needs `unicode-segmentation`,
+/// which this crate deliberately does not depend on; the total width stays
+/// correct either way, so the failure mode is a cosmetically odd final glyph,
+/// never an overrun. Since the total below is summed the same way, a cluster is
+/// also *over*-counted against the budget — a ZWJ sequence ratatui draws in two
+/// cells measures four here — so such input ellipsizes a little early. That
+/// errs in the safe direction and keeps one rule for both decisions.
+///
+/// Control characters measure **zero** columns, and deliberately so: ratatui
+/// 0.30's `Span::styled_graphemes` drops every grapheme containing a
+/// `char::is_control` before it reaches a cell, so such a character occupies no
+/// column on screen. `UnicodeWidthStr::width` disagrees — it counts a `\n` as
+/// one column — so the total below is summed with the same per-character rule
+/// the fill loop uses rather than with the string-level algorithm. Using both
+/// measures is what made `"abc\ndef"` (six rendered cells) get truncated inside
+/// a six-cell budget.
+fn truncate_with_ellipsis(input: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    // The single per-character width rule governing both decisions below.
+    let cell_width = |c: char| UnicodeWidthChar::width(c).unwrap_or(0);
+
+    if max_width == 0 {
         return String::new();
     }
-    let char_count = input.chars().count();
-    if char_count <= max_chars {
+    if input.chars().map(cell_width).sum::<usize>() <= max_width {
         return input.to_string();
     }
-    let keep = max_chars.saturating_sub(1);
-    let mut out: String = input.chars().take(keep).collect();
+    // Overflow confirmed, so one column now belongs to the `…`.
+    let budget = max_width - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in input.chars() {
+        let w = cell_width(c);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
     out.push('…');
     out
 }
 
+/// Pick the widest `Last`/`Tools` form that fits a card's bottom border, or
+/// `None` when even the shortest form would overrun the corner glyphs.
+///
+/// `usable_width` is `area.width - 2` — the cells between `└` and `┘`. Every
+/// form carries one leading and one trailing space, mirroring the ` ● Thinking `
+/// status badge, so the title never touches a corner.
+///
+/// PRD #339 pins the ladder — widest form first, each rung shorter than the
+/// last. Against the reference label (`last = "2m"`, `tools = 14`) the rungs
+/// measure 21 / 15 / 9 display columns:
+///
+/// | rung | form                     | reference width |
+/// |------|--------------------------|-----------------|
+/// | 1    | ` Last: 2m  Tools: 14 `  | 21              |
+/// | 2    | ` 2m · 14 tools `        | 15              |
+/// | 3    | ` 2m · 14 `              | 9               |
+/// | 4    | omitted (`None`)         | —               |
+///
+/// Those numbers describe the reference input only; they are NOT thresholds.
+/// The single rule is the measured **display** width (unicode columns — `·` is
+/// two bytes but one column) of the form actually being rendered: pick the
+/// widest rung whose own width fits `usable_width`. A longer elapsed string or
+/// tool count widens a rung, and the fit check catches that on its own — with
+/// `last = "1h 5m"` and `tools = 1234`, rung 1 measures 26 columns and a
+/// 22-cell border degrades to ` 1h 5m · 1234 tools ` instead of overrunning.
+///
+/// Deliberately no per-rung minimum-width floor: a floor is stricter than the
+/// fit check exactly when `form.width() < min_width`, i.e. precisely when the
+/// form fits and we would reject it anyway. Floors add no overrun protection —
+/// they only suppress forms that would otherwise fit, and any constant is
+/// calibrated to one reference input and wrong for every other one.
+///
+/// Returning `None` rather than a clipped form is correct: a border title is
+/// drawn over the border cells, so an oversized one silently eats the corner
+/// glyphs (`└`/`┘`) and the card stops looking like a card. Dropping the stats
+/// entirely degrades to a clean, if less informative, frame.
+#[doc(hidden)]
+pub fn card_stats_border_label(usable_width: u16, last: &str, tools: usize) -> Option<String> {
+    use unicode_width::UnicodeWidthStr;
+
+    // Pick the widest form whose display width fits the usable cells.
+    [
+        format!(" Last: {last}  Tools: {tools} "),
+        format!(" {last} · {tools} tools "),
+        format!(" {last} · {tools} "),
+    ]
+    .into_iter()
+    .find(|form| form.width() <= usable_width as usize)
+}
+
 /// Truncate a sequence of styled title segments to `max_chars` total characters,
 /// appending a single `…` (in the last surviving segment's style) when they
-/// don't all fit. Produces the SAME character sequence as
-/// [`truncate_with_ellipsis`] on the concatenated text — so text-only snapshots
-/// are unchanged — but preserves each segment's style, letting the coloured
+/// don't all fit, while preserving each segment's style — letting the coloured
 /// agent-type badge (PRD #20 M5) keep its registry colour even on a narrow card.
+///
+/// For single-width text this produces the same character sequence as
+/// [`truncate_with_ellipsis`] on the concatenated input, so text-only snapshots
+/// of the title match the plain truncator. The two diverge on wide or zero-width
+/// characters: this one still budgets `char`s, whereas `truncate_with_ellipsis`
+/// budgets display columns. Titles are the pre-existing char-counted surface and
+/// PRD #339 did not touch them; converting them is a separate change.
 fn truncate_styled_segments(
     segments: Vec<(String, Style)>,
     max_chars: usize,
@@ -3981,11 +5003,12 @@ fn focus_deck(
             // retry before the delete arm below treats it as stale. Post-PRD #93
             // the daemon-backed `EmbeddedPaneController` is the only production
             // `PaneController` (the old in-process `LocalDeck` is gone), so the
-            // downcast below always succeeds and the guard always operates on it.
+            // attach below always operates on it. Routed through the trait's
+            // `try_hydrate_pane` rather than a downcast so a mock can exercise
+            // this path — see the trait method's docs.
             let mut focus_result = pane.focus_pane(pane_id);
             if let Err(PaneError::CommandFailed(_)) = focus_result
-                && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                && embedded.hydrate_pane(pane_id)
+                && pane.try_hydrate_pane(pane_id)
             {
                 focus_result = pane.focus_pane(pane_id);
             }
@@ -4093,10 +5116,21 @@ fn dispatch_normal_mode_key(
 /// The caller passes the active tab, so a pane focused while another tab
 /// is active can never rewrite a different tab's selection — the gating
 /// the PRD calls for.
+///
+/// `current_index` is the highlight as it stands this frame. It only matters
+/// when several visible cards share one pane id: the Orchestration arm keys on
+/// pane id, and `position` returns the FIRST match, so re-deriving every frame
+/// pinned the highlight to the first of the group and made the rest impossible
+/// to select. Preferring the current index when it names the same pane keeps
+/// the cursor where the user put it. Duplicates are a bug in their own right
+/// (see the retire block in `state::AppState::apply_event`), but the deck
+/// should degrade to "reachable" rather than "silently unreachable" when one
+/// slips through.
 pub fn sync_and_derive_selection(
     tab: &mut Tab,
     focused_pane_id: Option<&str>,
     filtered: &[(&str, Option<&str>)],
+    current_index: Option<usize>,
 ) -> Option<usize> {
     match tab {
         Tab::Dashboard {
@@ -4130,10 +5164,13 @@ pub fn sync_and_derive_selection(
             {
                 *focused_role_pane_id = Some(fid.to_string());
             }
-            match focused_role_pane_id
-                .as_deref()
-                .and_then(|pid| filtered.iter().position(|(_, p)| *p == Some(pid)))
-            {
+            match focused_role_pane_id.as_deref().and_then(|pid| {
+                // Hold position within a same-pane group instead of snapping to
+                // its first member (see the `current_index` note above).
+                current_index
+                    .filter(|&i| filtered.get(i).is_some_and(|(_, p)| *p == Some(pid)))
+                    .or_else(|| filtered.iter().position(|(_, p)| *p == Some(pid)))
+            }) {
                 Some(idx) => Some(idx),
                 None => {
                     if focused_role_pane_id.is_some() {
@@ -4188,6 +5225,66 @@ fn dashboard_focus_target(ui: &UiState, total: usize) -> Option<usize> {
     })
 }
 
+/// PRD #241 M4 (review F2b): which pane does `Ctrl+D` go *back* to from command
+/// mode?
+///
+/// Answers the return leg of the toggle, per active tab, using the same targets
+/// each tab's own Enter/focus action already uses — so the chord lands exactly
+/// where the user would have landed the long way round:
+///
+/// * **Mode tab** — the remembered focused pane, else the agent pane
+///   (`Action::ModeTabFocus`).
+/// * **Orchestration tab** — the remembered focused role pane, else the start
+///   (orchestrator) role (`Action::OrchestrationFocus`).
+/// * **Dashboard** — the selected card's pane, but only when the session can
+///   take live input; a history-only or view-only card has nothing to type into,
+///   so `Action::Focus`'s gate applies here too.
+///
+/// `None` = nothing to return to; the caller stays in command mode and says so
+/// rather than pretending the chord did something.
+fn resume_pane_input_target(
+    ui: &UiState,
+    pane: &dyn PaneController,
+    tab_manager: &TabManager,
+    snapshot: &AppState,
+    filtered: &[(&String, &SessionState)],
+) -> Option<String> {
+    match tab_manager.active_tab() {
+        Tab::Mode {
+            focused_pane_id,
+            agent_pane_id,
+            ..
+        } => Some(
+            focused_pane_id
+                .clone()
+                .unwrap_or_else(|| agent_pane_id.clone()),
+        ),
+        Tab::Orchestration {
+            focused_role_pane_id,
+            role_pane_ids,
+            start_role_index,
+            ..
+        } => focused_role_pane_id
+            .clone()
+            .or_else(|| role_pane_ids.get(*start_role_index).cloned()),
+        Tab::Dashboard { .. } => {
+            // Prefer whatever the controller already has focused — returning to
+            // the pane you just left beats re-deriving from the card list — and
+            // fall back to the selected card.
+            let focused = pane
+                .as_any()
+                .downcast_ref::<EmbeddedPaneController>()
+                .and_then(|embedded| embedded.focused_pane_id());
+            let selected = dashboard_focus_target(ui, filtered.len())
+                .and_then(|i| filtered.get(i))
+                .and_then(|(id, _)| snapshot.sessions.get(*id))
+                .filter(|session| non_live_input_feedback(session.writable()).is_none())
+                .and_then(|session| session.pane_id.clone());
+            selected.or(focused)
+        }
+    }
+}
+
 /// PRD #113 M2/M4 — reconcile the dashboard's *active* selection highlight with
 /// the focused pane each frame, replacing the bare `sync_and_derive_selection`
 /// call in the outer loop. The dashboard selection is now active/inactive
@@ -4240,9 +5337,79 @@ fn reconcile_dashboard_selection(
             return;
         }
     }
-    if let Some(idx) = sync_and_derive_selection(tab, focused_pane_id, filtered) {
+    if let Some(idx) = sync_and_derive_selection(tab, focused_pane_id, filtered, ui.selected_index)
+    {
         ui.selected_index = Some(idx);
     }
+}
+
+/// PRD #341 M6 — a pane you are TYPING into must be showing live output.
+///
+/// M5 made command mode scroll the focused pane's scrollback; M1 gates both the
+/// painted cursor and the hardware cursor on `scrollback() == 0`. Between them
+/// they opened a hole the real-agent journey (`mode/live/002`) walks straight
+/// into: scroll back in command mode, `Ctrl+D` to resume typing, and the pane is
+/// still parked in history — so the chip says ` TYPING ` while *no* cursor of any
+/// kind renders, and the keystrokes go to a live agent the user cannot see. That
+/// is exactly the mode/reality contradiction this PRD exists to remove, inverted.
+///
+/// The fix snaps the pane back to live output, which is what every terminal does
+/// when you type. It is done HERE — a per-frame reconcile against the live
+/// `(mode, focused pane)` pair — and not on `Action::DetachToNormal`, for the same
+/// reason [`CommandBannerState::sync_mode`] derives its edge from the mode rather
+/// than from a hand-listed set of actions: `Ctrl+D` is only one of ~50 sites that
+/// assign `ui.mode`, and `Action::Focus`, `ModeTabFocus`, `OrchestrationFocus`,
+/// the tab-switch focus restore and every dialog dismissal all reach `PaneInput`
+/// too. A reset wired to one action would be missing from all the others.
+///
+/// Keying on the *pair* also covers moving focus between panes while already in
+/// `PaneInput` — the incoming pane may have been left scrolled from an earlier
+/// visit — and, because it fires only on a transition, it leaves the two places
+/// scrolling is legitimate untouched: command mode (the whole point of M5) and a
+/// wheel scroll over a focused non-mouse-mode pane in `PaneInput`, which stays put
+/// until the next keystroke resets it (`Action::ForwardToPane`).
+///
+/// The reset is unconditional rather than guarded on a nonzero offset: setting an
+/// already-zero offset to zero costs a lock and a store, and the guard is one more
+/// thing that can drift out of step with the cursor precondition it exists to
+/// satisfy.
+fn reconcile_pane_input_scrollback(ui: &mut UiState, pane: &dyn PaneController) {
+    // PRD #341 (code-review finding 3): `PaneInput` with NOTHING focused is a
+    // state that LIES, and it is reachable — a focused reactive side pane can
+    // vanish with no successor (`remap_focus_after_reactive_change` clears the
+    // tab's remembered id and returns none, so the caller focuses nothing).
+    // `Action::ForwardToPane` then silently drops every keystroke for want of a
+    // `focused_pane_id`, while the chip says ` TYPING ` and a Mode tab's renderer
+    // can still paint the live cursor from its own visual fallback
+    // (`visual_focus_id`) — a cursor and a typing label over a pane that receives
+    // nothing. That is precisely the contradiction M1 removed in the other
+    // direction, so leave `PaneInput`: command mode is the honest answer AND the
+    // safe resting state. Guessing a replacement pane to focus would be worse — a
+    // wrong guess sends the user's keystrokes somewhere they did not intend.
+    //
+    // Landing here IS a genuine entry into command mode, and the banner sees it as
+    // one: this runs before the frame's `observe_command_mode_edge`, so that frame
+    // arms the banner from the new mode rather than a stale one. It cannot fight
+    // the reconcile across frames either — with the mode now `Normal`,
+    // `typing_into` below is `None`, which equals the `last_pane_input_target` this
+    // frame stores, so every later frame takes the early return until something
+    // focuses a pane again.
+    if ui.mode == UiMode::PaneInput && pane.focused_pane_id().is_none() {
+        ui.mode = UiMode::Normal;
+    }
+    let typing_into = match ui.mode {
+        UiMode::PaneInput => pane.focused_pane_id(),
+        _ => None,
+    };
+    if typing_into == ui.last_pane_input_target {
+        return;
+    }
+    if let Some(pane_id) = typing_into.as_deref()
+        && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+    {
+        embedded.reset_scrollback(pane_id);
+    }
+    ui.last_pane_input_target = typing_into;
 }
 
 /// PRD #83 M2 — switch to `target_index` while preserving per-tab focus.
@@ -4477,6 +5644,103 @@ fn handle_normal_key(
     Action::Continue
 }
 
+/// PRD #341 M3 — the command-mode bindings that [`handle_normal_key`] services
+/// *in place* and reports as [`Action::Continue`].
+///
+/// KEEP IN SYNC with the `Action::Continue` arms of [`handle_normal_key`]
+/// directly above. They are the one ambiguous case for the banner's decay rule:
+/// moving the selection and clearing the filter are bound keys that prove the
+/// user is driving the deck, but they mutate `ui` themselves and so return the
+/// SAME `Action::Continue` an entirely unbound key returns. Every other bound key
+/// returns a distinguishable `Action`, and every other resolution path in the
+/// dispatch loop claims the key before this function is ever reached.
+///
+/// `ClearFilter` on an already-empty filter is deliberately counted as bound: the
+/// user pressed a key that IS in the command-mode vocabulary, which is what the
+/// decay rule asks about, not whether that key happened to have anything to do.
+///
+/// The non-configurable `Down` / `Up` aliases are included for the same reason
+/// [`handle_normal_key`] honours them — an arrow that moves the selection proves
+/// orientation exactly as `j` / `k` do.
+fn normal_key_claims_without_action(kb: &KeybindingConfig, key: &KeyEvent) -> bool {
+    kb.matches(KbAction::MoveDown, key)
+        || kb.matches(KbAction::MoveUp, key)
+        || kb.matches(KbAction::ClearFilter, key)
+        || matches!(key.code, KeyCode::Down | KeyCode::Up)
+}
+
+/// A character key with neither Ctrl nor Alt — what a user types when they
+/// believe they are talking to the agent.
+fn is_plain_printable(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// PRD #341 M3 — classify one command-mode keystroke for the banner's decay
+/// rule, or `None` when it should move nothing.
+///
+/// This is the asymmetry the PRD exists for, so it is worth stating plainly:
+///
+/// * A key that resolved to a command-mode binding **collapses** the banner. The
+///   user is driving the deck on purpose; the announcement has done its job.
+/// * A printable key that resolved to **nothing** does the opposite — it holds
+///   the banner up, and re-asserts it if it had already collapsed. That
+///   keystroke is the exact failure this PRD exists to fix: the user believes
+///   they are typing to the agent. Removing the signal at that moment would be
+///   backwards.
+/// * Anything else (an unbound function key, an unbound chord) moves nothing. It
+///   is neither evidence of orientation nor evidence of the mistake, so the
+///   banner simply keeps whatever state it had.
+///
+/// `claimed_before_mode_handler` reports whether one of the dispatch loop's
+/// earlier resolution passes (jump-to-card, the global shortcuts, focused-pane
+/// scroll, tab cycling, mode-tab navigation) took the key. Those all resolve
+/// bindings, and some of them — the scroll keys — legitimately report
+/// `Action::Continue`, so the flag has to be carried rather than re-derived from
+/// `resolved`.
+fn command_banner_key_signal(
+    kb: &KeybindingConfig,
+    key: &KeyEvent,
+    resolved: &Action,
+    claimed_before_mode_handler: bool,
+) -> Option<CommandBannerSignal> {
+    if claimed_before_mode_handler
+        || !matches!(resolved, Action::Continue)
+        || normal_key_claims_without_action(kb, key)
+    {
+        return Some(CommandBannerSignal::CommandAction);
+    }
+    is_plain_printable(key).then_some(CommandBannerSignal::UnboundPrintable)
+}
+
+/// PRD #341 M3 (code-review finding 1) — reconcile the command banner's edge
+/// memory against the live `UiMode`.
+///
+/// The ONE place [`CommandBannerState::sync_mode`] is called from, and it is
+/// called from TWO points in the app: once per rendered frame (`render_frame`) and
+/// once per event inside the input drain (`handle_key_event`, before the key is
+/// resolved). Both are load-bearing.
+///
+/// Rendering alone was not a dense enough feed. The drain loop deliberately keeps
+/// reading events without a redraw while the resulting mode is `PaneInput`, so a
+/// complete `Normal → PaneInput → Normal` round trip fits between two frames — two
+/// queued `Ctrl+D` presses, which a key repeat produces on its own. No frame
+/// observed the intermediate `PaneInput`, so no edge was emitted, and the fresh
+/// command-mode entry kept the collapse latched from the first press instead of
+/// re-arming the expanded banner. The mirror case is a bound key handled after an
+/// asynchronous mode change but before the first command-mode frame: it was
+/// dropped for having no armed banner to collapse, and the next frame then armed
+/// one anyway.
+///
+/// Observing the edge here — ahead of every read AND every write of the decay
+/// state — makes both structurally impossible: no keystroke is ever classified
+/// against, and no frame ever renders, a banner state whose edge memory disagrees
+/// with `ui.mode`.
+fn observe_command_mode_edge(ui: &mut UiState, now: std::time::Instant) {
+    ui.command_banner.sync_mode(ui.mode == UiMode::Normal, now);
+}
+
 fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
@@ -4510,6 +5774,23 @@ fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> Action {
         _ => {}
     }
     Action::Continue
+}
+
+/// Issue #142: one step of the Scheduled Tasks manager selection, WRAPPING at
+/// both ends. Extracted so the mouse wheel and the keyboard (`j`/Down,
+/// `k`/Up) share one definition of "next/previous row" and cannot drift apart —
+/// the wheel has no independent scroll offset, it moves `scheduled_selected` and
+/// the rendered viewport follows via [`visible_window`]. An empty list returns
+/// `selected` unchanged, so it neither panics nor underflows on `len - 1`.
+fn step_scheduled_selection(selected: usize, len: usize, forward: bool) -> usize {
+    if len == 0 {
+        return selected;
+    }
+    if forward {
+        (selected + 1) % len
+    } else {
+        (selected + len - 1) % len
+    }
 }
 
 /// PRD #127 M3.3: key handling for the "Scheduled Tasks" manager dialog.
@@ -4550,15 +5831,11 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
             Action::Continue
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            if len > 0 {
-                ui.scheduled_selected = (ui.scheduled_selected + 1) % len;
-            }
+            ui.scheduled_selected = step_scheduled_selection(ui.scheduled_selected, len, true);
             Action::Continue
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if len > 0 {
-                ui.scheduled_selected = (ui.scheduled_selected + len - 1) % len;
-            }
+            ui.scheduled_selected = step_scheduled_selection(ui.scheduled_selected, len, false);
             Action::Continue
         }
         // Add: PRD #170 (unify) — reuse the `Ctrl+n` flow. Open the directory
@@ -4892,7 +6169,21 @@ fn transition_after_dir_pick(ui: &mut UiState) {
                 Ok(Some(config)) => (config.modes, config.orchestrations),
                 _ => (vec![], vec![]),
             };
+            // PRD #140 M4.0: snapshot the daemon's live-orchestration
+            // directories now — before any orchestration can be opened from this
+            // form — so selecting an orchestration whose cwd already hosts one
+            // renders the non-blocking shared-resource warning above `[Submit]`.
+            // One-shot `ListAgents`, exactly like `live_schedule_names` at
+            // manager-open time; a down daemon just yields no warning. The query
+            // is skipped when the project offers no orchestration to select, so
+            // the common plain-pane `Ctrl+n` costs no extra round-trip.
+            let live_orch_cwds = if orchestrations.is_empty() {
+                Vec::new()
+            } else {
+                live_orchestration_cwds()
+            };
             NewPaneFormState::new(dir, name, command, modes, orchestrations)
+                .with_live_orchestration_cwds(live_orch_cwds)
         }
         // PRD #170: the picked dir is pre-seeded as the schedule's working_dir;
         // the Command field pre-fills from the resolved authoring command so a
@@ -5158,16 +6449,22 @@ enum Flow {
 }
 
 /// PRD #80: map a Ctrl-modified `KeyEvent` to the global command [`Action`] it
-/// triggers (works from any UI mode). Returns `None` for any key this layer
-/// does not own, so it falls through to the per-mode handlers. This is part of
-/// the thin `KeyEvent -> Option<Action>` mapper that pairs with
-/// [`dispatch_action`]; the M2 button bar produces the SAME variants from a
-/// click, so key and click cannot drift.
+/// triggers. Returns `None` for any key this layer does not own, so it falls
+/// through to the per-mode handlers. This is part of the thin
+/// `KeyEvent -> Option<Action>` mapper that pairs with [`dispatch_action`]; the
+/// M2 button bar produces the SAME variants from a click, so key and click
+/// cannot drift.
+///
+/// This is the MODE-INDEPENDENT mapping: "which global command is this chord
+/// bound to?". It is deliberately unchanged by PRD #241 — the mouse-dispatch
+/// mapper wants exactly this question answered, and so does the button bar.
+/// Key dispatch must go through [`global_action_for_mode`] instead, which
+/// applies the one mode restriction the PRD adds.
 pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     // PRD #40: the four configurable global commands resolve from the active
-    // keybinding config (any chord, any mode), defaulting to Ctrl+d/t/n/w. The
-    // caller excludes Ctrl+C before calling this, so a binding to Ctrl+C can't
-    // win here.
+    // keybinding config (any chord), defaulting to Ctrl+d/t/n/w. The caller
+    // excludes Ctrl+C before calling this, so a binding to Ctrl+C can't win
+    // here.
     if kb.matches(KbAction::Dashboard, key) {
         return Some(Action::DetachToNormal);
     }
@@ -5187,6 +6484,63 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
             KeyCode::PageUp => return Some(Action::GlobalPrevTab),
             _ => {}
         }
+    }
+    None
+}
+
+/// PRD #241 M1: the mode-aware wrapper around [`global_action`] used by the
+/// live key dispatch.
+///
+/// `Ctrl+W` is delete-previous-word in every shell, readline app, and editor
+/// the user runs *inside* a pane, yet it used to resolve the destructive
+/// `close_pane` command from any mode — so typing it in an embedded shell tore
+/// the pane down instead of deleting a word, and the word-delete behaviour was
+/// unobtainable. `ClosePane` is therefore scoped to command mode; in every
+/// other mode the chord is not claimed here, which lets `PaneInput` fall
+/// through to `handle_pane_input_key` → `keyevent_to_bytes` → `0x17` on the
+/// PTY.
+///
+/// This generalizes the `is_ctrl_c` carve-out (a mode-dependent global chord)
+/// instead of adding a second hardcoded special case. `Dashboard`, `NewPane`,
+/// and `ToggleLayout` keep resolving from EVERY mode — none of them is
+/// destructive, and two of them are the way *out* of a pane.
+///
+/// PRD #241 review F1: `UiMode::CloseConfirm` claims **nothing** here. The
+/// [`overlay_blocks_mouse`] / `modal_active` guards that make the dialog topmost are
+/// mouse-only, and this resolution runs *before* the per-mode key handler — so
+/// `Ctrl+PgUp` / `Ctrl+PgDn` (and `Ctrl+D`/`Ctrl+N`/`Ctrl+T`) still landed while
+/// the modal was up, moving the ground under an open confirmation. The armed
+/// target is now identity-bound so that could no longer redirect the teardown,
+/// but a dialog you can navigate out from under is still a lie about what is
+/// about to happen. The modal owns the keyboard until it is answered; `Ctrl+C`
+/// keeps its own carve-out to the quit flow.
+fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
+    if mode == UiMode::CloseConfirm {
+        return None;
+    }
+    match global_action(kb, key) {
+        Some(Action::CloseSelected) if mode != UiMode::Normal => None,
+        other => other,
+    }
+}
+
+/// PRD #241 M1 (L1 `keybindings/safety/003`, `/004`, `keybindings/remap/003`):
+/// resolve a key the way the live loop does for a given mode.
+///
+/// Composes the exact two production seams the dispatch loop uses, in the same
+/// order: [`global_action_for_mode`] first, then — in `PaneInput` — the
+/// PTY-forwarding fall-through (`handle_pane_input_key`). Returning `None`
+/// means "no global command and nothing to forward", i.e. the key belongs to
+/// that mode's own handler.
+pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
+    if let Some(action) = global_action_for_mode(kb, mode, key) {
+        return Some(action);
+    }
+    if mode == UiMode::PaneInput {
+        return match handle_pane_input_key(*key) {
+            Action::Continue => None,
+            forwarded => Some(forwarded),
+        };
     }
     None
 }
@@ -5343,6 +6697,38 @@ pub fn hit_test_button(button_rects: &[(Action, Rect)], col: u16, row: u16) -> O
         .find_map(|(action, rect)| point_in_rect(rect, col, row).then(|| action.clone()))
 }
 
+/// PRD #80 review FIX 5 / issue #142: whether `mode` puts a **blocking overlay**
+/// (a modal, the directory picker, or the new-pane form) on top of the deck, so
+/// mouse-wheel events must not reach the pane rendered behind it. Scroll in
+/// `Normal` / `PaneInput` stays untouched (pane scroll + child-app forwarding).
+///
+/// Deliberately an EXHAUSTIVE `match` with no `_` arm: this guard was originally
+/// a local `bool` in [`run_tui`], and `ScheduledTasks` — added long after — was
+/// simply forgotten, so wheeling over the Scheduled Tasks dialog scrolled the
+/// mode-tab side pane behind it (issue #142). A wildcard arm would let the next
+/// new `UiMode` repeat that silently; without one, adding a variant fails to
+/// COMPILE until its modality is declared here.
+fn overlay_blocks_mouse(mode: &UiMode) -> bool {
+    match mode {
+        UiMode::QuitConfirm
+        | UiMode::StopConfirm
+        // PRD #241 M3: the close confirmation is a topmost modal too —
+        // scrolling behind it must not reach a pane the user may be about to
+        // destroy.
+        | UiMode::CloseConfirm
+        | UiMode::ConfigGenPrompt
+        | UiMode::StarPrompt
+        | UiMode::Help
+        | UiMode::DirPicker
+        | UiMode::NewPaneForm
+        // Issue #142: the Scheduled Tasks manager is a topmost modal as well.
+        // The wheel over it belongs to ITS list (handled before this guard),
+        // never to whatever pane the centered dialog happens to cover.
+        | UiMode::ScheduledTasks => true,
+        UiMode::Normal | UiMode::Filter | UiMode::Rename | UiMode::PaneInput => false,
+    }
+}
+
 /// Whether the cell `(col, row)` falls inside `rect` (upper bounds exclusive).
 fn point_in_rect(rect: &Rect, col: u16, row: u16) -> bool {
     col >= rect.x
@@ -5378,12 +6764,16 @@ fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usi
         .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(*idx))
 }
 
-/// PRD #80 M3: close the tab at `idx` and reconcile shared state, reusing the
-/// same teardown the Ctrl+W tab-close path performs — unregister every
-/// successfully-closed pane, drop the matching sessions (keeping any that
-/// failed to close so the user can retry), clean their metadata, and resweep
-/// the dashboard layout. Used by [`Action::CloseTab`] (a `[×]` click); the
-/// Ctrl+W card path keeps its own inline message that names the specific pane.
+/// PRD #80 M3: close the tab at `idx` and reconcile shared state — unregister
+/// every successfully-closed pane, drop the matching sessions (keeping any that
+/// failed to close so the user can retry), clean their metadata, and resweep the
+/// dashboard layout.
+///
+/// PRD #241: the ONE tab teardown. Every door that destroys a tab — the `Ctrl+W`
+/// chord on an active Mode/Orchestration tab, a `[×]` click on the tab strip,
+/// and a confirmed close on a dashboard card whose pane lives inside such a tab
+/// — resolves to [`ClosePlan::Tab`] and lands here, so they cannot drift apart
+/// in what they remove or what they report.
 fn close_tab_by_index(
     idx: usize,
     ui: &mut UiState,
@@ -5412,8 +6802,6 @@ fn close_tab_by_index(
             if outcome.is_clean() {
                 ui.status_message = Some(("Closed tab".to_string(), std::time::Instant::now()));
             } else {
-                let failed_ids: Vec<&str> =
-                    outcome.failed.iter().map(|(id, _)| id.as_str()).collect();
                 let first_err = outcome
                     .failed
                     .first()
@@ -5423,13 +6811,23 @@ fn close_tab_by_index(
                     tracing::warn!(
                         pane_id = %id,
                         error = %e,
-                        "M3: close_pane failed during [×] tab teardown — card preserved"
+                        "M3: close_pane failed during tab teardown — pane and tab preserved"
                     );
                 }
+                // PRD #241: the tab is still here — `close_tab` keeps it when
+                // any pane refuses to stop, holding exactly the panes that did
+                // not close. Say that, because the previous wording ("Close
+                // partially failed …") was reported next to a tab that had
+                // already vanished, leaving the advice to retry with nothing to
+                // retry on. Closing is not transactional, so name both halves:
+                // what went, and what stayed.
+                let failed = outcome.failed.len();
+                let closed = outcome.closed.len();
                 ui.status_message = Some((
                     format!(
-                        "Close partially failed for {} pane(s) — first error: {first_err}",
-                        failed_ids.len()
+                        "Closed {closed} pane(s); {failed} could not be stopped, so the tab is \
+                         kept with them — press {} to retry. First error: {first_err}",
+                        display_notation(&ui.keybindings, KbAction::ClosePane)
                     ),
                     std::time::Instant::now(),
                 ));
@@ -5623,7 +7021,43 @@ fn dispatch_action(
             // split on the next frame (it reads `pane_layout`).
             ui.status_message = Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
         }
-        // Ctrl+d: enter Normal (command) mode, stay on current tab.
+        // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
+        // the current tab.
+        //
+        // PRD #241 M4 (review F2b): this used to be one-way — every mode
+        // collapsed to `Normal`, so from command mode the chord did nothing
+        // visible. That is the whole of issue #88 ("I honestly don't know how to
+        // get out of command mode"), and M4's `Ctrl+d: back to pane` hint would
+        // have been a lie without this half. From command mode the chord now
+        // re-enters the pane the current tab is focused on; with no pane to
+        // return to it stays put and says so, rather than silently doing
+        // nothing.
+        Action::DetachToNormal if ui.mode == UiMode::Normal => {
+            match resume_pane_input_target(ui, pane, tab_manager, snapshot, filtered) {
+                Some(target_pane_id) if pane.focus_pane(&target_pane_id).is_ok() => {
+                    ui.mode = UiMode::PaneInput;
+                    // Reset dismissed flags so art reappears when the user
+                    // returns to the dashboard (mirrors `Action::Focus`).
+                    for entry in ui.idle_art_cache.values_mut() {
+                        entry.dismissed = false;
+                    }
+                    ui.status_message = Some((
+                        format!(
+                            "PaneInput mode — type to interact, {} for dashboard",
+                            display_notation(&ui.keybindings, KbAction::Dashboard)
+                        ),
+                        std::time::Instant::now(),
+                    ));
+                }
+                _ => {
+                    ui.status_message = Some((
+                        "No pane to return to — press Enter on a card to open one".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
+            }
+        }
+        // Ctrl+d from anywhere else: leave for command mode.
         Action::DetachToNormal => {
             // Re-suppress the prompt in reactive panes when leaving PaneInput
             // so automated output stays clean.
@@ -5650,142 +7084,121 @@ fn dispatch_action(
                 UiMode::Help
             };
         }
-        // Ctrl+w: close selected pane (or entire mode tab if it's the agent pane).
+        // PRD #241 M3: Ctrl+w / the `[Close]` button REQUEST a close. Nothing
+        // is destroyed here — if anything is armed we raise the confirmation
+        // dialog (seeded to Cancel, bound to the armed target) and wait for an
+        // explicit `ConfirmCloseSelected`. Both doors land on this one arm,
+        // which is why the modal lives on the action rather than on the key
+        // handler; the tab strip's `×` is the third door and arms the identical
+        // transition from `Action::CloseTab`.
+        Action::CloseSelected => {
+            let target = resolve_close_target(ui, tab_manager, snapshot, filtered);
+            // `close_confirmation_for_action` stays the seam that decides whether
+            // this action confirms at all and seeds the dialog
+            // (`prompt/close-confirm/003`); the identity of what it confirms
+            // rides alongside it in `close_confirm_target`.
+            if let Some(prompt) =
+                close_confirmation_for_action(&Action::CloseSelected, target.is_some())
+                && let Some(target) = target
+            {
+                // PRD #241: the dialog's wording comes from the SAME resolution
+                // `ConfirmCloseSelected` runs below, so it can never promise a
+                // pane and take a tab.
+                let scope = resolve_close_plan(&target, tab_manager, snapshot)
+                    .map_or(CloseScope::Pane, |plan| plan.scope());
+                arm_close_confirmation(ui, prompt, target, scope);
+            }
+            // No target (PRD #113 finding 2: an inactive dashboard selection
+            // means nothing is armed) — stay exactly as silent as before, and
+            // in particular do NOT arm a modal that would let the user close
+            // card 0 by reflex.
+        }
+        // The confirmed close: tear down whatever the confirmation was ARMED
+        // against — never whatever is selected now (PRD #241 review F1).
         //
         // PRD #92 F4: inspect each close result and preserve the card / session
         // on failure so the user can see the error and retry.
-        Action::CloseSelected => {
-            // PR #151 (e2e layout_002 regression): branch on the ACTIVE tab.
-            // Ctrl+W routes here for BOTH "close the selected dashboard card" and
-            // "close the active Mode/Orchestration tab". The dashboard-card close
-            // below no-ops on an inactive selection (finding 2 / selection_012),
-            // but on a Mode/Orchestration tab the dashboard selection is `None`,
-            // so that gate wrongly suppressed the tab-close. When the active tab
-            // IS a closable tab, close it directly — regardless of
-            // `ui.selected_index` — mirroring the mouse [×] path
-            // (`close_tab_by_index`) so the keyboard closes the same tab the same
-            // way. (selection_016)
-            let active_is_closable_tab = matches!(
-                tab_manager.active_tab(),
-                Tab::Mode { .. } | Tab::Orchestration { .. }
-            );
-            if active_is_closable_tab {
-                close_tab_by_index(tab_manager.active_index(), ui, state, tab_manager);
-            }
-            // PRD #113 finding 2: on the Dashboard the destructive close requires
-            // a REAL active selection. When the selection is inactive (`None`)
-            // this is a no-op — no card-0 fallback (that fallback is reserved for
-            // Enter/Focus) — so an unarmed dashboard can never silently close
-            // card 0.
-            else if let Some(sid) = ui
-                .selected_index
-                .and_then(|i| filtered.get(i))
-                .map(|(id, _)| (*id).clone())
-                && let Some(session) = snapshot.sessions.get(&sid)
-                && let Some(ref pane_id) = session.pane_id
-            {
-                let closed_pane_id = pane_id.clone();
-                // Check if this pane belongs to a mode or orchestration tab.
-                let mode_tab_idx = tab_manager
-                    .tab_index_for_agent_pane(pane_id)
-                    .or_else(|| tab_manager.tab_index_for_pane(pane_id));
-                if let Some(tab_idx) = mode_tab_idx {
-                    // Close the entire tab (agent + side panes, or all role panes).
-                    match tab_manager.close_tab(tab_idx) {
-                        Ok(outcome) => {
-                            let mut st = state.blocking_write();
-                            for id in &outcome.closed {
-                                st.unregister_pane(id);
-                            }
-                            // Remove sessions whose pane_id is in the closed set ONLY.
-                            let closed_set: std::collections::HashSet<&str> =
-                                outcome.closed.iter().map(String::as_str).collect();
-                            st.sessions.retain(|_, s| {
-                                s.pane_id
-                                    .as_ref()
-                                    .is_none_or(|pid| !closed_set.contains(pid.as_str()))
-                            });
-                            drop(st);
-                            // Clean pane_metadata only for the successfully-closed panes.
-                            for id in &outcome.closed {
-                                ui.pane_metadata.remove(id);
-                            }
-                            if outcome.is_clean() {
-                                ui.status_message = Some((
-                                    format!("Closed tab containing pane {closed_pane_id}"),
-                                    std::time::Instant::now(),
-                                ));
-                            } else {
-                                let failed_ids: Vec<&str> =
-                                    outcome.failed.iter().map(|(id, _)| id.as_str()).collect();
-                                let first_err = outcome
-                                    .failed
-                                    .first()
-                                    .map(|(_, e)| e.as_str())
-                                    .unwrap_or("");
-                                for (id, e) in &outcome.failed {
-                                    tracing::warn!(
-                                        pane_id = %id,
-                                        error = %e,
-                                        "F4: close_pane failed during tab teardown — card preserved"
-                                    );
-                                }
-                                ui.status_message = Some((
-                                    format!(
-                                        "Close partially failed for {} pane(s) — first error: {first_err}",
-                                        failed_ids.len()
-                                    ),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                            // PRD #84 M4: remaining panes are sized by the
-                            // pre-draw `resize_panes_to_layout` next frame.
-                        }
-                        Err(e) => {
-                            ui.status_message = Some((
-                                format!("Failed to close tab: {e}"),
-                                std::time::Instant::now(),
-                            ));
-                        }
+        Action::ConfirmCloseSelected => {
+            // Leaving the modal is unconditional — whether the teardown
+            // succeeds or is preserved for retry, the dialog is done. Taking
+            // the target also disarms it, so a second confirmation cannot
+            // replay against a stale identity.
+            ui.mode = UiMode::Normal;
+            ui.close_confirm_displayed = false;
+            let target = ui.close_confirm_target.take();
+            // PRD #241: re-resolve the ARMED target through the same function
+            // that decided the dialog's wording. Whatever it says here is what
+            // the user was shown, because the two share this call.
+            let plan = target
+                .as_ref()
+                .and_then(|target| resolve_close_plan(target, tab_manager, snapshot));
+            match plan {
+                // PRD #241 review F1: something WAS armed and it no longer
+                // resolves — its tab or its session went away while the dialog
+                // was open. Close NOTHING and say so; the one thing a
+                // confirmation must never do is retarget onto whatever is
+                // selected now.
+                None => {
+                    if target.is_some() {
+                        ui.status_message = Some((
+                            "Nothing closed — what this confirmation was armed against is gone"
+                                .to_string(),
+                            std::time::Instant::now(),
+                        ));
                     }
-                } else {
-                    // Plain dashboard pane — close just this one and inspect the result.
-                    match pane.close_pane(pane_id) {
+                }
+                // A whole Mode/Orchestration tab: the agent pane plus every side
+                // or role pane. Reached both from a tab that was active when the
+                // chord landed AND from a dashboard card whose pane turns out to
+                // live in such a tab — which is why the dialog said "this tab
+                // and all its panes" either way.
+                Some(ClosePlan::Tab { index }) => {
+                    close_tab_by_index(index, ui, state, tab_manager);
+                }
+                // Plain dashboard pane — close just this one and inspect the
+                // result. PRD #92 F4: preserve the card / session on failure so
+                // the user can see the error and retry.
+                Some(ClosePlan::Pane {
+                    session_id,
+                    pane_id,
+                }) => {
+                    match pane.close_pane(&pane_id) {
                         Ok(()) => {
                             let mut st = state.blocking_write();
-                            st.sessions.remove(&sid);
-                            st.unregister_pane(&closed_pane_id);
+                            st.sessions.remove(&session_id);
+                            st.unregister_pane(&pane_id);
                             drop(st);
-                            ui.pane_metadata.remove(&closed_pane_id);
-                            ui.status_message = Some((
-                                format!("Closed pane {closed_pane_id}"),
-                                std::time::Instant::now(),
-                            ));
+                            ui.pane_metadata.remove(&pane_id);
+                            ui.status_message =
+                                Some((format!("Closed pane {pane_id}"), std::time::Instant::now()));
                         }
                         Err(e) => {
                             tracing::warn!(
-                                pane_id = %closed_pane_id,
+                                pane_id = %pane_id,
                                 error = %e,
                                 "F4: close_pane failed — card preserved for retry"
                             );
                             ui.status_message = Some((
                                 format!(
-                                    "Failed to close pane {closed_pane_id}: {e} — press {} to retry",
+                                    "Failed to close pane {pane_id}: {e} — press {} to retry",
                                     display_notation(&ui.keybindings, KbAction::ClosePane)
                                 ),
                                 std::time::Instant::now(),
                             ));
                         }
                     }
-                }
-                if ui.mode == UiMode::PaneInput {
-                    ui.mode = UiMode::Normal;
-                }
-                // Clamp selected_index so it doesn't point past the now-shorter list.
-                if let Some(idx) = ui.selected_index
-                    && idx > 0
-                {
-                    ui.selected_index = Some(idx - 1);
+                    // (PRD #241 M3: the "leave PaneInput after a close" reset
+                    // that used to live here is now unconditional at the top of
+                    // this arm — a confirmed close always arrives from the
+                    // modal.)
+                    // Clamp selected_index so it doesn't point past the
+                    // now-shorter list. The tab branch above does the same
+                    // inside `close_tab_by_index`.
+                    if let Some(idx) = ui.selected_index
+                        && idx > 0
+                    {
+                        ui.selected_index = Some(idx - 1);
+                    }
                 }
             }
             // PRD #89 M1.3 — Ctrl+W close-pane is a detach path; flush a fresh
@@ -5842,8 +7255,24 @@ fn dispatch_action(
         }
         // PRD #80 M3: click a tab's [×] → close that tab, reusing Ctrl+W's
         // tab-teardown semantics for the clicked tab.
+        //
+        // PRD #241 review F4: this was the third door into an irreversible
+        // teardown and the only one that stayed one-click. The PRD put the modal
+        // on the ACTION rather than the key precisely so every door inherits it,
+        // so arm the same confirmation here — bound to the CLICKED tab's stable
+        // id, which is what makes it safe for the dialog to outlive a tab-strip
+        // reorder. The Dashboard tab has no id and is never closable
+        // (`dashboard/pane/003`), so a stray `×` hit on it stays a no-op.
         Action::CloseTab(idx) => {
-            close_tab_by_index(idx, ui, state, tab_manager);
+            if let Some(id) = tab_manager.tabs().get(idx).and_then(tab_id_of) {
+                // A tab-strip `×` always takes the whole tab, so the dialog says
+                // so — through the same `resolve_close_plan` seam as every other
+                // door rather than a second hand-written answer.
+                let target = CloseTarget::Tab(id);
+                let scope = resolve_close_plan(&target, tab_manager, snapshot)
+                    .map_or(CloseScope::Pane, |plan| plan.scope());
+                arm_close_confirmation(ui, CloseConfirmState::default(), target, scope);
+            }
         }
         // PRD #80 M4 / PRD #83: single-click a card → select exactly that card
         // (PRD #68). Under #83 the Dashboard's selection is keyed by session id
@@ -6085,7 +7514,27 @@ fn dispatch_action(
                         // PRD #84 M4: the destination tab's panes are sized by
                         // the pre-draw `resize_panes_to_layout` next frame.
                     }
-                    match pane.focus_pane(pane_id) {
+                    // Same on-demand hydrate-and-retry `focus_deck` performs
+                    // (PRD #127 finding #2). A card can be backed by a LIVE
+                    // daemon agent and still have no local pane — a
+                    // broadcast-surfaced `SessionStart` that never went through
+                    // startup hydration, which is exactly how a daemon-spawned
+                    // or foreign-pane card arrives. `focus_pane` reports those
+                    // as `CommandFailed`, and the arm below reads that as
+                    // "stale" and DELETES the session.
+                    //
+                    // Only the digit-jump path got this guard when #127 added
+                    // it; Enter — the way a card is normally opened — kept the
+                    // bare delete, so pressing Enter on a live-but-unwired card
+                    // destroyed it. Attach the daemon's pane first and retry, so
+                    // the delete arm is reached only by genuinely dead cards.
+                    let mut focus_result = pane.focus_pane(pane_id);
+                    if let Err(PaneError::CommandFailed(_)) = focus_result
+                        && pane.try_hydrate_pane(pane_id)
+                    {
+                        focus_result = pane.focus_pane(pane_id);
+                    }
+                    match focus_result {
                         Ok(()) => {
                             ui.mode = UiMode::PaneInput;
                             // Reset dismissed flags so art reappears when
@@ -6719,6 +8168,11 @@ fn dispatch_action(
         }
         // quit-confirm [Cancel]: return to the dashboard.
         Action::DismissModal => {
+            // PRD #241 review F1: disarm the close confirmation on the way out
+            // so a later `ConfirmCloseSelected` can never replay a target the
+            // user already declined. Harmless for every other modal.
+            ui.close_confirm_target = None;
+            ui.close_confirm_displayed = false;
             ui.mode = UiMode::Normal;
         }
         // config-gen [Yes]: send the prompt to the pending target pane.
@@ -6905,8 +8359,10 @@ fn dispatch_action(
                     std::thread::sleep(sleep);
                 }
                 if let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes) {
-                    ui.status_message =
-                        Some((format!("PTY write failed: {e}"), std::time::Instant::now()));
+                    // `write_raw_bytes` already phrases the disconnected cases in
+                    // the user's terms, so surface it as-is rather than prefixing
+                    // it with a second, internal-sounding failure label.
+                    ui.status_message = Some((e.to_string(), std::time::Instant::now()));
                 }
                 ui.last_pane_keystroke_at = Some(std::time::Instant::now());
             }
@@ -7212,6 +8668,341 @@ fn resolve_orchestration_for_restore(
     Ok((orch, snap.start_role_index))
 }
 
+/// PRD #227 M2: whether this process pushed `KeyboardEnhancementFlags`.
+///
+/// The push is *gated* (see [`push_keyboard_enhancement`]), so it does not
+/// always happen — and an unmatched pop is not harmless: it tells the terminal
+/// to discard the top of a stack this process never contributed to, which
+/// inside a multiplexer can be a flag set some other program owns. Both
+/// teardown paths (normal exit and the panic hook) consult this flag.
+static KEYBOARD_ENHANCEMENT_PUSHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// PRD #227 M2: ask the terminal for the enhanced (kitty) keyboard protocol so
+/// modifier-bearing keypresses reach the deck at all. Without it a
+/// kitty-capable terminal stays in legacy mode, where Shift+Enter has no
+/// distinct encoding and arrives as a bare `\r` — the modifier is gone before
+/// any deck code runs, so the modifier-aware encoder (M1/M3) never sees it.
+///
+/// Gated on `supports_keyboard_enhancement()`, which returns `false` inside
+/// tmux: there the outer terminal cannot deliver the encoding anyway, so the
+/// feature self-disables and the deck degrades to its previous behavior rather
+/// than pushing a mode nothing honors.
+///
+/// `DISAMBIGUATE_ESCAPE_CODES` **only** — deliberately not
+/// `REPORT_ALL_KEYS_AS_ESCAPE_CODES`, which would re-encode ordinary
+/// text-producing keys as CSI-u and change how every existing dashboard
+/// binding arrives.
+fn push_keyboard_enhancement() {
+    if !matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    ) {
+        return;
+    }
+    if crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        ),
+    )
+    .is_ok()
+    {
+        KEYBOARD_ENHANCEMENT_PUSHED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// PRD #227 M2: undo [`push_keyboard_enhancement`]. Called from *both* teardown
+/// paths — normal exit and the panic hook — because a leaked push outlives the
+/// process and leaves the shell the user drops back into in the enhanced mode.
+///
+/// No-op unless this process actually pushed; the `swap` also makes a second
+/// call safe, so the two paths cannot double-pop.
+fn pop_keyboard_enhancement() {
+    if KEYBOARD_ENHANCEMENT_PUSHED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags,
+        );
+    }
+}
+
+/// PRD #227 M2: RAII pairing for [`push_keyboard_enhancement`], so the pop
+/// happens on *every* way out of [`run_tui`] rather than only the one that
+/// reaches the explicit teardown.
+///
+/// The teardown at the end of `run_tui` still pops explicitly, because the
+/// ORDER of the escape sequences there is deliberate — the pop must precede
+/// `ratatui::restore()`. But the event loop between the push and that teardown
+/// propagates I/O errors with `?`: a failed `terminal.draw`, `event::read`, or
+/// `event::poll` returns early and skips every line below it, teardown
+/// included. A leaked push is not cosmetic like a leaked mouse-capture — it
+/// outlives the process and corrupts key delivery in the shell the user is
+/// dropped back into. This guard's `Drop` covers the normal return, the
+/// `?`-error returns, and an unwinding panic, which is what makes the
+/// changelog's unconditional "popped on exit, so it cannot leak" wording true.
+///
+/// It is also the backstop for the one path the panic hook deliberately skips:
+/// the hook returns early while `in_guarded_parser_feed()` (it must not tear
+/// down a terminal the render loop is still using), so if such a panic ever
+/// escapes `catch_unwind` instead of being swallowed, this `Drop` is what pops.
+/// That pairing is what makes the hook's early return safe — and it holds only
+/// under `panic = "unwind"`, which is why the hook gates that return on
+/// `cfg(panic = "unwind")` and does the teardown itself in an abort build, where
+/// no `Drop` runs at all (PRD #227 audit item C).
+///
+/// Idempotent by construction: [`pop_keyboard_enhancement`] is a test-and-clear
+/// on [`KEYBOARD_ENHANCEMENT_PUSHED`], so the explicit teardown pop, this
+/// `Drop`, and the panic hook can all fire in any combination without a second
+/// pop ever discarding a flag set that another program on the terminal's stack
+/// owns.
+struct KeyboardEnhancementGuard;
+
+impl KeyboardEnhancementGuard {
+    /// Perform the (gated) push and return the guard that will undo it.
+    fn push() -> Self {
+        push_keyboard_enhancement();
+        Self
+    }
+}
+
+impl Drop for KeyboardEnhancementGuard {
+    fn drop(&mut self) {
+        pop_keyboard_enhancement();
+    }
+}
+
+/// PRD #80 / PRD #341 — process ONE key event, start to finish: reconcile the
+/// command banner's mode edge, map this `KeyEvent` to one [`Action`], feed the
+/// banner what the key resolved to, then run the action through
+/// [`dispatch_action`] — the single place every command action executes (a
+/// keystroke here, a mouse click from PRD #80 M2 on). The resolution blocks below
+/// are the thin `KeyEvent -> Option<Action>` mapper. Text input (filter / rename /
+/// new-pane-form typing) stays keyboard-driven inside the per-mode handlers, which
+/// mutate their own field and return `Action::Continue`.
+///
+/// PRD #341 M3 (code-review finding 1) — the ORDER here is the contract, not an
+/// implementation detail:
+///
+/// 1. [`observe_command_mode_edge`] runs FIRST, so a mode change made by the
+///    PREVIOUS event of this drained burst — or by anything else since the last
+///    frame — is observed before this key is classified. The drain deliberately
+///    keeps reading events without re-rendering while the resulting mode is
+///    `PaneInput`, so a whole `Normal → PaneInput → Normal` round trip can happen
+///    between two frames. Observing the edge only at render time missed exactly
+///    that, and the fresh command-mode entry stayed collapsed.
+/// 2. The mode the key was typed IN is captured next, because several handlers
+///    change `ui.mode` and the decay rule is about where the user *was*.
+/// 3. The key is resolved.
+/// 4. The banner is fed the resolution BEFORE the action executes:
+///    `dispatch_action` may leave command mode entirely, so this must read the
+///    resolution, not the aftermath.
+/// 5. The action is dispatched.
+///
+/// It is one function rather than an inline block in the drain loop so the L1 seam
+/// [`observe_command_banner_key_burst`] drives this exact sequence instead of a
+/// copy of it — the defect above was invisible to a test that fed
+/// [`CommandBannerSignal`]s straight into the state machine.
+#[allow(clippy::too_many_arguments)]
+fn handle_key_event(
+    key: KeyEvent,
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    state: &SharedState,
+    tab_manager: &mut TabManager,
+    snapshot: &AppState,
+    filtered: &[(&String, &SessionState)],
+    frame_area: Rect,
+) -> Flow {
+    observe_command_mode_edge(ui, std::time::Instant::now());
+    // How many cards this tab is showing — what the per-mode handlers clamp their
+    // selection against. Derived here rather than passed in so it cannot disagree
+    // with the `filtered` list the same call resolves against.
+    let total = filtered.len();
+    let mut action: Option<Action> = None;
+    // PRD #341 M3: the mode this keystroke was typed IN. Captured before
+    // any handler runs, because several of them change `ui.mode` — and
+    // the banner's decay rule is about the mode the user was in when they
+    // pressed the key, not the one they landed in.
+    let was_command_mode = ui.mode == UiMode::Normal;
+
+    // PRD #40: snapshot the active keybindings for this keypress (cheap
+    // HashMap clone; config is immutable for the session) so the mapper
+    // blocks below resolve shortcuts from config. `is_ctrl_c` marks the
+    // non-overridable quit trigger — it is NEVER mapped to a config
+    // action; it falls through to the per-mode handlers (which open the
+    // quit flow), so no user binding can hijack the emergency quit.
+    let kb = ui.keybindings.clone();
+    let is_ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // Jump-to-card in Normal mode (defaults 1..9): focus card N. PRD #40
+    // resolves the digits from config so they can be remapped.
+    if !is_ctrl_c && ui.mode == UiMode::Normal {
+        const JUMP_ACTIONS: [KbAction; 9] = [
+            KbAction::Jump1,
+            KbAction::Jump2,
+            KbAction::Jump3,
+            KbAction::Jump4,
+            KbAction::Jump5,
+            KbAction::Jump6,
+            KbAction::Jump7,
+            KbAction::Jump8,
+            KbAction::Jump9,
+        ];
+        if let Some(idx) = JUMP_ACTIONS.iter().position(|a| kb.matches(*a, &key)) {
+            action = Some(Action::FocusCard(idx));
+        }
+    }
+
+    // Global configurable shortcuts. PRD #40: resolved from config (any
+    // chord, not just Ctrl+key); `is_ctrl_c` excluded so it can't be
+    // hijacked away from the quit flow. PRD #241 M1: all of them still
+    // resolve from any mode EXCEPT the destructive `close_pane`, which
+    // is command-mode only so `Ctrl+W` reaches the PTY as word-delete
+    // while the user is typing in a pane.
+    if action.is_none() && !is_ctrl_c {
+        action = global_action_for_mode(&kb, ui.mode, &key);
+    }
+
+    // PRD #341 M5: command-mode focused-pane scrolling (`scroll_pane_up` /
+    // `scroll_pane_down`, defaults PageUp / PageDown) — the keyboard
+    // equivalent of the wheel, so command mode is a real read-only inspect
+    // mode. The scroll is applied in place; `Action::Continue` stops the
+    // key falling through to `dispatch_normal_mode_key`.
+    if action.is_none() && !is_ctrl_c && handle_focused_pane_scroll_key(&kb, ui.mode, &key, pane) {
+        action = Some(Action::Continue);
+    }
+
+    // Tab cycling in Normal mode: move_left/move_right (defaults h/l)
+    // plus the non-configurable Tab / Shift+Tab / Left / Right aliases.
+    if action.is_none() && !is_ctrl_c && ui.mode == UiMode::Normal {
+        action = cycle_tab_action(&kb, &key);
+    }
+
+    let selected_id: Option<String> = dashboard_focus_target(ui, filtered.len())
+        .and_then(|i| filtered.get(i))
+        .map(|(id, _)| (*id).clone());
+
+    // On a mode tab in Normal mode, move_down/move_up (defaults j/k,
+    // plus Down/Up arrows) navigate side panes, Enter focuses, Esc
+    // resets. `is_ctrl_c` excluded for the same safety-net reason.
+    if action.is_none()
+        && !is_ctrl_c
+        && ui.mode == UiMode::Normal
+        && matches!(tab_manager.active_tab(), Tab::Mode { .. })
+    {
+        action = mode_tab_nav_action(&kb, &key);
+    }
+
+    // PRD #341 M3: did one of the resolution passes above claim the key?
+    // Recorded here, at the boundary between "a binding took it" and "the
+    // per-mode handler gets it", because some of those passes report
+    // `Action::Continue` (the focused-pane scroll keys) and would
+    // otherwise be indistinguishable from an unbound key.
+    let claimed_before_mode_handler = action.is_some();
+
+    // Mode-specific key handling (only when no shortcut claimed the key).
+    if action.is_none() {
+        action = Some(match ui.mode {
+            UiMode::Normal => {
+                let selected_status = selected_id
+                    .as_ref()
+                    .and_then(|sid| snapshot.sessions.get(sid))
+                    .map(|session| session.status.clone());
+                dispatch_normal_mode_key(key, ui, total, selected_status, filtered, pane, &kb)
+            }
+            UiMode::Filter => handle_filter_key(key, ui),
+            UiMode::Help => handle_help_key(key, ui),
+            UiMode::Rename => {
+                // Capture commit intent before the handler clears
+                // `rename_text`. M2.11 fixup 5 — the dispatch
+                // loop drives both the controller call AND the
+                // UI display-name maps so the dashboard mirrors
+                // EXACTLY the controller-resolved label
+                // (Applied → trimmed canonical; Cleared → remove
+                // entries; Rejected → leave existing label
+                // intact). Empty/whitespace-only text reaches
+                // the controller as a "clear" → daemon-side
+                // `None`, so hydrate falls back to the agent_id
+                // on reconnect rather than restoring a stale
+                // label (PRD #76 M2.11 reviewer P1).
+                let commit = rename_commit_value(key, &ui.rename_text);
+                let r = handle_rename_key(key, ui, selected_id.as_deref());
+                if let Some(new_name) = commit {
+                    // Shared with the `[Save]` button (Action::SaveRename).
+                    commit_rename(&new_name, ui, pane, snapshot, selected_id.as_deref());
+                }
+                r
+            }
+            UiMode::DirPicker => handle_dir_picker_key(key, ui),
+            UiMode::NewPaneForm => handle_new_pane_form_key(key, ui),
+            UiMode::PaneInput => handle_pane_input_key(key),
+            UiMode::StarPrompt => handle_star_prompt_key(key, ui),
+            UiMode::ConfigGenPrompt => handle_config_gen_prompt_key(key, ui),
+            UiMode::QuitConfirm => {
+                // PRD #92 F1: the dialog needs to know the
+                // managed-agent count to decide whether picking
+                // Stop should go straight to shutdown or step
+                // through the secondary y/n confirmation. We
+                // count pane-backed sessions in the current
+                // snapshot (every dashboard card is a pane, so
+                // this is also "how many cards would lose their
+                // PTY"). Filter is irrelevant here — the user is
+                // about to terminate every agent on the daemon,
+                // not just the visible ones.
+                let managed_agents_count = snapshot
+                    .sessions
+                    .values()
+                    .filter(|s| s.pane_id.is_some())
+                    .count();
+                handle_quit_confirm_key(key, ui, managed_agents_count)
+            }
+            UiMode::StopConfirm => handle_stop_confirm_key(key, ui),
+            // PRD #241 M3: the close confirmation owns the keyboard
+            // while it is up; only Enter-on-Close escapes as
+            // `ConfirmCloseSelected`. Ctrl+C keeps its PRD #40 safety
+            // net — every other modal handler routes it to the quit
+            // flow, and this one must not be the exception that traps
+            // the user.
+            UiMode::CloseConfirm if is_ctrl_c => {
+                ui.close_confirm_target = None;
+                ui.close_confirm_displayed = false;
+                ui.quit_confirm_selected = 0;
+                ui.mode = UiMode::QuitConfirm;
+                Action::Continue
+            }
+            UiMode::CloseConfirm => handle_close_confirm_key(&mut ui.close_confirm, key),
+            UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, ui),
+        });
+    }
+
+    // PRD #341 M3 — feed the command banner's decay rule, at the
+    // production boundary immediately after key resolution and before the
+    // action executes. `dispatch_action` may leave command mode entirely
+    // (in which case the next frame's `sync_mode` clears the banner), so
+    // this must read the resolution, not the aftermath.
+    if was_command_mode {
+        let resolved = action.as_ref().unwrap_or(&Action::Continue);
+        if let Some(signal) =
+            command_banner_key_signal(&kb, &key, resolved, claimed_before_mode_handler)
+        {
+            ui.command_banner.handle(signal, std::time::Instant::now());
+        }
+    }
+
+    dispatch_action(
+        action.unwrap_or(Action::Continue),
+        ui,
+        pane,
+        state,
+        tab_manager,
+        snapshot,
+        filtered,
+        selected_id.as_deref(),
+        frame_area,
+    )
+}
+
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
@@ -7226,9 +9017,31 @@ pub fn run_tui(
         // screen out from under the render loop and exit the TUI, exactly the
         // crash this guard exists to prevent. Leave the terminal untouched and
         // let `catch_unwind` swallow it (the caller logs and drops the chunk).
+        //
+        // PRD #227 audit item C: gated on `panic = "unwind"`, which is every
+        // official build (`Cargo.toml` defines no `panic = "abort"` profile).
+        // The early return is only correct BECAUSE the panic is recoverable:
+        // under `panic = "abort"` nothing can catch it, `catch_unwind` never
+        // runs, `KeyboardEnhancementGuard::drop` never runs, and the process
+        // dies moments later — so returning here would leak the enhanced
+        // keyboard mode into the user's shell, the single failure mode this
+        // milestone exists to prevent. In an abort build the whole `if` is
+        // compiled out and the guarded case falls through to the full teardown
+        // below, which is the right trade when the deck is dying anyway.
+        //
+        // NOT solvable by simply moving the pop above this return: under unwind
+        // that would pop on every RECOVERED guarded-parser panic and silently
+        // disable Shift+Enter (and every other modifier-bearing key) for the
+        // rest of a session that keeps running perfectly well.
+        #[cfg(panic = "unwind")]
         if crate::embedded_pane::in_guarded_parser_feed() {
             return;
         }
+        // PRD #227 M2: pop the keyboard-enhancement flag on the crash path too.
+        // Unlike mouse capture, a leaked push is not merely cosmetic — it
+        // survives the process and corrupts key delivery in the shell the user
+        // is dropped back into.
+        pop_keyboard_enhancement();
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableMouseCapture,
@@ -7246,6 +9059,21 @@ pub fn run_tui(
     )?;
 
     let mut terminal = ratatui::init();
+
+    // PRD #227 M2: raw mode and the alternate screen are up, so negotiate the
+    // enhanced keyboard protocol now — before the event loop starts polling,
+    // since the support probe reads the terminal's reply off stdin itself.
+    //
+    // Held as an RAII guard, NOT a bare call: the event loop below returns early
+    // via `?` on any terminal I/O error, which would skip the explicit
+    // `pop_keyboard_enhancement()` in the teardown and leak the enhanced mode
+    // into the user's shell. The guard's `Drop` pops on that path (and on an
+    // unwind); the explicit teardown pop stays because it must run BEFORE
+    // `ratatui::restore()`, and the pop is idempotent so the two never conflict.
+    // Bound to a NAMED binding — `let _ = …` would drop it immediately and pop
+    // the flag before the event loop ever runs.
+    let _keyboard_enhancement = KeyboardEnhancementGuard::push();
+
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
     // PRD #196: restore the persisted global last-command so the new-pane form
@@ -7590,11 +9418,12 @@ pub fn run_tui(
             // see the matching `Ok` branch below. On `Err`, no
             // placeholder sessions are seeded, so the `Err` arm has
             // nothing to clean up.
-            let dead_slot_synthetic_ids = assign_synthetic_dead_slot_ids(
-                &mut role_pane_ids,
-                &bucket.cwd,
-                &bucket.orchestration_name,
-            );
+            // PRD #140 review: namespace the synthetic ids by the bucket's
+            // ROUTING IDENTITY, not `(cwd, name)`. Two same-`(name, cwd)` tabs
+            // are two buckets since M3.0, and a tuple-keyed id would alias a
+            // dead role across them onto one shared placeholder card.
+            let dead_slot_synthetic_ids =
+                assign_synthetic_dead_slot_ids(&mut role_pane_ids, &bucket.identity());
             // Now register the orchestrator pane mapping for any live
             // start role so M5 dispatch keeps routing work-done events
             // back to the right place.
@@ -8409,6 +10238,14 @@ pub fn run_tui(
             &filtered_ids,
         );
 
+        // PRD #341 M6: before laying out or drawing anything, make sure the pane
+        // we are about to paint a cursor into is looking at LIVE output. Runs
+        // once per iteration, ahead of the single `terminal.draw` below, so the
+        // very first frame after a mode/focus change into `PaneInput` already
+        // shows the live tail — the user never sees a typing chip over stale,
+        // cursorless history.
+        reconcile_pane_input_scrollback(&mut ui, &*pane);
+
         let term_width = terminal.get_frame().area().width;
         let has_embedded_panes = pane
             .as_any()
@@ -8507,9 +10344,12 @@ pub fn run_tui(
         let embedded_panes = pane.as_any().downcast_ref::<EmbeddedPaneController>();
         let all_pane_ids = embedded_panes.map(|e| e.pane_ids()).unwrap_or_default();
         let focused_pane_id = embedded_panes.and_then(|e| e.focused_pane_id());
-        // PRD #144: the bottom bar wraps to a second row when its full-label
-        // buttons don't fit one row, so reserve its actual height up front (the
-        // layout pass feeds both the PTY resize and the render this frame).
+        // PRD #144: the bottom bar wraps to ADDITIONAL rows when its full-label
+        // buttons don't fit one row — three at 80 columns with the default set, and
+        // more as the terminal narrows (PRD #341 decision 4) — so reserve its
+        // actual height up front (the layout pass feeds both the PTY resize and the
+        // render this frame). "A second row" was only ever true of the 120-column
+        // reference width `render/layout/004` pins.
         let bar_rows = bottom_bar_rows(&ui, frame_area.width, frame_area.height, &tab_view);
         let frame_layout = compute_frame_layout(
             frame_area,
@@ -8623,6 +10463,19 @@ pub fn run_tui(
                     );
                 }
             }
+            // PRD #241 F3b (review finding G2): a close that COMPLETED without
+            // being able to query the daemon may have left an agent running
+            // unattended. `close_pane` returns `Ok(())` there (nothing to retry —
+            // the card is already gone), so the warning arrives on this queue
+            // instead of the `Result`. Show it on the same status line the close
+            // path uses for its other outcomes; queued after the handler's
+            // "Closed pane N", so the warning is what the user is left reading.
+            // A single status line holds one message, so if several blind closes
+            // land in the same frame the last one is displayed — every one of them
+            // is also logged at WARN by `close_pane`.
+            for warning in embedded.take_close_warnings() {
+                ui.status_message = Some((warning, std::time::Instant::now()));
+            }
         }
 
         // Drain all pending events before re-rendering. This avoids a full
@@ -8634,6 +10487,38 @@ pub fn run_tui(
 
         // Process events in a tight loop until the queue is empty.
         loop {
+            // PRD #341 M3 (code-review finding 1): observe the command-mode edge
+            // once per EVENT, whatever its kind, before anything reads or writes
+            // the banner's decay state. `handle_key_event` repeats this for the key
+            // path (it owns that ordering for its L1 seam); this call is what
+            // covers the MOUSE paths, which dispatch actions of their own and then
+            // `continue` without going near it. Double-clicking
+            // `[Back to Pane]` / `[Command Mode]` is a real round trip inside one
+            // burst — both clicks dispatch the same `Action::DetachToNormal`, the
+            // first collapsing the banner on its way into `PaneInput` and the
+            // second coming straight back — so without this the mouse reproduced
+            // the very defect the key path was fixed for. `sync_mode` is
+            // idempotent, so the overlap costs two comparisons.
+            observe_command_mode_edge(&mut ui, std::time::Instant::now());
+
+            // PRD #241 review F5: never let input that PREDATES the close
+            // confirmation answer it. This drain loop deliberately processes a
+            // whole input burst without re-rendering, so the keystroke queued
+            // behind the `Ctrl+W` / `[Close]` click / tab-strip `×` that armed
+            // the dialog would otherwise be delivered to a modal that has not
+            // been drawn — confirming a destructive close the user never saw.
+            // Discard whatever is still buffered and break out to render first;
+            // `render_overlays` sets the flag once the dialog is actually on
+            // screen. (The dialog also has no `y` shortcut, so even if this
+            // were bypassed a single stray keystroke could at worst hit the
+            // default Cancel.)
+            if ui.mode == UiMode::CloseConfirm && !ui.close_confirm_displayed {
+                while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                    let _ = event::read()?;
+                }
+                break;
+            }
+
             let ev = event::read()?;
 
             // PRD #84 M4 (invariant 4): a terminal resize is now just a
@@ -8694,27 +10579,46 @@ pub fn run_tui(
                     crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 );
 
-                // PRD #80 review FIX 5: when a blocking overlay (any modal, the
-                // directory picker, or the new-pane form) is the topmost layer,
-                // swallow scroll-wheel events so they don't scroll the pane
-                // behind the overlay. Scroll in Normal / PaneInput is left
-                // untouched below (pane scroll + child-app forwarding).
-                let blocking_overlay = matches!(
-                    ui.mode,
-                    UiMode::QuitConfirm
-                        | UiMode::StopConfirm
-                        | UiMode::ConfigGenPrompt
-                        | UiMode::StarPrompt
-                        | UiMode::Help
-                        | UiMode::DirPicker
-                        | UiMode::NewPaneForm
-                );
                 let is_scroll = matches!(
                     mouse.kind,
                     crossterm::event::MouseEventKind::ScrollUp
                         | crossterm::event::MouseEventKind::ScrollDown
                 );
-                if is_scroll && blocking_overlay {
+
+                // Issue #142: the Scheduled Tasks manager owns the wheel while
+                // it is open — handled BEFORE the generic overlay swallow below
+                // so the wheel scrolls the manager's own list instead of merely
+                // being eaten (and instead of leaking to the side pane the
+                // centered dialog covers). The manager has no independent list
+                // offset: one wheel notch moves `scheduled_selected` by one row
+                // exactly like `j`/`k`, and the rendered viewport follows it
+                // through `visible_window`.
+                if is_scroll && ui.mode == UiMode::ScheduledTasks {
+                    // While the delete confirmation is armed it is the only
+                    // input layer (`y`/`n`/Esc) — the wheel must NOT move the
+                    // selection out from under the row being confirmed, so it is
+                    // swallowed without effect.
+                    if !ui.scheduled_delete_confirm {
+                        let forward =
+                            matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollDown);
+                        ui.scheduled_selected = step_scheduled_selection(
+                            ui.scheduled_selected,
+                            ui.scheduled_tasks.len(),
+                            forward,
+                        );
+                    }
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // PRD #80 review FIX 5: when a blocking overlay (any modal, the
+                // directory picker, or the new-pane form) is the topmost layer,
+                // swallow scroll-wheel events so they don't scroll the pane
+                // behind the overlay. Scroll in Normal / PaneInput is left
+                // untouched below (pane scroll + child-app forwarding).
+                if is_scroll && overlay_blocks_mouse(&ui.mode) {
                     if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                         break;
                     }
@@ -8859,6 +10763,10 @@ pub fn run_tui(
                     ui.mode,
                     UiMode::QuitConfirm
                         | UiMode::StopConfirm
+                        // PRD #241 M3: its [Cancel]/[Close] buttons live in
+                        // `modal_button_rects`; any miss is consumed here
+                        // rather than falling through to the pane behind it.
+                        | UiMode::CloseConfirm
                         | UiMode::ConfigGenPrompt
                         | UiMode::StarPrompt
                         | UiMode::Help
@@ -8929,10 +10837,16 @@ pub fn run_tui(
                 // keyboard, where tab-cycling is Normal-mode-only). The global
                 // button_rects (which carry the inline-edit Apply/Save/Cancel
                 // buttons in those modes) stay active.
+                // PRD #341 M3: set when the hit landed on the BOTTOM BAR's own
+                // buttons, as opposed to a tab header / close affordance. Only
+                // the bottom bar collapses the banner — it is the surface whose
+                // buttons are the mouse equivalent of a command-mode binding.
+                let mut hit_bottom_bar = false;
                 let mouse_action = if !(is_down || is_up) {
                     None
                 } else {
                     let mut action = hit_test_button(&ui.button_rects, mouse.column, mouse.row);
+                    hit_bottom_bar = action.is_some();
                     if action.is_none() && !text_input_mode {
                         action = hit_test_tab_close(&ui.tab_close_rects, mouse.column, mouse.row)
                             .or_else(|| {
@@ -8943,6 +10857,18 @@ pub fn run_tui(
                 };
                 if let Some(action) = mouse_action {
                     if is_down {
+                        // PRD #341 M3: a bottom-bar button click is the mouse
+                        // equivalent of a command-mode binding — it proves the
+                        // user has oriented — so it collapses the banner. Fed
+                        // BEFORE `dispatch_action`, which may leave command mode
+                        // entirely; the decay rule is about the mode the click
+                        // was made IN, not the one it landed in.
+                        if hit_bottom_bar && ui.mode == UiMode::Normal {
+                            ui.command_banner.handle(
+                                CommandBannerSignal::BottomBarClick,
+                                std::time::Instant::now(),
+                            );
+                        }
                         let frame_area = terminal.get_frame().area();
                         let selected_id: Option<String> =
                             dashboard_focus_target(&ui, filtered.len())
@@ -9133,33 +11059,22 @@ pub fn run_tui(
                     && let Some(pane_id) = embedded.focused_pane_id()
                 {
                     match mouse.kind {
+                        // PRD #341 M5: the wheel scrolls the focused agent pane in
+                        // ANY mode — matching the side panes above, which have
+                        // always hit-tested without consulting `ui.mode`. Whether
+                        // the event reaches the child is the ONE decision
+                        // `scroll_focused_agent_pane` owns; it is command mode's
+                        // job never to.
                         crossterm::event::MouseEventKind::ScrollUp
-                            if ui.mode == UiMode::PaneInput =>
-                        {
-                            if embedded.mouse_mode_enabled(&pane_id) {
-                                let (col, row) = pane_relative_coords(
-                                    mouse.column,
-                                    mouse.row,
-                                    &ui.focused_pane_rect,
-                                );
-                                let _ = embedded.forward_mouse_scroll(&pane_id, true, col, row);
-                            } else {
-                                embedded.scroll_pane(&pane_id, 3);
-                            }
-                        }
-                        crossterm::event::MouseEventKind::ScrollDown
-                            if ui.mode == UiMode::PaneInput =>
-                        {
-                            if embedded.mouse_mode_enabled(&pane_id) {
-                                let (col, row) = pane_relative_coords(
-                                    mouse.column,
-                                    mouse.row,
-                                    &ui.focused_pane_rect,
-                                );
-                                let _ = embedded.forward_mouse_scroll(&pane_id, false, col, row);
-                            } else {
-                                embedded.scroll_pane(&pane_id, -3);
-                            }
+                        | crossterm::event::MouseEventKind::ScrollDown => {
+                            let up =
+                                matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp);
+                            let (col, row) = pane_relative_coords(
+                                mouse.column,
+                                mouse.row,
+                                &ui.focused_pane_rect,
+                            );
+                            scroll_focused_agent_pane(embedded, &pane_id, ui.mode, up, col, row);
                         }
                         crossterm::event::MouseEventKind::Down(
                             crossterm::event::MouseButton::Left,
@@ -9430,159 +11345,19 @@ pub fn run_tui(
                 continue;
             }
 
-            // ---------------------------------------------------------------
-            // PRD #80: map this KeyEvent to one `Action`, then run it through
-            // `dispatch_action` — the single place every command action
-            // executes (keystroke today, mouse click from M2 on). The blocks
-            // below are the thin `KeyEvent -> Option<Action>` mapper. Text
-            // input (filter / rename / new-pane-form typing) stays
-            // keyboard-driven inside the per-mode handlers, which mutate their
-            // own field and return `Action::Continue`.
-            // ---------------------------------------------------------------
+            // PRD #80 / PRD #341: one funnel per key event — observe the mode
+            // edge, resolve, feed the banner, dispatch. `handle_key_event` owns
+            // that order (see its doc comment) and the L1 burst seam drives the
+            // identical call, so the drain's ordering is testable.
             let frame_area = terminal.get_frame().area();
-            let mut action: Option<Action> = None;
-
-            // PRD #40: snapshot the active keybindings for this keypress (cheap
-            // HashMap clone; config is immutable for the session) so the mapper
-            // blocks below resolve shortcuts from config. `is_ctrl_c` marks the
-            // non-overridable quit trigger — it is NEVER mapped to a config
-            // action; it falls through to the per-mode handlers (which open the
-            // quit flow), so no user binding can hijack the emergency quit.
-            let kb = ui.keybindings.clone();
-            let is_ctrl_c =
-                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-
-            // Jump-to-card in Normal mode (defaults 1..9): focus card N. PRD #40
-            // resolves the digits from config so they can be remapped.
-            if !is_ctrl_c && ui.mode == UiMode::Normal {
-                const JUMP_ACTIONS: [KbAction; 9] = [
-                    KbAction::Jump1,
-                    KbAction::Jump2,
-                    KbAction::Jump3,
-                    KbAction::Jump4,
-                    KbAction::Jump5,
-                    KbAction::Jump6,
-                    KbAction::Jump7,
-                    KbAction::Jump8,
-                    KbAction::Jump9,
-                ];
-                if let Some(idx) = JUMP_ACTIONS.iter().position(|a| kb.matches(*a, &key)) {
-                    action = Some(Action::FocusCard(idx));
-                }
-            }
-
-            // Global configurable shortcuts (work from any mode). PRD #40:
-            // resolved from config (any chord, not just Ctrl+key); `is_ctrl_c`
-            // excluded so it can't be hijacked away from the quit flow.
-            if action.is_none() && !is_ctrl_c {
-                action = global_action(&kb, &key);
-            }
-
-            // Tab cycling in Normal mode: move_left/move_right (defaults h/l)
-            // plus the non-configurable Tab / Shift+Tab / Left / Right aliases.
-            if action.is_none() && !is_ctrl_c && ui.mode == UiMode::Normal {
-                action = cycle_tab_action(&kb, &key);
-            }
-
-            let selected_id: Option<String> = dashboard_focus_target(&ui, filtered.len())
-                .and_then(|i| filtered.get(i))
-                .map(|(id, _)| (*id).clone());
-
-            // On a mode tab in Normal mode, move_down/move_up (defaults j/k,
-            // plus Down/Up arrows) navigate side panes, Enter focuses, Esc
-            // resets. `is_ctrl_c` excluded for the same safety-net reason.
-            if action.is_none()
-                && !is_ctrl_c
-                && ui.mode == UiMode::Normal
-                && matches!(tab_manager.active_tab(), Tab::Mode { .. })
-            {
-                action = mode_tab_nav_action(&kb, &key);
-            }
-
-            // Mode-specific key handling (only when no shortcut claimed the key).
-            if action.is_none() {
-                action = Some(match ui.mode {
-                    UiMode::Normal => {
-                        let selected_status = selected_id
-                            .as_ref()
-                            .and_then(|sid| snapshot.sessions.get(sid))
-                            .map(|session| session.status.clone());
-                        dispatch_normal_mode_key(
-                            key,
-                            &mut ui,
-                            total,
-                            selected_status,
-                            &filtered,
-                            &*pane,
-                            &kb,
-                        )
-                    }
-                    UiMode::Filter => handle_filter_key(key, &mut ui),
-                    UiMode::Help => handle_help_key(key, &mut ui),
-                    UiMode::Rename => {
-                        // Capture commit intent before the handler clears
-                        // `rename_text`. M2.11 fixup 5 — the dispatch
-                        // loop drives both the controller call AND the
-                        // UI display-name maps so the dashboard mirrors
-                        // EXACTLY the controller-resolved label
-                        // (Applied → trimmed canonical; Cleared → remove
-                        // entries; Rejected → leave existing label
-                        // intact). Empty/whitespace-only text reaches
-                        // the controller as a "clear" → daemon-side
-                        // `None`, so hydrate falls back to the agent_id
-                        // on reconnect rather than restoring a stale
-                        // label (PRD #76 M2.11 reviewer P1).
-                        let commit = rename_commit_value(key, &ui.rename_text);
-                        let r = handle_rename_key(key, &mut ui, selected_id.as_deref());
-                        if let Some(new_name) = commit {
-                            // Shared with the `[Save]` button (Action::SaveRename).
-                            commit_rename(
-                                &new_name,
-                                &mut ui,
-                                &*pane,
-                                &snapshot,
-                                selected_id.as_deref(),
-                            );
-                        }
-                        r
-                    }
-                    UiMode::DirPicker => handle_dir_picker_key(key, &mut ui),
-                    UiMode::NewPaneForm => handle_new_pane_form_key(key, &mut ui),
-                    UiMode::PaneInput => handle_pane_input_key(key),
-                    UiMode::StarPrompt => handle_star_prompt_key(key, &mut ui),
-                    UiMode::ConfigGenPrompt => handle_config_gen_prompt_key(key, &mut ui),
-                    UiMode::QuitConfirm => {
-                        // PRD #92 F1: the dialog needs to know the
-                        // managed-agent count to decide whether picking
-                        // Stop should go straight to shutdown or step
-                        // through the secondary y/n confirmation. We
-                        // count pane-backed sessions in the current
-                        // snapshot (every dashboard card is a pane, so
-                        // this is also "how many cards would lose their
-                        // PTY"). Filter is irrelevant here — the user is
-                        // about to terminate every agent on the daemon,
-                        // not just the visible ones.
-                        let managed_agents_count = snapshot
-                            .sessions
-                            .values()
-                            .filter(|s| s.pane_id.is_some())
-                            .count();
-                        handle_quit_confirm_key(key, &mut ui, managed_agents_count)
-                    }
-                    UiMode::StopConfirm => handle_stop_confirm_key(key, &mut ui),
-                    UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, &mut ui),
-                });
-            }
-
-            let flow = dispatch_action(
-                action.unwrap_or(Action::Continue),
+            let flow = handle_key_event(
+                key,
                 &mut ui,
                 &*pane,
                 &state,
                 &mut tab_manager,
                 &snapshot,
                 &filtered,
-                selected_id.as_deref(),
                 frame_area,
             );
             if flow == Flow::Break {
@@ -9647,6 +11422,9 @@ pub fn run_tui(
     // EOF, and the agents survive — same property the round-7 loop
     // already guarded for the external-daemon case.
 
+    // PRD #227 M2: undo the enhanced-keyboard push (no-op if it never happened)
+    // alongside the mouse-capture / bracketed-paste restores.
+    pop_keyboard_enhancement();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
@@ -10147,6 +11925,27 @@ fn render_frame(
         ActiveTabView::Mode { mode_name, .. } => Some(mode_name.as_str()),
     };
 
+    // PRD #341 M3: reconcile the banner against the mode this frame is about to
+    // draw, then read its decay state ONCE and thread that one value into every
+    // pane-rendering path below. Doing it here — rather than at each
+    // `render_terminal_panes` call — means every tab type asks the same question
+    // at the same instant, so a Dashboard pane and a Mode-tab pane can never
+    // disagree about whether the banner is up. `visibility` latches the TTL
+    // collapse, which is why it takes `&mut`.
+    //
+    // No tick machinery: the main loop polls with a 16ms timeout and redraws
+    // continuously, so "the TTL elapsed" becomes visible on the next frame.
+    //
+    // The reconcile is NOT this frame's only one (finding 1): `handle_key_event`
+    // runs the same [`observe_command_mode_edge`] before every event it resolves,
+    // because a burst drained between two frames can change the mode more than
+    // once. This call is what covers a mode change made anywhere outside the
+    // drain — the per-frame `reconcile_pane_input_scrollback` drop out of
+    // `PaneInput`, a daemon-driven state change, the startup focus.
+    let now = std::time::Instant::now();
+    observe_command_mode_edge(ui, now);
+    let banner_visibility = ui.command_banner.visibility(now);
+
     // PRD #13: the canvas is left unpainted so the terminal's own background
     // shows through (`Color::Reset`). Filling it with an absolute color was
     // the original light-terminal bug — a black slab over a light theme.
@@ -10231,6 +12030,7 @@ fn render_frame(
                 active_mode_name,
                 focused_pane_id.as_deref(),
                 &pane_status,
+                banner_visibility,
             );
             return;
         }
@@ -10276,6 +12076,8 @@ fn render_frame(
                 &pane_status,
                 &ui.selection,
                 None,
+                ui.mode,
+                banner_visibility,
                 Some(&pane_outer_rects),
             );
         }
@@ -10290,13 +12092,10 @@ fn render_frame(
     let cols = grid_columns(dashboard_area.width);
 
     // Choose card density based on available vertical space
-    // wide = true when each column has inner width >= 60 (card border takes 2 chars)
-    let col_width = dashboard_area.width / cols.max(1) as u16;
-    let wide = col_width.saturating_sub(2) >= 60;
     // 1 row for title + 1 row for stats bar at bottom of dashboard
     let available_for_density = dashboard_area.height.saturating_sub(2);
-    let density = choose_density(sessions.len(), cols, available_for_density, wide);
-    let card_height = density.card_height(wide);
+    let density = choose_density(sessions.len(), cols, available_for_density);
+    let card_height = density.card_height();
 
     // Update idle art state machine
     update_idle_art(
@@ -10365,6 +12164,8 @@ fn render_frame(
                 &pane_status,
                 &ui.selection,
                 None,
+                ui.mode,
+                banner_visibility,
                 Some(&pane_outer_rects),
             );
         }
@@ -10448,6 +12249,9 @@ fn render_frame(
                 card_number,
                 density,
                 idle_art,
+                // PRD #341 M4: the live deck's mode, so the seam that pins the
+                // selection accent and the running app cannot disagree.
+                ui.mode,
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -10482,6 +12286,8 @@ fn render_frame(
             &pane_status,
             &ui.selection,
             None,
+            ui.mode,
+            banner_visibility,
             Some(&pane_outer_rects),
         );
     }
@@ -10542,10 +12348,521 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
     if ui.mode == UiMode::QuitConfirm {
         ui.modal_button_rects = render_quit_confirm(frame, ui.quit_confirm_selected);
     }
+    if ui.mode == UiMode::CloseConfirm {
+        ui.modal_button_rects = render_close_confirm(frame, &ui.close_confirm);
+        // PRD #241 review F5: the dialog has now reached the screen, so input
+        // arriving from here on is a genuine answer to it. Until this flip, the
+        // run loop refuses to feed it anything (see the drain at the top of the
+        // event loop).
+        ui.close_confirm_displayed = true;
+    }
     if ui.mode == UiMode::StopConfirm {
         // M5 adds no buttons to the secondary Stop-confirm dialog (not in the
         // contract); its keystrokes (y/n/Enter/Esc) remain the only path.
         render_stop_confirm(frame, ui.stop_confirm_selected, ui.stop_confirm_agent_count);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PRD #341 M3 — dim + decaying COMMAND MODE banner
+// ---------------------------------------------------------------------------
+//
+// Two independent signals share this section, and keeping them independent is
+// the whole design:
+//
+// * **The dimming** persists for the entire time the UI is in command mode. It
+//   is the steady-state "this pane is inert" cue, and it must NOT decay — the
+//   PRD is explicit that only the banner's size is transient.
+// * **The banner** announces the *transition*. Once the user has demonstrably
+//   oriented (a bound key, a bottom-bar click, or simply enough elapsed time to
+//   have read it) it collapses to the persistent bottom-bar chip, because
+//   holding it up is then just occlusion over a pane they are trying to read.
+//
+// Dimming rather than blanking is also deliberate (PRD "Why dim rather than
+// blank"): command mode is the SAFE resting state where the user decides what
+// to do next, and those decisions are driven by what the panes show. Blinding it
+// would punish the safe behaviour and push people into `PaneInput` just to
+// watch — the one mode where a mistyped key reaches an agent.
+
+/// PRD #341 M3 — an input that can move the command banner's decay state.
+///
+/// Named for what the USER did rather than for the resulting state, because the
+/// mapping between the two is the part that is easy to get backwards: a bound
+/// key collapses the banner, an unbound printable *re-asserts* it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandBannerSignal {
+    /// The UI entered command mode. Re-arms the banner and restarts the TTL.
+    EnterCommandMode,
+    /// The UI left command mode. Clears the banner entirely.
+    LeaveCommandMode,
+    /// A keystroke resolved to a command-mode binding. The user is driving the
+    /// deck on purpose, so the announcement has done its job.
+    CommandAction,
+    /// A printable keystroke resolved to nothing at all. This is the exact
+    /// failure the PRD exists to fix — the user believes they are typing to the
+    /// agent — so the signal must get LOUDER, never quieter.
+    UnboundPrintable,
+    /// A bottom-bar button was clicked. Like [`Self::CommandAction`], it proves
+    /// orientation: the user aimed at a deck affordance.
+    BottomBarClick,
+}
+
+/// PRD #341 M3 — what the command banner should look like this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandBannerVisibility {
+    /// The full banner (block letters where they fit — see [`BannerTier`]).
+    Expanded,
+    /// Decayed: the pane stays dimmed, and the persistent bottom-bar mode chip
+    /// carries the signal on its own.
+    Collapsed,
+    /// Not in command mode — no banner at all.
+    Hidden,
+}
+
+/// PRD #341 M3 — the command banner's decay state (the PRD's "Banner decay
+/// rule", verbatim).
+///
+/// Modelled on the `status_message: Option<(String, Instant)>` pattern: an
+/// instant recorded when the phase started, expired lazily against
+/// [`COMMAND_BANNER_TTL`] by whoever asks — here [`Self::visibility`], which the
+/// render pass calls once per frame. The main loop already polls with a 16ms
+/// timeout and redraws continuously, so the timed decay needs no tick machinery
+/// of its own.
+///
+/// `now` is injected rather than read from the clock so the decay is testable
+/// without sleeping; the live call sites pass the real `Instant::now()`.
+#[derive(Debug, Default)]
+pub struct CommandBannerState {
+    /// The last mode [`Self::sync_mode`] observed: `true` while the UI is in
+    /// command mode. This is the state machine's *edge memory* and nothing else —
+    /// no rendering reads it.
+    ///
+    /// PRD #341 M3 (code-review finding 1): `entered_at.is_some()` used to serve
+    /// as both the render state and the edge memory, which made a MISSED edge
+    /// indistinguishable from "already entered" — the round trip that never
+    /// reached a frame looked exactly like never having left. Keeping the two
+    /// apart means a future change to how the expanded phase is timed cannot
+    /// silently break edge detection, and vice versa.
+    in_command_mode: bool,
+    /// When the CURRENT expanded phase started, or `None` when not in command
+    /// mode.
+    ///
+    /// It is the start of the *phase*, not of the mode: an unbound printable
+    /// re-stamps it (see [`Self::handle`]).
+    entered_at: Option<std::time::Instant>,
+    /// Latched once the banner has collapsed, so a collapse survives until the
+    /// next fresh entry (or a re-assertion). Without the latch the banner would
+    /// pop back up as soon as the collapsing key's frame passed.
+    collapsed: bool,
+}
+
+impl CommandBannerState {
+    /// Apply one [`CommandBannerSignal`].
+    pub fn handle(&mut self, signal: CommandBannerSignal, now: std::time::Instant) {
+        match signal {
+            // Re-arm on every fresh entry: a new instant AND the latch cleared.
+            CommandBannerSignal::EnterCommandMode => {
+                self.in_command_mode = true;
+                self.entered_at = Some(now);
+                self.collapsed = false;
+            }
+            CommandBannerSignal::LeaveCommandMode => {
+                self.in_command_mode = false;
+                self.entered_at = None;
+                self.collapsed = false;
+            }
+            // Orientation proven — collapse early, before the TTL.
+            CommandBannerSignal::CommandAction | CommandBannerSignal::BottomBarClick => {
+                if self.entered_at.is_some() {
+                    self.collapsed = true;
+                }
+            }
+            // The asymmetry that is the point of the whole rule: a printable key
+            // that did nothing HOLDS the banner up, and re-asserts it if it had
+            // already collapsed.
+            //
+            // The fresh instant is load-bearing. Clearing the latch alone would
+            // re-assert a banner whose entry instant is already older than the
+            // TTL, so `visibility` would collapse it again on the very next
+            // frame and the user would see nothing at all.
+            CommandBannerSignal::UnboundPrintable => {
+                if self.entered_at.is_some() {
+                    self.entered_at = Some(now);
+                    self.collapsed = false;
+                }
+            }
+        }
+    }
+
+    /// Reconcile against the live `UiMode`, emitting the entry / exit signal on a
+    /// transition. Idempotent: calling it every frame with an unchanged mode does
+    /// nothing.
+    ///
+    /// This — not a hand-edited list of transition sites — is how the running app
+    /// feeds [`CommandBannerSignal::EnterCommandMode`] /
+    /// [`CommandBannerSignal::LeaveCommandMode`]. `Action::DetachToNormal` (the
+    /// `Ctrl+D` chord, in both directions) is the transition the PRD names, but it
+    /// is one of ~50 sites that assign `ui.mode`: every dialog dismissal, every
+    /// filter/rename commit, every focus and restore path lands on `Normal` or
+    /// `PaneInput` too. A banner armed at only some of them would be missing
+    /// exactly where the user is most lost. Deriving the edge from the mode itself
+    /// cannot miss one.
+    ///
+    /// PRD #341 M3 (code-review finding 1): deriving the edge is necessary but the
+    /// FEED has to be dense enough to see it. Rendering is not — the input drain
+    /// keeps processing events without a redraw — so [`observe_command_mode_edge`]
+    /// also calls this before every event is resolved. The comparison is against
+    /// [`Self::in_command_mode`], the dedicated edge memory, so "we never saw the
+    /// intermediate mode" cannot masquerade as "the mode did not change".
+    pub fn sync_mode(&mut self, command_mode: bool, now: std::time::Instant) {
+        match (command_mode, self.in_command_mode) {
+            (true, false) => self.handle(CommandBannerSignal::EnterCommandMode, now),
+            (false, true) => self.handle(CommandBannerSignal::LeaveCommandMode, now),
+            _ => {}
+        }
+    }
+
+    /// The banner's state at `now`, latching the TTL collapse as a side effect so
+    /// a later re-assertion is distinguishable from "never collapsed".
+    ///
+    /// Uses `saturating_duration_since` so a `now` behind the recorded instant
+    /// (clock games in a test, a rounding artifact) reads as "no time has passed"
+    /// rather than misbehaving.
+    pub fn visibility(&mut self, now: std::time::Instant) -> CommandBannerVisibility {
+        let Some(entered_at) = self.entered_at else {
+            return CommandBannerVisibility::Hidden;
+        };
+        if self.collapsed {
+            return CommandBannerVisibility::Collapsed;
+        }
+        if now.saturating_duration_since(entered_at) >= COMMAND_BANNER_TTL {
+            self.collapsed = true;
+            return CommandBannerVisibility::Collapsed;
+        }
+        CommandBannerVisibility::Expanded
+    }
+}
+
+/// PRD #341 M3 — which rung of the narrow-pane fallback ladder a pane's inner
+/// area can afford.
+///
+/// Five-row block letters need roughly 60 columns and 7 rows, and panes are
+/// frequently far smaller (a Dashboard pane column at 67% of an 80-column
+/// terminal, split across two tiled panes, is nowhere near). Rather than let the
+/// banner clip or overrun the border, the degradation is explicit and — per the
+/// PRD — decided by a pure function so the choice is testable independently of
+/// rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BannerTier {
+    /// Block-letter `COMMAND MODE` plus the `Ctrl+D to type` subtitle.
+    BlockCommandModeWithSubtitle,
+    /// Block-letter `COMMAND` alone.
+    BlockCommand,
+    /// One reversed line: ` COMMAND MODE — Ctrl+D to type `.
+    SingleLineWithSubtitle,
+    /// One reversed word: ` COMMAND `.
+    SingleWord,
+    /// Nothing — the dimming and the M2 bottom-bar chip carry the signal.
+    Omitted,
+}
+
+impl BannerTier {
+    /// The smallest pane inner area this tier is willing to render into.
+    ///
+    /// The ink is centred inside it and never exceeds it — block `COMMAND MODE`
+    /// is 57 columns of glyphs inside the 60 this tier asks for — so "the
+    /// selected tier fits" follows from `w <= width && h <= height` alone. The
+    /// thresholds are the PRD's own sizes ("roughly 60 columns and 7 rows"), with
+    /// the slack deliberately left as breathing room from the border.
+    ///
+    /// The two single-line tiers demand **two** rows for a one-row line. A pane
+    /// with a single row of inner area is degenerate — the line would sit flush
+    /// between two borders with the entire pane content erased — so those tiers
+    /// decline it and the ladder falls through to [`Self::Omitted`], where the
+    /// dimming and the bottom-bar chip still name the mode.
+    pub fn rendered_size(self) -> (u16, u16) {
+        match self {
+            Self::BlockCommandModeWithSubtitle => (60, 7),
+            Self::BlockCommand => (40, 5),
+            Self::SingleLineWithSubtitle => (31, 2),
+            Self::SingleWord => (9, 2),
+            Self::Omitted => (0, 0),
+        }
+    }
+}
+
+/// The ladder, richest rung first. [`command_banner_tier`] walks it in order and
+/// takes the first rung that fits.
+///
+/// Monotonicity — "a wider or taller area must never select a *poorer* rung" —
+/// is a property of this structure, not of the thresholds. Growing an area can
+/// only ever ADD rungs to the set that fit (each rung's predicate is
+/// `w <= width && h <= height`, monotone in both arguments), and the answer is
+/// the first fitting rung in a fixed order, so the answer can only improve. A
+/// hand-written `if` chain has to re-earn that at every branch; this cannot lose
+/// it. [`BannerTier::Omitted`] requires `0x0`, so the search always terminates.
+const BANNER_LADDER: [BannerTier; 5] = [
+    BannerTier::BlockCommandModeWithSubtitle,
+    BannerTier::BlockCommand,
+    BannerTier::SingleLineWithSubtitle,
+    BannerTier::SingleWord,
+    BannerTier::Omitted,
+];
+
+/// PRD #341 M3 — pick the banner tier for a pane's **inner** area (the area
+/// inside the border, i.e. what `Block::inner` returns).
+///
+/// Total function: every size, including degenerate ones like `0x0` or `200x1`,
+/// maps to a tier, and the tier always fits.
+pub fn command_banner_tier(width: u16, height: u16) -> BannerTier {
+    BANNER_LADDER
+        .into_iter()
+        .find(|tier| {
+            let (w, h) = tier.rendered_size();
+            w <= width && h <= height
+        })
+        .unwrap_or(BannerTier::Omitted)
+}
+
+/// Rows in one block glyph.
+const BLOCK_ROWS: usize = 5;
+
+/// Blank columns between two adjacent block glyphs.
+const BLOCK_GLYPH_GAP: u16 = 1;
+
+/// PRD #341 M3b — a hand-rolled 5-row block font covering exactly the distinct
+/// glyphs in "COMMAND MODE" (C, O, M, A, N, D, E) plus a word space.
+///
+/// No text renderer exists in this repo — `src/ascii_art.rs` is LLM-generated
+/// idle art, not a font — and this is deliberately NOT a general one either: it
+/// is a private lookup table for one string. Each glyph is a fixed-width bitmap
+/// where `#` is an inked cell and `.` is background; the word space is a
+/// narrower all-background glyph so "COMMAND MODE" reads as two words without
+/// costing a full letter's width.
+const BLOCK_FONT: [(char, [&str; BLOCK_ROWS]); 8] = [
+    ('C', ["####", "#...", "#...", "#...", "####"]),
+    ('O', ["####", "#..#", "#..#", "#..#", "####"]),
+    ('M', ["#..#", "####", "####", "#..#", "#..#"]),
+    ('A', [".##.", "#..#", "####", "#..#", "#..#"]),
+    ('N', ["#..#", "##.#", "#.##", "#..#", "#..#"]),
+    ('D', ["###.", "#..#", "#..#", "#..#", "###."]),
+    ('E', ["####", "#...", "###.", "#...", "####"]),
+    (' ', ["..", "..", "..", "..", ".."]),
+];
+
+/// The bitmap for `ch`, or `None` for a character the font does not cover.
+/// Unknown characters are skipped rather than substituted — the font's whole
+/// input is two `const` strings, so an unknown character is a code change, not
+/// user data.
+fn block_glyph(ch: char) -> Option<&'static [&'static str; BLOCK_ROWS]> {
+    BLOCK_FONT
+        .iter()
+        .find(|(c, _)| *c == ch)
+        .map(|(_, rows)| rows)
+}
+
+/// How many columns `text` occupies when drawn with [`draw_block_text`].
+fn block_text_width(text: &str) -> u16 {
+    let mut width = 0u16;
+    for (index, rows) in text.chars().filter_map(block_glyph).enumerate() {
+        if index > 0 {
+            width = width.saturating_add(BLOCK_GLYPH_GAP);
+        }
+        width = width.saturating_add(rows[0].len() as u16);
+    }
+    width
+}
+
+/// The banner's style: `REVERSED | BOLD` and nothing else.
+///
+/// PRD #13 / Decision "light & dark safety": no absolute colour at all. Reversing
+/// against whatever foreground/background the user's theme provides is legible on
+/// light and dark terminals alike, and `REVERSED` is universally supported — which
+/// is what keeps the design from depending on `Modifier::DIM`, the one modifier
+/// some terminals ignore. Where DIM is dropped the banner and the bottom-bar chip
+/// still carry the mode on their own.
+///
+/// Built from [`Style::reset`] so the banner CLEARS the dimming it is drawn over
+/// (and any styling the agent's own output left in those cells) instead of
+/// inheriting it — a `REVERSED | DIM` plaque is exactly the muted thing this
+/// banner must not be.
+fn banner_style() -> Style {
+    Style::reset().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+}
+
+/// Stamp one banner cell, replacing whatever was there.
+fn put_banner_cell(buf: &mut Buffer, x: u16, y: u16, symbol: &str) {
+    if let Some(cell) = buf.cell_mut((x, y)) {
+        cell.set_symbol(symbol);
+        cell.set_style(banner_style());
+    }
+}
+
+/// Stamp `text` starting at `(x, y)`, one cell per character.
+fn put_banner_text(buf: &mut Buffer, x: u16, y: u16, text: &str) {
+    for (offset, ch) in text.chars().enumerate() {
+        let Ok(offset) = u16::try_from(offset) else {
+            return;
+        };
+        put_banner_cell(
+            buf,
+            x.saturating_add(offset),
+            y,
+            ch.encode_utf8(&mut [0; 4]),
+        );
+    }
+}
+
+/// Clear one cell of a block word's bounding box to a dimmed blank.
+///
+/// Keeps `Modifier::DIM` and no colour of its own, so a cleared cell is still
+/// part of the dimmed pane rather than a bright hole punched in it.
+fn clear_block_cell(buf: &mut Buffer, x: u16, y: u16) {
+    if let Some(cell) = buf.cell_mut((x, y)) {
+        cell.set_symbol(" ");
+        cell.set_style(Style::reset().add_modifier(Modifier::DIM));
+    }
+}
+
+/// Draw `text` in block letters with its top-left corner at `(x, y)`.
+///
+/// The word claims its whole bounding box before any ink lands: the counters of
+/// an `O`, the notch of a `C` and the columns between two glyphs are all part of
+/// the letterform, and pane text showing through them turns the word into
+/// something that reads as corruption rather than as `COMMAND` — the opposite of
+/// the "unmistakable" this PRD is for. It is a narrow exception to "dim, never
+/// erase": the banner only ever claims the cells it is itself drawn on, and
+/// [`command_banner_tier`] has already guaranteed the rest of the pane — the
+/// content the user is reading to decide what to do next — stays visible around
+/// it.
+fn draw_block_text(buf: &mut Buffer, x: u16, y: u16, text: &str) {
+    for row in 0..BLOCK_ROWS as u16 {
+        for col in 0..block_text_width(text) {
+            clear_block_cell(buf, x.saturating_add(col), y.saturating_add(row));
+        }
+    }
+
+    let mut cursor = x;
+    for (index, rows) in text.chars().filter_map(block_glyph).enumerate() {
+        if index > 0 {
+            cursor = cursor.saturating_add(BLOCK_GLYPH_GAP);
+        }
+        for (row, pixels) in rows.iter().enumerate() {
+            for (col, pixel) in pixels.bytes().enumerate() {
+                if pixel == b'#' {
+                    put_banner_cell(
+                        buf,
+                        cursor.saturating_add(col as u16),
+                        y.saturating_add(row as u16),
+                        " ",
+                    );
+                }
+            }
+        }
+        cursor = cursor.saturating_add(rows[0].len() as u16);
+    }
+}
+
+/// The banner's block-letter phrase (tier 1).
+const BANNER_PHRASE: &str = "COMMAND MODE";
+/// The banner's block-letter word (tier 2), when the phrase no longer fits.
+const BANNER_WORD: &str = "COMMAND";
+/// The subtitle under the tier-1 block letters — the way OUT of command mode,
+/// which is the question issue #88 recorded users asking out loud.
+const BANNER_SUBTITLE: &str = "Ctrl+D to type";
+/// Tier 3: the whole announcement on one reversed line.
+const BANNER_LINE: &str = " COMMAND MODE — Ctrl+D to type ";
+/// Tier 4: the last thing to go, and deliberately the same word as the
+/// bottom-bar chip so the two read as one vocabulary.
+const BANNER_WORD_LINE: &str = " COMMAND ";
+
+/// Draw one reversed line centred in `inner`.
+fn draw_centred_banner_line(buf: &mut Buffer, inner: Rect, text: &str) {
+    let width = text.chars().count() as u16;
+    let x = inner.x + inner.width.saturating_sub(width) / 2;
+    let y = inner.y + inner.height.saturating_sub(1) / 2;
+    put_banner_text(buf, x, y, text);
+}
+
+/// PRD #341 M3 — draw the command banner centred in a focused pane's `inner`
+/// area, at the richest tier that area can afford.
+///
+/// Every tier is centred within `inner` and sized from
+/// [`BannerTier::rendered_size`], which [`command_banner_tier`] has already
+/// checked against `inner`, so the banner cannot clip, cannot overrun the
+/// border, and cannot panic on a small-but-valid pane (`render/layout/005` is the
+/// house precedent for that last one). `put_banner_cell` is bounds-checked on top
+/// of that.
+fn draw_command_banner(buf: &mut Buffer, inner: Rect) {
+    match command_banner_tier(inner.width, inner.height) {
+        BannerTier::BlockCommandModeWithSubtitle => {
+            // Block letters, one blank row, then the subtitle.
+            let block_width = block_text_width(BANNER_PHRASE);
+            let total_height = BLOCK_ROWS as u16 + 2;
+            let x = inner.x + inner.width.saturating_sub(block_width) / 2;
+            let y = inner.y + inner.height.saturating_sub(total_height) / 2;
+            draw_block_text(buf, x, y, BANNER_PHRASE);
+            let subtitle_width = BANNER_SUBTITLE.chars().count() as u16;
+            put_banner_text(
+                buf,
+                inner.x + inner.width.saturating_sub(subtitle_width) / 2,
+                y + BLOCK_ROWS as u16 + 1,
+                BANNER_SUBTITLE,
+            );
+        }
+        BannerTier::BlockCommand => {
+            let block_width = block_text_width(BANNER_WORD);
+            let x = inner.x + inner.width.saturating_sub(block_width) / 2;
+            let y = inner.y + inner.height.saturating_sub(BLOCK_ROWS as u16) / 2;
+            draw_block_text(buf, x, y, BANNER_WORD);
+        }
+        BannerTier::SingleLineWithSubtitle => draw_centred_banner_line(buf, inner, BANNER_LINE),
+        BannerTier::SingleWord => draw_centred_banner_line(buf, inner, BANNER_WORD_LINE),
+        BannerTier::Omitted => {}
+    }
+}
+
+/// PRD #341 M3 — the command-mode treatment of ONE focused pane: dim its inner
+/// area, then draw the banner over it if it has not decayed.
+///
+/// The caller has already established both gates — command mode, and this pane
+/// being the focused one (Decision 4: the focused pane only, never every pane) —
+/// so this function does not re-check them. What it does guarantee is the
+/// ordering the PRD requires: the dim is applied to the WHOLE inner area
+/// unconditionally, and the banner is a separate, later decision. `Collapsed`
+/// therefore removes only the banner; the pane stays dimmed for as long as the
+/// user is in command mode.
+///
+/// The content underneath is dimmed, never erased. `Modifier::DIM` attenuates the
+/// cells that are already there, so the user can still read which agent is
+/// mid-work and which one they are about to close — the decisions command mode
+/// exists to make.
+fn render_command_mode_overlay(
+    buf: &mut Buffer,
+    pane_rect: Rect,
+    visibility: CommandBannerVisibility,
+) {
+    let inner = Rect {
+        x: pane_rect.x.saturating_add(1),
+        y: pane_rect.y.saturating_add(1),
+        width: pane_rect.width.saturating_sub(2),
+        height: pane_rect.height.saturating_sub(2),
+    }
+    .intersection(*buf.area());
+    if inner.is_empty() {
+        return;
+    }
+
+    for y in inner.y..inner.y.saturating_add(inner.height) {
+        for x in inner.x..inner.x.saturating_add(inner.width) {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.modifier.insert(Modifier::DIM);
+            }
+        }
+    }
+
+    if visibility == CommandBannerVisibility::Expanded {
+        draw_command_banner(buf, inner);
     }
 }
 
@@ -10566,6 +12883,25 @@ fn render_terminal_panes(
     pane_status: &HashMap<&str, SessionStatus>,
     selection: &Option<TextSelection>,
     visual_focus_id: Option<&str>,
+    // Issue #88 follow-up / PRD #341 M1+M3: the live `UiState::mode`. Two
+    // different questions are asked of it here, and they are NOT complements:
+    //
+    // * `input_active` (`mode == PaneInput`) — do keystrokes reach the focused
+    //   pane right now? Threaded to `TerminalWidget::with_input_active` so the
+    //   Cyan `focused` accent and the painted cursor appear ONLY when the pane is
+    //   actually live; in command mode the border falls through to the agent's
+    //   status colour and thickens instead, which is what makes the mode visible
+    //   on a full-screen mode tab where nothing else on screen changes.
+    // * command mode (`mode == Normal`) — should the focused pane be dimmed and
+    //   the banner drawn? Every OTHER mode (a modal, an inline filter/rename row)
+    //   is also not `PaneInput`, but those already cover the screen or own the
+    //   bottom row; dimming a pane behind them would be noise, not signal.
+    mode: UiMode,
+    // PRD #341 M3: the banner's decay state for this frame, from the single
+    // `UiState::command_banner`. Deliberately a SEPARATE input from `mode`: the
+    // dimming is gated by mode and focus alone and persists for the whole time in
+    // command mode, while only this controls whether the banner is drawn over it.
+    banner: CommandBannerVisibility,
     // PRD #84: per-pane OUTER rects (aligned 1:1 with `pane_ids`) precomputed by
     // `compute_frame_layout` — the SAME rects `resize_panes_to_layout` sized the
     // PTYs to this frame. `Some` => draw into exactly those; `None` => recompute
@@ -10577,6 +12913,8 @@ fn render_terminal_panes(
     if pane_ids.is_empty() {
         return None;
     }
+    let input_active = mode == UiMode::PaneInput;
+    let command_mode = mode == UiMode::Normal;
     let focused_id = visual_focus_id
         .map(|s| s.to_string())
         .or_else(|| ctrl.focused_pane_id());
@@ -10584,15 +12922,23 @@ fn render_terminal_panes(
     // Get pane info for display names
     let pane_infos = ctrl.list_panes().unwrap_or_default();
     let pane_name = |id: &str| -> String {
-        if let Some(name) = display_names.get(id) {
-            return name.clone();
-        }
-        if let Some(info) = pane_infos.iter().find(|p| p.pane_id == id)
+        let base = if let Some(name) = display_names.get(id) {
+            name.clone()
+        } else if let Some(info) = pane_infos.iter().find(|p| p.pane_id == id)
             && !info.title.is_empty()
         {
-            return info.title.clone();
+            info.title.clone()
+        } else {
+            format!("pane {id}")
+        };
+        // A pane whose I/O task gave up keeps rendering its last frame, so
+        // without this marker it is indistinguishable from an agent that is
+        // merely quiet — and every keystroke into it is silently dropped. Mark
+        // it in the title so the state is visible before the user types.
+        match ctrl.pane_lost_reason(id) {
+            Some(reason) => format!("{base} — {}", reason.title_marker()),
+            None => base,
         }
-        format!("pane {id}")
     };
 
     // Track the focused pane's rect and screen for hardware cursor positioning.
@@ -10629,7 +12975,8 @@ fn render_terminal_panes(
                     // PRD #84 M5: this pane was sized to `chunks[i]` by
                     // `resize_panes_to_layout` this frame, so attest the contract.
                     let mut widget = TerminalWidget::new(Arc::clone(&screen), title, focused)
-                        .contract_guaranteed(true);
+                        .contract_guaranteed(true)
+                        .with_input_active(input_active);
                     // PRD #155 (M3): supply the pane's status so a non-focused
                     // pane renders its status-colored border via the palette (the
                     // focus override stays inside TerminalWidget). Panes without a
@@ -10660,7 +13007,8 @@ fn render_terminal_panes(
                         // by `resize_panes_to_layout` this frame — attest it.
                         let mut widget =
                             TerminalWidget::new(Arc::clone(&screen), title, is_focused)
-                                .contract_guaranteed(true);
+                                .contract_guaranteed(true)
+                                .with_input_active(input_active);
                         // PRD #155 (M3): same status threading as the Tiled arm.
                         if let Some(status) = pane_status.get(pane_id.as_str()) {
                             widget = widget.with_status(status.clone());
@@ -10695,7 +13043,16 @@ fn render_terminal_panes(
     }
 
     // Set hardware cursor in the focused pane for real blinking.
-    if let Some(rect) = focused_pane_rect
+    //
+    // PRD #341 M1: only while the pane is LIVE. This call is the sole reason a
+    // real terminal cursor is visible anywhere in the TUI — ratatui's
+    // `Terminal::draw` hides the cursor for any frame that never asks for a
+    // position — so skipping it in command mode removes the loudest "type here"
+    // signal on screen from the one mode where typing reaches nothing. Focus
+    // deliberately survives the mode switch, so `focused_pane_rect` alone is not
+    // the right question; `input_active` is.
+    if input_active
+        && let Some(rect) = focused_pane_rect
         && let Some(screen_arc) = focused_screen
         && let Ok(parser) = screen_arc.lock()
     {
@@ -10711,6 +13068,19 @@ fn render_terminal_panes(
                 frame.set_cursor_position(Position::new(inner_x + ccol, inner_y + crow));
             }
         }
+    }
+
+    // PRD #341 M3: dim the focused pane and, until it decays, draw the COMMAND
+    // MODE banner over it.
+    //
+    // Gated on `command_mode` AND on there being a focused pane, independently of
+    // `banner` — Decision 4 scopes both treatments to the focused pane, and the
+    // dimming must persist for the entire time in command mode while only the
+    // banner decays. Drawn AFTER the panes (so it lands on real content) and
+    // BEFORE the selection highlight (so an active text selection stays crisp
+    // rather than being dimmed along with everything else).
+    if command_mode && let Some(rect) = focused_pane_rect {
+        render_command_mode_overlay(frame.buffer_mut(), rect, banner);
     }
 
     // Render selection highlight over the focused pane.
@@ -10777,6 +13147,10 @@ fn render_mode_tab(
     // `render_frame` into both `render_terminal_panes` calls below, so mode-tab
     // panes get the same status-colored borders as the dashboard's panes.
     pane_status: &HashMap<&str, SessionStatus>,
+    // PRD #341 M3: the banner decay state `render_frame` read once for this
+    // frame, forwarded rather than re-derived so a Mode tab and a Dashboard pane
+    // cannot disagree about whether the banner is up.
+    banner: CommandBannerVisibility,
 ) {
     // PRD #83: `focused_pane_id` is keyed by stable pane id. `None` (or an
     // id that isn't one of this tab's side panes) means the agent pane is
@@ -10806,6 +13180,8 @@ fn render_mode_tab(
             pane_status,
             &ui.selection,
             agent_visual_focus,
+            ui.mode,
+            banner,
             // Mode-tab panes recompute their rects (out of the Cards finding's
             // scope); the agent pane is a single Stacked pane filling agent_area.
             None,
@@ -10827,6 +13203,8 @@ fn render_mode_tab(
             pane_status,
             &ui.selection,
             side_visual_focus.as_deref(),
+            ui.mode,
+            banner,
             // Mode side panes recompute via pane_stack_rects (Tiled) — same
             // split as the `side_pane_rects` above; out of the Cards finding's scope.
             None,
@@ -10908,20 +13286,16 @@ fn render_stats_bar(
         }
     }
 
-    // PRD #20 finding #10: when more than one real agent type is active, show a
-    // compact per-agent-type breakdown (e.g. `1 ClaudeCode │ 1 Codex`), each in
-    // its registry badge color. A single-agent deck shows nothing extra — the
-    // breakdown would just restate the `active` count.
-    if stats.by_agent_type.len() > 1 {
-        for (agent_type, count) in &stats.by_agent_type {
-            let spec = crate::agent_registry::spec(agent_type);
-            spans.push(Span::styled("  \u{2502}  ", text_dim()));
-            spans.push(Span::styled(
-                format!("{count} {}", spec.label),
-                Style::default().fg(spec.badge_color),
-            ));
-        }
-    }
+    // The per-agent-type breakdown (PRD #20 finding #10) used to render here.
+    // Removed: this bar is drawn into the LAST ROW OF `dashboard_area` — the
+    // left column, narrower than the terminal whenever panes are open — as an
+    // unwrapped Paragraph, so it clips silently at the right edge. One segment
+    // per agent type (~12-18 columns each) pushed the `tools` total and the
+    // `mode:` indicator off-screen on a real multi-agent deck, which is how the
+    // breakdown was actually observed: `… │ 19 idle │ 14 ClaudeCode` and
+    // nothing after it. The information was redundant anyway — every card
+    // already carries its registry-colored type badge (`render_session_card`),
+    // directly under this bar.
 
     // Always show total tools
     spans.push(Span::styled("  \u{2502}  ", text_dim()));
@@ -10973,8 +13347,68 @@ fn button_shortcut_label(keybindings: &KeybindingConfig, action: KbAction) -> St
     s
 }
 
-fn global_bar_buttons(keybindings: &KeybindingConfig, has_pane_control: bool) -> Vec<Button> {
+/// PRD #241 M4 (review F2a): the ONE mode-aware answer to "which global
+/// commands does this mode actually offer, and which way does the dashboard
+/// chord travel from here?"
+///
+/// Both user-visible surfaces read it, which is what makes the mode-awareness
+/// real rather than test-only: the LIVE bottom bar ([`global_bar_buttons`], via
+/// `render_bottom_bar`) and the hints string ([`dashboard_hints_string`], via
+/// the `render_hints_bar_*_to_buffer` seams). The first cut fixed only the
+/// string — which nothing in the running app rendered — so the tests passed over
+/// a seam the app never called while the live bar kept offering `[Close Ctrl+W]`
+/// in modes where the chord no longer closes, and never named the way back to
+/// the pane at all.
+struct ModeGlobals {
+    /// Does the `close_pane` chord resolve in this mode? (PRD #241 M1 scoped it
+    /// to command mode.) Drives both the hint and the `[Close]` button's
+    /// enabled state, so the bar can't offer a command the keyboard refuses.
+    close_available: bool,
+    /// Lowercase hint label for the dashboard chord, naming the trip it makes
+    /// FROM this mode.
+    dashboard_hint: &'static str,
+    /// Title-cased button label for the same chord.
+    dashboard_button: &'static str,
+}
+
+impl ModeGlobals {
+    fn for_mode(mode: UiMode) -> Self {
+        if mode == UiMode::Normal {
+            // Already in command mode: the chord's only remaining trip is back
+            // to the pane, and that is the one issue #88's reporter could not
+            // find on screen.
+            Self {
+                close_available: true,
+                dashboard_hint: "back to pane",
+                dashboard_button: "Back to Pane",
+            }
+        } else {
+            Self {
+                close_available: false,
+                dashboard_hint: "dashboard",
+                dashboard_button: "Command Mode",
+            }
+        }
+    }
+}
+
+fn global_bar_buttons(
+    keybindings: &KeybindingConfig,
+    mode: UiMode,
+    has_pane_control: bool,
+) -> Vec<Button> {
+    let g = ModeGlobals::for_mode(mode);
     vec![
+        // PRD #241 M4: the way out, named for the direction it travels. In
+        // command mode this is the only on-screen answer to "how do I get back
+        // to my pane?" — the gap issue #88 reported. `Action::DetachToNormal` is
+        // a toggle, so one button serves both trips.
+        Button::new(
+            g.dashboard_button,
+            button_shortcut_label(keybindings, KbAction::Dashboard),
+            Action::DetachToNormal,
+            true,
+        ),
         // PRD #80 review FIX 3: New Pane is ALWAYS enabled — you can always
         // create the first pane, even with no panes / controller yet.
         Button::new(
@@ -10983,11 +13417,14 @@ fn global_bar_buttons(keybindings: &KeybindingConfig, has_pane_control: bool) ->
             Action::NewPane,
             true,
         ),
+        // PRD #241 M1/M4: dimmed and inert outside command mode, where the
+        // chord no longer resolves — a disabled button records no rect, so the
+        // click is the same silent no-op the key now is.
         Button::new(
             "Close",
             button_shortcut_label(keybindings, KbAction::ClosePane),
             Action::CloseSelected,
-            has_pane_control,
+            has_pane_control && g.close_available,
         ),
         Button::new(
             "Toggle Layout",
@@ -11063,29 +13500,44 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
 /// an empty input). A button wider than `width` is still placed at the start of
 /// its own row (the caller clips it to the buffer). Pure data: no rendering, so
 /// the same layout drives the render AND the reserved height budget.
-fn layout_button_bar(label_widths: &[u16], width: u16) -> (Vec<Rect>, u16) {
+///
+/// PRD #341 M2: `first_row_indent` is the cells row 0 must leave free at its left
+/// edge for the mode chip. Only row 0 pays it — wrapped continuation rows start at
+/// `x = 0` and get the full `width`, because the chip is one row tall. Reserving
+/// the band across the whole bar area instead charged every row for a chip drawn
+/// on one of them, which cost the dashboard a content row at several widths (with
+/// the default button set: 4 rows instead of 3 at 60 cols, 5 instead of 4 at 50).
+/// Row 0's own indent is unavoidable, so a width where the chip pushes row 0's
+/// last button over still pays (78–86 cols with the default set).
+fn layout_button_bar(label_widths: &[u16], width: u16, first_row_indent: u16) -> (Vec<Rect>, u16) {
     const SEP: u16 = 1;
     let mut rects = Vec::with_capacity(label_widths.len());
-    let mut x = 0u16;
+    let mut x = first_row_indent.min(width);
     let mut y = 0u16;
     let mut row_has_button = false;
     for &w in label_widths {
-        if row_has_button && x.saturating_add(SEP).saturating_add(w) > width {
-            // Would overflow the current row — wrap to a fresh one.
+        // Where this button would start if it stayed on the current row.
+        let mut start = if row_has_button {
+            x.saturating_add(SEP)
+        } else {
+            x
+        };
+        // Wrap when it would overflow AND a fresh row would actually help — a
+        // fresh row starts at column 0, so that is exactly "we are not already
+        // there". This is what lets an indented row 0 push its FIRST button down
+        // instead of off the right edge, while a button wider than the whole bar
+        // still sits at the start of its own row and is clipped by the caller.
+        if start > 0 && start.saturating_add(w) > width {
             y += 1;
-            x = 0;
-            row_has_button = false;
-        }
-        if row_has_button {
-            x = x.saturating_add(SEP);
+            start = 0;
         }
         rects.push(Rect {
-            x,
+            x: start,
             y,
             width: w,
             height: 1,
         });
-        x = x.saturating_add(w);
+        x = start.saturating_add(w);
         row_has_button = true;
     }
     let rows = if label_widths.is_empty() { 0 } else { y + 1 };
@@ -11102,23 +13554,31 @@ fn layout_button_bar(label_widths: &[u16], width: u16) -> (Vec<Rect>, u16) {
 /// [`layout_button_bar`]; a button whose wrapped row falls outside `area`'s
 /// reserved height is dropped whole (the height budget reserves the bar's
 /// actual row count, so on the dashboard this never clips a real button).
+///
+/// PRD #341 M2: `area` is the FULL bar area including the mode chip's cells, and
+/// `first_row_indent` is what the chip took off row 0 — so the buttons flow around
+/// a one-row chip instead of the whole bar being shifted right. `bottom_bar_rows`
+/// passes the identical pair to the identical `layout_button_bar`, which is what
+/// keeps the reserved height equal to the rendered height.
 fn render_button_bar(
     frame: &mut Frame,
     keybindings: &KeybindingConfig,
+    mode: UiMode,
     area: Rect,
+    first_row_indent: u16,
     has_pane_control: bool,
     extra_buttons: &[Button],
 ) -> Vec<(Action, Rect)> {
     // Global commands first, then any context-specific buttons (e.g. the
     // dashboard's Filter / Rename / Generate). One funnel, one bar.
-    let mut buttons = global_bar_buttons(keybindings, has_pane_control);
+    let mut buttons = global_bar_buttons(keybindings, mode, has_pane_control);
     buttons.extend(extra_buttons.iter().cloned());
 
     let widths: Vec<u16> = buttons
         .iter()
         .map(|b| b.display_label().chars().count() as u16)
         .collect();
-    let (placements, _rows) = layout_button_bar(&widths, area.width);
+    let (placements, _rows) = layout_button_bar(&widths, area.width, first_row_indent);
 
     let mut rects = Vec::with_capacity(buttons.len());
     let buf = frame.buffer_mut();
@@ -11144,6 +13604,128 @@ fn render_button_bar(
     rects
 }
 
+/// PRD #341 M2 — the persistent mode chip's text: the bottom bar's always-there
+/// "you are here" label, in the vocabulary settled for this PRD.
+///
+/// It is deliberately the complement of [`ModeGlobals::dashboard_button`], which
+/// names where the `Ctrl+D` chord GOES. With only the destination on screen the
+/// words "Command Mode" appeared precisely when the user was NOT in command mode
+/// — worse than no label at all. The chip states the current fact, the button the
+/// available trip; neither replaces the other.
+///
+/// `None` for the two inline-input modes: their bar row IS an input field with
+/// its own prompt and cursor at cell 0, and this PRD's vocabulary names no label
+/// for them. Every other mode reaches the bar through the wide-button-bar path,
+/// where keystrokes drive the deck rather than a pane, so it reads ` COMMAND `.
+fn mode_chip_label(mode: UiMode) -> Option<&'static str> {
+    match mode {
+        UiMode::PaneInput => Some(CHIP_TYPING),
+        UiMode::Filter | UiMode::Rename => None,
+        _ => Some(CHIP_COMMAND),
+    }
+}
+
+/// The chip for every mode that drives the deck.
+const CHIP_COMMAND: &str = " COMMAND ";
+/// The chip for `UiMode::PaneInput`.
+const CHIP_TYPING: &str = " TYPING ";
+
+/// The one space between the chip and the bar content, part of the band
+/// [`mode_chip_bar_split`] reserves.
+const GAP_AFTER_CHIP: u16 = 1;
+
+/// The narrowest bar row any chip is drawn on: the WIDEST label's band.
+///
+/// PRD #341 M2 (code-review finding 2): the threshold is shared across modes even
+/// though the bands are not, because the labels differ in length and a per-label
+/// threshold leaves a one-column window where ` TYPING ` fits and ` COMMAND ` does
+/// not — `Ctrl+D` taking the user from a visible mode label to none, which is
+/// finding 2's defect in miniature. Above this width every mode gets its own
+/// (differently sized) chip; below it, all of them lose it together.
+fn mode_chip_min_width() -> u16 {
+    [CHIP_COMMAND, CHIP_TYPING]
+        .into_iter()
+        .map(|label| label.chars().count() as u16)
+        .max()
+        .unwrap_or(0)
+        + GAP_AFTER_CHIP
+}
+
+/// PRD #341 M2 — split a bottom-bar row into `(chip_band, rest)`: the cells the
+/// mode chip takes off the left edge, and the width left for the bar's own
+/// content.
+///
+/// The ONE source of truth for the chip's width budget, read by
+/// [`render_mode_chip`] AND by [`bottom_bar_rows`] AND by the button-bar render.
+/// All three derive the layout from the same `chip_band`, so the reservation
+/// cannot disagree with what renders — if it did, the bar would clip or overlap
+/// the cards, the PRD #144 height-budget contract `render/layout/004` pins.
+///
+/// `chip_band` covers the chip plus one separating space. It is 0 — no chip at
+/// all — only for a mode with no label, or for a row too narrow to fit the label
+/// at all (`width < band`). Whenever the label fits, the band is reserved and the
+/// buttons flow around it.
+///
+/// PRD #341 M2 (code-review finding 2): the threshold used to be twice the band,
+/// on the reasoning that a narrow bar needs its button labels more than a chip.
+/// That inverted the priority at exactly the widths where it matters, and it did
+/// so asymmetrically: ` COMMAND ` (a 10-cell band) vanished below 20 columns while
+/// ` TYPING ` (9) survived to 18, so at 19 columns `Ctrl+D` took the user from a
+/// visible ` TYPING ` label to no current-mode words at all — and once the banner
+/// has decayed (or its tier is [`BannerTier::Omitted`]) command mode then had no
+/// persistent textual label anywhere on screen. The chip is the highest-value
+/// element in the bar; the buttons yield to it, not the reverse. Below
+/// [`mode_chip_min_width`] the omission is symmetric — every mode loses its chip at
+/// the same width, which is a bar too narrow for a single button anyway.
+///
+/// `rest` is what a SINGLE-ROW bar (an input field, a status message) has left
+/// after the chip. The wrapping button bar does not use it: the chip is one row
+/// tall, so only its row 0 is indented (see [`layout_button_bar`]'s
+/// `first_row_indent`) and continuation rows get the full width back — so the
+/// buttons pay for the chip by wrapping, not by disappearing.
+fn mode_chip_bar_split(mode: UiMode, width: u16) -> (u16, u16) {
+    let Some(label) = mode_chip_label(mode) else {
+        return (0, width);
+    };
+    if width < mode_chip_min_width() {
+        return (0, width);
+    }
+    let band = label.chars().count() as u16 + GAP_AFTER_CHIP;
+    (band, width - band)
+}
+
+/// PRD #341 M2 — draw the mode chip at `area`'s left edge and return the rect
+/// left for the bar's own content (same row, same right edge).
+///
+/// Styled `Modifier::REVERSED | BOLD` with no colour at all — the same
+/// terminal-relative trick the active tab uses (`render_tab_strip`), so the chip
+/// inverts against whatever background the user's theme provides and reads on
+/// light and dark terminals alike without an absolute RGB value (PRD #13).
+fn render_mode_chip(frame: &mut Frame, mode: UiMode, area: Rect) -> Rect {
+    let (band, rest) = mode_chip_bar_split(mode, area.width);
+    if band == 0 {
+        return area;
+    }
+    let label = mode_chip_label(mode).expect("a non-zero chip band implies a label");
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            label,
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        )),
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: band.saturating_sub(GAP_AFTER_CHIP),
+            height: 1,
+        },
+    );
+    Rect {
+        x: area.x.saturating_add(band),
+        width: rest,
+        ..area
+    }
+}
+
 /// PRD #144 — how many rows the bottom bar will occupy this frame, so the layout
 /// pass can reserve exactly that height (a wrapped 2-row bar must cede one row
 /// from the dashboard/pane region or the cards clip/overlap). Input / status
@@ -11164,7 +13746,7 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16, tab_view: &Activ
         UiMode::Filter | UiMode::Rename | UiMode::PaneInput => 1,
         _ if ui.status_message.is_some() => 1,
         _ => {
-            let mut buttons = global_bar_buttons(&ui.keybindings, true);
+            let mut buttons = global_bar_buttons(&ui.keybindings, ui.mode, true);
             if !matches!(tab_view, ActiveTabView::Mode { .. }) {
                 buttons.extend(dashboard_context_buttons(&ui.keybindings, true));
             }
@@ -11172,7 +13754,12 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16, tab_view: &Activ
                 .iter()
                 .map(|b| b.display_label().chars().count() as u16)
                 .collect();
-            let (_, rows) = layout_button_bar(&widths, width);
+            // PRD #341 M2: the mode chip is part of the bar's width budget, so
+            // the buttons flow around it — indenting row 0 only, exactly as
+            // `render_button_bar` does. Same split, same call, same arguments: a
+            // second opinion here would mis-reserve the height.
+            let (chip_band, _) = mode_chip_bar_split(ui.mode, width);
+            let (_, rows) = layout_button_bar(&widths, width, chip_band);
             rows.max(1)
         }
     };
@@ -11187,6 +13774,18 @@ fn render_bottom_bar(
     has_pane_control: bool,
     extra_buttons: &[Button],
 ) {
+    // PRD #341 M2: the mode chip owns cell 0 of the bar wherever the bar has one
+    // — the context-rich Cards path (Dashboard / Orchestration), the global-only
+    // Mode-tab path, and the PaneInput row alike — so the current mode is stated
+    // in words in the SAME screen position on every tab, in both modes.
+    // Everything else in the bar draws into what it leaves.
+    //
+    // The single-row branches take the chip-shortened rect; the wrapping button
+    // bar keeps the FULL rect and indents only its row 0, so a wrapped bar does
+    // not pay the chip's ~10 cells on every row (see `layout_button_bar`).
+    let full_area = area;
+    let (chip_band, _) = mode_chip_bar_split(ui.mode, area.width);
+    let area = render_mode_chip(frame, ui.mode, area);
     match ui.mode {
         UiMode::Filter => {
             let line = Line::from(vec![
@@ -11241,10 +13840,11 @@ fn render_bottom_bar(
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
             }
-            let command_mode_label = button_shortcut_label(&ui.keybindings, KbAction::Dashboard);
+            // PRD #241 M4: same mode-aware seam the wide bar uses, so the two
+            // surfaces can never disagree about which way `Ctrl+D` travels.
             let buttons = [Button::new(
-                "Command Mode",
-                command_mode_label,
+                ModeGlobals::for_mode(ui.mode).dashboard_button,
+                button_shortcut_label(&ui.keybindings, KbAction::Dashboard),
                 Action::DetachToNormal,
                 true,
             )];
@@ -11264,7 +13864,9 @@ fn render_bottom_bar(
                 let rects = render_button_bar(
                     frame,
                     &ui.keybindings,
-                    area,
+                    ui.mode,
+                    full_area,
+                    chip_band,
                     has_pane_control,
                     extra_buttons,
                 );
@@ -11475,6 +14077,79 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect)
         Button::new("Detach", "", Action::DetachAndQuit, true),
         Button::new("Stop", "", Action::RequestStop, true),
         Button::new("Cancel", "", Action::DismissModal, true),
+    ];
+    let btn_row = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + popup_area.height.saturating_sub(3),
+        width: popup_area.width.saturating_sub(2),
+        height: 1,
+    };
+    render_modal_button_row(frame, &buttons, btn_row, 1)
+}
+
+/// PRD #241 M3: the close confirmation dialog. Same shape as
+/// [`render_quit_confirm`] — a centered popup with an option list, a keyboard
+/// hint row, and clickable buttons — with Cancel first and highlighted by
+/// default so the reflexive Enter is the harmless one.
+fn render_close_confirm(frame: &mut Frame, state: &CloseConfirmState) -> Vec<(Action, Rect)> {
+    let selected = state.selected;
+    let area = frame.area();
+    let popup_width = 64u16.min(area.width.saturating_sub(4));
+    let popup_height = 9u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let mut text = vec![
+        Line::from(""),
+        Line::styled(
+            close_confirm_header(state.scope),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+    ];
+
+    for (i, (label, desc)) in close_confirm_options(state.scope).iter().enumerate() {
+        let cursor = if i == selected { ">" } else { " " };
+        let style = if i == selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            text_primary()
+        };
+        text.push(Line::styled(
+            format!("  {cursor} {label:<7} \u{2014} {desc}"),
+            style,
+        ));
+    }
+
+    text.push(Line::from(""));
+    text.push(Line::styled(
+        "  Up/Down: navigate  Enter: confirm  Esc: cancel",
+        text_primary(),
+    ));
+
+    let block = Block::default()
+        .title(" Close ")
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    frame.render_widget(Paragraph::new(text).block(block), popup_area);
+
+    // Clickable equivalents of the two options, on the blank row above the
+    // keyboard hint (same placement as the quit dialog's button row).
+    let buttons = [
+        Button::new("Cancel", "", Action::DismissModal, true),
+        Button::new("Close", "", Action::ConfirmCloseSelected, true),
     ];
     let btn_row = Rect {
         x: popup_area.x + 1,
@@ -11735,20 +14410,40 @@ fn jump_range_notation(keybindings: &KeybindingConfig) -> String {
 }
 
 /// PRD #40: build the dashboard hints-bar text from the active keybinding
-/// config. With the default config this reproduces the previous hardcoded
-/// string byte-for-byte (`Ctrl+n: new  …  Ctrl+c: quit`); a remapped action
-/// shows the user's key (e.g. `Alt+Shift+l: layout`), and an unbound action
-/// shows `(unbound)` rather than a bare `: new`. Single source of truth for
-/// both the live hints bar (`render_bottom_bar`) and the standalone
-/// [`render_hints_bar_to_buffer`] snapshot entrypoint.
-fn dashboard_hints_string(keybindings: &KeybindingConfig) -> String {
+/// config. A remapped action shows the user's key (e.g. `Alt+Shift+l: layout`),
+/// and an unbound action shows `(unbound)` rather than a bare `: new`. Single
+/// source of truth for the [`render_hints_bar_to_buffer`] /
+/// [`render_hints_bar_for_mode_to_buffer`] entrypoints.
+///
+/// PRD #241 M4 made it mode-aware, fixing two ways the old fixed string lied:
+///
+/// * it advertised `close` unconditionally, but after M1 the chord only closes
+///   in command mode — promising a key that no longer does anything is worse
+///   than saying nothing; and
+/// * it read `Ctrl+d: dashboard` *while the user was standing in the
+///   dashboard*, naming the destination they had already reached and never
+///   revealing that the same chord is the way back to the pane. (Issue #88: "I
+///   honestly don't know how to get out of command mode.") In command mode the
+///   hint now names the trip the user actually needs.
+fn dashboard_hints_string(keybindings: &KeybindingConfig, mode: UiMode) -> String {
+    let g = ModeGlobals::for_mode(mode);
+    // Only advertise close where close works.
+    let close = if g.close_available {
+        format!(
+            "{}: close  ",
+            display_notation(keybindings, KbAction::ClosePane)
+        )
+    } else {
+        String::new()
+    };
+    // Name the direction the chord travels FROM here.
+    let dashboard_label = g.dashboard_hint;
     // `Ctrl+c: quit` is hardcoded: quit is not a remappable action — Ctrl+C is
     // the non-overridable modal trigger (Detach/Stop/Cancel), so the hint is a
     // fixed string rather than a config-derived notation.
     format!(
-        "{}: new  {}: close  {}: layout  {}: dashboard ({} {} {})  Ctrl+c: quit",
+        "{}: new  {close}{}: layout  {}: {dashboard_label} ({} {} {})  Ctrl+c: quit",
         display_notation(keybindings, KbAction::NewPane),
-        display_notation(keybindings, KbAction::ClosePane),
         display_notation(keybindings, KbAction::ToggleLayout),
         display_notation(keybindings, KbAction::Dashboard),
         jump_range_notation(keybindings),
@@ -11787,9 +14482,23 @@ pub fn render_help_overlay_with_bindings_to_buffer(
 /// PRD #40 (L1 `keybindings/hints/001`): render the dashboard hints bar
 /// against an arbitrary [`KeybindingConfig`] into a standalone `Buffer` for
 /// snapshot testing. Uses the shared [`dashboard_hints_string`] builder so the
-/// snapshot matches the live bar's content.
+/// snapshot matches the live bar's content. Renders the command-mode bar; use
+/// [`render_hints_bar_for_mode_to_buffer`] to see another mode's.
 pub fn render_hints_bar_to_buffer(
     keybindings: &KeybindingConfig,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    render_hints_bar_for_mode_to_buffer(keybindings, UiMode::Normal, width, height)
+}
+
+/// PRD #241 M4 (L1 `keybindings/hints/003`): the mode-aware hints bar. The
+/// close hint appears only where the chord actually closes, and the
+/// dashboard/pane chord is labelled with the direction it travels FROM the
+/// given mode.
+pub fn render_hints_bar_for_mode_to_buffer(
+    keybindings: &KeybindingConfig,
+    mode: UiMode,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -11798,7 +14507,7 @@ pub fn render_hints_bar_to_buffer(
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
-    let hints = dashboard_hints_string(keybindings);
+    let hints = dashboard_hints_string(keybindings, mode);
     terminal
         .draw(|frame| {
             let area = Rect {
@@ -11834,9 +14543,16 @@ fn render_help_overlay(
     let left: Vec<Line> = vec![
         Line::styled("  Global (works from any pane)", cyan),
         Line::from(""),
-        help_key_line(&n(KbAction::Dashboard), "Command mode (dashboard)"),
+        // PRD #241 M4: the old "Command mode (dashboard)" named only the
+        // outbound trip, so a user already in command mode read it as dead
+        // text and could not find the way back to their pane (issue #88).
+        help_key_line(&n(KbAction::Dashboard), "Toggle command / pane"),
         help_key_line(&n(KbAction::NewPane), "Create new pane"),
-        help_key_line(&n(KbAction::ClosePane), "Close selected pane"),
+        // PRD #241 review F6: `close_pane` is NOT global any more — M1 scoped it
+        // to command mode so the chord reaches the PTY as word-delete while you
+        // are typing in a pane. It is listed under "Dashboard (command mode)"
+        // below; leaving it here would document a key that does nothing where
+        // the heading promises it works.
         help_key_line(&n(KbAction::ToggleLayout), "Toggle layout (stacked/tiled)"),
         // Quit is not a remappable action: Ctrl+C (non-overridable) opens the
         // Detach/Stop/Cancel modal, so the help row is a fixed string.
@@ -11867,6 +14583,8 @@ fn render_help_overlay(
         ),
         help_key_line(&jump_range_notation(keybindings), "Jump to pane N"),
         help_key_line(&n(KbAction::FocusPane), "Focus selected pane"),
+        // PRD #241: command-mode only, and it asks before it destroys anything.
+        help_key_line(&n(KbAction::ClosePane), "Close selected pane (confirms)"),
         help_key_line(&n(KbAction::Filter), "Filter sessions"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
         help_key_line(&n(KbAction::Rename), "Rename session"),
@@ -11883,6 +14601,20 @@ fn render_help_overlay(
             "Approve / deny permission",
         ),
         help_key_line(&n(KbAction::OpenScheduledTasks), "Scheduled Tasks manager"),
+        // PRD #341 M5: command mode is a real read-only inspect mode — the wheel
+        // and these keys scroll the focused pane's own scrollback without ever
+        // reaching the agent.
+        help_key_line(
+            &format!(
+                "{} / {}",
+                n(KbAction::ScrollPaneUp),
+                n(KbAction::ScrollPaneDown)
+            ),
+            // Kept short on purpose: `help_key_line` leaves 29 cells for the
+            // description in a 50-cell column, and the two-key notation already
+            // says which way each one goes.
+            "Scroll focused pane",
+        ),
         help_key_line(&n(KbAction::Help), "Toggle this help"),
     ];
 
@@ -12552,13 +15284,38 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     } else {
         0
     };
+    // PRD #140 M4.0: the same-cwd orchestration warning block — a blank
+    // separator row plus the copy lines — shown only when the selected
+    // orchestration's directory already hosts a live one. Empty otherwise, so
+    // every other form state keeps its exact prior geometry.
+    let warning_lines: &[&str] = if form.same_cwd_orchestration_warning() {
+        &SAME_CWD_ORCHESTRATION_WARNING
+    } else {
+        &[]
+    };
+    let warning_rows: u16 = if warning_lines.is_empty() {
+        0
+    } else {
+        warning_lines.len() as u16 + 1
+    };
+    // Widest warning line, so the modal grows to show the copy un-clipped
+    // instead of truncating the `/worktree-prd` pointer.
+    let warning_w: u16 = warning_lines
+        .iter()
+        .map(|l| l.chars().count() as u16)
+        .max()
+        .unwrap_or(0);
     // PRD #144: content-size & center. Width grows to fit the mode chip row
     // (plus borders + a little margin) but never below the comfortable 56-col
     // base; height is the reserved field rows. `modal_rect` clamps to 90% of
     // terminal. The `9 + name_rows` base reproduces the prior `10` when the Name
     // row is shown (unlocked) and trims a row when it is hidden (locked).
-    let desired_w = chip_row_w.saturating_add(4).max(56);
-    let desired_h = 9 + name_rows + agent_rows + mode_extra + cmd_rows + schedule_rows;
+    // PRD #140 M4.0: the warning block widens the modal when its copy is wider
+    // than the chip row (`warning_w` is 0 when no warning shows, so the width is
+    // unchanged in every other state).
+    let desired_w = chip_row_w.max(warning_w).saturating_add(4).max(56);
+    let desired_h =
+        9 + name_rows + agent_rows + mode_extra + cmd_rows + schedule_rows + warning_rows;
     let popup_area = modal_rect(desired_w, desired_h, area, 56, 10);
     let popup_width = popup_area.width;
 
@@ -12695,6 +15452,21 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
                 },
             ),
         ]));
+    }
+    // PRD #140 M4.0: the same-cwd shared-resource warning sits directly above
+    // the action row — the last thing read before Enter — and is purely
+    // informational: `[Submit]` below it is untouched, so the user may proceed
+    // into the shared directory deliberately.
+    if !warning_lines.is_empty() {
+        lines.push(Line::from(""));
+        for text in warning_lines {
+            lines.push(Line::styled(
+                *text,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
     }
     lines.push(Line::from(""));
     // PRD #80 M8: reserve a row for the [Submit]/[Cancel] buttons (overlaid).
@@ -12885,6 +15657,97 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     (field_rects, chip_rects, button_rects)
 }
 
+/// PRD #341 M5 — how far one scroll input moves the focused pane's view. Shared
+/// by the wheel and the keyboard bindings so the two cannot drift apart.
+const FOCUSED_PANE_SCROLL_LINES: isize = 3;
+
+/// PRD #341 M5 — move dot-agent-deck's OWN scrollback for the focused pane.
+///
+/// The single scroll operation both doors funnel into: the mouse wheel
+/// ([`scroll_focused_agent_pane`]) and the `scroll_pane_up` / `scroll_pane_down`
+/// bindings ([`handle_focused_pane_scroll_key`]). Nothing here can reach the
+/// child — it only sets a vt100 scrollback offset.
+fn scroll_focused_pane_scrollback(embedded: &EmbeddedPaneController, pane_id: &str, up: bool) {
+    let delta = if up {
+        FOCUSED_PANE_SCROLL_LINES
+    } else {
+        -FOCUSED_PANE_SCROLL_LINES
+    };
+    embedded.scroll_pane(pane_id, delta);
+}
+
+/// PRD #341 M5 — the ONE decision a wheel event over the focused agent pane
+/// makes: forward it into the child's mouse protocol, or move our own scrollback.
+///
+/// Extracted out of the event loop so the live mouse arm and the L1 seam
+/// ([`observe_focused_agent_mouse_scroll`]) exercise the same code rather than two
+/// agreeing copies. `pane_col` / `pane_row` are already pane-relative (the caller
+/// applies [`pane_relative_coords`]).
+///
+/// Forwarding is a `PaneInput`-only behaviour — it is how you drive the *agent's*
+/// pager while typing to it. In command mode the wheel must always drive our
+/// scrollback and never reach the agent's mouse protocol (PRD #341 risk row
+/// "Scroll-forwarding regression"): command mode is the safe resting state, and a
+/// wheel that leaks into a full-screen TUI there would move the ground under a
+/// user who is only reading. That is why the mode test and the `mouse_mode_enabled`
+/// test are ANDed in ONE expression instead of nesting the second inside a
+/// mode-gated arm: this is the only `forward_mouse_scroll` call site on the
+/// focused-pane path, and it is structurally unreachable unless
+/// `mode == UiMode::PaneInput`.
+fn scroll_focused_agent_pane(
+    embedded: &EmbeddedPaneController,
+    pane_id: &str,
+    mode: UiMode,
+    up: bool,
+    pane_col: u16,
+    pane_row: u16,
+) {
+    if mode == UiMode::PaneInput && embedded.mouse_mode_enabled(pane_id) {
+        let _ = embedded.forward_mouse_scroll(pane_id, up, pane_col, pane_row);
+    } else {
+        scroll_focused_pane_scrollback(embedded, pane_id, up);
+    }
+}
+
+/// PRD #341 M5 — the keyboard door to the focused-pane scroll operation. Returns
+/// `true` when `key` was claimed (so the caller must not fall through to the
+/// per-mode handler).
+///
+/// Resolution goes through [`KeybindingConfig`] alone: there is no hardcoded
+/// `KeyCode::PageUp` / `PageDown` match anywhere on this path, so remapping
+/// `scroll_pane_up` / `scroll_pane_down` in `[dashboard]` both enables the new
+/// chord and retires the default — the property `mode/scroll/002` pins.
+///
+/// Command mode only. In `PaneInput` PageUp/PageDown belong to the agent
+/// (`keyevent_to_bytes` forwards them as `ESC [ 5 ~` / `ESC [ 6 ~`), and claiming
+/// them here would steal a pager key from every child app.
+///
+/// A claimed key with no focused embedded pane is a silent no-op, matching every
+/// other bound-but-inapplicable command in the deck.
+fn handle_focused_pane_scroll_key(
+    kb: &KeybindingConfig,
+    mode: UiMode,
+    key: &KeyEvent,
+    pane: &dyn PaneController,
+) -> bool {
+    if mode != UiMode::Normal {
+        return false;
+    }
+    let up = if kb.matches(KbAction::ScrollPaneUp, key) {
+        true
+    } else if kb.matches(KbAction::ScrollPaneDown, key) {
+        false
+    } else {
+        return false;
+    };
+    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+        && let Some(pane_id) = embedded.focused_pane_id()
+    {
+        scroll_focused_pane_scrollback(embedded, &pane_id, up);
+    }
+    true
+}
+
 /// Convert screen-absolute mouse coordinates to pane-relative coordinates.
 /// Returns (col, row) relative to the pane's inner area (inside border).
 fn pane_relative_coords(screen_col: u16, screen_row: u16, pane_rect: &Option<Rect>) -> (u16, u16) {
@@ -12907,6 +15770,30 @@ fn grid_columns(width: u16) -> usize {
     }
 }
 
+/// PRD #341 M4 — the selected card's border accent, de-emphasised when the
+/// keyboard is NOT driving the deck.
+///
+/// Selection deliberately survives the mode switch (it is where `Ctrl+D` sends
+/// you back to), so before this the deck looked equally live in both modes — on
+/// the Dashboard the pane overlay sits off to the right and the deck is where the
+/// user's eyes already are, which made it the weakest tab for mode signalling.
+///
+/// The colour is [`palette::SELECTED`] in both modes and the `▸ ` title marker
+/// stays in both (Decision 5: the user must still be able to tell WHAT is
+/// selected while typing). Only the accent's weight moves: command mode keeps
+/// today's full-strength BOLD, `PaneInput` drops BOLD **and** adds
+/// `Modifier::DIM`. Two channels rather than one because DIM is not honoured by
+/// every terminal — where it is ignored, the missing BOLD still reads as
+/// de-emphasised.
+fn selected_card_border_style(mode: UiMode) -> Style {
+    let base = Style::default().fg(palette::SELECTED);
+    if mode == UiMode::PaneInput {
+        base.add_modifier(Modifier::DIM)
+    } else {
+        base.add_modifier(Modifier::BOLD)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_session_card(
     frame: &mut Frame,
@@ -12918,6 +15805,9 @@ fn render_session_card(
     card_number: Option<u8>,
     density: CardDensity,
     idle_art: Option<&IdleArtEntry>,
+    // PRD #341 M4: which mode the deck is being rendered in. Only the selected
+    // card's accent reads it (see `selected_card_border_style`).
+    mode: UiMode,
 ) {
     let is_placeholder = session.agent_type == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
@@ -12995,11 +15885,11 @@ fn render_session_card(
 
     let border_style = if is_selected {
         // PRD #155 Option A: selection uses the dedicated `selected` accent role
-        // (Magenta + BOLD, paired with the `▸ ` title marker above) — distinct
-        // from every status color and from the focused-pane cyan.
-        Style::default()
-            .fg(palette::SELECTED)
-            .add_modifier(Modifier::BOLD)
+        // (Magenta, paired with the `▸ ` title marker above) — distinct from
+        // every status color and from the focused-pane cyan. PRD #341 M4: its
+        // WEIGHT now tracks the mode, so the deck looks live exactly when the
+        // keyboard is driving it.
+        selected_card_border_style(mode)
     } else if is_placeholder {
         // Placeholder ("No agent") cards read as secondary: dim the terminal's
         // own foreground (matching the prior DarkGray intent) so the empty slot
@@ -13009,7 +15899,22 @@ fn render_session_card(
         Style::default().fg(status_color)
     };
 
-    let block = Block::default()
+    // PRD #339: `Last` / `Tools` ride the bottom border instead of a content
+    // row. Border cells are paid for by `Borders::ALL` either way, so the
+    // counters cost zero rows and card height stops depending on card width.
+    // Bottom-RIGHT mirrors the top-right status badge: volatile live state hugs
+    // the right edge while `Dir:` / `Prmt:` / tool lines own the left rail.
+    //
+    // The border reads `Last: 2m`, not `Last: 2m ago` — four columns of suffix
+    // are expensive there, and the `Last:` label already says "time since".
+    let elapsed = format_elapsed(session.last_activity);
+    let stats_title = card_stats_border_label(
+        area.width.saturating_sub(2),
+        &elapsed,
+        session.tool_count as usize,
+    );
+
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(Line::from(title_spans))
@@ -13018,6 +15923,13 @@ fn render_session_card(
             Line::from(Span::styled(status_text, status_style))
                 .alignment(ratatui::layout::Alignment::Right),
         );
+    // Omitted entirely when even the shortest form would overrun the corners.
+    if let Some(stats) = stats_title {
+        block = block.title_bottom(
+            Line::from(Span::styled(stats, text_primary()))
+                .alignment(ratatui::layout::Alignment::Right),
+        );
+    }
 
     // PRD #13 Option A: selection is cued by the `▸ ` title prefix and the
     // Magenta+BOLD border above (the `selected` palette accent, PRD #155) — no
@@ -13029,7 +15941,6 @@ fn render_session_card(
     frame.render_widget(block, area);
 
     let w = inner.width as usize;
-    let wide = w >= 60;
 
     let cwd_display = session
         .cwd
@@ -13038,37 +15949,19 @@ fn render_session_card(
         .map(|n| n.to_string_lossy())
         .unwrap_or_else(|| "—".into());
 
-    let elapsed = format_elapsed(session.last_activity);
-
     let mut lines: Vec<Line<'_>> = Vec::new();
 
-    if wide {
-        let right_spans = vec![
-            Span::styled("Last: ", text_primary()),
-            Span::raw(format!("{}  ", elapsed)),
-            Span::styled("Tools: ", text_primary()),
-            Span::raw(session.tool_count.to_string()),
-        ];
-        let right_len: usize = right_spans.iter().map(|s| s.width()).sum();
-        let dir_label_len = 6; // "Dir:  "
-        let max_dir = w.saturating_sub(right_len + dir_label_len + 1);
-
-        let dir_display = truncate_with_ellipsis(cwd_display.as_ref(), max_dir);
-
-        lines.push(padded_line(
-            vec![
-                Span::styled("Dir:  ", text_primary()),
-                Span::raw(dir_display),
-            ],
-            right_spans,
-            w,
-        ));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("Dir:  ", text_primary()),
-            Span::raw(cwd_display),
-        ]));
-    }
+    // PRD #339: with the counters on the border, `Dir:` gets the whole inner
+    // width at every card width — one un-branched form, always ellipsized (the
+    // old narrow branch bare-clipped the path with no `…`).
+    let dir_label_len = 6; // "Dir:  "
+    lines.push(Line::from(vec![
+        Span::styled("Dir:  ", text_primary()),
+        Span::raw(truncate_with_ellipsis(
+            cwd_display.as_ref(),
+            w.saturating_sub(dir_label_len),
+        )),
+    ]));
 
     if is_placeholder {
         lines.push(Line::from(Span::styled(
@@ -13086,15 +15979,6 @@ fn render_session_card(
                 Span::raw(display),
             ]));
         }
-    }
-
-    if !wide {
-        lines.push(Line::from(vec![
-            Span::styled("Last: ", text_primary()),
-            Span::raw(format!("{}  ", elapsed)),
-            Span::styled("Tools: ", text_primary()),
-            Span::raw(session.tool_count.to_string()),
-        ]));
     }
 
     if density != CardDensity::Compact {
@@ -13123,21 +16007,6 @@ fn render_session_card(
         let art_widget = Paragraph::new(art_lines);
         frame.render_widget(art_widget, inner);
     }
-}
-
-/// Build a single line with left-aligned and right-aligned span groups,
-/// padded with spaces to fill `width`.
-fn padded_line<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Line<'a> {
-    let left_len: usize = left.iter().map(|s| s.width()).sum();
-    let right_len: usize = right.iter().map(|s| s.width()).sum();
-    let gap = width.saturating_sub(left_len + right_len);
-
-    let mut spans = left;
-    if gap > 0 {
-        spans.push(Span::raw(" ".repeat(gap)));
-    }
-    spans.extend(right);
-    Line::from(spans)
 }
 
 fn flash_dot(status: &SessionStatus, tick: u64) -> &'static str {
@@ -13217,28 +16086,34 @@ fn status_style(status: &SessionStatus) -> (&str, Style) {
     }
 }
 
+/// Time since `last_activity` in the compact form the card's bottom border
+/// renders (PRD #339): `0s`, `3s`, `1m 30s`, `1m`, `1h 5m`, `1h`.
+///
+/// No ` ago` suffix — four columns of it are expensive on a border, and the
+/// `Last:` label already says "time since". [`render_session_card`] is the only
+/// caller, so there is one form and one function.
 fn format_elapsed(last_activity: DateTime<Utc>) -> String {
     let now = Utc::now();
     let delta = now.signed_duration_since(last_activity);
     let total_secs = delta.num_seconds().max(0);
 
     if total_secs < 60 {
-        format!("{}s ago", total_secs)
+        format!("{}s", total_secs)
     } else if total_secs < 3600 {
         let mins = total_secs / 60;
         let secs = total_secs % 60;
         if secs == 0 {
-            format!("{}m ago", mins)
+            format!("{}m", mins)
         } else {
-            format!("{}m {}s ago", mins, secs)
+            format!("{}m {}s", mins, secs)
         }
     } else {
         let hours = total_secs / 3600;
         let mins = (total_secs % 3600) / 60;
         if mins == 0 {
-            format!("{}h ago", hours)
+            format!("{}h", hours)
         } else {
-            format!("{}h {}m ago", hours, mins)
+            format!("{}h {}m", hours, mins)
         }
     }
 }
@@ -13432,14 +16307,14 @@ impl From<CardDensityKind> for CardDensity {
 }
 
 impl CardDensityKind {
-    /// Rendered card height in rows at this density. `wide = true`
-    /// matches the in-process layout's "card is wide enough to show
-    /// the stats row inline" branch; the L1 snapshot test uses this
-    /// to size its `TestBackend` rather than hardcoding the value
-    /// (M2.1 reviewer S3).
+    /// Rendered card height in rows at this density. The L1 snapshot
+    /// tests use this to size their `TestBackend` rather than
+    /// hardcoding the value (M2.1 reviewer S3). Since PRD #339 the
+    /// height depends on density alone — card width no longer enters
+    /// the calculation.
     #[doc(hidden)]
-    pub fn rendered_height(self, wide: bool) -> u16 {
-        CardDensity::from(self).card_height(wide)
+    pub fn rendered_height(self) -> u16 {
+        CardDensity::from(self).card_height()
     }
 }
 
@@ -13534,6 +16409,26 @@ pub fn render_quit_confirm_to_buffer(
     })
 }
 
+/// PRD #241 M3 (L1 `prompt/close-confirm/001`): render the close confirmation
+/// into a standalone Buffer through the SAME `render_close_confirm` the live
+/// modal draws, so the snapshot and the running dialog cannot drift.
+///
+/// `state.scope` selects the target-aware copy exactly as it does live: a
+/// `CloseConfirmState` with the default [`CloseScope::Pane`] renders the
+/// single-pane wording, and one carrying [`CloseScope::Tab`] renders the
+/// whole-tab wording. Production never picks the scope by hand — see
+/// [`resolve_close_plan`] — so a test that wants the tab copy should set the
+/// field, not assume it.
+pub fn render_close_confirm_to_buffer(
+    state: &CloseConfirmState,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        render_close_confirm(frame, state);
+    })
+}
+
 /// L1 test seam: render `render_stop_confirm` into a standalone Buffer.
 /// See `render_stats_bar_to_buffer` for the rationale.
 #[doc(hidden)]
@@ -13580,6 +16475,12 @@ pub fn render_config_gen_prompt_to_buffer(
 /// `dashboard/pane/004`. The `selected` flag drives the renderer's
 /// selection-highlight path so tests can pin the highlight styling
 /// (PRD #13 `theme/guard/001`).
+///
+/// PRD #341 M4: the selection accent is now mode-dependent, so this seam is the
+/// explicit **command-mode (`UiMode::Normal`) compatibility baseline** — the
+/// full-strength Magenta+BOLD+`▸ ` rendering, byte-for-byte what it produced
+/// before the mode became an input. Use [`render_card_for_mode_to_buffer`] to
+/// vary the mode.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_card_to_buffer(
@@ -13589,6 +16490,40 @@ pub fn render_card_to_buffer(
     density: CardDensityKind,
     tick: u64,
     selected: bool,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    render_card_for_mode_to_buffer(
+        session,
+        display_name,
+        card_number,
+        density,
+        tick,
+        selected,
+        UiMode::Normal,
+        width,
+        height,
+    )
+}
+
+/// PRD #341 M4 L1 seam: render exactly one session card **as the running deck
+/// draws it in `mode`**.
+///
+/// Routes through the same private `render_session_card` the live Dashboard calls
+/// (`render_dashboard`, which passes `ui.mode`), so an assertion made here is an
+/// assertion about what the user actually sees. `mode` is the ONLY input
+/// [`render_card_to_buffer`] does not expose; that seam is this one pinned to
+/// `UiMode::Normal`.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn render_card_for_mode_to_buffer(
+    session: &SessionState,
+    display_name: Option<&str>,
+    card_number: Option<u8>,
+    density: CardDensityKind,
+    tick: u64,
+    selected: bool,
+    mode: UiMode,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -13616,6 +16551,7 @@ pub fn render_card_to_buffer(
                 card_number,
                 density.into(),
                 None,
+                mode,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -13629,6 +16565,10 @@ pub fn render_card_to_buffer(
 /// the derived index (see `sync_and_derive_selection`). PRD #113: `selected`
 /// is now `Option<usize>` — `Some(i)` paints the highlight on card `i`, `None`
 /// (an inactive selection) paints no highlight at all.
+///
+/// PRD #341 M4: like [`render_card_to_buffer`], this is the command-mode
+/// (`UiMode::Normal`) baseline — the full-strength selection accent. The
+/// mode-varying single-card seam is [`render_card_for_mode_to_buffer`].
 #[doc(hidden)]
 pub fn render_dashboard_cards_to_buffer(
     cards: &[(&SessionState, Option<&str>)],
@@ -13640,11 +16580,7 @@ pub fn render_dashboard_cards_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    // `render_session_card` computes `wide` from the inner width (full
-    // width minus the two border columns); mirror that so the card height
-    // we size the buffer with matches what the renderer actually draws.
-    let wide = (width as usize).saturating_sub(2) >= 60;
-    let card_height = density.rendered_height(wide);
+    let card_height = density.rendered_height();
     let height = card_height.saturating_mul(cards.len() as u16).max(1);
 
     let backend = TestBackend::new(width, height);
@@ -13680,6 +16616,7 @@ pub fn render_dashboard_cards_to_buffer(
                     card_number,
                     card_density,
                     None,
+                    UiMode::Normal,
                 );
             }
         })
@@ -13749,6 +16686,631 @@ pub fn render_button_bar_with_bindings_to_buffer(
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
+}
+
+/// PRD #241 M4 (review F2a / T2) L1 seam: render the bottom bar **as the running
+/// app draws it in `mode`**.
+///
+/// This is [`render_bottom_bar`] itself — the function `render_frame` calls on
+/// every frame — with nothing but `UiState::mode` varied, so an assertion made
+/// here is an assertion about what the user actually sees. That distinction is
+/// the point of the seam: `render_hints_bar_for_mode_to_buffer` renders a string
+/// the live UI never draws, so a mode-awareness test written against it can pass
+/// while the running bar still offers `[Close Ctrl+W]` in a mode where the chord
+/// does nothing.
+///
+/// In command mode expect `[Back to Pane Ctrl+D]` and an enabled `[Close
+/// Ctrl+W]`; in `PaneInput` expect the single `[Command Mode Ctrl+D]`
+/// affordance; in any other mode the wide bar renders with `[Close Ctrl+W]`
+/// dimmed and inert.
+pub fn render_button_bar_for_mode_to_buffer(
+    keybindings: &KeybindingConfig,
+    mode: UiMode,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
+    ui.mode = mode;
+    terminal
+        .draw(|frame| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            render_bottom_bar(frame, &mut ui, area, true, &ctx_buttons);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #341 M1 L1 seam: render ONE focused embedded pane through the real
+/// [`render_terminal_panes`] path in `mode`, and report where — if anywhere —
+/// the completed frame asked the terminal to put its hardware cursor.
+///
+/// This is a `*_to_position` rather than a `*_to_buffer` seam because
+/// `Frame::set_cursor_position` writes no buffer cell: it is the frame's
+/// out-of-band request, and on ratatui 0.30 `CompletedFrame` does not expose it
+/// either. `TestBackend` does — `Terminal::apply_buffer_with_cursor` calls
+/// `show_cursor` + `set_cursor_position` for a frame that asked and
+/// `hide_cursor` for one that did not — so `cursor_visible()` is the exact
+/// question M1 cares about: does a real cursor appear in this mode at all?
+///
+/// Returns `Some(position)` when the frame requested a cursor, `None` when it
+/// left it hidden. Mirrors the placement/naming of the `*_to_buffer` seams above.
+#[doc(hidden)]
+pub fn render_focused_pane_cursor_for_mode_to_position(
+    mode: UiMode,
+) -> Option<ratatui::layout::Position> {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    // The pane fills the frame, so its inner area is exactly the PTY screen —
+    // the PRD #84 invariant-3 contract `contract_guaranteed(true)` attests.
+    const SCREEN_ROWS: u16 = 6;
+    const SCREEN_COLS: u16 = 20;
+    const PANE_ID: &str = "1";
+
+    // A screen that has printed something, so the vt100 cursor sits at a real
+    // cell inside the inner area rather than on a parked / hidden one.
+    let ctrl = EmbeddedPaneController::for_render_seam_with_focused_pane(
+        PANE_ID,
+        SCREEN_ROWS,
+        SCREEN_COLS,
+        b"hi",
+    );
+    let backend = TestBackend::new(SCREEN_COLS + 2, SCREEN_ROWS + 2);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            render_terminal_panes(
+                frame,
+                Some(&ctrl),
+                area,
+                &[PANE_ID.to_string()],
+                PaneLayout::Stacked,
+                &HashMap::new(),
+                &HashMap::new(),
+                &None,
+                Some(PANE_ID),
+                // The one input the seam varies: exactly what `render_frame`
+                // passes (`ui.mode`).
+                mode,
+                // PRD #341 M3: irrelevant to the cursor question — the banner
+                // never draws a cursor — so pin the state a pane that has never
+                // been in command mode carries.
+                CommandBannerVisibility::Hidden,
+                None,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+
+    let backend = terminal.backend();
+    backend.cursor_visible().then(|| backend.cursor_position())
+}
+
+/// PRD #341 M3 L1 seam: render ONE embedded pane through the real
+/// [`render_terminal_panes`] path with `content` already on its screen, and hand
+/// back the completed buffer.
+///
+/// The three gating inputs are all explicit and all independent, which is the
+/// point of the seam:
+///
+/// * `mode` — the live `UiState::mode`. Command mode dims; `PaneInput` does not.
+/// * `focused` — is this THE focused pane? Decision 4 scopes the dimming and the
+///   banner to the focused pane only, never every pane.
+/// * `visibility` — the banner's decay state. It gates the BANNER only; the
+///   dimming ignores it entirely.
+///
+/// Passing `Expanded` with `PaneInput`, or with `focused = false`, is therefore a
+/// meaningful thing to ask for: both must still come back undimmed and
+/// bannerless. A seam that folded the three into one flag could not express the
+/// question.
+///
+/// The pane fills the buffer, so its inner area is exactly `width - 2` by
+/// `height - 2` — the same inner area [`command_banner_tier`] is asked about.
+#[doc(hidden)]
+pub fn render_command_banner_pane_to_buffer(
+    mode: UiMode,
+    focused: bool,
+    visibility: CommandBannerVisibility,
+    content: &[u8],
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    const PANE_ID: &str = "1";
+    // `render_terminal_panes` resolves the focused pane as
+    // `visual_focus_id.or_else(|| ctrl.focused_pane_id())`, and the seam's
+    // controller focuses its only pane. Naming an id no pane carries is how the
+    // seam asks for "this pane is NOT the focused one" without the fallback
+    // quietly focusing it anyway.
+    const NO_PANE: &str = "\u{0}unfocused";
+
+    // The pane fills the buffer, so the inner area is `width - 2` by `height - 2`
+    // — but `width`/`height` are caller-controlled and this is a `pub` entry point
+    // of the release library, so a 1x1 or 2x2 area would derive a 0-row / 0-col
+    // parser, and vt100 panics indexing an empty grid on the first byte. Floor each
+    // derived axis at 1; the controller seam then runs the same value through
+    // `parser_init_dims`, so no seam can build a degenerate parser.
+    let rows = height.saturating_sub(2).max(1);
+    let cols = width.saturating_sub(2).max(1);
+    let ctrl =
+        EmbeddedPaneController::for_render_seam_with_focused_pane(PANE_ID, rows, cols, content);
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            render_terminal_panes(
+                frame,
+                Some(&ctrl),
+                area,
+                &[PANE_ID.to_string()],
+                PaneLayout::Stacked,
+                &HashMap::new(),
+                &HashMap::new(),
+                &None,
+                Some(if focused { PANE_ID } else { NO_PANE }),
+                mode,
+                visibility,
+                None,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #341 M5 — what one scroll input did to the focused agent pane: where our
+/// own scrollback stood before and after, and every byte the pane queued for the
+/// child while handling it.
+///
+/// The two numbers and the byte log are the whole M5 contract. "Command mode
+/// scrolls our scrollback" is `scrollback_after != scrollback_before`; "command
+/// mode never reaches the agent's mouse protocol" is `forwarded_bytes.is_empty()`.
+/// Recording the bytes rather than asserting on a flag is deliberate — a flag can
+/// be right while the write still happens.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FocusedPaneScrollObservation {
+    /// Our vt100 scrollback offset before the input (0 = live output).
+    pub scrollback_before: usize,
+    /// Our vt100 scrollback offset after the input.
+    pub scrollback_after: usize,
+    /// Every byte the pane queued for the child, flattened in order. Empty means
+    /// the agent saw nothing at all.
+    pub forwarded_bytes: Vec<u8>,
+}
+
+/// Rows/cols and history for the M5 scroll seams. The screen is small and the
+/// history generous so a 3-line scroll always has somewhere to go — vt100 clamps
+/// the offset to the real scrollback size, so a short history would make a
+/// correctly-scrolling path look like a no-op.
+const SCROLL_SEAM_ROWS: u16 = 6;
+const SCROLL_SEAM_COLS: u16 = 20;
+const SCROLL_SEAM_HISTORY_LINES: usize = 60;
+const SCROLL_SEAM_PANE_ID: &str = "1";
+
+/// The scrolled-off output every scroll-seam pane starts with.
+fn scroll_seam_history() -> String {
+    (0..SCROLL_SEAM_HISTORY_LINES)
+        .map(|i| format!("line {i}\r\n"))
+        .collect()
+}
+
+/// Build the M5 seam's focused pane: a real vt100 parser carrying
+/// [`SCROLL_SEAM_HISTORY_LINES`] of scrolled-off output, parked at
+/// `initial_scrollback`, plus the recorder standing in for the child.
+fn scroll_seam_pane(
+    mouse_mode_enabled: bool,
+    initial_scrollback: usize,
+) -> (
+    EmbeddedPaneController,
+    crate::embedded_pane::SeamChildInput,
+    usize,
+) {
+    let history = scroll_seam_history();
+    let (ctrl, mut child_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
+        SCROLL_SEAM_PANE_ID,
+        SCROLL_SEAM_ROWS,
+        SCROLL_SEAM_COLS,
+        history.as_bytes(),
+        mouse_mode_enabled,
+    );
+    // Park the view where the caller wants it, through the production scroll
+    // primitive, then discard anything the setup itself queued so the observation
+    // only covers the input under test.
+    ctrl.reset_scrollback(SCROLL_SEAM_PANE_ID);
+    if initial_scrollback > 0 {
+        ctrl.scroll_pane(SCROLL_SEAM_PANE_ID, initial_scrollback as isize);
+    }
+    let _ = child_input.drain_bytes();
+    let before = scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID);
+    assert_eq!(
+        before, initial_scrollback,
+        "the seam's pane must hold enough history to park at initial_scrollback"
+    );
+    (ctrl, child_input, before)
+}
+
+/// A seam pane's current vt100 scrollback offset (0 = live output).
+fn scroll_seam_scrollback(ctrl: &EmbeddedPaneController, pane_id: &str) -> usize {
+    ctrl.get_screen(pane_id)
+        .and_then(|screen| screen.lock().ok().map(|p| p.screen().scrollback()))
+        .expect("the seam's panes always have a screen")
+}
+
+/// PRD #341 M5 L1 seam: send ONE wheel event over the focused agent pane and
+/// report what it did.
+///
+/// Drives [`scroll_focused_agent_pane`] — the exact function the live mouse arm
+/// calls, and the only place the forward-or-scroll decision is made — so the four
+/// `(mode, mouse_mode_enabled)` cells this seam sweeps are the four the running app
+/// takes. `pane_col` / `pane_row` are pane-relative, as they are at the live call
+/// site (which applies [`pane_relative_coords`] first).
+#[doc(hidden)]
+pub fn observe_focused_agent_mouse_scroll(
+    mode: UiMode,
+    mouse_mode_enabled: bool,
+    up: bool,
+    initial_scrollback: usize,
+    pane_col: u16,
+    pane_row: u16,
+) -> FocusedPaneScrollObservation {
+    let (ctrl, mut child_input, scrollback_before) =
+        scroll_seam_pane(mouse_mode_enabled, initial_scrollback);
+
+    scroll_focused_agent_pane(&ctrl, SCROLL_SEAM_PANE_ID, mode, up, pane_col, pane_row);
+
+    FocusedPaneScrollObservation {
+        scrollback_before,
+        scrollback_after: scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID),
+        forwarded_bytes: child_input.drain_bytes(),
+    }
+}
+
+/// PRD #341 M5 L1 seam: press ONE key against the focused agent pane and report
+/// what it did.
+///
+/// Drives [`handle_focused_pane_scroll_key`] — the exact function the live key
+/// dispatch calls, resolving `key` against `keybindings` with no hardcoded
+/// `KeyCode` of its own — so a remap that the app would honour is honoured here,
+/// and a default the app would have retired is retired here.
+#[doc(hidden)]
+pub fn observe_focused_agent_key_scroll(
+    keybindings: &KeybindingConfig,
+    mode: UiMode,
+    key: KeyEvent,
+    initial_scrollback: usize,
+) -> FocusedPaneScrollObservation {
+    // Child mouse reporting is irrelevant to a keystroke; leaving it ON is the
+    // stricter setup — a keyboard path that leaked into the child's mouse protocol
+    // would be caught rather than masked.
+    let (ctrl, mut child_input, scrollback_before) = scroll_seam_pane(true, initial_scrollback);
+
+    handle_focused_pane_scroll_key(keybindings, mode, &key, &ctrl);
+
+    FocusedPaneScrollObservation {
+        scrollback_before,
+        scrollback_after: scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID),
+        forwarded_bytes: child_input.drain_bytes(),
+    }
+}
+
+/// The second pane the M6 reconcile seam adds next to [`SCROLL_SEAM_PANE_ID`].
+const RECONCILE_SEAM_SECOND_PANE_ID: &str = "2";
+
+/// PRD #341 M6 — which of the reconcile seam's two panes a step acts on.
+///
+/// The seam owns the ids rather than taking `&str`, so a test cannot name a pane
+/// the fixture does not have, and "the pane focus starts on" versus "the other
+/// one" reads as such at the call site.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileSeamPane {
+    /// The pane the fixture starts with focus on.
+    First,
+    /// The other pane, unfocused until something focuses it.
+    Second,
+}
+
+/// PRD #341 M6 — where the reconcile seam's two panes were looking immediately
+/// before the frame under test, and where they were looking after it.
+///
+/// BOTH panes are reported because the reconcile resets at most the ONE pane the
+/// user is typing into: "the incoming pane snapped back" is half the claim and "the
+/// one we left alone stayed put" is the other half. The `*_before` numbers are what
+/// makes an `*_after` of 0 mean anything — without them, a pane that never scrolled
+/// reads exactly like a pane that scrolled and was correctly snapped back.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PaneInputScrollbackObservation {
+    /// [`ReconcileSeamPane::First`]'s scrollback offset just before the second
+    /// reconcile (0 = live output).
+    pub first_before: usize,
+    /// `First`'s offset after it.
+    pub first_after: usize,
+    /// [`ReconcileSeamPane::Second`]'s offset just before the second reconcile.
+    pub second_before: usize,
+    /// `Second`'s offset after it.
+    pub second_after: usize,
+}
+
+/// Resolve a seam pane to the id its fixture registered it under.
+fn reconcile_seam_pane_id(pane: ReconcileSeamPane) -> &'static str {
+    match pane {
+        ReconcileSeamPane::First => SCROLL_SEAM_PANE_ID,
+        ReconcileSeamPane::Second => RECONCILE_SEAM_SECOND_PANE_ID,
+    }
+}
+
+/// Move focus through the production [`PaneController::focus_pane`] — the same call
+/// `Action::Focus` makes — so the seam cannot focus a pane in a way the app never
+/// would (e.g. leaving two panes focused, which would make
+/// `focused_pane_id`'s answer arbitrary).
+fn focus_reconcile_seam_pane(ctrl: &EmbeddedPaneController, pane: ReconcileSeamPane) {
+    ctrl.focus_pane(reconcile_seam_pane_id(pane))
+        .expect("the reconcile seam registers both of its panes");
+}
+
+/// PRD #341 M6 L1 seam: run [`reconcile_pane_input_scrollback`] over TWO
+/// consecutive frames and report what the second one did to the panes' scrollback.
+///
+/// The reconcile is a per-frame edge detector on the `(mode, focused pane)` pair, so
+/// a single call can answer nothing: every question M6 asks is about what THIS frame
+/// does given what the previous one recorded. Hence the shape —
+///
+/// 1. `first_mode` / `first_focus` establish the remembered target by running a real
+///    reconcile — not by writing `UiState::last_pane_input_target` by hand, which
+///    would let the seam disagree with the app about what a frame records.
+/// 2. `scroll_between` then optionally parks one pane `n` lines back in history,
+///    which is exactly when a user scrolls: while the previous frame's mode is still
+///    in force.
+/// 3. `second_mode` / `second_focus` are the frame under test. A `second_focus` that
+///    differs from `first_focus` moves focus the way the app does, so "focus walked
+///    onto a pane someone left scrolled" is expressible without ever leaving
+///    `PaneInput`.
+/// 4. The reconcile runs again and both panes' offsets come back.
+///
+/// The seam calls the real `reconcile_pane_input_scrollback` twice and holds NO copy
+/// of its comparison rule — so if what counts as "the user just started typing here"
+/// changes, what this seam reports changes with it.
+#[doc(hidden)]
+pub fn observe_pane_input_scrollback_reconcile(
+    first_mode: UiMode,
+    first_focus: ReconcileSeamPane,
+    scroll_between: Option<(ReconcileSeamPane, usize)>,
+    second_mode: UiMode,
+    second_focus: ReconcileSeamPane,
+) -> PaneInputScrollbackObservation {
+    // Pane one is the M5 fixture verbatim — same history, same inert backend, parked
+    // at live output. Pane two is the same fixture pane, added unfocused.
+    let (ctrl, _first_child_input, _) = scroll_seam_pane(false, 0);
+    let _second_child_input = ctrl.add_scroll_seam_pane(
+        RECONCILE_SEAM_SECOND_PANE_ID,
+        SCROLL_SEAM_ROWS,
+        SCROLL_SEAM_COLS,
+        scroll_seam_history().as_bytes(),
+    );
+
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+
+    focus_reconcile_seam_pane(&ctrl, first_focus);
+    ui.mode = first_mode;
+    reconcile_pane_input_scrollback(&mut ui, &ctrl);
+
+    if let Some((pane, lines)) = scroll_between {
+        let pane_id = reconcile_seam_pane_id(pane);
+        ctrl.scroll_pane(pane_id, lines as isize);
+        assert_eq!(
+            scroll_seam_scrollback(&ctrl, pane_id),
+            lines,
+            "the seam's panes must hold enough history to park at scroll_between"
+        );
+    }
+
+    focus_reconcile_seam_pane(&ctrl, second_focus);
+    let first_before = scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID);
+    let second_before = scroll_seam_scrollback(&ctrl, RECONCILE_SEAM_SECOND_PANE_ID);
+
+    ui.mode = second_mode;
+    reconcile_pane_input_scrollback(&mut ui, &ctrl);
+
+    PaneInputScrollbackObservation {
+        first_before,
+        first_after: scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID),
+        second_before,
+        second_after: scroll_seam_scrollback(&ctrl, RECONCILE_SEAM_SECOND_PANE_ID),
+    }
+}
+
+/// PRD #341 (code-review finding 3) — what two consecutive frames did to the mode
+/// and the banner while nothing at all was focused.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PaneInputFocusLossObservation {
+    /// `ui.mode` after the first frame's reconcile.
+    pub mode_after_first_frame: UiMode,
+    /// The banner that first frame renders — the transition into command mode has
+    /// to arm it, or the drop out of `PaneInput` would be silent.
+    pub banner_after_first_frame: CommandBannerVisibility,
+    /// `ui.mode` after a SECOND frame with nothing focused still. Reported because
+    /// "the reconcile and the mode do not fight across frames" is a claim about the
+    /// steady state, not about one frame.
+    pub mode_after_second_frame: UiMode,
+    /// The banner that second frame renders, at the caller's `second_frame_at`.
+    ///
+    /// This is the load-bearing half of the no-fight claim, and why the seam takes
+    /// the two instants: ask about a second frame one TTL later and a state that had
+    /// truly settled reports [`CommandBannerVisibility::Collapsed`], while one
+    /// re-entering command mode every frame would re-stamp its entry instant and
+    /// report `Expanded` forever.
+    pub banner_after_second_frame: CommandBannerVisibility,
+}
+
+/// PRD #341 (code-review finding 3) L1 seam: run the per-frame reconcile against a
+/// controller with NO focused pane, twice, and report the mode and banner each
+/// frame settled on.
+///
+/// Drives the production [`reconcile_pane_input_scrollback`] and
+/// [`observe_command_mode_edge`] in the order the main loop runs them (the
+/// reconcile happens before `render_frame`), so what comes back is what the running
+/// app would do with a focus that vanished under it.
+///
+/// The two frame instants are injected, as everywhere else in this state machine,
+/// so a caller can put the second frame a whole [`COMMAND_BANNER_TTL`] later
+/// without sleeping — see [`PaneInputFocusLossObservation::banner_after_second_frame`].
+#[doc(hidden)]
+pub fn observe_pane_input_without_focused_pane(
+    initial_mode: UiMode,
+    first_frame_at: std::time::Instant,
+    second_frame_at: std::time::Instant,
+) -> PaneInputFocusLossObservation {
+    let ctrl = EmbeddedPaneController::for_render_seam_without_panes();
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    ui.mode = initial_mode;
+    // The pane the user WAS typing into before it vanished: without it the first
+    // frame's reconcile would have nothing to forget, and "the target is cleared"
+    // would pass for a state that never had one.
+    ui.last_pane_input_target = Some("vanished".to_string());
+
+    let frame = |ui: &mut UiState, at: std::time::Instant| {
+        reconcile_pane_input_scrollback(ui, &ctrl);
+        observe_command_mode_edge(ui, at);
+        (ui.mode, ui.command_banner.visibility(at))
+    };
+    let (mode_after_first_frame, banner_after_first_frame) = frame(&mut ui, first_frame_at);
+    let (mode_after_second_frame, banner_after_second_frame) = frame(&mut ui, second_frame_at);
+
+    PaneInputFocusLossObservation {
+        mode_after_first_frame,
+        banner_after_first_frame,
+        mode_after_second_frame,
+        banner_after_second_frame,
+    }
+}
+
+/// PRD #341 M3 (code-review finding 1) — what ONE drained input burst did to the
+/// command banner.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CommandBannerBurstObservation {
+    /// `ui.mode` after each key, in the order the keys were pressed — one entry
+    /// per key. This is how a test proves the burst really took the round trip it
+    /// meant to (`Normal → PaneInput → Normal`) instead of asserting on a banner
+    /// state produced by keys that went somewhere else entirely.
+    pub modes: Vec<UiMode>,
+    /// What the frame immediately BEFORE the burst rendered. A drain always
+    /// follows a render, and in command mode that render is what arms the banner,
+    /// so this is the state the first key acts on.
+    pub visibility_before: CommandBannerVisibility,
+    /// What the FIRST frame after the whole burst renders.
+    ///
+    /// Nothing in between is reported, deliberately: the defect's precondition is
+    /// that NO frame runs between the events, so asking mid-burst would insert the
+    /// very render whose absence is the bug — and `visibility` latches the TTL
+    /// collapse, so the question is not even free of side effects. Two readings,
+    /// at the two moments the user actually sees something.
+    pub visibility_after: CommandBannerVisibility,
+}
+
+/// The inert pane the burst seam's controller holds focus on.
+const BURST_SEAM_PANE_ID: &str = "1";
+
+/// PRD #341 M3 L1 seam: press a whole burst of keys with NO frame in between —
+/// the input drain's real behaviour — and report what the next frame would show.
+///
+/// Drives the production [`handle_key_event`] once per key, which is the whole
+/// point: that function owns the ordering finding 1 was about (observe the mode
+/// edge → capture the mode typed in → resolve → feed the banner → dispatch), and
+/// the seam adds nothing but the loop. Key resolution is the app's own
+/// (`global_action_for_mode` and friends, from the caller's `keybindings`), the
+/// mode changes are the app's own (`dispatch_action`), and the banner is fed by the
+/// app's own [`command_banner_key_signal`]. The original defect survived a test
+/// that fed [`CommandBannerSignal`]s straight into the state machine precisely
+/// because that skipped every one of those steps.
+///
+/// The fixture is a Dashboard tab with one inert focused pane and an empty
+/// snapshot, which is the minimum that makes `Ctrl+D` a working round trip:
+/// `resume_pane_input_target` falls back to the controller's focused pane, so the
+/// chord re-enters `PaneInput` and the chord after it returns to command mode.
+///
+/// `now` is the real clock (one `Instant::now()` per step, as in the app). A burst
+/// completes in microseconds — orders of magnitude inside [`COMMAND_BANNER_TTL`] —
+/// so the timed decay cannot interfere; the TTL itself is covered separately
+/// against an injected clock.
+#[doc(hidden)]
+pub fn observe_command_banner_key_burst(
+    keybindings: &KeybindingConfig,
+    initial_mode: UiMode,
+    keys: &[KeyEvent],
+) -> CommandBannerBurstObservation {
+    use std::sync::Arc;
+
+    let ctrl: Arc<EmbeddedPaneController> =
+        Arc::new(EmbeddedPaneController::for_render_seam_with_focused_pane(
+            BURST_SEAM_PANE_ID,
+            SCROLL_SEAM_ROWS,
+            SCROLL_SEAM_COLS,
+            b"",
+        ));
+    let mut tab_manager = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let snapshot = AppState::default();
+    let filtered: Vec<(&String, &SessionState)> = Vec::new();
+    let frame_area = Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 24,
+    };
+
+    let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
+    ui.mode = initial_mode;
+
+    // The frame BEFORE the burst, asking the same two questions in the same order
+    // `render_frame` does. A drain always follows a render, and in command mode
+    // that render is what ARMS the banner — start from a never-armed state instead
+    // and nothing can collapse, so a round trip would come back expanded for the
+    // wrong reason and the seam would report health it never measured.
+    let opening = std::time::Instant::now();
+    observe_command_mode_edge(&mut ui, opening);
+    let visibility_before = ui.command_banner.visibility(opening);
+
+    let mut modes = Vec::with_capacity(keys.len());
+    for key in keys {
+        // No render between iterations — exactly the drain the defect needs.
+        let _ = handle_key_event(
+            *key,
+            &mut ui,
+            &*ctrl,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            frame_area,
+        );
+        modes.push(ui.mode);
+    }
+
+    // The frame that follows the burst.
+    let closing = std::time::Instant::now();
+    observe_command_mode_edge(&mut ui, closing);
+    CommandBannerBurstObservation {
+        modes,
+        visibility_before,
+        visibility_after: ui.command_banner.visibility(closing),
+    }
 }
 
 /// PRD #80 M6 L1 seam: render the filter-mode bottom row (the inline filter
@@ -13921,6 +17483,56 @@ pub fn render_new_pane_form_to_buffer(
     })
 }
 
+/// PRD #140 M4.0 L1 seam: render the new-pane form with an ORCHESTRATION
+/// selected into a `Buffer`, for a form directory of `form_cwd` and the
+/// directories `live_orchestration_cwds` that the daemon reports as already
+/// hosting a live orchestration.
+///
+/// Drives the production `render_new_pane_form` through a `TestBackend`, so the
+/// warning decision it exercises is literally the one the interactive `Ctrl+n`
+/// flow runs ([`live_orchestration_in_same_cwd`], fed there by
+/// [`live_orchestration_cwds`] instead of this parameter). A `form_cwd` present
+/// in the list renders [`SAME_CWD_ORCHESTRATION_WARNING`]; a fresh one renders
+/// the form unchanged. Either way the `[Submit]` action stays — the warning
+/// never blocks. Mirrors [`render_new_pane_form_to_buffer`].
+pub fn render_new_pane_orchestration_guard_to_buffer(
+    form_cwd: &str,
+    live_orchestration_cwds: &[&str],
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    let orchestrations = vec![OrchestrationConfig {
+        name: "tdd-cycle".to_string(),
+        roles: vec![crate::project_config::OrchestrationRoleConfig {
+            name: "orchestrator".to_string(),
+            command: "claude".to_string(),
+            start: true,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        }],
+    }];
+    let mut form = NewPaneFormState::new(
+        std::path::PathBuf::from(form_cwd),
+        "myname".to_string(),
+        "mycmd".to_string(),
+        Vec::new(),
+        orchestrations,
+    )
+    .with_live_orchestration_cwds(
+        live_orchestration_cwds
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect(),
+    );
+    // Select the single orchestration option (index 0 is "No mode"; there are no
+    // plain modes) — the state the guard applies to.
+    form.selection_index = 1;
+    render_overlay_to_buffer(width, height, |frame| {
+        render_new_pane_form(frame, &form);
+    })
+}
+
 /// PRD #170 (unify) L1 seam: render the new-pane form MODE-LOCKED to schedule
 /// authoring into a `Buffer`. `edit` picks the variant — `false` builds the Add
 /// form (` New Schedule `, no edit row), `true` builds the Edit form
@@ -13968,6 +17580,34 @@ mod tests {
 
     fn default_ui() -> UiState {
         UiState::default()
+    }
+
+    /// PRD #163 M5: the OSC 52 clipboard escape is built by one shared
+    /// function, so the bytes are identical on every platform — the Windows
+    /// backend changes only the *write target* (`CONOUT$` instead of
+    /// `/dev/tty`), never the sequence. Pin the exact framing (OSC `\x1b]`,
+    /// selector `52;c;`, base64 payload, ST `\x1b\\`) here, host-agnostically,
+    /// so a future platform branch cannot drift the wire bytes.
+    #[test]
+    fn osc52_clipboard_sequence_is_platform_independent() {
+        assert_eq!(osc52_clipboard_sequence("hi"), "\x1b]52;c;aGk=\x1b\\");
+        // Empty selection still produces a well-formed (clipboard-clearing)
+        // sequence rather than a bare prefix.
+        assert_eq!(osc52_clipboard_sequence(""), "\x1b]52;c;\x1b\\");
+        // Multi-byte UTF-8 is encoded from the raw bytes, not the chars.
+        assert_eq!(osc52_clipboard_sequence("é"), "\x1b]52;c;w6k=\x1b\\");
+
+        // Structural assertions independent of the payload: the ST terminator
+        // (not BEL) is what raw-mode terminals accept most widely.
+        let seq = osc52_clipboard_sequence("cargo test-fast\nsecond line");
+        assert!(seq.starts_with("\x1b]52;c;"), "unexpected prefix: {seq:?}");
+        assert!(seq.ends_with("\x1b\\"), "must terminate with ST: {seq:?}");
+        assert!(!seq.contains('\x07'), "must not use the BEL terminator");
+        let payload = seq
+            .strip_prefix("\x1b]52;c;")
+            .and_then(|s| s.strip_suffix("\x1b\\"))
+            .expect("sequence is prefix+payload+ST");
+        assert_eq!(payload, base64_encode(b"cargo test-fast\nsecond line"));
     }
 
     /// PRD #196: the new-pane Command-field seed resolver honors the fallback
@@ -14388,18 +18028,55 @@ mod tests {
         // one row; at 31 the third wraps to a second row.
         let widths = [10u16, 10, 10];
 
-        let (fit, rows) = layout_button_bar(&widths, 32);
+        let (fit, rows) = layout_button_bar(&widths, 32, 0);
         assert_eq!(rows, 1, "32 cols fits all three on one row");
         assert_eq!(fit[0], Rect::new(0, 0, 10, 1));
         assert_eq!(fit[1], Rect::new(11, 0, 10, 1)); // after a 1-col separator
         assert_eq!(fit[2], Rect::new(22, 0, 10, 1));
 
-        let (wrapped, rows) = layout_button_bar(&widths, 31);
+        let (wrapped, rows) = layout_button_bar(&widths, 31, 0);
         assert_eq!(rows, 2, "31 cols forces the third button onto a second row");
         assert_eq!(wrapped[2], Rect::new(0, 1, 10, 1));
 
         // Empty input occupies no rows.
-        assert_eq!(layout_button_bar(&[], 80), (Vec::new(), 0));
+        assert_eq!(layout_button_bar(&[], 80, 0), (Vec::new(), 0));
+    }
+
+    // PRD #341 M2 — the mode chip is one row tall, so only row 0 pays for it. A
+    // wrapped continuation row must reclaim the band's cells: charging every row
+    // for it cost the dashboard a content row at several widths (see
+    // `layout_button_bar`).
+    #[test]
+    fn layout_button_bar_indents_only_the_first_row() {
+        let widths = [10u16, 10, 10];
+
+        // With a 10-cell chip band, 32 cols no longer fits all three on row 0 —
+        // but the wrapped row starts at column 0, NOT at the indent.
+        let (placed, rows) = layout_button_bar(&widths, 32, 10);
+        assert_eq!(rows, 2);
+        assert_eq!(
+            placed[0],
+            Rect::new(10, 0, 10, 1),
+            "row 0 starts after the chip"
+        );
+        assert_eq!(placed[1], Rect::new(21, 0, 10, 1));
+        assert_eq!(
+            placed[2],
+            Rect::new(0, 1, 10, 1),
+            "a continuation row reclaims the chip band"
+        );
+
+        // An indent that leaves row 0 too narrow for even the first button pushes
+        // it down rather than off the right edge.
+        let (pushed, rows) = layout_button_bar(&[10u16], 15, 10);
+        assert_eq!(rows, 2);
+        assert_eq!(pushed[0], Rect::new(0, 1, 10, 1));
+
+        // A button wider than the whole bar still sits at the start of its own row
+        // (the caller clips it) — unchanged by the indent parameter.
+        let (oversized, rows) = layout_button_bar(&[40u16], 20, 0);
+        assert_eq!(rows, 1);
+        assert_eq!(oversized[0], Rect::new(0, 0, 40, 1));
     }
 
     // PRD #144 A2 — `bottom_bar_rows` must never reserve so many rows that the
@@ -14549,6 +18226,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -14562,6 +18240,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -14575,6 +18254,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -14588,6 +18268,145 @@ mod tests {
         assert_eq!(bucket.cwd, orch_cwd);
         assert_eq!(bucket.orchestration_name, "tdd-cycle");
         assert_eq!(bucket.role_slots.len(), 3);
+    }
+
+    /// Scenario: Hydrate two tabs with the same orchestration name and cwd,
+    /// giving each tab's orchestrator and coder panes a distinct shared
+    /// instance id. The tokened records must rebuild as two two-pane buckets,
+    /// while otherwise-identical legacy records without ids retain the
+    /// one-bucket fallback.
+    #[test]
+    fn partition_separates_same_name_cwd_orchestrations_by_instance_id() {
+        fn orchestration_panes(ids: [Option<&str>; 2]) -> Vec<HydratedPane> {
+            let mut panes = Vec::new();
+            for (tab_index, orchestration_id) in ids.into_iter().enumerate() {
+                for (role_index, (role_name, is_start_role)) in
+                    [("orchestrator", true), ("coder", false)]
+                        .into_iter()
+                        .enumerate()
+                {
+                    panes.push(hydrated(
+                        &format!("pane-{tab_index}-{role_name}"),
+                        &format!("agent-{tab_index}-{role_name}"),
+                        Some("/work/project"),
+                        Some(TabMembership::Orchestration {
+                            name: "tdd-cycle".into(),
+                            role_index,
+                            role_name: role_name.into(),
+                            is_start_role,
+                            orchestration_cwd: Some("/work/project".into()),
+                            display_title: None,
+                            orchestration_id: orchestration_id.map(str::to_string),
+                        }),
+                    ));
+                }
+            }
+            panes
+        }
+
+        let legacy = partition_hydrated_panes(&orchestration_panes([None, None]));
+        assert_eq!(
+            legacy.orchestration_buckets.len(),
+            1,
+            "legacy memberships without orchestration_id keep the (name, cwd) fallback"
+        );
+        assert_eq!(
+            legacy.orchestration_buckets[0].role_slots.len(),
+            4,
+            "the legacy fallback keeps all four panes in its single bucket"
+        );
+
+        let tokened = partition_hydrated_panes(&orchestration_panes([
+            Some("orch-tab-a"),
+            Some("orch-tab-b"),
+        ]));
+        assert_eq!(
+            tokened.orchestration_buckets.len(),
+            2,
+            "distinct orchestration_id values must rebuild two tabs; got {}",
+            tokened.orchestration_buckets.len()
+        );
+        assert!(
+            tokened
+                .orchestration_buckets
+                .iter()
+                .all(|bucket| bucket.role_slots.len() == 2),
+            "each rebuilt tab must retain exactly its orchestrator and coder panes: {:?}",
+            tokened
+                .orchestration_buckets
+                .iter()
+                .map(|bucket| &bucket.role_slots)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// PRD #140 review: the same-cwd guard compared raw `Path`s, so a SYMLINKED
+    /// alias of a live orchestration's directory — the same tree, the same
+    /// `.dot-agent-deck/*-{role}.md` files — silently skipped the warning. Both
+    /// sides are now canonicalised best-effort.
+    #[test]
+    fn same_cwd_guard_sees_through_a_symlinked_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("project");
+        std::fs::create_dir(&real).unwrap();
+        let alias = tmp.path().join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&real, &alias).unwrap();
+
+        let live = vec![real.to_string_lossy().into_owned()];
+        assert!(
+            live_orchestration_in_same_cwd(&real, &live),
+            "the exact same path must still warn"
+        );
+        assert!(
+            live_orchestration_in_same_cwd(&alias, &live),
+            "a symlinked alias of the live orchestration's directory is the same \
+             tree and must warn"
+        );
+        // A non-canonical spelling of the same directory (`project/../project`)
+        // is likewise the same tree.
+        assert!(
+            live_orchestration_in_same_cwd(&real.join("..").join("project"), &live),
+            "a non-canonical spelling of the live directory must warn"
+        );
+        // A genuinely different sibling directory must NOT warn — the
+        // canonicalising compare must not collapse everything under one root.
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert!(
+            !live_orchestration_in_same_cwd(&other, &live),
+            "a different directory must not warn"
+        );
+    }
+
+    /// PRD #140 review: canonicalisation is BEST-EFFORT and fails OPEN. Paths
+    /// that don't exist on this filesystem (the L1 render seam's synthetic
+    /// `/work/...` fixtures, a directory deleted between the daemon snapshot and
+    /// the form opening) must keep the raw verdict rather than panic or
+    /// false-positive.
+    #[test]
+    fn same_cwd_guard_falls_back_to_raw_compare_for_nonexistent_paths() {
+        let live = vec!["/work/already-live".to_string()];
+        assert!(live_orchestration_in_same_cwd(
+            Path::new("/work/already-live"),
+            &live
+        ));
+        // Trailing separator is the same directory as a `Path`.
+        assert!(live_orchestration_in_same_cwd(
+            Path::new("/work/already-live/"),
+            &live
+        ));
+        assert!(!live_orchestration_in_same_cwd(
+            Path::new("/work/fresh"),
+            &live
+        ));
+        // Nothing known → never a warning.
+        assert!(!live_orchestration_in_same_cwd(
+            Path::new("/work/already-live"),
+            &[]
+        ));
     }
 
     /// PRD #107 follow-up: the user-typed title persisted on each role
@@ -14610,6 +18429,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None, // leading slot omits the title
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -14623,6 +18443,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: Some("My Custom Run".into()),
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -14653,6 +18474,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/home/u/project-a".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -14666,6 +18488,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/home/u/project-b".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -14694,6 +18517,7 @@ mod tests {
                 is_start_role: true,
                 orchestration_cwd: None,
                 display_title: None,
+                orchestration_id: None,
             }),
         )];
         let p = partition_hydrated_panes(&panes);
@@ -14715,6 +18539,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -14728,6 +18553,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -14745,6 +18571,17 @@ mod tests {
             && s.pane_id == "11"
             && s.role_name.is_empty()
             && !s.is_start_role));
+    }
+
+    /// PRD #140 review: test shorthand for the LEGACY (token-less) routing
+    /// identity — the `OrchestrationIdentity` shape a pre-#140 client's
+    /// hydration bucket carries, and the one the dead-slot id namespace used to
+    /// be hard-coded to.
+    fn legacy_identity(cwd: &str, name: &str) -> crate::state::OrchestrationIdentity {
+        crate::state::OrchestrationIdentity::NameCwd {
+            name: name.to_string(),
+            cwd: cwd.to_string(),
+        }
     }
 
     // Symptom 2 (`.dot-agent-deck/agent-card-lifecycle-bugs.md`):
@@ -14773,7 +18610,12 @@ mod tests {
             Some("p-auditor".to_string()),
             None,
         ];
-        fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
+        fill_dead_slots_with_placeholders(
+            &mut slots,
+            &legacy_identity("/work", "tdd-cycle"),
+            "/work",
+            &mut state,
+        );
 
         assert!(
             slots.iter().all(Option::is_some),
@@ -14804,22 +18646,52 @@ mod tests {
 
     #[test]
     fn dead_slot_pane_id_is_deterministic_per_role() {
-        // Same (cwd, name, role_index) must produce the same id so a
+        // Same (identity, role_index) must produce the same id so a
         // reconnect doesn't keep minting fresh placeholder cards on
         // every reattach.
-        let a = dead_slot_pane_id("/work", "tdd-cycle", 4);
-        let b = dead_slot_pane_id("/work", "tdd-cycle", 4);
+        let a = dead_slot_pane_id(&legacy_identity("/work", "tdd-cycle"), 4);
+        let b = dead_slot_pane_id(&legacy_identity("/work", "tdd-cycle"), 4);
         assert_eq!(a, b);
         // Different role_index → different id.
-        let c = dead_slot_pane_id("/work", "tdd-cycle", 3);
+        let c = dead_slot_pane_id(&legacy_identity("/work", "tdd-cycle"), 3);
         assert_ne!(a, c);
         // Different orchestration → different id.
-        let d = dead_slot_pane_id("/work", "other-cycle", 4);
+        let d = dead_slot_pane_id(&legacy_identity("/work", "other-cycle"), 4);
         assert_ne!(a, d);
         // is_dead_slot_pane_id accepts the synthesized id and rejects
         // a normal numeric pane id.
         assert!(is_dead_slot_pane_id(&a));
         assert!(!is_dead_slot_pane_id("42"));
+    }
+
+    /// PRD #140 review: the dead-slot namespace must partition exactly the way
+    /// the ROUTING identity does. Two tabs of the same orchestration in the same
+    /// directory differ only by their `Instance` token, so a namespace that
+    /// dropped the token would alias their dead slots onto one placeholder card
+    /// — the collision `dead_slot_pane_id`'s own doc comment promises can't
+    /// happen.
+    #[test]
+    fn dead_slot_pane_id_is_namespaced_by_orchestration_instance() {
+        let instance = |id: &str| crate::state::OrchestrationIdentity::Instance {
+            id: id.to_string(),
+            name: "tdd-cycle".to_string(),
+        };
+        let tab_a = dead_slot_pane_id(&instance("orch-tab-a"), 4);
+        let tab_b = dead_slot_pane_id(&instance("orch-tab-b"), 4);
+        assert_ne!(
+            tab_a, tab_b,
+            "two same-(name, cwd) tabs told apart only by their instance token \
+             must mint distinct dead-slot ids"
+        );
+        // Still idempotent per identity, so a reconnect reuses the same card.
+        assert_eq!(tab_a, dead_slot_pane_id(&instance("orch-tab-a"), 4));
+        // A tokened id can never collide with a token-less one, whatever the
+        // cwd/name spelling — the two variants are different routing groups.
+        assert_ne!(
+            tab_a,
+            dead_slot_pane_id(&legacy_identity("/work", "tdd-cycle"), 4)
+        );
+        assert!(is_dead_slot_pane_id(&tab_a) && is_dead_slot_pane_id(&tab_b));
     }
 
     // Follow-up to 0d5e651 (auditor finding #4): the old format
@@ -14833,8 +18705,8 @@ mod tests {
         // Under the old `-`-separated form both inputs formatted to
         // `__dead-slot__-/a-b-c-1`. Under the length-prefixed form
         // they are guaranteed distinct.
-        let a = dead_slot_pane_id("/a", "b-c", 1);
-        let b = dead_slot_pane_id("/a-b", "c", 1);
+        let a = dead_slot_pane_id(&legacy_identity("/a", "b-c"), 1);
+        let b = dead_slot_pane_id(&legacy_identity("/a-b", "c"), 1);
         assert_ne!(
             a, b,
             "differently-hyphenated (cwd, orchestration_name) tuples \
@@ -14860,7 +18732,12 @@ mod tests {
 
         let mut state = AppState::default();
         let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
-        fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
+        fill_dead_slots_with_placeholders(
+            &mut slots,
+            &legacy_identity("/work", "tdd-cycle"),
+            "/work",
+            &mut state,
+        );
         let first_dead = slots[1].clone().unwrap();
         let placeholder_count_first = state
             .sessions
@@ -14869,7 +18746,12 @@ mod tests {
             .count();
         // Second pass — same input shape (slots are already filled,
         // so the helper short-circuits on each iteration).
-        fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
+        fill_dead_slots_with_placeholders(
+            &mut slots,
+            &legacy_identity("/work", "tdd-cycle"),
+            "/work",
+            &mut state,
+        );
         let placeholder_count_second = state
             .sessions
             .values()
@@ -14900,14 +18782,24 @@ mod tests {
 
         // First reconnect: dead role at index 1.
         let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
-        fill_dead_slots_with_placeholders(&mut slots, cwd, orchestration_name, &mut state);
+        fill_dead_slots_with_placeholders(
+            &mut slots,
+            &legacy_identity(cwd, orchestration_name),
+            cwd,
+            &mut state,
+        );
         let first_dead = slots[1].clone().unwrap();
 
         // Second reconnect: hydration rebuilt `role_pane_ids` from
         // scratch — the dead role's slot is `None` again. Run the
         // helper a second time.
         let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
-        fill_dead_slots_with_placeholders(&mut slots, cwd, orchestration_name, &mut state);
+        fill_dead_slots_with_placeholders(
+            &mut slots,
+            &legacy_identity(cwd, orchestration_name),
+            cwd,
+            &mut state,
+        );
         let second_dead = slots[1].clone().unwrap();
 
         // The synthetic id is deterministic, so both reconnect
@@ -14947,7 +18839,8 @@ mod tests {
             Some("p-other".to_string()),
             None,
         ];
-        let assigned = assign_synthetic_dead_slot_ids(&mut slots, "/work", "tdd-cycle");
+        let assigned =
+            assign_synthetic_dead_slot_ids(&mut slots, &legacy_identity("/work", "tdd-cycle"));
         assert_eq!(
             assigned.len(),
             2,
@@ -15006,8 +18899,10 @@ mod tests {
 
         // Phase 1 (production hydration): mint synthetic ids for the
         // dead slot. State must remain untouched.
-        let synthetic_ids =
-            assign_synthetic_dead_slot_ids(&mut role_pane_ids, "/work", "tdd-cycle");
+        let synthetic_ids = assign_synthetic_dead_slot_ids(
+            &mut role_pane_ids,
+            &legacy_identity("/work", "tdd-cycle"),
+        );
         assert_eq!(synthetic_ids.len(), 1, "exactly the role 2 slot is dead");
         assert!(state.sessions.is_empty(), "phase 1 must not seed sessions");
 
@@ -15127,7 +19022,12 @@ mod tests {
 
         // A dead-slot placeholder seeded by `fill_dead_slots_with_placeholders`.
         let mut slots: Vec<Option<String>> = vec![Some(real_pane.clone()), None];
-        fill_dead_slots_with_placeholders(&mut slots, "/work", "tdd-cycle", &mut state);
+        fill_dead_slots_with_placeholders(
+            &mut slots,
+            &legacy_identity("/work", "tdd-cycle"),
+            "/work",
+            &mut state,
+        );
         let dead_pane = slots[1].clone().unwrap();
 
         // A separate session that lives only on the dashboard (not in
@@ -15200,6 +19100,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -15213,6 +19114,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -15242,6 +19144,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -15279,6 +19182,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -15292,6 +19196,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -15337,6 +19242,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -15350,6 +19256,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -15479,6 +19386,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -15492,6 +19400,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -15590,6 +19499,7 @@ mod tests {
             cwd: "/remote/proj".into(),
             orchestration_name: "review".into(),
             display_title: None,
+            orchestration_id: None,
             role_slots: vec![
                 OrchestrationRoleSlot {
                     role_index: 0,
@@ -15642,12 +19552,14 @@ mod tests {
     #[test]
     fn test_format_elapsed() {
         let now = Utc::now();
-        assert_eq!(format_elapsed(now), "0s ago");
-        assert_eq!(format_elapsed(now - Duration::seconds(3)), "3s ago");
-        assert_eq!(format_elapsed(now - Duration::seconds(90)), "1m 30s ago");
-        assert_eq!(format_elapsed(now - Duration::seconds(60)), "1m ago");
-        assert_eq!(format_elapsed(now - Duration::seconds(3900)), "1h 5m ago");
-        assert_eq!(format_elapsed(now - Duration::seconds(3600)), "1h ago");
+        // PRD #339: compact form, no ` ago` suffix — the card's bottom border
+        // is the only surface that renders this.
+        assert_eq!(format_elapsed(now), "0s");
+        assert_eq!(format_elapsed(now - Duration::seconds(3)), "3s");
+        assert_eq!(format_elapsed(now - Duration::seconds(90)), "1m 30s");
+        assert_eq!(format_elapsed(now - Duration::seconds(60)), "1m");
+        assert_eq!(format_elapsed(now - Duration::seconds(3900)), "1h 5m");
+        assert_eq!(format_elapsed(now - Duration::seconds(3600)), "1h");
     }
 
     #[test]
@@ -16054,6 +19966,117 @@ mod tests {
         // Contains delegation protocol.
         assert!(content.contains("Delegation protocol"));
         assert!(content.contains("dot-agent-deck work-done"));
+        // Issue #303: the protocol advertises the shell-safe input path, says
+        // when it is required, and explains why — an orchestrator told only
+        // "use --task-file" without the reason drifts back to `--task`.
+        //
+        // The anchors are deliberately formatting-independent (reviewer finding
+        // 4): pinning `expanded by **your own shell**` or a full punctuated
+        // character list makes a harmless copy edit fail the test without
+        // making anything safer.
+        let file_form = content
+            .find("delegate --to <role-name> --task-file")
+            .expect("delegation protocol must show a --task-file delegate invocation");
+        let inline_form = content
+            .find("delegate --to <role-name> --task \"")
+            .expect("delegation protocol must keep the inline --task form as the secondary option");
+        // The regression guard that actually matters: the default must stay the
+        // file form. Substring presence alone would still pass if a future edit
+        // put the inline command back on top.
+        assert!(
+            file_form < inline_form,
+            "the --task-file delegate command must come BEFORE the inline --task one, \
+             so the file form reads as the default"
+        );
+        assert!(
+            content.contains("work-done --done --task-file"),
+            "delegation protocol must show a --task-file work-done invocation"
+        );
+        // Round 4 / the #303 e2e gate: the file form is a preference, not a hard
+        // dependency on a permission the agent may not hold. A restricted tool
+        // allowlist otherwise turns this guidance into a stall at an approval
+        // prompt — the same silent-failure class #303 exists to remove.
+        let fallback = content.find("not authorized").expect(
+            "delegation protocol must state what to do when the file-writing tool is not \
+             authorized",
+        );
+        assert!(
+            content.contains("approval prompt"),
+            "delegation protocol must name the approval prompt as the failure to avoid"
+        );
+        assert!(
+            fallback < inline_form,
+            "the no-file-writing-tool branch must appear BEFORE the inline --task example \
+             it redirects to"
+        );
+        assert!(
+            content.contains("will not fit that one plain line"),
+            "delegation protocol must say what to do when neither form fits"
+        );
+        assert!(
+            content.contains("backticks"),
+            "delegation protocol must name backticks as genuinely transformed"
+        );
+        assert!(
+            content.contains("own shell"),
+            "delegation protocol must explain WHY --task is unsafe"
+        );
+        // The shell-safety advice stays distinct from the context-length advice
+        // about referencing `.dot-agent-deck/<task-slug>.md` inside `--task`.
+        assert!(
+            content.contains("context length"),
+            "delegation protocol must not conflate shell safety with context length"
+        );
+        // Auditor finding 1: the advice has to cover creating the file and the
+        // path, not only the final read. Round 3 deleted the heredoc fallback
+        // round 2 had recommended — a task line equal to the delimiter ends the
+        // heredoc and Bash executes every line after it, and task files are
+        // exactly where untrusted text lands — so the guard is now that a
+        // non-shell writer is the recommendation AND that no heredoc operator
+        // appears anywhere in the generated protocol.
+        assert!(
+            content.contains("file-writing tool"),
+            "delegation protocol must tell the orchestrator to write the task file with a \
+             file-writing tool"
+        );
+        assert!(
+            !content.contains("<<"),
+            "delegation protocol must not recommend a heredoc: a task line equal to the \
+             delimiter terminates it and everything after it is executed as shell commands"
+        );
+        assert!(
+            content.contains("[a-z0-9][a-z0-9-]*"),
+            "delegation protocol must require a slug from a strict ASCII allowlist"
+        );
+        assert!(
+            content.contains("--task-file '.dot-agent-deck/"),
+            "every executable --task-file example must single-quote the path"
+        );
+        // Auditor findings 4/5 (#329's advice half): the file outlives the handoff.
+        assert!(
+            content.contains("secrets"),
+            "delegation protocol must warn that task files persist and must not carry secrets"
+        );
+        // Auditor round-3 finding 4: the final-completion example used a fixed
+        // `final-summary.md` while the text above it demanded a fresh path — a
+        // copied example truncates a prior summary, and follows a symlink if one
+        // is parked there. It must carry the same replaceable slug.
+        assert!(
+            content.contains("final-summary-<summary-slug>.md"),
+            "the final work-done example must use a replaceable per-summary path, not a \
+             fixed clobber target"
+        );
+        assert!(
+            content.contains("does not already exist"),
+            "the protocol must require a path that does not already exist, not merely one \
+             git does not track"
+        );
+        // Round-3 blocker 2: the defining allowlist sentence must be
+        // self-sufficient and agree with its own explanation.
+        crate::state::assert_inline_allowlist_agrees_with_explanation(
+            &content,
+            "orchestrator delegation protocol",
+        );
         // Instructs orchestrator to wait then delegate.
         assert!(content.contains("Wait for the user to tell you what to work on"));
         assert!(content.contains("delegate immediately"));
@@ -17747,6 +21770,158 @@ mod tests {
         snapshot
     }
 
+    /// A controller whose pane is NOT wired locally: `focus_pane` fails until
+    /// the pane is attached on demand. Models the real case a live card hits —
+    /// a `SessionStart` surfaced over the broadcast that never went through
+    /// startup hydration.
+    struct UnwiredPC {
+        /// Whether the daemon actually has a pane to attach (`false` = the
+        /// card really is dead).
+        hydratable: bool,
+        wired: std::sync::Mutex<bool>,
+        hydrate_calls: std::sync::Mutex<usize>,
+    }
+    impl UnwiredPC {
+        fn new(hydratable: bool) -> Self {
+            Self {
+                hydratable,
+                wired: std::sync::Mutex::new(false),
+                hydrate_calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+    impl crate::pane::PaneController for UnwiredPC {
+        fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            if *self.wired.lock().unwrap() {
+                Ok(())
+            } else {
+                Err(crate::pane::PaneError::CommandFailed(
+                    "Pane p0 not found".to_string(),
+                ))
+            }
+        }
+        fn try_hydrate_pane(&self, _id: &str) -> bool {
+            *self.hydrate_calls.lock().unwrap() += 1;
+            if self.hydratable {
+                *self.wired.lock().unwrap() = true;
+            }
+            self.hydratable
+        }
+        fn create_pane_with_options(
+            &self,
+            _c: Option<&str>,
+            _d: Option<&str>,
+            _o: crate::pane::AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), crate::pane::PaneError> {
+            Ok(("p0".to_string(), "a0".to_string()))
+        }
+        fn write_to_pane(&self, _i: &str, _t: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _i: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn rename_pane(
+            &self,
+            _i: &str,
+            _n: &str,
+        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+            Ok(crate::pane::RenameOutcome::Applied(_n.to_string()))
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+            Ok(vec![])
+        }
+        fn resize_pane(
+            &self,
+            _i: &str,
+            _d: crate::pane::PaneDirection,
+            _a: u16,
+        ) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "unwired-mock"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Drive `Action::Focus` (Enter) against a card whose pane is not wired
+    /// locally. Returns `(session_survived, hydrate_attempts, entered_pane_input)`.
+    fn enter_on_unwired_card(hydratable: bool) -> (bool, usize, bool) {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(UnwiredPC::new(hydratable));
+        let mut tab_manager = TabManager::new(pc.clone());
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        let mut ui = default_ui();
+        ui.selected_index = Some(0);
+
+        dispatch_action(
+            Action::Focus,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            Some("s0"),
+            Rect::new(0, 0, 80, 24),
+        );
+
+        let survived = state.blocking_read().sessions.contains_key("s0");
+        let calls = *pc.hydrate_calls.lock().unwrap();
+        (survived, calls, matches!(ui.mode, UiMode::PaneInput))
+    }
+
+    /// Scenario: Press Enter on a dashboard card that is backed by a LIVE
+    /// daemon agent but has no local pane yet (the broadcast-surfaced case).
+    /// The deck must attach the pane on demand and open it, NOT treat the
+    /// failed focus as a stale card and delete it — which is what destroyed
+    /// live cards before, since only the digit-jump path had this guard.
+    #[spec("dashboard/selection/020")]
+    #[test]
+    fn selection_020_enter_hydrates_a_live_card_instead_of_deleting_it() {
+        let (survived, calls, entered) = enter_on_unwired_card(true);
+        assert_eq!(
+            calls, 1,
+            "Enter must attempt an on-demand attach exactly once"
+        );
+        assert!(
+            survived,
+            "Enter deleted a LIVE card whose pane merely wasn't wired yet"
+        );
+        assert!(
+            entered,
+            "after a successful attach, Enter must open the pane"
+        );
+    }
+
+    /// Scenario: Press Enter on a card whose pane the daemon genuinely does
+    /// not have. The on-demand attach fails, so the card really is stale and
+    /// the existing cleanup must still remove it — the fix must not turn a
+    /// dead card into an undeletable one.
+    #[spec("dashboard/selection/021")]
+    #[test]
+    fn selection_021_enter_still_removes_a_genuinely_stale_card() {
+        let (survived, calls, entered) = enter_on_unwired_card(false);
+        assert_eq!(calls, 1, "the attach must still be attempted");
+        assert!(
+            !survived,
+            "a card with no backing daemon pane must still be cleaned up"
+        );
+        assert!(!entered, "a failed attach must not enter PaneInput mode");
+    }
+
     /// Scenario: Open a second (Mode) tab so a tab switch is possible, arm the
     /// Dashboard's highlight on card 2 (active selection), then drive the real
     /// tab-switch path — `Action::CycleTabNext` away from the Dashboard and
@@ -18267,9 +22442,9 @@ mod tests {
     /// Scenario: PRD #113 review finding 2 — an INACTIVE dashboard selection
     /// means nothing is armed, so the close-pane action must be a NO-OP. With
     /// three cards and `selected_index = None`, dispatching `Action::CloseSelected`
-    /// must NOT fall back to closing card 0: no `close_pane` call is issued and
-    /// no session is removed (matching the `dashboard/pane/003` "never close
-    /// without a real selection" invariant).
+    /// must NOT fall back to closing card 0: it opens no confirmation, issues no
+    /// `close_pane` call, and removes no session (matching the
+    /// `dashboard/pane/003` "never close without a real selection" invariant).
     #[spec("dashboard/selection/012")]
     #[test]
     fn selection_012_inactive_close_is_noop() {
@@ -18299,6 +22474,14 @@ mod tests {
             area,
         );
 
+        // PRD #241 M3: nothing armed ⇒ nothing to confirm. The close request
+        // must stay as silent as it was before the modal existed — arming a
+        // dialog here would give the reflexive Enter a card to destroy.
+        assert_eq!(
+            ui.mode,
+            UiMode::Normal,
+            "an inactive selection must not open the close confirmation"
+        );
         assert!(
             pc.closed.lock().unwrap().is_empty(),
             "an inactive selection must not close any card (no fallback to card 0)"
@@ -18314,11 +22497,11 @@ mod tests {
     /// inactive-selection close no-op (selection_012) must NOT suppress closing a
     /// Mode/Orchestration TAB via Ctrl+W. With a Mode tab active and
     /// `selected_index == None` (the real condition on a Mode tab — nothing armed
-    /// on the dashboard), dispatching `Action::CloseSelected` must close that tab;
-    /// likewise for an active Orchestration tab. Today this FAILS: the close
-    /// routes through the dashboard-selection gate that short-circuits on `None`,
-    /// so the tab persists (the keyboard Ctrl+W tab-close regressed while the
-    /// mouse click-to-close path, which bypasses the gate, still works).
+    /// on the dashboard), `Action::CloseSelected` must arm the PRD #241
+    /// confirmation and the follow-up `Action::ConfirmCloseSelected` must close
+    /// that tab; likewise for an active Orchestration tab. Bounds
+    /// `dashboard/selection/012`: an unarmed dashboard CARD stays a no-op, but an
+    /// active tab remains a valid confirmation target.
     #[spec("dashboard/selection/016")]
     #[test]
     fn selection_016_inactive_selection_does_not_block_tab_close() {
@@ -18359,6 +22542,29 @@ mod tests {
             None,
             area,
         );
+        // PRD #241 M3: an active tab IS a target, so the request confirms
+        // rather than no-ops — but nothing is torn down until the user says so.
+        assert_eq!(
+            ui.mode,
+            UiMode::CloseConfirm,
+            "an active Mode tab must arm the close confirmation"
+        );
+        assert_eq!(
+            tab_manager.tab_count(),
+            2,
+            "opening the confirmation must not close anything yet"
+        );
+        dispatch_action(
+            Action::ConfirmCloseSelected,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            area,
+        );
         assert_eq!(
             tab_manager.tab_count(),
             1,
@@ -18378,6 +22584,22 @@ mod tests {
         ui.selected_index = None;
         dispatch_action(
             Action::CloseSelected,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            area,
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::CloseConfirm,
+            "an active Orchestration tab must arm the close confirmation"
+        );
+        dispatch_action(
+            Action::ConfirmCloseSelected,
             &mut ui,
             &*pc,
             &state,
@@ -19131,64 +23353,57 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn test_choose_density_wide() {
-        // Wide layout (no extra stats line)
+    fn test_choose_density() {
         // Spacious=10, Normal=8, Compact=5
 
         // 1 session, 1 col, plenty of height -> Spacious
-        assert_eq!(choose_density(1, 1, 20, true), CardDensity::Spacious);
+        assert_eq!(choose_density(1, 1, 20), CardDensity::Spacious);
 
         // 2 sessions, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(2, 2, 10, true), CardDensity::Spacious);
+        assert_eq!(choose_density(2, 2, 10), CardDensity::Spacious);
 
         // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
-        assert_eq!(choose_density(2, 2, 9, true), CardDensity::Normal);
+        assert_eq!(choose_density(2, 2, 9), CardDensity::Normal);
 
         // 4 sessions, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
-        assert_eq!(choose_density(4, 2, 16, true), CardDensity::Normal);
+        assert_eq!(choose_density(4, 2, 16), CardDensity::Normal);
 
         // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*5=10 fits)
-        assert_eq!(choose_density(4, 2, 15, true), CardDensity::Compact);
+        assert_eq!(choose_density(4, 2, 15), CardDensity::Compact);
 
         // Many sessions, small screen -> Compact
-        assert_eq!(choose_density(10, 1, 20, true), CardDensity::Compact);
+        assert_eq!(choose_density(10, 1, 20), CardDensity::Compact);
 
         // Edge: 0 sessions -> Spacious (0 rows needed)
-        assert_eq!(choose_density(0, 1, 10, true), CardDensity::Spacious);
+        assert_eq!(choose_density(0, 1, 10), CardDensity::Spacious);
     }
 
     #[test]
-    fn test_choose_density_narrow() {
-        // Narrow layout: each mode needs 1 extra row for stats line
-        // Spacious=11, Normal=9, Compact=6
+    fn test_choose_density_boundaries() {
+        // Density is a function of card count, columns, and height only.
+        // Spacious=10, Normal=8, Compact=5.
 
-        // 1 session, height 11 -> Spacious (1*11=11)
-        assert_eq!(choose_density(1, 1, 11, false), CardDensity::Spacious);
+        // 1 session, height 11 -> Spacious (1*10=10)
+        assert_eq!(choose_density(1, 1, 11), CardDensity::Spacious);
 
-        // 1 session, height 10 -> Normal (1*9=9 fits)
-        assert_eq!(choose_density(1, 1, 10, false), CardDensity::Normal);
+        // 1 session, height 10 -> Spacious (1*10=10)
+        assert_eq!(choose_density(1, 1, 10), CardDensity::Spacious);
 
-        // 2 sessions, 1 col, height 18 -> Normal (2*9=18)
-        assert_eq!(choose_density(2, 1, 18, false), CardDensity::Normal);
+        // 2 sessions, 1 col, height 18 -> Normal (2*8=16)
+        assert_eq!(choose_density(2, 1, 18), CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 17 -> Compact (2*6=12 fits)
-        assert_eq!(choose_density(2, 1, 17, false), CardDensity::Compact);
+        // 2 sessions, 1 col, height 17 -> Normal (2*8=16)
+        assert_eq!(choose_density(2, 1, 17), CardDensity::Normal);
     }
 
     /// Acceptance criterion 1: `card_height` is derived from rendered content,
-    /// so it returns exactly Compact=5 / Normal=8 / Spacious=10 (wide) and
-    /// 6 / 9 / 11 (narrow). Locks the six values against future drift.
+    /// so it returns exactly Compact=5 / Normal=8 / Spacious=10. Locks the
+    /// three density-derived values against future drift.
     #[test]
     fn card_height_001_content_derived_values() {
-        // Wide layout (no inline stats line).
-        assert_eq!(CardDensity::Compact.card_height(true), 5);
-        assert_eq!(CardDensity::Normal.card_height(true), 8);
-        assert_eq!(CardDensity::Spacious.card_height(true), 10);
-
-        // Narrow layout (+1 row for the inline stats line on every tier).
-        assert_eq!(CardDensity::Compact.card_height(false), 6);
-        assert_eq!(CardDensity::Normal.card_height(false), 9);
-        assert_eq!(CardDensity::Spacious.card_height(false), 11);
+        assert_eq!(CardDensity::Compact.card_height(), 5);
+        assert_eq!(CardDensity::Normal.card_height(), 8);
+        assert_eq!(CardDensity::Spacious.card_height(), 10);
     }
 
     /// Review finding S1: the card grid must re-clamp a stale scroll offset
@@ -19311,6 +23526,110 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // PRD #227 M2 — keyboard-enhancement push/pop lifecycle
+    // ---------------------------------------------------------------------------
+
+    // These two drive `KEYBOARD_ENHANCEMENT_PUSHED` (a process-global) directly
+    // rather than through `push_keyboard_enhancement()`, which self-disables
+    // under a test harness because `supports_keyboard_enhancement()` finds no
+    // kitty-capable terminal. Storing `true` is the stand-in for "the gated push
+    // succeeded". Safe to share the static across them because nextest runs each
+    // test in its own process; the pop they trigger writes 5 bytes of escape
+    // sequence to the captured test stdout and touches nothing else.
+    //
+    // The `?`-error return inside `run_tui`'s event loop that motivates the guard
+    // is NOT reachable in-process (it needs a real terminal whose `draw` /
+    // `read` / `poll` fails), so these cover the guard MECHANISM — that `Drop`
+    // pops at all, and that it cannot double-pop — rather than that specific
+    // call site. The end-to-end pop-on-exit evidence is the L2
+    // `embed/key-forwarding/002` assertion on the deck's real output stream.
+
+    /// Pin the exact bytes crossterm writes for the push and the pop.
+    ///
+    /// The L2 `embed/key-forwarding/002` test asserts on these literal sequences
+    /// in the deck's real output stream, which is the only direct evidence M2
+    /// ran at all. That assertion would silently stop proving anything if a
+    /// crossterm upgrade changed the encoding, so pin it here where the failure
+    /// is a compile-fast unit test naming the new form rather than a puzzling
+    /// PTY-test timeout. Note the pop is `CSI < 1 u`, NOT the `>` form.
+    #[test]
+    fn keyboard_enhancement_wire_bytes_are_the_ones_the_e2e_asserts() {
+        use crossterm::Command;
+
+        let mut push = String::new();
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        )
+        .write_ansi(&mut push)
+        .expect("format push command");
+        assert_eq!(
+            push, "\x1b[>1u",
+            "crossterm's PushKeyboardEnhancementFlags encoding changed; update the \
+             PUSH_ENHANCEMENT constant in tests/e2e_pane_shift_enter.rs to match"
+        );
+
+        let mut pop = String::new();
+        crossterm::event::PopKeyboardEnhancementFlags
+            .write_ansi(&mut pop)
+            .expect("format pop command");
+        assert_eq!(
+            pop, "\x1b[<1u",
+            "crossterm's PopKeyboardEnhancementFlags encoding changed; update the \
+             POP_ENHANCEMENT constant in tests/e2e_pane_shift_enter.rs to match"
+        );
+    }
+
+    /// The guard pops when it leaves scope — the property that covers every
+    /// `run_tui` exit path the explicit teardown misses.
+    #[test]
+    fn keyboard_enhancement_guard_pops_on_scope_exit() {
+        KEYBOARD_ENHANCEMENT_PUSHED.store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let _guard = KeyboardEnhancementGuard;
+            assert!(
+                KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst),
+                "the flag must stay set while the guard is alive — popping early \
+                 would disable the enhanced protocol for the whole session"
+            );
+        }
+        assert!(
+            !KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst),
+            "the guard's Drop must pop the keyboard-enhancement flag; without it a \
+             `?`-error return from run_tui's event loop leaks the enhanced mode \
+             into the shell the user is dropped back into"
+        );
+    }
+
+    /// The explicit teardown pop and the guard's `Drop` both firing must pop
+    /// exactly once, so neither can discard a flag set another program on the
+    /// terminal's stack owns.
+    #[test]
+    fn keyboard_enhancement_pop_is_idempotent() {
+        KEYBOARD_ENHANCEMENT_PUSHED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let guard = KeyboardEnhancementGuard;
+
+        // Stands in for the explicit pop in run_tui's normal teardown.
+        pop_keyboard_enhancement();
+        assert!(
+            !KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst),
+            "the first pop must clear the flag"
+        );
+
+        // The guard now drops on top of that. The test-and-clear means it finds
+        // the flag already false and emits nothing.
+        drop(guard);
+        assert!(
+            !KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst),
+            "a second pop must remain a no-op"
+        );
+
+        // A pop with no push at all is likewise inert (the tmux case, where the
+        // support probe returns false and nothing is ever pushed).
+        pop_keyboard_enhancement();
+        assert!(!KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // ---------------------------------------------------------------------------
     // keyevent_to_bytes tests
     // ---------------------------------------------------------------------------
 
@@ -19328,6 +23647,18 @@ mod tests {
         assert_eq!(
             keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(vec![b'\r'])
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            Some(b"\x1b[13;5u".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            Some(vec![0x1b, b'\r'])
         );
         assert_eq!(
             keyevent_to_bytes(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
@@ -19355,6 +23686,467 @@ mod tests {
         assert_eq!(keyevent_to_bytes(&key), Some(vec![0x1a]));
     }
 
+    /// Every NON-LETTER `Ctrl+<char>` alias, enumerated one at a time.
+    ///
+    /// Deliberately a hand-written list rather than a restatement of
+    /// [`ctrl_c0_byte`]'s rules: the rules are the implementation, this is the
+    /// intent, and the exhaustive sweep in
+    /// [`ctrl_c0_byte_maps_exactly_the_documented_alias_set`] fails if a rule ever
+    /// grows wider (or narrower) than the list.
+    const CTRL_C0_SYMBOL_ALIASES: &[(char, u8)] = &[
+        // NUL
+        ('@', 0x00),
+        (' ', 0x00),
+        ('2', 0x00),
+        // ESC — `Ctrl+[` is how vim leaves insert mode inside an embedded pane.
+        ('[', 0x1b),
+        ('3', 0x1b),
+        // FS
+        ('\\', 0x1c),
+        ('4', 0x1c),
+        // GS
+        (']', 0x1d),
+        ('5', 0x1d),
+        // RS
+        ('^', 0x1e),
+        ('6', 0x1e),
+        // US — `Ctrl+_` / `Ctrl+/` is readline's undo.
+        ('_', 0x1f),
+        ('7', 0x1f),
+        ('/', 0x1f),
+        // DEL
+        ('?', 0x7f),
+        ('8', 0x7f),
+    ];
+
+    /// Lowercase and uppercase `Ctrl+letter`, expressed as an ORDINAL (the nth
+    /// letter → byte n) rather than as the `& 0x1f` mask [`ctrl_c0_byte`] uses,
+    /// so the two formulations have to agree.
+    fn ctrl_c0_letter_aliases() -> Vec<(char, u8)> {
+        ('a'..='z')
+            .chain('A'..='Z')
+            .enumerate()
+            .map(|(i, c)| (c, (i % 26) as u8 + 1))
+            .collect()
+    }
+
+    /// PRD #227: the C0 controls that are NOT Ctrl+letter. With the enhanced
+    /// (kitty) protocol active (M2) the terminal disambiguates these into
+    /// `CSI <code>;5u`, which crossterm reports as `Char(c) + CONTROL` — so
+    /// Ctrl+[ arrives as `Char('[') + CONTROL`, not as the legacy
+    /// `KeyCode::Esc`. Each must still reach the pane as its single C0 byte.
+    ///
+    /// The DIGIT aliases are here for two independent reasons: they are xterm's
+    /// unshifted way to reach the same seven bytes (and under M2 the *only* way,
+    /// since `@ ^ _ ?` are shifted symbols the protocol reports as their
+    /// unshifted key), and `0x1c..=0x1f` decoded by crossterm's LEGACY parser
+    /// arrives as `Char('4'..='7') + CONTROL` too.
+    #[test]
+    fn keyevent_ctrl_c0_controls() {
+        for (ch, want) in CTRL_C0_SYMBOL_ALIASES
+            .iter()
+            .copied()
+            .chain(ctrl_c0_letter_aliases())
+        {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+            assert_eq!(
+                keyevent_to_bytes(&key),
+                Some(vec![want]),
+                "Ctrl+{ch:?} must forward the C0 byte {want:#04x}, not the literal character"
+            );
+            // Alt+Ctrl+<char> keeps the ESC prefix in front of the same byte.
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL | KeyModifiers::ALT);
+            assert_eq!(
+                keyevent_to_bytes(&key),
+                Some(vec![0x1b, want]),
+                "Alt+Ctrl+{ch:?} must forward ESC followed by {want:#04x}"
+            );
+        }
+    }
+
+    /// The alias table is a closed set: exhaustive over all 128 ASCII characters
+    /// plus a couple of non-ASCII ones, so neither a too-wide rule (`'0'..='9'`
+    /// swallowing Ctrl+0/Ctrl+1/Ctrl+9, which have no control byte) nor a
+    /// too-narrow one can pass.
+    #[test]
+    fn ctrl_c0_byte_maps_exactly_the_documented_alias_set() {
+        let letters = ctrl_c0_letter_aliases();
+        for byte in 0u8..=127 {
+            let c = byte as char;
+            let expected = letters
+                .iter()
+                .chain(CTRL_C0_SYMBOL_ALIASES)
+                .find(|(alias, _)| *alias == c)
+                .map(|(_, want)| *want);
+            assert_eq!(
+                ctrl_c0_byte(c),
+                expected,
+                "Ctrl+{c:?} ({byte:#04x}): the alias table and the documented set disagree"
+            );
+        }
+        // Non-ASCII must never be masked into a control byte (`c as u8` would
+        // truncate the codepoint).
+        for c in ['é', 'λ', '€', '🙂'] {
+            assert_eq!(ctrl_c0_byte(c), None, "Ctrl+{c:?} is not a C0 alias");
+        }
+    }
+
+    /// PRD #227 review item A: run OUR encoder against THEIR decoder.
+    ///
+    /// crossterm's `parse_event` is `pub(crate)`, so the only way to reach the
+    /// real decoder is to give crossterm a terminal to read from: `tty_fd()`
+    /// returns stdin when stdin is a tty, so this installs a PTY slave on fd 0
+    /// and writes keypresses into the master. Bytes then travel the exact
+    /// production path — PTY line discipline, `Parser::advance`, `parse_event` —
+    /// instead of a hand-transcribed copy of crossterm's tables that could
+    /// silently drift from them on an upgrade.
+    ///
+    /// # Only sound when the test owns the process
+    ///
+    /// Every piece of state this probe touches is PROCESS-global, not per-test:
+    /// fd 0, crossterm 0.28's raw-mode flag, and crossterm's lazily-built event
+    /// reader (cached in a process-wide `Mutex<Option<...>>`). A concurrent
+    /// stdin/event user in the same process could consume the queued event
+    /// between this probe's `poll` and its `read`, at which point `event::read`
+    /// blocks and the 5 s deadline in [`Self::decode`] never gets a chance to
+    /// fire — a hang, not a failure. The cached reader also outlives `Drop`,
+    /// still holding a registration for the PTY the probe just closed.
+    ///
+    /// [`keyevent_ctrl_c0_matches_crossterm_decoder`] therefore refuses to run
+    /// unless it owns the process (its `NEXTEST_EXECUTION_MODE=process-per-test`
+    /// guard). Under process-per-test there is no competing consumer, so the
+    /// deadline really does bound `decode`, and the stale cached reader is
+    /// harmless because the process exits moments later. That same guard is what
+    /// makes the panic safety of [`Self::new`] acceptable — read its note before
+    /// reusing this type anywhere else.
+    #[cfg(unix)]
+    struct CrosstermInputProbe {
+        master: std::fs::File,
+        /// Kept alive only so the slave end stays open for the probe's lifetime;
+        /// fd 0 is a `dup` of it and is what crossterm actually reads.
+        _slave: std::fs::File,
+        /// `dup` of the original fd 0, put back by `Drop`; `-1` if that `dup`
+        /// failed. `-1` does NOT prove fd 0 was closed — `dup` also fails with
+        /// `EMFILE`/`EINTR` on a perfectly valid stdin — so `Drop` reads it only
+        /// as "nothing to put back" and never closes fd 0 on its strength.
+        saved_stdin: libc::c_int,
+    }
+
+    #[cfg(unix)]
+    impl CrosstermInputProbe {
+        /// # Panic safety: none, deliberately
+        ///
+        /// The two `openpty` descriptors stay bare `c_int`s until the last few
+        /// lines, so any failing assertion below leaks them, and one that fires
+        /// after the `dup2` also leaves fd 0 pointing at the probe PTY with
+        /// crossterm's raw-mode flag set. No `Drop` runs, because `Self` does not
+        /// exist yet.
+        ///
+        /// That is acceptable for exactly one reason: the only caller refuses to
+        /// run unless it owns the process, so a panic here means a dedicated,
+        /// already-failed process that is about to exit and take the leaked
+        /// descriptors and the redirected fd 0 with it. There is no sibling test
+        /// left to corrupt, and no production code in this process at all.
+        /// Loosen that guard — or call this from anywhere else — and this needs
+        /// real `OwnedFd` plumbing first.
+        fn new() -> Self {
+            let mut master: libc::c_int = -1;
+            let mut slave: libc::c_int = -1;
+            // SAFETY: `openpty` writes the two fds through the out-pointers; the
+            // trailing name/termios/winsize arguments are documented as optional
+            // and passed as NULL.
+            //
+            // All three NULLs are `null_mut`, not `null`, because macOS and glibc
+            // disagree on the constness of the last two: Apple declares them
+            // `*mut termios` / `*mut winsize` while glibc declares them `*const`.
+            // `null_mut` satisfies both — exactly on macOS, and by the standard
+            // `*mut T` -> `*const T` coercion on Linux, which also pins the
+            // otherwise-free `T` from each parameter's expected type. `null()`
+            // builds on Linux and breaks the macOS build (rustc E0308), so do not
+            // "simplify" these back.
+            let rc = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(
+                rc,
+                0,
+                "openpty failed ({}). This test needs a PTY to hand crossterm's own \
+                 decoder real input.",
+                std::io::Error::last_os_error()
+            );
+
+            // SAFETY: termios/fcntl calls on the fd `openpty` just handed us,
+            // which is open and unshared for the whole block. On an assertion
+            // failure the two fds leak — see the panic-safety note above for why
+            // that is tolerable here.
+            //
+            // RAW, because a canonical-mode slave withholds bytes until a newline
+            // and `cfmakeraw` also clears ISIG/IXON — so 0x03/0x1a/0x11 arrive as
+            // DATA instead of signalling or flow-controlling the test process.
+            // This is also the state the deck's own terminal is in.
+            //
+            // NON-BLOCKING, because crossterm reads only after `poll` reports
+            // POLLIN but loops and reads again while an escape sequence is
+            // incomplete; on a blocking fd that second read would hang the whole
+            // process, whereas `EWOULDBLOCK` sends it back to `poll` and lets the
+            // per-keypress deadline in `decode` fail cleanly instead.
+            unsafe {
+                let mut tio: libc::termios = std::mem::zeroed();
+                assert_eq!(
+                    libc::tcgetattr(slave, &mut tio),
+                    0,
+                    "tcgetattr on the probe pty slave ({})",
+                    std::io::Error::last_os_error()
+                );
+                libc::cfmakeraw(&mut tio);
+                assert_eq!(
+                    libc::tcsetattr(slave, libc::TCSANOW, &tio),
+                    0,
+                    "tcsetattr on the probe pty slave ({})",
+                    std::io::Error::last_os_error()
+                );
+                let flags = libc::fcntl(slave, libc::F_GETFL);
+                assert_ne!(
+                    flags,
+                    -1,
+                    "F_GETFL on the probe pty slave ({})",
+                    std::io::Error::last_os_error()
+                );
+                assert_ne!(
+                    libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK),
+                    -1,
+                    "F_SETFL O_NONBLOCK on the probe pty slave ({})",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            // SAFETY: `dup`/`dup2` on fd 0 with an fd we own. The `dup` result is
+            // stashed unchecked ON PURPOSE: a failure only costs us the ability to
+            // restore fd 0 in `Drop`, which in this process nobody observes, and
+            // `-1` is explicitly NOT read as "fd 0 was closed" (see the field's
+            // doc). The `dup2` itself is asserted, because without it crossterm
+            // would read the developer's real terminal rather than the probe.
+            let saved_stdin = unsafe { libc::dup(libc::STDIN_FILENO) };
+            let rc = unsafe { libc::dup2(slave, libc::STDIN_FILENO) };
+            assert_ne!(
+                rc,
+                -1,
+                "dup2 of the probe pty onto stdin failed ({})",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(
+                unsafe { libc::isatty(libc::STDIN_FILENO) },
+                1,
+                "stdin must be the probe pty, otherwise crossterm would fall back \
+                 to /dev/tty and read the developer's real terminal"
+            );
+
+            // crossterm's decoder branches on its OWN raw-mode flag for `0x0a`
+            // (upstream issue #371: in raw mode `\n` is Ctrl+J, in cooked mode it
+            // is Enter), so the probe has to match the deck: raw. `tty_fd()`
+            // resolves to the fd-0 pty installed above, so this cannot touch the
+            // developer's terminal.
+            crossterm::terminal::enable_raw_mode().expect("enable raw mode on the probe pty");
+            assert!(
+                crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
+                "crossterm must report raw mode, otherwise 0x0a decodes as Enter and \
+                 re-encodes as 0x0d"
+            );
+
+            // SAFETY: both fds came from our own `openpty` and have not been
+            // handed to anything that closes them, so wrapping them in `File`
+            // moves sole ownership to `Self` and they close on `Drop`. (fd 0 is a
+            // separate descriptor — the `dup2` above — and is dealt with there.)
+            // This is the first point at which anything is owned; every assertion
+            // before it leaks.
+            let (master, slave) = unsafe {
+                use std::os::unix::io::FromRawFd;
+                (
+                    std::fs::File::from_raw_fd(master),
+                    std::fs::File::from_raw_fd(slave),
+                )
+            };
+            Self {
+                master,
+                _slave: slave,
+                saved_stdin,
+            }
+        }
+
+        /// Feed `bytes` as if the terminal had sent them, and return the single
+        /// `KeyEvent` crossterm decodes from them.
+        ///
+        /// The deadline is a real bound only because the caller owns the process:
+        /// with no other event consumer, a `poll` that reports POLLIN is followed
+        /// by a `read` that cannot be beaten to the queued event, so `read`
+        /// returns rather than blocking past the deadline.
+        fn decode(&self, bytes: &[u8]) -> KeyEvent {
+            use std::io::Write;
+            (&self.master)
+                .write_all(bytes)
+                .expect("write the keypress into the probe pty");
+            (&self.master).flush().expect("flush the probe pty");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "crossterm decoded no key event from {bytes:02x?} within 5s"
+                );
+                if !crossterm::event::poll(std::time::Duration::from_millis(50))
+                    .expect("poll the probe pty")
+                {
+                    continue;
+                }
+                match crossterm::event::read().expect("read from the probe pty") {
+                    crossterm::event::Event::Key(key) => return key,
+                    // A stray resize/focus event is not what we asked about.
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CrosstermInputProbe {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            // SAFETY: put back the fd 0 we replaced, using a descriptor this
+            // struct owns. If the `dup` in `new` failed there is nothing to put
+            // back, and fd 0 is left as the (soon to be closed) probe pty rather
+            // than closed outright — closing it would be acting on an inference
+            // `dup` failure does not support. Harmless: the caller owns the
+            // process and it is about to exit.
+            unsafe {
+                if self.saved_stdin >= 0 {
+                    libc::dup2(self.saved_stdin, libc::STDIN_FILENO);
+                    libc::close(self.saved_stdin);
+                }
+            }
+        }
+    }
+
+    /// PRD #227 review item A: the encoder must be the exact INVERSE of
+    /// crossterm's decoder over the whole control range, in BOTH wire forms.
+    ///
+    /// This is the property test that the one-alias-at-a-time fixes kept missing.
+    /// `Ctrl+[` regressed under M2, was fixed by naming `[`, and then `Ctrl+3`
+    /// and `Ctrl+8` regressed the same way — because nothing asserted the
+    /// mapping was *complete*. Feeding every control byte through crossterm and
+    /// back out through [`keyevent_to_bytes`] catches all of them at once, and
+    /// catches the next one for free.
+    ///
+    /// Every byte in `0x00..=0x1f` plus `0x7f` round-trips; there is no
+    /// documented exception. `0x0a` is the one that DEPENDS on terminal state:
+    /// crossterm reports it as `Ctrl+J` in raw mode (which re-encodes to `0x0a`)
+    /// but as `Enter` in cooked mode (which would re-encode to `0x0d`), so the
+    /// probe asserts raw mode is active — matching the deck, which never runs
+    /// the pane-input path outside raw mode.
+    ///
+    /// Runs only under a process-per-test runner — `cargo nextest`, i.e.
+    /// `cargo test-fast`, the fast-tier gate — because [`CrosstermInputProbe`]
+    /// is sound only with the process to itself; see the guard at the top of the
+    /// body.
+    #[cfg(unix)]
+    #[test]
+    fn keyevent_ctrl_c0_matches_crossterm_decoder() {
+        // Decision 26-style runtime skip. The precondition
+        // [`CrosstermInputProbe`] documents is PROCESS ISOLATION, so the guard
+        // asserts that property directly instead of a proxy for it: nextest
+        // publishes its isolation model in `NEXTEST_EXECUTION_MODE`, and only the
+        // value `process-per-test` means "this process is yours". Every other
+        // reading skips — variable absent (a plain `cargo test` puts every unit
+        // test of the crate in ONE process), empty, renamed, or some future
+        // shared-process mode — because the guard has to fail safe: a sibling
+        // stdin/event consumer turns `decode`'s bounded wait into an unbounded one
+        // (a hang, not a failure), and a sibling toggling crossterm's
+        // process-global raw-mode flag makes phase 1's `0x0a` expectation WRONG
+        // rather than merely slow. A shared-process runner that still advertised
+        // itself as nextest would walk straight into both. `cargo test-fast` is
+        // nextest in process-per-test mode, so the official fast-tier gate
+        // (CLAUDE.md rule 5) runs this test.
+        let process_per_test = matches!(
+            std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+            Ok("process-per-test")
+        );
+        if !process_per_test {
+            eprintln!(
+                "SKIP: keyevent_ctrl_c0_matches_crossterm_decoder needs \
+                 NEXTEST_EXECUTION_MODE=process-per-test, i.e. PROCESS ISOLATION (it \
+                 installs a PTY on fd 0 and drives crossterm's process-global raw-mode \
+                 flag and cached event reader). Run it under `cargo test-fast` / \
+                 `cargo nextest run`, which is process-per-test; plain `cargo test` shares \
+                 one process across the whole crate, and any other execution mode is \
+                 skipped the same way."
+            );
+            return;
+        }
+
+        let probe = CrosstermInputProbe::new();
+
+        // --- Phase 1: the LEGACY wire form. Every control byte a legacy
+        // terminal can deliver must survive decode → encode unchanged. ---
+        for byte in (0x00u8..=0x1f).chain(std::iter::once(0x7f)) {
+            let key = probe.decode(&[byte]);
+            assert_eq!(
+                keyevent_to_bytes(&key).as_deref(),
+                Some(&[byte][..]),
+                "control byte {byte:#04x} decoded by crossterm as {key:?} did not re-encode \
+                 to itself — the deck would forward something else to the agent's PTY"
+            );
+        }
+
+        // --- Phase 2: the M2 wire form. `DISAMBIGUATE_ESCAPE_CODES` makes the
+        // terminal send `CSI <codepoint>;5u` instead of the collapsed byte, so
+        // crossterm reports `Char(c) + CONTROL` and producing the byte becomes
+        // the deck's job. This is the form that regressed twice. ---
+        for (ch, want) in CTRL_C0_SYMBOL_ALIASES
+            .iter()
+            .copied()
+            .chain(ctrl_c0_letter_aliases())
+        {
+            // `1 + ctrl(4)` = 5 — the kitty modifier parameter for Ctrl alone.
+            let wire = format!("\x1b[{};5u", ch as u32);
+            let key = probe.decode(wire.as_bytes());
+            assert_eq!(
+                keyevent_to_bytes(&key).as_deref(),
+                Some(&[want][..]),
+                "{wire:?} (Ctrl+{ch:?}) decoded by crossterm as {key:?} must forward \
+                 {want:#04x}; forwarding the literal character instead is the Ctrl+[ / \
+                 Ctrl+3 regression"
+            );
+        }
+
+        // --- Phase 3: the modifier-bearing keys M1/M3 added, checked against
+        // the real decoder rather than a hand-made `KeyEvent`. Each of these is
+        // its own inverse: what a kitty terminal sends is exactly what the deck
+        // forwards. ---
+        for (wire, want) in [
+            // The headline of PRD #227.
+            ("\x1b[13;2u", "\x1b[13;2u"), // Shift+Enter
+            ("\x1b[13;5u", "\x1b[13;5u"), // Ctrl+Enter
+            ("\x1b[1;2A", "\x1b[1;2A"),   // Shift+Up
+            ("\x1b[1;2B", "\x1b[1;2B"),   // Shift+Down
+            ("\x1b[1;5C", "\x1b[1;5C"),   // Ctrl+Right
+            ("\x1b[1;5D", "\x1b[1;5D"),   // Ctrl+Left
+        ] {
+            let key = probe.decode(wire.as_bytes());
+            assert_eq!(
+                keyevent_to_bytes(&key).as_deref(),
+                Some(want.as_bytes()),
+                "{wire:?} decoded by crossterm as {key:?} must be forwarded verbatim as \
+                 {want:?}; collapsing it to the unmodified legacy byte is the bug PRD #227 \
+                 fixes"
+            );
+        }
+    }
+
     #[test]
     fn keyevent_alt_prefix() {
         let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
@@ -19366,6 +24158,14 @@ mod tests {
         assert_eq!(
             keyevent_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL)),
+            Some(b"\x1b[1;5A".to_vec())
         );
         assert_eq!(
             keyevent_to_bytes(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
@@ -19928,6 +24728,147 @@ mod tests {
         // Degenerate inputs.
         assert_eq!(visible_window(0, 0, 4), (0, 0));
         assert_eq!(visible_window(5, 0, 0), (0, 0));
+    }
+
+    // Issue #142 — every `UiMode`'s wheel modality is declared explicitly. The
+    // bug was an OMISSION: `ScheduledTasks` was missing from the wheel-blocking
+    // guard, so wheeling over the manager dialog scrolled the mode-tab side pane
+    // behind it. Listing all variants here (paired with the exhaustive `match` in
+    // `overlay_blocks_mouse`, which has no `_` arm) makes a repeat of that
+    // omission fail loudly rather than silently leak.
+    #[test]
+    fn overlay_blocks_mouse_is_declared_for_every_ui_mode() {
+        // Topmost overlays: the wheel must never reach the pane behind them.
+        for mode in [
+            UiMode::QuitConfirm,
+            UiMode::StopConfirm,
+            UiMode::CloseConfirm,
+            UiMode::ConfigGenPrompt,
+            UiMode::StarPrompt,
+            UiMode::Help,
+            UiMode::DirPicker,
+            UiMode::NewPaneForm,
+            UiMode::ScheduledTasks,
+        ] {
+            assert!(
+                overlay_blocks_mouse(&mode),
+                "{mode:?} is a topmost overlay — the wheel must not reach the pane behind it"
+            );
+        }
+
+        // Non-overlay modes keep the ordinary pane scroll / child-app forwarding.
+        for mode in [
+            UiMode::Normal,
+            UiMode::Filter,
+            UiMode::Rename,
+            UiMode::PaneInput,
+        ] {
+            assert!(
+                !overlay_blocks_mouse(&mode),
+                "{mode:?} has no blocking overlay — pane scrolling must stay live"
+            );
+        }
+    }
+
+    // Issue #142 — the wheel and `j`/`k` share one step definition, so the
+    // manager's wheel WRAPS at both ends exactly like the keyboard, and an empty
+    // list can neither panic nor underflow.
+    #[test]
+    fn manager_selection_step_wraps_like_the_keyboard() {
+        assert_eq!(step_scheduled_selection(0, 3, true), 1);
+        assert_eq!(step_scheduled_selection(1, 3, false), 0);
+        // Wrap at both ends, matching `(sel + 1) % len` / `(sel + len - 1) % len`.
+        assert_eq!(step_scheduled_selection(2, 3, true), 0);
+        assert_eq!(step_scheduled_selection(0, 3, false), 2);
+        // Single row: every step is a no-op.
+        assert_eq!(step_scheduled_selection(0, 1, true), 0);
+        assert_eq!(step_scheduled_selection(0, 1, false), 0);
+        // Empty list: `selected` comes back UNCHANGED, no underflow on `len - 1`.
+        // A nonzero input is the only one that proves "unchanged" — `0 -> 0`
+        // would also pass for a helper that clamped everything to zero.
+        assert_eq!(step_scheduled_selection(4, 0, true), 4);
+        assert_eq!(step_scheduled_selection(4, 0, false), 4);
+    }
+
+    // Issue #142 (review finding 3) — pin the KEYBOARD ENTRY POINT, not just the
+    // shared helper: `j`/Down step forward, `k`/Up step back, both wrap at both
+    // ends, and an empty list leaves the selection alone. The helper test above
+    // exercises `step_scheduled_selection` in isolation and the e2e tests drive
+    // the WHEEL, so neither would notice a future edit that unwires one of these
+    // four keys or flips its direction. This test would.
+    #[test]
+    fn manager_keyboard_steps_selection_in_both_directions() {
+        fn press(ui: &mut UiState, code: KeyCode) -> usize {
+            let action = handle_scheduled_tasks_key(KeyEvent::new(code, KeyModifiers::NONE), ui);
+            assert!(
+                matches!(action, Action::Continue),
+                "{code:?} must only move the selection, never emit an action"
+            );
+            assert_eq!(
+                ui.mode,
+                UiMode::ScheduledTasks,
+                "{code:?} must leave the manager dialog open"
+            );
+            ui.scheduled_selected
+        }
+
+        let mut ui = default_ui();
+        ui.mode = UiMode::ScheduledTasks;
+        ui.scheduled_tasks = vec![
+            make_scheduled_task("a", true),
+            make_scheduled_task("b", true),
+            make_scheduled_task("c", true),
+        ];
+        ui.scheduled_selected = 0;
+
+        // Forward: `j` and Down each advance exactly one row...
+        assert_eq!(press(&mut ui, KeyCode::Char('j')), 1, "`j` must move DOWN");
+        assert_eq!(press(&mut ui, KeyCode::Down), 2, "Down must move DOWN");
+        // ...and wrap off the last row back to the first.
+        assert_eq!(
+            press(&mut ui, KeyCode::Char('j')),
+            0,
+            "`j` on the last row must wrap to the first"
+        );
+        assert_eq!(press(&mut ui, KeyCode::Down), 1, "Down must move DOWN");
+        assert_eq!(press(&mut ui, KeyCode::Down), 2, "Down must move DOWN");
+        assert_eq!(
+            press(&mut ui, KeyCode::Down),
+            0,
+            "Down on the last row must wrap to the first"
+        );
+
+        // Backward: `k` and Up each retreat one row, wrapping off the first row
+        // back to the last.
+        assert_eq!(
+            press(&mut ui, KeyCode::Char('k')),
+            2,
+            "`k` on the first row must wrap to the last"
+        );
+        assert_eq!(press(&mut ui, KeyCode::Char('k')), 1, "`k` must move UP");
+        assert_eq!(press(&mut ui, KeyCode::Up), 0, "Up must move UP");
+        assert_eq!(
+            press(&mut ui, KeyCode::Up),
+            2,
+            "Up on the first row must wrap to the last"
+        );
+
+        // Empty list: a NONZERO selection survives every one of the four keys
+        // untouched — no clamp to zero, no underflow on `len - 1`, no panic.
+        ui.scheduled_tasks.clear();
+        ui.scheduled_selected = 4;
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Down,
+            KeyCode::Up,
+        ] {
+            assert_eq!(
+                press(&mut ui, code),
+                4,
+                "{code:?} must leave an empty list's selection unchanged"
+            );
+        }
     }
 
     // PRD #127 N2 — the manager dialog stays OPEN after run-now and after a
