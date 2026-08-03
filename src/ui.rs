@@ -16227,7 +16227,7 @@ mod tests {
             show: true,
             labels: vec!["seven-roles".into()],
             active_index: 0,
-            orchestration_statuses: vec![],
+            orchestration_statuses: vec![Some(vec![])],
         };
 
         let mut expanded_rect: Option<Rect> = None;
