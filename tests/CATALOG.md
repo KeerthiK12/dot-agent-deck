@@ -2843,6 +2843,22 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** PaneInput key forwarding; help-overlay or bottom-bar discoverability; filesystem loading of `keybindings.toml`.
 - **Platform coverage:** mac+linux+windows.
 
+#### mode/live
+
+##### mode/live/001 — A real PTY-attached deck keeps the persistent mode chip after the command banner collapses.
+- **Layer:** L2 PTY (the real `dot-agent-deck` binary in the isolated `TuiDeck` harness, asserted on the rendered vt100 grid and terminal attributes).
+- **Agent:** none (synthetic `printf; sleep` stand-in pane).
+- **Asserts:** Ctrl+D enters command mode with readable DIM pane content, the expanded banner, and the left-anchored ` COMMAND ` chip; the bound `j` action collapses the banner without removing the chip or content; Ctrl+D returns to a banner-free ` TYPING ` chip.
+- **Does not assert:** a genuine agent boot or agent response; real-agent cursor and scroll behavior (covered by `mode/live/002`); exact block-glyph shapes or subtitle position.
+- **Platform coverage:** mac+linux.
+
+##### mode/live/002 — A real interactive Haiku agent visibly traverses typing, command-mode reading and scrollback, then typing again. [reel]
+- **Layer:** L2 PTY (the real `dot-agent-deck` binary in the isolated `TuiDeck` harness, asserted on the rendered vt100 grid and terminal attributes; flaky-tolerant pre-PR real-agent tier).
+- **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`, `--ax-screen-reader`, `--allowedTools Bash Read`, no `-p`), with isolated imported credentials plus onboarding/project trust seeded in the per-test HOME; the supported accessibility renderer keeps genuine interactive output in terminal scrollback instead of repainting it out of the vt100 history.
+- **Asserts:** the live prompt accepts typed keystrokes and exposes both cursor channels with ` TYPING `; the submitted prefix-glob directive makes Haiku inspect and visibly list a uniquely named fixture sentinel; Ctrl+D hides the hardware cursor and removes the painted block while retaining readable DIM output, the expanded banner, and ` COMMAND `; wheel-up reveals older real-agent filename output through deck scrollback rather than the child mouse path; Ctrl+D restores the cursor treatment and ` TYPING `.
+- **Does not assert:** exact model prose, tool-call wording, response timing, pixel-level DIM appearance, light-versus-dark terminal rendering, or command-mode indication on all three tab types (covered at L1 by the mode suites and manually validated across tabs).
+- **Platform coverage:** mac+linux.
+
 ### Scheduled tasks (PRD #127)
 
 #### scheduler/reload

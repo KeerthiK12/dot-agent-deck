@@ -315,6 +315,40 @@ pub struct TuiDeck {
     recording_redactions: Vec<String>,
 }
 
+/// Observable terminal-cell styling from the outer vt100 screen driven by the
+/// real deck binary. L2 rendering tests use this to assert user-visible
+/// attributes such as DIM without reaching into production UI state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridCellStyle {
+    pub fgcolor: vt100::Color,
+    pub bgcolor: vt100::Color,
+    pub bold: bool,
+    pub dim: bool,
+    pub inverse: bool,
+}
+
+impl From<&vt100::Cell> for GridCellStyle {
+    fn from(cell: &vt100::Cell) -> Self {
+        Self {
+            fgcolor: cell.fgcolor(),
+            bgcolor: cell.bgcolor(),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            inverse: cell.inverse(),
+        }
+    }
+}
+
+/// Hardware-cursor state after the outer vt100 parser has consumed the real
+/// terminal stream, including the style of the cell beneath that cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalCursorSnapshot {
+    pub hidden: bool,
+    pub row: u16,
+    pub col: u16,
+    pub cell: Option<GridCellStyle>,
+}
+
 impl TuiDeck {
     /// One-line convenience: build a default deck and launch it.
     pub fn launch_with_fixture(fixture_name: &str) -> Self {
@@ -1171,6 +1205,75 @@ impl TuiDeck {
     /// state.
     pub fn snapshot_grid(&self) -> String {
         self.parser.lock().unwrap().screen().contents()
+    }
+
+    /// Return the real terminal's current hardware-cursor visibility, position,
+    /// and cell styling as parsed from the deck's PTY output.
+    pub fn terminal_cursor_snapshot(&self) -> TerminalCursorSnapshot {
+        let parser = self.parser.lock().unwrap();
+        let screen = parser.screen();
+        let (row, col) = screen.cursor_position();
+        TerminalCursorSnapshot {
+            hidden: screen.hide_cursor(),
+            row,
+            col,
+            cell: screen.cell(row, col).map(GridCellStyle::from),
+        }
+    }
+
+    /// Wait for the real terminal's hardware cursor visibility to match the
+    /// requested state. Live agent TUIs can repaint their prompt one frame
+    /// after their final output, so cursor assertions need the same bounded
+    /// observable-state wait as grid assertions.
+    pub fn wait_for_terminal_cursor_hidden_within(&self, hidden: bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.terminal_cursor_snapshot().hidden == hidden {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Return the styling at one cell of the real terminal grid.
+    pub fn grid_cell_style(&self, row: u16, col: u16) -> Option<GridCellStyle> {
+        self.parser
+            .lock()
+            .unwrap()
+            .screen()
+            .cell(row, col)
+            .map(GridCellStyle::from)
+    }
+
+    /// Locate visible ASCII text and return the style of each occupied cell.
+    /// The mode-indication L2 tests use unique ASCII sentinels, so one character
+    /// maps to one terminal cell and the returned vector aligns with `needle`.
+    pub fn visible_text_cell_styles(&self, needle: &str) -> Option<Vec<GridCellStyle>> {
+        assert!(
+            needle.is_ascii(),
+            "visible text style lookup requires ASCII"
+        );
+        let parser = self.parser.lock().unwrap();
+        let screen = parser.screen();
+        let grid = screen.contents();
+        for (row, line) in grid.lines().enumerate() {
+            let Some(byte_col) = line.find(needle) else {
+                continue;
+            };
+            let col = line[..byte_col].chars().count() as u16;
+            let styles = (0..needle.len() as u16)
+                .map(|offset| {
+                    screen
+                        .cell(row as u16, col + offset)
+                        .map(GridCellStyle::from)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(styles);
+        }
+        None
     }
 
     /// Write raw bytes to the deck's PTY master — the input side of the
