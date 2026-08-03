@@ -1,6 +1,6 @@
 # PRD #339: Move card Last/Tools stats into the bottom border
 
-**Status**: In progress
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-08-02
 
@@ -115,7 +115,7 @@ No (CLAUDE.md rule 9 asks the question; the answer here is no). This is a refine
 - [x] **M3 — Narrow-width fallback.** The degradation ladder is implemented as one testable function with unit tests across a width sweep.
 - [x] **M4 — `Dir` uses full width.** Single un-branched `Dir:` line, ellipsized via `truncate_with_ellipsis`.
 - [x] **M5 — L1 coverage.** New snapshots pin the bottom-border content at a wide and a narrow card width; `card_height_001_content_derived_values` reduced to three assertions; existing `render_dashboard__pane_00*` snapshots regenerated. Each new `#[spec]` test carries a `/// Scenario:` comment (rule 7) and a `tests/CATALOG.md` entry.
-- [ ] **M6 — Changelog and docs.** Fragment added via `dot-ai-changelog-fragment`. **The original premise here — "no user-facing docs currently describe the card stats row" — turned out to be false**, and review caught it: `docs/session-management.md:25,29` describes the fields and embeds `docs/img/session-management-card.jpg`, which visibly shows `Last: 0s ago  Tools: 14` on the `Dir:` content row. Both the prose and the screenshot need updating, so this is a docs change, not a docs skip.
+- [x] **M6 — Changelog and docs.** Fragment added via `dot-ai-changelog-fragment`. **The original premise here — "no user-facing docs currently describe the card stats row" — turned out to be false**, and review caught it: `docs/session-management.md:25,29` describes the fields and embeds `docs/img/session-management-card.jpg`, which visibly shows `Last: 0s ago  Tools: 14` on the `Dir:` content row. Both the prose and the screenshot need updating, so this is a docs change, not a docs skip.
 
 ## Risks
 
@@ -153,6 +153,10 @@ The card was `format_elapsed`'s only caller anywhere in `src/`, `tests/` or `xta
 `CardDensity::card_height`, `choose_density`, and `CardDensityKind::rendered_height` each simply drop their `wide: bool` parameter.
 
 ## Work Log
+
+### 2026-08-03 — Complete
+
+All six milestones landed. PR [#340](https://github.com/vfarcic/dot-agent-deck/pull/340): CI green (9/9), `cargo test-fast` 1431/1431, `cargo test-e2e` 2791/2791, fmt/clippy clean, `cargo xtask linkage-check` and `cargo xtask docs --tests` both pass. Greptile review settled with 0 inline findings, confidence 5/5. Review raised 11 findings; 9 were fixed here and 2 were declined and filed as follow-ups instead of dropped silently: [#357](https://github.com/vfarcic/dot-agent-deck/issues/357) (`truncate_styled_segments` budgets chars, not display columns), [#358](https://github.com/vfarcic/dot-agent-deck/issues/358) (test-harness credentials left in world-traversable `/tmp` sandbox HOMEs), [#359](https://github.com/vfarcic/dot-agent-deck/issues/359) (repo-wide East-Asian-ambiguous-width policy). Demo reel published: https://youtu.be/W73TozxLd8A.
 
 ### 2026-08-02 — Open Questions resolved, implementation started
 
