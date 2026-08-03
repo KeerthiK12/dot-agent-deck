@@ -564,6 +564,21 @@ impl EmbeddedPaneController {
     /// no resize task are spawned, and nothing reaches a socket. Rendering only
     /// ever reads `screen` / `is_focused` / `name`, and scrolling only ever reads
     /// `screen` / `mouse_mode`, which is the whole point of the seams.
+    ///
+    /// `rows` / `cols` are caller-controlled on every seam above, and these are
+    /// ordinary `pub` entry points of the release library — so they go through the
+    /// same [`parser_init_dims`] guard the hydration path uses rather than reaching
+    /// `vt100::Parser::new` raw. A zero axis would otherwise build a parser whose
+    /// grid panics on the first byte, and `u16::MAX` square would ask for ~4.3
+    /// billion cells. This is the single construction point for a seam pane, so it
+    /// is the single place the guard has to sit.
+    ///
+    /// Valid dims are not enough on their own: `parser_init_dims` admits a 1-row /
+    /// 1-col parser, and vt100 0.16.2 underflows in `col_wrap` the moment text
+    /// wraps in one that short. The live output path already contains that exact
+    /// bug with [`guarded_parser_feed`], so the seam feeds through the same guard
+    /// and rebuilds the parser at the same geometry on a contained panic — the
+    /// pane then renders blank instead of taking the process down.
     fn seam_pane(
         pane_id: &str,
         rows: u16,
@@ -572,8 +587,17 @@ impl EmbeddedPaneController {
         mouse_mode_enabled: bool,
         focused: bool,
     ) -> (Pane, tokio::sync::mpsc::UnboundedReceiver<StreamCmd>) {
+        let (rows, cols) = parser_init_dims(rows, cols);
         let mut parser = vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES);
-        parser.process(bytes);
+        if guarded_parser_feed(|| parser.process(bytes)).is_err() {
+            tracing::warn!(
+                rows,
+                cols,
+                "vt100 parser panicked seeding an inert seam pane; rebuilding it empty at the \
+                 same geometry. Known vt100 0.16.2 edge case in a very short pane."
+            );
+            parser = vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES);
+        }
 
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
         // Dropped immediately: an inert backend must not be able to resize an

@@ -16487,8 +16487,14 @@ pub fn render_command_banner_pane_to_buffer(
     // quietly focusing it anyway.
     const NO_PANE: &str = "\u{0}unfocused";
 
-    let rows = height.saturating_sub(2);
-    let cols = width.saturating_sub(2);
+    // The pane fills the buffer, so the inner area is `width - 2` by `height - 2`
+    // — but `width`/`height` are caller-controlled and this is a `pub` entry point
+    // of the release library, so a 1x1 or 2x2 area would derive a 0-row / 0-col
+    // parser, and vt100 panics indexing an empty grid on the first byte. Floor each
+    // derived axis at 1; the controller seam then runs the same value through
+    // `parser_init_dims`, so no seam can build a degenerate parser.
+    let rows = height.saturating_sub(2).max(1);
+    let cols = width.saturating_sub(2).max(1);
     let ctrl =
         EmbeddedPaneController::for_render_seam_with_focused_pane(PANE_ID, rows, cols, content);
     let backend = TestBackend::new(width, height);
