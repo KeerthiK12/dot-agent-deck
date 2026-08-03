@@ -22,7 +22,7 @@ Events reach the deck by different mechanisms per agent — that is why this lay
 
 | Strategy | Reference agent | Mechanism | Install / activation | Module |
 |---|---|---|---|---|
-| `NativeHooks` | Claude Code | Hook scripts installed into the agent's own config that shell back to the deck | Machine-global, at TUI startup (`auto_install`) | [`src/hooks_manage.rs`](../../src/hooks_manage.rs) |
+| `NativeHooks` | Claude Code, Devin | Hook scripts installed into the agent's own config that shell back to the deck | Machine-global, at TUI startup (`auto_install`) | [`src/hooks_manage.rs`](../../src/hooks_manage.rs), [`src/devin_hooks_manage.rs`](../../src/devin_hooks_manage.rs) |
 | `Plugin` | OpenCode | A JS plugin materialized into the agent's plugin directory | Machine-global, at TUI startup (`auto_install`) | [`src/opencode_manage.rs`](../../src/opencode_manage.rs) |
 | `Extension` | Pi | A bundled TypeScript extension materialized into the agent's HOME (`include_str!`) | Auto-materialized at spawn time (guarded on the spawn command being `pi`) | [`src/orchestrator_ext.rs`](../../src/orchestrator_ext.rs) — see [pi-extension.md](pi-extension.md) |
 | `Wrapper` | Codex | `dot-agent-deck wrap -- <cmd>` spawns the agent, passes stdio through transparently, and tees stdout/stderr through pattern detection into events | No install step — the launch command is rewritten to wrap the agent | [`src/wrap.rs`](../../src/wrap.rs) |
@@ -235,6 +235,14 @@ Two follow-up PRDs build directly on the PRD #20 machinery documented here:
 
 - **Gemini** — a **wrapper**-strategy agent, so a thin registry entry + a Gemini-specific `classify_line` rule set + detection + e2e. It reuses `dot-agent-deck wrap` wholesale; the PRD is small *because the wrapper strategy already exists*.
 - **Aider** — introduces the **new log-watcher** strategy (`dot-agent-deck watch --agent aider --log <path>` tailing Aider's structured logs into `AgentEvent`s). That PRD carries the one-time log-watcher `IntegrationStrategy` implementation; every log-watching agent after it is back on the cheap path.
+
+### Devin — the second `NativeHooks` agent
+
+Devin CLI is the second agent to reuse the `NativeHooks` strategy, and it is the cheapest possible registry addition: a typed identity, a registry entry, and one `hook.rs` ingestion arm. No wrapper, no trust ceremony, no plugin. Its hooks post the **same Claude-Code JSON shape** Codex's do, so the existing `ClaudeCodeHookInput` deserializer and `build_event_typed` path are reused wholesale — only the `AgentType` stamp differs.
+
+The one place Devin diverges from Claude's installer is **config safety**. Claude's `~/.claude/settings.json` is a file the deck has always rewritten wholesale, so `hooks_manage` treats any read/parse failure as an empty config. Devin's `~/.config/devin/config.json` is a **shared** file holding the user's model, permissions, MCP servers, and theme — and Devin documents it as JSON *with comment support*, which `serde_json` cannot parse. Claude's parse-failure-as-empty fallback would silently destroy a valid user config the first time anyone wrote a `//` comment in it. So `devin_hooks_manage` borrows `codex_hooks_manage`'s discipline instead: only `NotFound` is empty; malformed content is backed up to `config.json.bak` and the install errors; a structurally-incompatible shape errors without touching the file; the read-modify-write is serialized by an in-process mutex and published atomically.
+
+**Known interaction — duplicate events.** Devin also reads Claude's hook files (`~/.claude/settings.json`) by default (`read_config_from.claude`, absent = `true`). A user who has both the deck's Claude and Devin hooks installed therefore gets two hook invocations per lifecycle event from one Devin session — one stamped `AgentType::Devin` and one `AgentType::ClaudeCode` — which makes the card's agent badge flap. The installer detects this and warns with the one-line remedy (`"read_config_from": { "claude": false }`) rather than writing that key itself, since it also governs the user's Claude rules/commands/subagent imports.
 
 [`AgentSpec`]: ../../src/agent_registry.rs
 [`AgentType`]: ../../src/event.rs
