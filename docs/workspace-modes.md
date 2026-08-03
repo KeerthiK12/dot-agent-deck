@@ -151,9 +151,19 @@ A **thicker border** (`┃` rather than `│`) marks the currently focused pane.
 
 The focused pane's border **turns cyan only while you are typing into it** (PaneInput mode). In command mode every border — focused pane included — shows its agent's status color instead: green for working, blue for thinking, yellow for waiting on you, red for an error, gray for idle. So the border answers two questions at once: its *weight* tells you which pane `Enter` / `Ctrl+d` will drop you into, and its *color* tells you whether your keystrokes are reaching it yet.
 
+The border is not the only signal. A chip at the left of the bottom bar names the current mode — ` COMMAND ` or ` TYPING ` — in the same place on every tab; the focused pane carries a cursor only while you are typing into it; and entering command mode dims that pane and briefly overlays a `COMMAND MODE · Ctrl+D to type` banner. See [Which mode you're in](keyboard-shortcuts.md#which-mode-youre-in) for the full set.
+
+### Command Mode Is Read-Only, Not Idle
+
+Command mode is where you decide what to do next, and it is the **safe resting state** — the one mode in which a stray keystroke cannot reach an agent. It is deliberately not a blind spot: pane content stays fully readable there (dimmed, never blanked), and you can scroll back through it. The scroll wheel over the focused agent pane and the `PageUp` / `PageDown` keys both move Agent Deck's own scrollback in command mode, matching side panes, which have always scrolled in any mode. So reviewing what an agent did no longer means dropping into the mode where a mistyped key goes into it.
+
+In command mode the wheel is never forwarded to the agent's mouse protocol, so a full-screen TUI running in the pane cannot scroll under you while you read.
+
 ### PaneInput Mode
 
 Press `Enter` on a selected side pane to enter PaneInput mode — this lets you type directly into the pane's shell (run commands, send input, interact with running processes). `Ctrl+c` sends SIGINT to the pane's process. Press `Ctrl+d` to exit PaneInput mode and return to Normal mode.
+
+This is the mode the bottom-bar chip calls ` TYPING `, and the only one in which the focused pane shows a cursor. `PageUp` / `PageDown` belong to the program running in the pane here — they are sent through to it rather than scrolling the deck's view.
 
 If no side pane is selected, `Enter` focuses the agent pane instead.
 

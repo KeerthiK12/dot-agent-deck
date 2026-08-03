@@ -9,9 +9,10 @@ title: Keyboard Shortcuts
 
 Every keyboard action below is also reachable with the mouse — the dashboard is fully clickable, not keyboard-only. Each clickable affordance carries its keyboard shortcut inline, so the on-screen controls double as a legend, and clicking one performs exactly the same action as its shortcut.
 
-- **Persistent button bar.** The bottom row exposes the global commands — `[Back to Pane Ctrl+D]`, `[New Pane Ctrl+N]`, `[Close Ctrl+W]`, `[Toggle Layout Ctrl+T]`, `[Help ?]`, and `[Quit Ctrl+C]`. On terminals too narrow for the full labels the bar wraps to a second row rather than dropping any of them. This replaces the old status-bar legend. The bar follows the mode you are in: the first button reads `[Back to Pane Ctrl+D]` in command mode and `[Command Mode Ctrl+D]` while you are typing in a pane, and `[Close Ctrl+W]` is dimmed and inert outside command mode, matching the key. `[Close]` opens the same close confirmation the `Ctrl+W` key does.
+- **Persistent button bar.** The bottom row exposes the global commands — `[Back to Pane Ctrl+D]`, `[New Pane Ctrl+N]`, `[Close Ctrl+W]`, `[Toggle Layout Ctrl+T]`, `[Help ?]`, and `[Quit Ctrl+C]`. On terminals too narrow for the full labels the bar wraps to a second row rather than dropping any of them. This replaces the old status-bar legend. The bar follows the mode you are in: the first button reads `[Back to Pane Ctrl+D]` in command mode and `[Command Mode Ctrl+D]` while you are typing in a pane, and `[Close Ctrl+W]` is dimmed and inert outside command mode, matching the key. `[Close]` opens the same close confirmation the `Ctrl+W` key does. At the far left of the bar, before the buttons, a highlighted chip names the mode you are in right now — ` COMMAND ` or ` TYPING ` (see [Which mode you're in](#which-mode-youre-in)).
 - **Tab strip.** Click a tab header to switch to it; Mode and Orchestration tabs carry a clickable `[×]` close affordance (the Dashboard tab has none). The `[×]` opens the same close confirmation as `Ctrl+W` and the `[Close]` button — every route into a pane teardown asks first.
 - **Dashboard cards.** Single-click a card to select it, double-click to focus its pane. The bar adds clickable `[Filter /]`, `[Rename r]`, and `[Generate g]` buttons.
+- **Scroll wheel.** A mode tab's side panes scroll when the pointer is over them; anywhere else the wheel scrolls the focused pane. The focused pane now scrolls in **command mode** too, not only while you are typing into it — command mode is a read-only inspect mode, so reading back through an agent's output no longer means entering the mode where a stray keystroke reaches it. In command mode the wheel always moves Agent Deck's own scrollback and is never forwarded to the agent's mouse protocol, so a full-screen TUI running in the pane cannot move under you while you read. While you are typing in a pane, the wheel is forwarded to the agent when it has mouse reporting enabled, exactly as before, and scrolls our scrollback otherwise. Side panes have always scrolled in any mode and are unchanged.
 - **Dialogs, picker, and forms.** Each carries explicit clickable buttons alongside its keyboard controls: quit/config-gen/star/help dialog buttons; the directory picker's clickable rows, `..` parent, and `[Confirm]`/`[Cancel]`/`[Filter]`; the inline filter/rename `[Apply]`/`[Save]`/`[Cancel]`; the `[Command Mode Ctrl+D]` affordance while in a pane; and the new-pane form's clickable mode chips with `[Submit]`/`[Cancel]`.
 
 All the keyboard shortcuts below continue to work unchanged.
@@ -24,6 +25,18 @@ All the keyboard shortcuts below continue to work unchanged.
 | `Ctrl+N` | New pane (directory picker, then name + command form) | Any mode |
 | `Ctrl+T` | Toggle stacked / tiled layout | Any mode |
 | `Ctrl+W` | Close the selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab — after a confirmation dialog. The dashboard tab itself cannot be closed. | **Command mode only** |
+
+### Which mode you're in
+
+`Ctrl+D` toggles between two modes, and the deck names the one you are in rather than leaving you to infer it. A chip at the far left of the bottom bar reads ` COMMAND ` when your keystrokes drive the deck and ` TYPING ` when they go into the focused pane. It is in the same place on every tab, whenever the bar is showing its buttons — the one exception is while an inline **Filter** or **Rename** field is open, where that row *is* the input field and its own prompt tells you where your keystrokes are going. Those two words are the vocabulary the rest of this page uses: "command mode" is ` COMMAND `, and "typing in a pane" (`PaneInput` internally) is ` TYPING `.
+
+The chip and the first button in the bar answer different questions, which is why both are there: the chip says where you *are*, while `[Back to Pane Ctrl+D]` / `[Command Mode Ctrl+D]` says where `Ctrl+D` would take you.
+
+Three other things change with the mode:
+
+- **No cursor in command mode.** The focused pane shows no cursor at all — neither the highlighted block nor your terminal's own blinking one. A cursor now means, without exception, that what you type lands in that pane.
+- **The focused pane dims, with a banner.** Entering command mode dims the focused pane's content — still perfectly readable, just visibly inert — and overlays a large `COMMAND MODE · Ctrl+D to type` banner. The banner clears itself after about 2.5 seconds, or immediately when you press a command-mode key or click a bottom-bar button. Typing a key that isn't bound to anything keeps it up (or brings it back), because that is the moment you most likely thought you were talking to the agent. The dimming stays for as long as you are in command mode. In a pane too small for the block letters, the banner degrades to a single line and then drops out entirely; the chip and the dimming still tell you where you are.
+- **The selected dashboard card dims while you type.** The selected card keeps its `▸ ` marker in both modes so you never lose track of the selection, but its highlight is de-emphasised while you are typing in a pane — the deck looks inert exactly when the pane looks live.
 
 ### `Ctrl+W` closes only from command mode
 
@@ -69,6 +82,8 @@ These shortcuts work in **command mode**. If you're typing in an agent pane, pre
 | `j` / `Down` | Select next card (wraps at end) |
 | `k` / `Up` | Select previous card (wraps at start) |
 | `1`–`9` | Jump to card N and focus its pane |
+| `PageUp` | Scroll the focused pane back (see [Scrolling back through a pane](#scrolling-back-through-a-pane)) |
+| `PageDown` | Scroll the focused pane forward |
 | `/` | Filter sessions (opens filter input — see [Dialogs](#dialogs)) |
 | `r` | Rename selected session (opens rename input — see [Dialogs](#dialogs)) |
 | `g` | Generate `.dot-agent-deck.toml` (opens config-generation prompt — see [Dialogs](#dialogs)) |
@@ -76,6 +91,14 @@ These shortcuts work in **command mode**. If you're typing in an agent pane, pre
 | `?` | Toggle help overlay |
 | `y` / `n` | Approve / deny a pending permission request (only when an agent is waiting) |
 | `Esc` | Clear active filter |
+
+### Scrolling back through a pane
+
+`PageUp` / `PageDown` scroll the focused pane's output back and forward, three lines at a time — the keyboard equivalent of the scroll wheel. They are the `scroll_pane_up` and `scroll_pane_down` actions and are remappable like any other binding (see [Actions and defaults](#actions-and-defaults)).
+
+They work in **command mode only**, and that is deliberate: while you are typing in a pane, `PageUp` and `PageDown` are sent straight through to whatever is running there as `ESC[5~` / `ESC[6~`, so a pager, an editor, or the agent's own scrollback keeps them. Press `Ctrl+D` first, and the same keys scroll the deck's own view of the pane instead.
+
+These are the unmodified keys. `Ctrl+PageUp` / `Ctrl+PageDown` remain tab navigation and are unaffected.
 
 ## Directory Picker
 
@@ -179,8 +202,12 @@ help = "F1"                      # open help with F1 instead of ?
 | `approve_permission` | `y` | Approve a pending permission request |
 | `deny_permission` | `n` | Deny a pending permission request |
 | `generate_config` | `g` | Generate `.dot-agent-deck.toml` (config-generation prompt) |
+| `scroll_pane_up` | `PageUp` | Scroll the focused pane back — **command mode only**; in a pane the key is passed to the agent |
+| `scroll_pane_down` | `PageDown` | Scroll the focused pane forward — **command mode only**; in a pane the key is passed to the agent |
 
-The `Down`/`Up`/`Tab`/`Shift+Tab`/`Left`/`Right` aliases and `Ctrl+PageUp` / `Ctrl+PageDown` tab navigation are not remappable and always work alongside your bindings.
+The `Down`/`Up`/`Tab`/`Shift+Tab`/`Left`/`Right` aliases and `Ctrl+PageUp` / `Ctrl+PageDown` tab navigation are not remappable and always work alongside your bindings. `Ctrl+PageUp` / `Ctrl+PageDown` are separate chords from the unmodified `PageUp` / `PageDown` above, so remapping the scroll actions does not affect tab navigation.
+
+Rebinding `scroll_pane_up` / `scroll_pane_down` both enables the new chord and retires the default, so `scroll_pane_up = "Ctrl+u"` leaves plain `PageUp` doing nothing in command mode. Setting either to `""` unbinds it and leaves the scroll wheel as the only way to scroll that pane.
 
 **Quit is not a remappable action.** No key directly quits — `Ctrl+C` (hardcoded, non-overridable) opens the quit/detach modal (Detach / Stop / Cancel). There is no `quit` config key; a `quit = "…"` line is treated as an unknown action and ignored with a warning.
 
