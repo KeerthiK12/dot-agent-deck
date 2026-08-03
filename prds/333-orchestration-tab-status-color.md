@@ -1,6 +1,6 @@
 # PRD #333: Orchestration tab label reflects highest-priority pane activity
 
-**Status**: Not Started
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-08-03
 **GitHub Issue**: [#333](https://github.com/vfarcic/dot-agent-deck/issues/333)
@@ -34,10 +34,10 @@ Scope decisions, confirmed with the user during PRD creation:
 
 ## Milestones
 
-- [ ] **M1 — Aggregate-priority resolver.** A pure function that takes an orchestration tab's pane statuses and returns the single highest-priority `SessionStatus` per the table above (or a defined "no panes" fallback). Unit-testable in isolation from rendering.
-- [ ] **M2 — Wire into tab-label rendering.** `render_tab_bar_to_buffer` colors an orchestration tab's label using `palette::status_color()` on the resolver's output instead of the current neutral/fixed label color. Non-orchestration tabs are unaffected.
-- [ ] **M3 — Tests.** L1 widget/snapshot coverage (`insta`) for the resolver's priority ordering (including the Compacting→Thinking and Unknown→Idle aliasing) and for the rendered tab-bar color under representative multi-pane mixes. Per CLAUDE.md rule 4, this is a functional TUI change and needs harness coverage, not just the pure-function unit test in M1.
-- [ ] **M4 — Documentation.** Note the new tab-label behavior wherever the tab bar / orchestration tabs are currently documented (check `docs/` for an existing orchestration-tabs page before adding a new one).
+- [x] **M1 — Aggregate-priority resolver.** A pure function that takes an orchestration tab's pane statuses and returns the single highest-priority `SessionStatus` per the table above (or a defined "no panes" fallback). Unit-testable in isolation from rendering.
+- [x] **M2 — Wire into tab-label rendering.** `render_tab_bar_to_buffer` colors an orchestration tab's label using `palette::status_color()` on the resolver's output instead of the current neutral/fixed label color. Non-orchestration tabs are unaffected.
+- [x] **M3 — Tests.** L1 widget/snapshot coverage (`insta`) for the resolver's priority ordering (including the Compacting→Thinking and Unknown→Idle aliasing) and for the rendered tab-bar color under representative multi-pane mixes. Per CLAUDE.md rule 4, this is a functional TUI change and needs harness coverage, not just the pure-function unit test in M1.
+- [x] **M4 — Documentation.** Note the new tab-label behavior wherever the tab bar / orchestration tabs are currently documented (check `docs/` for an existing orchestration-tabs page before adding a new one).
 
 ## Success Criteria
 
@@ -49,3 +49,9 @@ Scope decisions, confirmed with the user during PRD creation:
 
 - **Priority collisions reading as "wrong."** If a tab is mostly Idle with one pane transiently Thinking, the label will flip to Blue even though "nothing important" is happening from the user's point of view. Mitigation: this is the explicitly requested behavior (highest-priority-wins), not a bug — revisit only if real usage shows it's noisy.
 - **Aggregate color may be mistaken for a single pane's status when a tab is later focused and only one pane is visible.** Mitigation: this PRD only changes the *tab bar* label; it does not touch how any individual pane or deck card renders its own status, so there's no ambiguity once the user is inside the tab.
+
+## Work Log
+
+### 2026-08-03 — M1-M4 complete
+
+The aggregate-priority resolver, its wiring into `render_tab_bar_to_buffer`, L1 `insta` snapshot coverage for the priority ordering and aliasing, and the `docs/orchestration.md` note all landed. `tests/render_tab_strip.rs` also gained a real zero-pane orchestration tab case for `layout_004`. Implementation complete.
