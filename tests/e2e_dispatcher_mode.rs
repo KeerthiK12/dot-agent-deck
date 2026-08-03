@@ -184,17 +184,43 @@ fn dispatcher_001_opens_mode_tab_with_real_agent() {
     // below fails or the agent creates it late.
     let _worktree_guard = SiblingWorktreeGuard(expected_worktree.clone());
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(180);
-    while std::time::Instant::now() < deadline && !expected_worktree.is_dir() {
-        std::thread::sleep(Duration::from_millis(500));
+    // A real agent sometimes answers instead of acting — it acknowledges the
+    // instruction, or asks a clarifying question, and then sits idle. Re-nudge on
+    // a fixed cadence rather than waiting out one long silence, so a single
+    // conversational detour doesn't fail the run. Bounded: NUDGES × NUDGE_EVERY
+    // is the whole budget, and it stays inside this test's nextest kill window
+    // (see `.config/nextest.toml`) so the assertion below — and its grid dump —
+    // actually runs instead of the process being killed mid-wait.
+    const NUDGE_EVERY: Duration = Duration::from_secs(70);
+    const NUDGES: u32 = 3;
+    let mut dispatched = false;
+    'outer: for round in 0..NUDGES {
+        if round > 0 {
+            deck.send_keys(
+                b"You have not called the dispatch command yet. \
+                  Run `dot-agent-deck dispatch probe-unit --task \"list the files here\"` now, \
+                  with no further questions.\r",
+            );
+        }
+        let until = std::time::Instant::now() + NUDGE_EVERY;
+        while std::time::Instant::now() < until {
+            if expected_worktree.is_dir() {
+                dispatched = true;
+                break 'outer;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
+
     assert!(
-        expected_worktree.is_dir(),
-        "the dispatcher agent never produced a dispatch worktree at {} within 180s — \
-         expected it to call `dot-agent-deck dispatch probe-unit` and the daemon to \
-         create the sibling worktree.\n\
+        dispatched,
+        "the dispatcher agent never produced a dispatch worktree at {} after {} nudges \
+         over {}s — expected it to call `dot-agent-deck dispatch probe-unit` and the \
+         daemon to create the sibling worktree.\n\
          Final grid:\n{}",
         expected_worktree.display(),
+        NUDGES,
+        NUDGE_EVERY.as_secs() * NUDGES as u64,
         deck.snapshot_grid()
     );
 }
