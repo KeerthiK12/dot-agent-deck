@@ -2788,6 +2788,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** click dispatch for the destination button; exact spacing after the chip; context-specific buttons after the universal prefix.
 - **Platform coverage:** mac+linux+windows.
 
+##### mode/chip/003 — Narrow mode chips disappear symmetrically without changing the bar's row budget.
+- **Layer:** L1 (ratatui `TestBackend` through the production bottom-bar renderer; no PTY or subprocess).
+- **Agent:** none.
+- **Asserts:** across every width 0–24, ` COMMAND ` is present if and only if ` TYPING ` is present, both are absent below the shared 10-column threshold and present at or above it, and Normal/PaneInput/Filter/Rename rendering never panics; the command bar's reserved and rendered rows remain 11/5/3/2/1 at widths 19/40/80/120/200.
+- **Does not assert:** click dispatch, exact button placement within each wrapped row, or full-frame card geometry (covered by `render/layout/004`).
+- **Platform coverage:** mac+linux+windows.
+
 #### mode/banner
 
 ##### mode/banner/001 — A fresh command-mode entry dims only the focused pane and centres the full block banner without erasing agent output.
@@ -2816,6 +2823,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (synthetic vt100 content in small-but-valid focused panes).
 - **Asserts:** nonempty 0×0, 1×1, 2×2, 1×40, and 40×1 pane renders do not panic and return the exact requested buffer size; all three release-exposed controller seam paths resolve a single axis just above `PTY_RESIZE_DIM_MAX` to the safe 24×80 parser fallback; tiers 2–4 render their exact block-COMMAND, full reversed line, and reversed word fallbacks entirely inside the inner area; tier 5 omits safely; all valid bordered sizes retain DIM and avoid `Color::Rgb`; after decay the pane stays dim/readable with no banner while the bottom bar still carries the persistent ` COMMAND ` chip.
 - **Does not assert:** the full tier-1 banner (covered by `mode/banner/001`); the transition rules that produce Collapsed (covered by `mode/banner/003`); M6 PTY/real-agent behavior.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/banner/005 — Same-drain mode edges preserve the command banner's real key semantics.
+- **Layer:** L1 (in-process production `handle_key_event` burst observer with no render between keys; no PTY or subprocess).
+- **Agent:** none (one inert focused pane).
+- **Asserts:** a queued double-`Ctrl+D` burst traverses Normal → PaneInput → Normal and re-expands the banner; `Ctrl+D` then bound `Ctrl+T` from PaneInput lands Normal → Normal and stays Collapsed; single bound `Ctrl+T`, bound-then-unbound-printable, and single PaneInput exit control rows retain their distinct Collapsed/Expanded outcomes, with the before-burst visibility pinned for every case.
+- **Does not assert:** mouse bursts, wall-clock TTL expiry (covered by `mode/banner/003`), or rendered banner geometry.
 - **Platform coverage:** mac+linux+windows.
 
 #### mode/deck
@@ -2848,6 +2862,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (two in-memory panes with synthetic history and production focus changes).
 - **Asserts:** command-mode scrollback is nonzero before entering PaneInput and zero afterward; an unchanged PaneInput target deliberately retains its offset; moving PaneInput focus snaps only the newly targeted second pane while leaving the first at live output; an unchanged command-mode target deliberately retains its offset. Every case pins both pre- and post-reconcile offsets for both panes.
 - **Does not assert:** hardware-cursor rendering after the reset (covered by `mode/live/002`); key dispatch for entering PaneInput; real-agent output.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/scroll/004 — PaneInput without a focused pane settles in command mode exactly once.
+- **Layer:** L1 (in-process two-frame production scrollback reconcile plus command-banner edge observer with injected `Instant`s; no PTY or subprocess).
+- **Agent:** none (a controller with no panes).
+- **Asserts:** a no-focus PaneInput frame lands in Normal with an Expanded banner, remains Normal on the next frame, and reports Collapsed exactly at the TTL so the entry instant was not re-stamped; equal frame instants remain Expanded, and an already-Normal initial mode produces the identical idempotent result.
+- **Does not assert:** how focus vanished, focus replacement policy when another pane exists, rendered banner geometry, or real-agent behavior.
 - **Platform coverage:** mac+linux+windows.
 
 #### mode/live

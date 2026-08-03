@@ -20,8 +20,9 @@ use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
     BannerTier, COMMAND_BANNER_TTL, CardDensityKind, CommandBannerSignal, CommandBannerState,
     CommandBannerVisibility, ReconcileSeamPane, UiMode, command_banner_tier,
-    observe_focused_agent_key_scroll, observe_focused_agent_mouse_scroll,
-    observe_pane_input_scrollback_reconcile, render_button_bar_for_mode_to_buffer,
+    observe_command_banner_key_burst, observe_focused_agent_key_scroll,
+    observe_focused_agent_mouse_scroll, observe_pane_input_scrollback_reconcile,
+    observe_pane_input_without_focused_pane, render_button_bar_for_mode_to_buffer,
     render_button_bar_to_buffer, render_button_bar_with_bindings_to_buffer,
     render_card_for_mode_to_buffer, render_card_to_buffer, render_command_banner_pane_to_buffer,
     render_focused_pane_cursor_for_mode_to_position,
@@ -77,6 +78,13 @@ fn buffer_to_styled_text(buffer: &Buffer) -> String {
         out.push('\n');
     }
     out
+}
+
+fn nonblank_rows(buffer: &Buffer) -> usize {
+    let area = buffer.area();
+    (area.y..area.y + area.height)
+        .filter(|&y| (area.x..area.x + area.width).any(|x| buffer[(x, y)].symbol().trim() != ""))
+        .count()
 }
 
 fn selected_card_fixture() -> SessionState {
@@ -355,6 +363,61 @@ fn mode_chip_002_is_universal_and_keeps_destination_button() {
         typing_text.contains("[Command Mode Ctrl+D]"),
         "PaneInput must retain the destination button alongside the TYPING chip\n{typing_text}"
     );
+}
+
+/// Scenario: Sweep every bottom-bar width from zero through 24 columns in command, PaneInput, Filter, and Rename modes, then render the command bar at the known wrapping widths. COMMAND and TYPING must appear symmetrically at the shared 10-column threshold without panics, and the rendered row count must exactly consume the rows reserved at 19, 40, 80, 120, and 200 columns.
+#[spec("mode/chip/003")]
+#[test]
+fn mode_chip_003_narrow_threshold_is_symmetric_and_preserves_row_budget() {
+    let config = KeybindingConfig::default();
+
+    for width in 0..=24 {
+        let mut rendered = Vec::new();
+        for mode in [
+            UiMode::Normal,
+            UiMode::PaneInput,
+            UiMode::Filter,
+            UiMode::Rename,
+        ] {
+            let result = std::panic::catch_unwind(|| {
+                render_button_bar_for_mode_to_buffer(&config, mode, width, 16)
+            });
+            assert!(
+                result.is_ok(),
+                "bottom-bar rendering must not panic in {mode:?} at width {width}"
+            );
+            rendered.push(result.expect("checked above"));
+        }
+
+        let command_present = find_ascii_text(&rendered[0], COMMAND_CHIP).is_some();
+        let typing_present = find_ascii_text(&rendered[1], TYPING_CHIP).is_some();
+        assert_eq!(
+            command_present, typing_present,
+            "COMMAND and TYPING chip visibility must be symmetric at width {width}"
+        );
+        assert_eq!(
+            command_present,
+            width >= 10,
+            "both mode chips must be absent below the shared 10-column threshold and present at or above it (width {width})"
+        );
+    }
+
+    for (width, reserved_rows) in [(19, 11), (40, 5), (80, 3), (120, 2), (200, 1)] {
+        let tall_bar = render_button_bar_for_mode_to_buffer(&config, UiMode::Normal, width, 16);
+        assert_eq!(
+            nonblank_rows(&tall_bar),
+            usize::from(reserved_rows),
+            "the unconstrained {width}-column command bar must naturally render {reserved_rows} rows"
+        );
+
+        let reserved_bar =
+            render_button_bar_for_mode_to_buffer(&config, UiMode::Normal, width, reserved_rows);
+        assert_eq!(
+            nonblank_rows(&reserved_bar),
+            usize::from(reserved_rows),
+            "the {width}-column command bar must render into every one of its {reserved_rows} reserved rows"
+        );
+    }
 }
 
 /// Scenario: Render a roomy focused pane with readable agent output in freshly-entered command mode, then render the same pane in PaneInput and as an unfocused command-mode pane. Only the focused command pane must keep its content while dimming the inner area and centring the large COMMAND MODE banner with its Ctrl+D subtitle; snapshots pin the command and typing states.
@@ -823,6 +886,75 @@ fn mode_banner_004_degraded_and_collapsed_states_never_escape_the_pane() {
     insta::assert_snapshot!("mode_banner_004_degraded_and_collapsed", snapshot);
 }
 
+/// Scenario: Feed five queued key bursts through the production per-key handler with a frame only before and after each burst. The two defect cases must observe their real intermediate modes and produce the opposite final banner states, while three controls pin ordinary bound, unbound-printable, and single-entry behavior.
+#[spec("mode/banner/005")]
+#[test]
+fn mode_banner_005_same_drain_mode_edges_preserve_banner_semantics() {
+    let config = KeybindingConfig::default();
+    let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+    let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+    let printable = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+
+    let cases = [
+        (
+            "double Ctrl+D round trip",
+            UiMode::Normal,
+            vec![ctrl_d, ctrl_d],
+            vec![UiMode::PaneInput, UiMode::Normal],
+            CommandBannerVisibility::Expanded,
+            CommandBannerVisibility::Expanded,
+        ),
+        (
+            "bound key immediately after PaneInput exits",
+            UiMode::PaneInput,
+            vec![ctrl_d, ctrl_t],
+            vec![UiMode::Normal, UiMode::Normal],
+            CommandBannerVisibility::Hidden,
+            CommandBannerVisibility::Collapsed,
+        ),
+        (
+            "single bound command key",
+            UiMode::Normal,
+            vec![ctrl_t],
+            vec![UiMode::Normal],
+            CommandBannerVisibility::Expanded,
+            CommandBannerVisibility::Collapsed,
+        ),
+        (
+            "unbound printable after a bound command key",
+            UiMode::Normal,
+            vec![ctrl_t, printable],
+            vec![UiMode::Normal, UiMode::Normal],
+            CommandBannerVisibility::Expanded,
+            CommandBannerVisibility::Expanded,
+        ),
+        (
+            "single entry from PaneInput",
+            UiMode::PaneInput,
+            vec![ctrl_d],
+            vec![UiMode::Normal],
+            CommandBannerVisibility::Hidden,
+            CommandBannerVisibility::Expanded,
+        ),
+    ];
+
+    for (context, initial_mode, keys, expected_modes, before, after) in cases {
+        let observed = observe_command_banner_key_burst(&config, initial_mode, &keys);
+        assert_eq!(
+            observed.modes, expected_modes,
+            "{context} must traverse the intended real modes"
+        );
+        assert_eq!(
+            observed.visibility_before, before,
+            "{context} must start from the banner state rendered before the drain"
+        );
+        assert_eq!(
+            observed.visibility_after, after,
+            "{context} must leave the first post-drain frame in the expected banner state"
+        );
+    }
+}
+
 /// Scenario: Render the same selected Dashboard card in command mode and PaneInput through the production card renderer. Command mode must retain the full Magenta+BOLD accent, while PaneInput keeps the `▸ ` marker but visibly de-emphasises the selection without introducing an absolute RGB colour; a colour-and-modifier-aware snapshot pins both states.
 #[spec("mode/deck/001")]
 #[test]
@@ -1107,5 +1239,67 @@ fn mode_scroll_003_pane_input_target_change_snaps_scrollback_to_live_output() {
         ),
         (3, 3, 0, 0),
         "an unchanged command-mode pane must retain its offset so command-mode scrolling remains possible"
+    );
+}
+
+/// Scenario: Render two consecutive no-focus frames from PaneInput and from an already-Normal mode using injected frame instants. The first frame must drop safely to command mode and expand its banner exactly once; one TTL later the second frame must remain Normal with a Collapsed banner, while equal instants keep it Expanded without re-entering.
+#[spec("mode/scroll/004")]
+#[test]
+fn mode_scroll_004_pane_input_without_focus_settles_in_command_mode_once() {
+    let epoch = Instant::now();
+    let settled = observe_pane_input_without_focused_pane(
+        UiMode::PaneInput,
+        epoch,
+        epoch + COMMAND_BANNER_TTL,
+    );
+    assert_eq!(
+        (
+            settled.mode_after_first_frame,
+            settled.banner_after_first_frame,
+            settled.mode_after_second_frame,
+            settled.banner_after_second_frame,
+        ),
+        (
+            UiMode::Normal,
+            CommandBannerVisibility::Expanded,
+            UiMode::Normal,
+            CommandBannerVisibility::Collapsed,
+        ),
+        "PaneInput without focus must enter command mode once, then let the banner collapse at the TTL instead of re-stamping it every frame"
+    );
+
+    let same_instant = observe_pane_input_without_focused_pane(UiMode::PaneInput, epoch, epoch);
+    assert_eq!(
+        (
+            same_instant.mode_after_first_frame,
+            same_instant.banner_after_first_frame,
+            same_instant.mode_after_second_frame,
+            same_instant.banner_after_second_frame,
+        ),
+        (
+            UiMode::Normal,
+            CommandBannerVisibility::Expanded,
+            UiMode::Normal,
+            CommandBannerVisibility::Expanded,
+        ),
+        "without elapsed time the settled command banner must remain expanded across the second frame"
+    );
+
+    let already_normal =
+        observe_pane_input_without_focused_pane(UiMode::Normal, epoch, epoch + COMMAND_BANNER_TTL);
+    assert_eq!(
+        (
+            already_normal.mode_after_first_frame,
+            already_normal.banner_after_first_frame,
+            already_normal.mode_after_second_frame,
+            already_normal.banner_after_second_frame,
+        ),
+        (
+            settled.mode_after_first_frame,
+            settled.banner_after_first_frame,
+            settled.mode_after_second_frame,
+            settled.banner_after_second_frame,
+        ),
+        "reconciling an already-Normal no-focus state must be idempotent"
     );
 }
