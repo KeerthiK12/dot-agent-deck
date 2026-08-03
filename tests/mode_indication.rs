@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dot_agent_deck::event::AgentType;
@@ -15,10 +16,12 @@ use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::state::{SessionState, SessionStatus};
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
-    CardDensityKind, UiMode, observe_focused_agent_key_scroll, observe_focused_agent_mouse_scroll,
-    render_button_bar_for_mode_to_buffer, render_button_bar_to_buffer,
-    render_button_bar_with_bindings_to_buffer, render_card_for_mode_to_buffer,
-    render_card_to_buffer, render_focused_pane_cursor_for_mode_to_position,
+    BannerTier, COMMAND_BANNER_TTL, CardDensityKind, CommandBannerSignal, CommandBannerState,
+    CommandBannerVisibility, UiMode, command_banner_tier, observe_focused_agent_key_scroll,
+    observe_focused_agent_mouse_scroll, render_button_bar_for_mode_to_buffer,
+    render_button_bar_to_buffer, render_button_bar_with_bindings_to_buffer,
+    render_card_for_mode_to_buffer, render_card_to_buffer, render_command_banner_pane_to_buffer,
+    render_focused_pane_cursor_for_mode_to_position,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -132,6 +135,100 @@ fn assert_mode_chip_at_origin(buffer: &Buffer, expected: &str, context: &str) {
     }
 }
 
+fn inner_rect(buffer: &Buffer) -> Rect {
+    let area = buffer.area();
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+fn find_ascii_text(buffer: &Buffer, needle: &str) -> Option<(u16, u16)> {
+    let chars = needle.chars().collect::<Vec<_>>();
+    let area = buffer.area();
+    if chars.len() > usize::from(area.width) {
+        return None;
+    }
+    for y in area.y..area.y + area.height {
+        for x in area.x..=area.x + area.width - chars.len() as u16 {
+            if chars
+                .iter()
+                .enumerate()
+                .all(|(offset, ch)| buffer[(x + offset as u16, y)].symbol() == ch.to_string())
+            {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+fn modifier_bounds(buffer: &Buffer, modifier: Modifier) -> Option<Rect> {
+    let area = buffer.area();
+    let mut min_x = u16::MAX;
+    let mut min_y = u16::MAX;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut found = false;
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if buffer[(x, y)].modifier.contains(modifier) {
+                found = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    found.then(|| Rect::new(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+}
+
+fn assert_banner_within_inner_area(buffer: &Buffer, context: &str) -> Option<Rect> {
+    let inner = inner_rect(buffer);
+    let bounds = modifier_bounds(buffer, Modifier::REVERSED);
+    if let Some(bounds) = bounds {
+        assert!(
+            bounds.x >= inner.x
+                && bounds.y >= inner.y
+                && bounds.x + bounds.width <= inner.x + inner.width
+                && bounds.y + bounds.height <= inner.y + inner.height,
+            "{context} banner {bounds:?} must stay within pane inner area {inner:?}"
+        );
+    }
+    bounds
+}
+
+fn assert_command_inner_area_is_dimmed(buffer: &Buffer, context: &str) {
+    let inner = inner_rect(buffer);
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + inner.width {
+            let cell = &buffer[(x, y)];
+            assert!(
+                cell.modifier.contains(Modifier::DIM) || cell.modifier.contains(Modifier::REVERSED),
+                "{context} inner cell ({x}, {y}) must remain DIM unless the REVERSED banner overlays it, got {:?}",
+                cell.style()
+            );
+        }
+    }
+}
+
+fn assert_inner_area_has_no_modifier(buffer: &Buffer, modifier: Modifier, context: &str) {
+    let inner = inner_rect(buffer);
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + inner.width {
+            let cell = &buffer[(x, y)];
+            assert!(
+                !cell.modifier.contains(modifier),
+                "{context} inner cell ({x}, {y}) must not carry {modifier:?}, got {:?}",
+                cell.style()
+            );
+        }
+    }
+}
+
 fn render_cursor_widget(input_active: bool) -> Buffer {
     const SCREEN_ROWS: u16 = 3;
     const SCREEN_COLS: u16 = 8;
@@ -240,6 +337,389 @@ fn mode_chip_002_is_universal_and_keeps_destination_button() {
         typing_text.contains("[Command Mode Ctrl+D]"),
         "PaneInput must retain the destination button alongside the TYPING chip\n{typing_text}"
     );
+}
+
+/// Scenario: Render a roomy focused pane with readable agent output in freshly-entered command mode, then render the same pane in PaneInput and as an unfocused command-mode pane. Only the focused command pane must keep its content while dimming the inner area and centring the large COMMAND MODE banner with its Ctrl+D subtitle; snapshots pin the command and typing states.
+#[spec("mode/banner/001")]
+#[test]
+fn mode_banner_001_big_banner_dims_only_the_focused_command_pane() {
+    const CONTENT: &[u8] = b"FOCUSED AGENT OUTPUT remains readable\r\nanother status line";
+    const WIDTH: u16 = 66;
+    const HEIGHT: u16 = 15;
+
+    let command = render_command_banner_pane_to_buffer(
+        UiMode::Normal,
+        true,
+        CommandBannerVisibility::Expanded,
+        CONTENT,
+        WIDTH,
+        HEIGHT,
+    );
+    let typing = render_command_banner_pane_to_buffer(
+        UiMode::PaneInput,
+        true,
+        CommandBannerVisibility::Expanded,
+        CONTENT,
+        WIDTH,
+        HEIGHT,
+    );
+    let unfocused = render_command_banner_pane_to_buffer(
+        UiMode::Normal,
+        false,
+        CommandBannerVisibility::Expanded,
+        CONTENT,
+        WIDTH,
+        HEIGHT,
+    );
+
+    assert_eq!(
+        command_banner_tier(WIDTH - 2, HEIGHT - 2),
+        BannerTier::BlockCommandModeWithSubtitle,
+        "roomy fixture must exercise the full block-letter tier"
+    );
+    let banner = assert_banner_within_inner_area(&command, "roomy command pane")
+        .expect("fresh command mode must render a REVERSED block banner");
+    let inner = inner_rect(&command);
+    let left_margin = banner.x - inner.x;
+    let right_margin = inner.x + inner.width - (banner.x + banner.width);
+    let top_margin = banner.y - inner.y;
+    let bottom_margin = inner.y + inner.height - (banner.y + banner.height);
+    assert!(
+        left_margin.abs_diff(right_margin) <= 1 && top_margin.abs_diff(bottom_margin) <= 1,
+        "block banner must be centred in {inner:?}, got {banner:?} with margins left={left_margin}, right={right_margin}, top={top_margin}, bottom={bottom_margin}"
+    );
+    assert!(
+        banner.width >= 40 && banner.height >= 5,
+        "tier 1 must visibly occupy a block-letter region, got {banner:?}"
+    );
+    let (subtitle_x, subtitle_y) = find_ascii_text(&command, "Ctrl+D to type")
+        .expect("tier 1 must render the Ctrl+D to type subtitle");
+    assert_eq!(
+        subtitle_x,
+        inner.x + (inner.width - "Ctrl+D to type".len() as u16) / 2,
+        "subtitle must be horizontally centred"
+    );
+    assert!(subtitle_y >= banner.y && subtitle_y < banner.y + banner.height);
+
+    assert_command_inner_area_is_dimmed(&command, "focused command pane");
+    let (content_x, content_y) = find_ascii_text(&command, "FOCUSED AGENT OUTPUT")
+        .expect("dimming must leave the underlying agent output legible, not erase it");
+    for x in content_x..content_x + "FOCUSED AGENT OUTPUT".len() as u16 {
+        assert!(
+            command[(x, content_y)].modifier.contains(Modifier::DIM),
+            "underlying readable content cell ({x}, {content_y}) must carry DIM"
+        );
+    }
+    assert_no_rgb(&command, "command banner");
+
+    assert!(find_ascii_text(&typing, "FOCUSED AGENT OUTPUT").is_some());
+    assert!(
+        modifier_bounds(&typing, Modifier::REVERSED).is_none(),
+        "PaneInput must never render the command banner"
+    );
+    assert_inner_area_has_no_modifier(&typing, Modifier::DIM, "PaneInput pane");
+
+    assert!(find_ascii_text(&unfocused, "FOCUSED AGENT OUTPUT").is_some());
+    assert!(
+        modifier_bounds(&unfocused, Modifier::REVERSED).is_none(),
+        "an unfocused command-mode pane must not render the banner"
+    );
+    assert_inner_area_has_no_modifier(&unfocused, Modifier::DIM, "unfocused command pane");
+
+    insta::assert_snapshot!(
+        "mode_banner_001_big_and_typing_states",
+        format!(
+            "COMMAND MODE\nPLAIN\n{}\nSTYLED\n{}\nPANE INPUT\nPLAIN\n{}\nSTYLED\n{}",
+            buffer_to_text(&command),
+            buffer_to_styled_text(&command),
+            buffer_to_text(&typing),
+            buffer_to_styled_text(&typing),
+        )
+    );
+}
+
+fn banner_tier_rank(tier: BannerTier) -> u8 {
+    match tier {
+        BannerTier::BlockCommandModeWithSubtitle => 1,
+        BannerTier::BlockCommand => 2,
+        BannerTier::SingleLineWithSubtitle => 3,
+        BannerTier::SingleWord => 4,
+        BannerTier::Omitted => 5,
+    }
+}
+
+/// Scenario: Sweep command-banner inner-area dimensions from degenerate through roomy and ask the production pure selector which fallback tier fits. Every tier must own a reachable size band, every selected rendering must fit, and adding width or height must never degrade the choice.
+#[spec("mode/banner/002")]
+#[test]
+fn mode_banner_002_narrow_fallback_ladder_is_monotonic_and_fits() {
+    for (width, height, expected) in [
+        (60, 7, BannerTier::BlockCommandModeWithSubtitle),
+        (40, 5, BannerTier::BlockCommand),
+        (31, 2, BannerTier::SingleLineWithSubtitle),
+        (9, 2, BannerTier::SingleWord),
+        (8, 2, BannerTier::Omitted),
+    ] {
+        assert_eq!(
+            command_banner_tier(width, height),
+            expected,
+            "{width}x{height} must select its documented fallback band"
+        );
+    }
+
+    for (width, height) in [(0, 0), (1, 1), (200, 1), (3, 200)] {
+        assert_eq!(
+            command_banner_tier(width, height),
+            BannerTier::Omitted,
+            "degenerate {width}x{height} inner area must safely omit the banner"
+        );
+    }
+
+    for width in 0..=100 {
+        for height in 0..=12 {
+            let tier = command_banner_tier(width, height);
+            let (rendered_width, rendered_height) = tier.rendered_size();
+            assert!(
+                rendered_width <= width && rendered_height <= height,
+                "{tier:?} reports {rendered_width}x{rendered_height}, which does not fit the selected {width}x{height} inner area"
+            );
+
+            if width < 100 {
+                let wider = command_banner_tier(width + 1, height);
+                assert!(
+                    banner_tier_rank(wider) <= banner_tier_rank(tier),
+                    "widening {width}x{height} to {}x{height} degraded {tier:?} to {wider:?}",
+                    width + 1
+                );
+            }
+            if height < 12 {
+                let taller = command_banner_tier(width, height + 1);
+                assert!(
+                    banner_tier_rank(taller) <= banner_tier_rank(tier),
+                    "heightening {width}x{height} to {width}x{} degraded {tier:?} to {taller:?}",
+                    height + 1
+                );
+            }
+        }
+    }
+}
+
+/// Scenario: Drive the command-banner state with an injected Instant through fresh entry, deterministic TTL expiry, bound actions, unbound printable keys, a bottom-bar click, leave, and re-entry. Bound actions, clicks, and expiry collapse the banner; an unbound printable holds or re-asserts it, and every fresh command-mode entry re-arms it.
+#[spec("mode/banner/003")]
+#[test]
+fn mode_banner_003_decay_state_is_deterministic_and_rearms() {
+    assert_eq!(COMMAND_BANNER_TTL, Duration::from_millis(2500));
+
+    let epoch = Instant::now();
+    let mut state = CommandBannerState::default();
+
+    state.handle(CommandBannerSignal::EnterCommandMode, epoch);
+    assert_eq!(
+        state.visibility(epoch),
+        CommandBannerVisibility::Expanded,
+        "fresh command-mode entry must show the big banner"
+    );
+    assert_eq!(
+        state.visibility(epoch + COMMAND_BANNER_TTL - Duration::from_millis(1)),
+        CommandBannerVisibility::Expanded,
+        "the banner must remain expanded while its entry Instant is younger than the TTL"
+    );
+    assert_eq!(
+        state.visibility(epoch + COMMAND_BANNER_TTL),
+        CommandBannerVisibility::Collapsed,
+        "reaching the TTL must deterministically collapse and latch the banner without sleeping"
+    );
+
+    let bound_entry = epoch + Duration::from_secs(10);
+    state.handle(CommandBannerSignal::EnterCommandMode, bound_entry);
+    state.handle(
+        CommandBannerSignal::CommandAction,
+        bound_entry + Duration::from_millis(100),
+    );
+    assert_eq!(
+        state.visibility(bound_entry + Duration::from_millis(100)),
+        CommandBannerVisibility::Collapsed,
+        "a key that resolved to a command-mode Action must collapse before the TTL"
+    );
+
+    let click_entry = epoch + Duration::from_secs(20);
+    state.handle(CommandBannerSignal::EnterCommandMode, click_entry);
+    state.handle(
+        CommandBannerSignal::BottomBarClick,
+        click_entry + Duration::from_millis(100),
+    );
+    assert_eq!(
+        state.visibility(click_entry + Duration::from_millis(100)),
+        CommandBannerVisibility::Collapsed,
+        "a bottom-bar button click must collapse the banner"
+    );
+
+    let unbound_entry = epoch + Duration::from_secs(30);
+    state.handle(CommandBannerSignal::EnterCommandMode, unbound_entry);
+    state.handle(
+        CommandBannerSignal::UnboundPrintable,
+        unbound_entry + Duration::from_millis(100),
+    );
+    assert_eq!(
+        state.visibility(unbound_entry + Duration::from_millis(100)),
+        CommandBannerVisibility::Expanded,
+        "an unbound printable before the TTL must hold the big signal"
+    );
+
+    state.handle(
+        CommandBannerSignal::CommandAction,
+        unbound_entry + Duration::from_millis(200),
+    );
+    assert_eq!(
+        state.visibility(unbound_entry + Duration::from_millis(200)),
+        CommandBannerVisibility::Collapsed,
+    );
+    state.handle(
+        CommandBannerSignal::UnboundPrintable,
+        unbound_entry + Duration::from_millis(300),
+    );
+    assert_eq!(
+        state.visibility(unbound_entry + Duration::from_millis(300)),
+        CommandBannerVisibility::Expanded,
+        "an unbound printable after collapse must re-assert the big banner with a fresh clock"
+    );
+
+    state.handle(
+        CommandBannerSignal::LeaveCommandMode,
+        unbound_entry + Duration::from_millis(400),
+    );
+    assert_eq!(
+        state.visibility(unbound_entry + Duration::from_millis(400)),
+        CommandBannerVisibility::Hidden,
+        "leaving command mode must clear the banner state"
+    );
+    let reentry = epoch + Duration::from_secs(40);
+    state.handle(CommandBannerSignal::EnterCommandMode, reentry);
+    assert_eq!(
+        state.visibility(reentry),
+        CommandBannerVisibility::Expanded,
+        "each fresh command-mode entry must re-arm the big banner"
+    );
+}
+
+/// Scenario: Render freshly-expanded command banners at the block-COMMAND, reversed-line, reversed-word, and omitted fallback sizes, then render a roomy pane after banner decay. Every render must survive, stay inside the pane border, keep the focused inner area dimmed, and leave the persistent COMMAND chip as the collapsed signal; a snapshot pins all degraded states.
+#[spec("mode/banner/004")]
+#[test]
+fn mode_banner_004_degraded_and_collapsed_states_never_escape_the_pane() {
+    const CONTENT: &[u8] = b"small pane output";
+    let cases = [
+        ("BLOCK COMMAND", 40, 5, BannerTier::BlockCommand, true),
+        (
+            "SINGLE LINE",
+            31,
+            2,
+            BannerTier::SingleLineWithSubtitle,
+            true,
+        ),
+        ("SINGLE WORD", 9, 2, BannerTier::SingleWord, true),
+        ("OMITTED", 8, 2, BannerTier::Omitted, false),
+    ];
+    let mut snapshot = String::new();
+
+    for (label, inner_width, inner_height, expected_tier, expects_banner) in cases {
+        assert_eq!(
+            command_banner_tier(inner_width, inner_height),
+            expected_tier,
+            "{label} fixture must select the intended tier"
+        );
+        let width = inner_width + 2;
+        let height = inner_height + 2;
+        let rendered = std::panic::catch_unwind(|| {
+            render_command_banner_pane_to_buffer(
+                UiMode::Normal,
+                true,
+                CommandBannerVisibility::Expanded,
+                CONTENT,
+                width,
+                height,
+            )
+        });
+        assert!(
+            rendered.is_ok(),
+            "{label} banner must not panic in its small-but-valid {width}x{height} pane"
+        );
+        let buffer = rendered.expect("checked above");
+        assert_eq!((buffer.area().width, buffer.area().height), (width, height));
+        let bounds = assert_banner_within_inner_area(&buffer, label);
+        assert_eq!(
+            bounds.is_some(),
+            expects_banner,
+            "{label} must render a banner exactly when its tier is not Omitted"
+        );
+        assert_command_inner_area_is_dimmed(&buffer, label);
+        assert_no_rgb(&buffer, label);
+
+        match expected_tier {
+            BannerTier::BlockCommand => {
+                assert!(find_ascii_text(&buffer, "Ctrl+D to type").is_none());
+                assert!(bounds.is_some_and(|rect| rect.height >= 5));
+            }
+            BannerTier::SingleLineWithSubtitle => {
+                assert!(
+                    find_ascii_text(&buffer, " COMMAND MODE — Ctrl+D to type ").is_some(),
+                    "tier 3 must use the complete single reversed line"
+                );
+            }
+            BannerTier::SingleWord => {
+                assert!(
+                    find_ascii_text(&buffer, " COMMAND ").is_some(),
+                    "tier 4 must use the single reversed word"
+                );
+                assert!(find_ascii_text(&buffer, "MODE").is_none());
+            }
+            BannerTier::Omitted => {
+                assert!(
+                    find_ascii_text(&buffer, "COMMAND").is_none(),
+                    "tier 5 must omit banner text while retaining DIM"
+                );
+            }
+            BannerTier::BlockCommandModeWithSubtitle => {
+                panic!("tier 1 is covered by mode/banner/001, not a degraded fixture")
+            }
+        }
+
+        let _ = writeln!(
+            snapshot,
+            "{label} ({width}x{height})\nPLAIN\n{}\nSTYLED\n{}",
+            buffer_to_text(&buffer),
+            buffer_to_styled_text(&buffer)
+        );
+    }
+
+    let collapsed = render_command_banner_pane_to_buffer(
+        UiMode::Normal,
+        true,
+        CommandBannerVisibility::Collapsed,
+        CONTENT,
+        66,
+        15,
+    );
+    assert!(
+        modifier_bounds(&collapsed, Modifier::REVERSED).is_none(),
+        "collapsed-after-decay pane must remove only the banner"
+    );
+    assert_command_inner_area_is_dimmed(&collapsed, "collapsed command pane");
+    assert!(
+        find_ascii_text(&collapsed, "small pane output").is_some(),
+        "collapsed command pane must keep readable content"
+    );
+
+    let chip =
+        render_button_bar_for_mode_to_buffer(&KeybindingConfig::default(), UiMode::Normal, 120, 2);
+    assert_mode_chip_at_origin(&chip, COMMAND_CHIP, "collapsed command-mode frame");
+    let _ = writeln!(
+        snapshot,
+        "COLLAPSED AFTER DECAY\nPLAIN\n{}\nSTYLED\n{}\nPERSISTENT CHIP\n{}",
+        buffer_to_text(&collapsed),
+        buffer_to_styled_text(&collapsed),
+        buffer_to_text(&chip)
+    );
+
+    insta::assert_snapshot!("mode_banner_004_degraded_and_collapsed", snapshot);
 }
 
 /// Scenario: Render the same selected Dashboard card in command mode and PaneInput through the production card renderer. Command mode must retain the full Magenta+BOLD accent, while PaneInput keeps the `▸ ` marker but visibly de-emphasises the selection without introducing an absolute RGB colour; a colour-and-modifier-aware snapshot pins both states.

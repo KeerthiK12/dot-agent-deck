@@ -2788,6 +2788,36 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** click dispatch for the destination button; exact spacing after the chip; context-specific buttons after the universal prefix.
 - **Platform coverage:** mac+linux+windows.
 
+#### mode/banner
+
+##### mode/banner/001 — A fresh command-mode entry dims only the focused pane and centres the full block banner without erasing agent output.
+- **Layer:** L1 (in-process production focused-pane renderer through a `TestBackend`-backed buffer seam plus `insta` style-aware capture).
+- **Agent:** none (one synthetic vt100 pane rendered focused in command mode and PaneInput, then unfocused in command mode).
+- **Asserts:** a roomy focused command pane selects the full block-letter tier, centres its REVERSED block region and `Ctrl+D to type` subtitle, retains readable underlying agent output, and applies DIM throughout the inner area except where the banner overlays it; the same focused PaneInput pane and an unfocused command pane have neither banner nor DIM, and no rendered cell uses `Color::Rgb`.
+- **Does not assert:** timed decay or input-driven collapse (covered by `mode/banner/003`); narrow fallback geometry (covered by `mode/banner/002` and `/004`); terminal-specific visual support for DIM or the live binary path (M6 L2 scope).
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/banner/002 — The narrow-pane fallback ladder is pure, monotonic, safe, and always fits.
+- **Layer:** unit/L1 (pure `command_banner_tier(width, height)` width/height sweep; no renderer, PTY, or subprocess).
+- **Agent:** none.
+- **Asserts:** all five tiers own a reachable size band in the documented order; 0×0, 1×1, very-wide/one-row, and very-tall/three-column areas safely omit; every selected tier reports rendered dimensions within the available inner area; increasing either dimension never selects a lower tier.
+- **Does not assert:** glyph shapes, centring, modifiers, or clipping in the actual buffer (covered by `mode/banner/001` and `/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/banner/003 — Banner decay is deterministic, asymmetric for bound versus unbound keys, and re-arms on every entry.
+- **Layer:** L1 state-machine unit using an injected `Instant`; no sleep, PTY, or subprocess.
+- **Agent:** none.
+- **Asserts:** the named TTL is 2.5 seconds; fresh entry is expanded until the TTL and collapsed at expiry; a command-mode Action and a bottom-bar click collapse early; an unbound printable holds the banner before decay and re-asserts it with a fresh clock after collapse; leaving hides/clears it and re-entry expands it again.
+- **Does not assert:** command keybinding resolution itself; rendering or persistent DIM (covered by `mode/banner/001` and `/004`); wall-clock scheduling in the 16ms live loop.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/banner/004 — Every degraded and collapsed banner state stays inside the focused pane.
+- **Layer:** L1 (production pane render seam under `catch_unwind` at tier-boundary sizes plus `insta` text/style capture).
+- **Agent:** none (synthetic vt100 content in small-but-valid focused panes).
+- **Asserts:** tiers 2–4 render their exact block-COMMAND, full reversed line, and reversed word fallbacks entirely inside the inner area; tier 5 omits safely; all sizes retain DIM and avoid `Color::Rgb`; after decay the pane stays dim/readable with no banner while the bottom bar still carries the persistent ` COMMAND ` chip.
+- **Does not assert:** the full tier-1 banner (covered by `mode/banner/001`); the transition rules that produce Collapsed (covered by `mode/banner/003`); M6 PTY/real-agent behavior.
+- **Platform coverage:** mac+linux+windows.
+
 #### mode/deck
 
 ##### mode/deck/001 — The selected deck-card accent is full-strength only in command mode.
