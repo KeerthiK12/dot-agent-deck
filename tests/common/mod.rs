@@ -813,6 +813,30 @@ impl TuiDeck {
         }
     }
 
+    /// Wait for an observable grid state, then keep asserting that it remains
+    /// visible for `hold_for`. Recording-focused E2E scenarios use this for
+    /// deliberate demo beats without putting raw sleeps in test bodies.
+    pub fn wait_until_grid_then_hold(
+        &self,
+        what: &str,
+        hold_for: Duration,
+        pred: impl Fn(&str) -> bool,
+    ) {
+        self.wait_until_grid(what, |grid| pred(grid));
+        let deadline = Instant::now() + hold_for;
+        loop {
+            let grid = self.snapshot_grid();
+            assert!(
+                pred(&grid),
+                "grid state {what:?} changed during its {hold_for:?} demo hold.\nFinal grid:\n{grid}"
+            );
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Wait until `needle` is ABSENT from the rendered grid, or panic after
     /// the timeout. For asserting a modal/overlay/form closed.
     pub fn wait_for_absence(&self, needle: &str) {

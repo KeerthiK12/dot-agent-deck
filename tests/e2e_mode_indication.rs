@@ -22,6 +22,8 @@ const INPUT_PROBE: &str = "INPUT_PROBE_85BC";
 const SCROLL_PREFIX: &str = "MODE_LIVE_SCROLL_";
 const FIRST_SCROLL_FILE: &str = "MODE_LIVE_SCROLL_000_85BC9576.txt";
 const SENTINEL: &str = "MODE_LIVE_SCROLL_ZZZ_SENTINEL_85BC9576.md";
+const SCROLL_FIXTURE_FILE_COUNT: usize = 43;
+const DEMO_BEAT_DWELL: Duration = Duration::from_secs(2);
 
 fn command_chip_is_left_anchored(grid: &str) -> bool {
     grid.lines().any(|line| line.starts_with(" COMMAND "))
@@ -120,7 +122,10 @@ fn mode_live_002_real_haiku_user_journey() {
         .with_continue_session("mode-live-haiku", agent_command)
         .launch_with_fixture("minimal");
 
-    for index in 0..70 {
+    // The 45-row deck leaves 42 inner pane rows. The sentinel plus Claude's
+    // completion, mode, and prompt rows consume four, so 38 numbered filenames
+    // fit at live output; 43 puts the first file five rows into real scrollback.
+    for index in 0..SCROLL_FIXTURE_FILE_COUNT {
         std::fs::write(
             deck.workdir()
                 .join(format!("MODE_LIVE_SCROLL_{index:03}_85BC9576.txt")),
@@ -172,11 +177,15 @@ fn mode_live_002_real_haiku_user_journey() {
     let live_cursor = assert_typing_cursor_is_visible(&deck, "completed real Haiku turn");
 
     deck.send_keys(b"\x04");
-    deck.wait_until_grid("real agent in command mode with banner and chip", |grid| {
-        grid.contains(COMMAND_BANNER_SUBTITLE)
-            && grid.contains(SENTINEL)
-            && command_chip_is_left_anchored(grid)
-    });
+    deck.wait_until_grid_then_hold(
+        "real agent in command mode with banner and chip",
+        DEMO_BEAT_DWELL,
+        |grid| {
+            grid.contains(COMMAND_BANNER_SUBTITLE)
+                && grid.contains(SENTINEL)
+                && command_chip_is_left_anchored(grid)
+        },
+    );
 
     let command_cursor = deck.terminal_cursor_snapshot();
     assert!(
@@ -199,9 +208,11 @@ fn mode_live_002_real_haiku_user_journey() {
         "precondition: the oldest filename must begin outside the live viewport so wheel scroll can be observed"
     );
     deck.scroll_n(150, 10, false, 30);
-    deck.wait_until_grid("command-mode wheel reveals old real-agent output", |grid| {
-        grid.contains(FIRST_SCROLL_FILE)
-    });
+    deck.wait_until_grid_then_hold(
+        "command-mode wheel reveals old real-agent output",
+        DEMO_BEAT_DWELL,
+        |grid| grid.contains(FIRST_SCROLL_FILE) && command_chip_is_left_anchored(grid),
+    );
     assert!(
         deck.terminal_cursor_snapshot().hidden,
         "scrolling in command mode must not restore an interactive cursor"
@@ -215,6 +226,11 @@ fn mode_live_002_real_haiku_user_journey() {
         deck.wait_for_terminal_cursor_hidden_within(false, Duration::from_secs(30)),
         "the real Haiku prompt did not restore its hardware cursor after the turn\nFinal grid:\n{}",
         deck.snapshot_grid()
+    );
+    deck.wait_until_grid_then_hold(
+        "returned live Haiku prompt with TYPING chip",
+        DEMO_BEAT_DWELL,
+        |grid| typing_chip_is_left_anchored(grid) && !grid.contains(COMMAND_BANNER_SUBTITLE),
     );
     let returned_cursor =
         assert_typing_cursor_is_visible(&deck, "returned interactive Haiku prompt");
