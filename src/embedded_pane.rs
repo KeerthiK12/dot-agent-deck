@@ -531,6 +531,22 @@ impl EmbeddedPaneController {
         SeamChildInput { rx }
     }
 
+    /// PRD #341 (code-review finding 3) — L1 seam constructor: an inert controller
+    /// with **no panes at all**, so [`Self::focused_pane_id`] answers `None`.
+    ///
+    /// That is the state the finding is about — `UiMode::PaneInput` with nothing
+    /// focused, which a vanished reactive pane with no successor really does
+    /// produce — and it cannot be posed against either
+    /// [`Self::for_render_seam_with_focused_pane`] or
+    /// [`Self::for_scroll_seam_with_focused_pane`], both of which focus their pane
+    /// by construction. `for_render_only_tests` builds exactly this controller but
+    /// is `#[cfg(test)]`, hence unreachable from the integration tests that drive
+    /// the `pub` L1 seams in `ui.rs`.
+    #[doc(hidden)]
+    pub fn for_render_seam_without_panes() -> Self {
+        Self::new(render_only_socket_path(), render_only_runtime())
+    }
+
     /// Shared body of the two L1 seam constructors: one focused pane whose vt100
     /// screen has already consumed `bytes`, with no daemon behind it.
     ///
