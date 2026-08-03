@@ -1,6 +1,6 @@
 # PRD #341: Make Command vs PaneInput mode unmistakable
 
-**Status**: Implemented — PR pending
+**Status**: Complete (2026-08-03) — [PR #353](https://github.com/vfarcic/dot-agent-deck/pull/353) merged as `258a4d4` (a merge commit, history preserved), issue #341 closed. M1–M7 all landed: both cursor paths gated on `input_active`, a persistent mode chip, the dim + decaying banner with its narrow-pane fallback ladder, mode-aware deck selection, command-mode pane scroll, and full test coverage (L1 snapshots, a PTY-attached L2 test, and a real-agent Haiku scenario) plus docs and changelog. `cargo test-fast` 1442/1442; the full `cargo test-e2e` gate 2803/2803, no retries. No `graduate-` follow-up — rule 9 was asked at PRD creation and answered no, so this ships visible with no `experimental` gate. Five follow-up issues filed for deferred or newly-found items: #362, #363, #364, #365, #366 (see Work Log).
 **Priority**: High
 **Created**: 2026-08-02
 
@@ -152,6 +152,12 @@ No. CLAUDE.md rule 9 requires the question be asked for a new user-visible surfa
 5. Does M4's de-emphasis risk making the Dashboard feel dead in PaneInput, where the user may still want to track which card is selected?
 
 ## Work Log
+
+### 2026-08-03 (later) — Merged and archived
+
+PR #353 merged into `main` as `258a4d4` (a merge commit, history preserved); issue #341 closed automatically via the PR body's closing keyword. The merge itself was run by the user directly (`gh pr merge 353 --merge`) after Claude Code's auto-mode permission classifier denied two automated attempts in the release session (`gh pr merge 353 --merge` and the equivalent raw `pulls/353/merge` API call) — the same classifier that denied `gh issue close` during PRD #249's close-out (`prds/done/249-delegate-respawn-readiness.md`). Left for a human rather than worked around, consistent with that precedent.
+
+Five follow-up issues were filed. Two resolve items this PRD's Work Log already flagged as deliberately out of scope: **#362** (the wheel's missing pointer hit-test — forwards clamped, fictional coordinates to the child) and **#363** (`wire_stream_pane`'s unvalidated vt100 dimensions on the shipped spawn path — contained today by `guarded_parser_feed`, not eliminated). Three more were found during the merge-gate review rather than in M1–M7's own scope, and are process/tooling gaps rather than product defects: **#364** (`delegate_011`'s pre-existing wall-clock flake against loaded CI runners — unrelated to this PRD's diff, which touched only a markdown URL when it last failed), **#365** (demo reel clips hold a frozen final frame ~2s too long), and **#366** (CLAUDE.md rule 8 gap — Greptile posts no review object on re-review, so `--json reviews` alone is a dead end for confirming the gate settled).
 
 ### 2026-08-03 — All milestones implemented; review and e2e gate green
 
