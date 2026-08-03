@@ -21,10 +21,10 @@ Each session card shows the agent's current state:
 Cards also display:
 
 - **Title row** — card number, the pane's display name (or `agent_type · session_id` if it hasn't been renamed), an animated status dot, and the status label
-- **`Dir:`** — the working directory (basename, truncated to fit)
-- **`Last:`** — elapsed time since the agent's last activity, alongside **`Tools:`** showing the total tool-call count
+- **`Dir:`** — the working directory (basename), shortened with `…` when it doesn't fit
 - **`Prmt:`** — the most recent user prompt(s)
 - **Recent tool calls** — the last commands the agent ran
+- **`Last:` and `Tools:`** — elapsed time since the agent's last activity and the total tool-call count, shown in the card's bottom-right border. Narrow cards abbreviate them to `2m · 14 tools`, then `2m · 14`; the very narrowest omit them.
 
 ![Single agent card showing directory, last activity, tool count, recent prompt, and recent tool calls](/img/session-management-card.jpg)
 

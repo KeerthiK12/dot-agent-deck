@@ -11,7 +11,13 @@
 #     uniform stream is the proof there is no resolution/fps/pixfmt seam between
 #     the card and clip segments;
 #   * the pixel format is yuv420p and the frame rate is a constant 30/1;
-#   * the duration is at least the sum of the per-card hold durations.
+#   * the duration is at least the sum of the per-card hold durations, AND no
+#     longer than the engine's own bound on it (card holds + each clip's re-timing
+#     budget + a small per-clip allowance for agg's trailing hold). That upper
+#     bound is the regression guard for PRD #339, where a 15.5s cast rendered as a
+#     161s video: the re-timer mistook the render loop's per-frame tails (which
+#     print nothing and outnumber real keystrokes ~35:1) for typed characters and
+#     gave each its own 100ms step.
 #
 # It needs only agg + ffmpeg/ffprobe (already in devbox.json). It is LOCAL-ONLY
 # and never runs in CI. The real YouTube upload is NOT exercised here — that
@@ -27,15 +33,14 @@ REEL="$HERE/../reel.sh"
 FIXTURES="$HERE/fixtures"
 MANIFEST="$FIXTURES/manifest.json"
 
-# Expected stitched-canvas resolution = the MAX native across all segments. With
-# the engine's card constants (CARD_COLS x CARD_ROWS at CARD_FONT_SIZE in reel.sh)
-# the card canvas (~1139x893, even-rounded to 1140x894) is LARGER than these tiny
-# 80x24 fixture clips (790x560), so the CARD drives the target and the clips are
-# scaled up to it. (For the real reel, clips are recorded much larger than a card,
-# so the clip drives the target instead.) Override via env if the toolchain or the
-# card constants legitimately change.
-EXPECTED_W="${EXPECTED_W:-1140}"
-EXPECTED_H="${EXPECTED_H:-894}"
+# Expected stitched-canvas resolution = the engine's FIXED 16:9 output canvas
+# (REEL_W x REEL_H in reel.sh), independent of the fixtures. It used to be the
+# per-axis MAX native across all segments, which is what produced PRD #339's
+# 1140x1142 portrait reel — width from the card, height from a portrait clip, an
+# aspect belonging to neither. Mirror the engine's env overrides so the two stay in
+# lock-step.
+EXPECTED_W="${REEL_W:-1920}"
+EXPECTED_H="${REEL_H:-1080}"
 
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 
@@ -67,9 +72,9 @@ IFS=',' read -r W H PIXFMT FR < <(
 [[ "$PIXFMT" == "yuv420p" ]] || fail "pix_fmt '$PIXFMT' != yuv420p"
 [[ "$FR" == "30/1" ]]        || fail "avg_frame_rate '$FR' != 30/1"
 
-# Duration must be at least the sum of the per-card holds. The engine now holds
-# every card a FLAT CARD_HOLD seconds (default 4), independent of text length, so
-# the lower bound is simply the entry count times that hold. Mirror the engine's
+# Duration must be at least the sum of the per-card holds. The engine holds every
+# card a FLAT CARD_HOLD seconds (default 4), independent of text length, so the
+# lower bound is simply the entry count times that hold. Mirror the engine's
 # CARD_HOLD env override so the two stay in lock-step.
 CARD_HOLD="${CARD_HOLD:-4}"
 sum_holds="$(jq --argjson h "$CARD_HOLD" 'length * $h' "$MANIFEST")"
@@ -77,6 +82,36 @@ DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT")"
 awk -v d="$DUR" -v m="$sum_holds" 'BEGIN { exit !(d + 0 >= m + 0) }' \
   || fail "duration ${DUR}s < sum of card holds ${sum_holds}s"
 
-echo "SMOKE PASS: ${W}x${H} ${PIXFMT} ${FR}, 1 uniform video stream, duration=${DUR}s (>= card holds ${sum_holds}s)"
+# ...and at MOST the bound the engine promises. retime.sh caps each clip at
+# max(MIN_BUDGET, MAX_STRETCH x the clip's own duration), so the whole reel cannot
+# exceed the card holds plus those per-clip caps plus agg's trailing static hold
+# (CLIP_IDLE) and one frame-rounding second per clip. Mirror the re-timer's
+# defaults so the two stay in lock-step. This is the assertion that fails loudly if
+# the re-timer ever again turns a short cast into a slideshow.
+MAX_STRETCH="${MAX_STRETCH:-1.6}"
+MIN_BUDGET="${MIN_BUDGET:-8}"
+CLIP_IDLE="${CLIP_IDLE:-2}"
+# Per clip: max(MIN_BUDGET, MAX_STRETCH x its own duration), + CLIP_IDLE for agg's
+# trailing hold + 1s of frame/encoder rounding. Clip paths are relative to the
+# fixtures dir (that is where the engine ran), so resolve them from there. The
+# fixture casts are sub-second, so MIN_BUDGET is their binding cap; for a real
+# multi-second cast the MAX_STRETCH term dominates.
+max_dur="$(cd "$FIXTURES" && {
+  total="$(awk -v c="$(jq 'length' "$MANIFEST")" -v h="$CARD_HOLD" 'BEGIN { print c * h }')"
+  while IFS= read -r clip; do
+    if [[ "$clip" == *.cast ]]; then
+      cdur="$(jq -sr '.[1:] | if length == 0 then 0 else .[-1][0] end' "$clip")"
+    else
+      cdur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$clip")"
+    fi
+    total="$(awk -v t="$total" -v d="${cdur:-0}" -v ms="$MAX_STRETCH" -v mb="$MIN_BUDGET" -v ci="$CLIP_IDLE" \
+      'BEGIN { b = d * ms; if (b < mb) b = mb; print t + b + ci + 1 }')"
+  done < <(jq -r '.[].clip' "$MANIFEST")
+  printf '%s' "$total"
+})"
+awk -v d="$DUR" -v m="$max_dur" 'BEGIN { exit !(d + 0 <= m + 0) }' \
+  || fail "duration ${DUR}s > engine's own bound ${max_dur}s — a segment is being stretched (see retime.sh MAX_STRETCH/MIN_BUDGET)"
+
+echo "SMOKE PASS: ${W}x${H} ${PIXFMT} ${FR}, 1 uniform video stream, duration=${DUR}s (card holds ${sum_holds}s <= dur <= bound ${max_dur}s)"
 echo "--- ffprobe ($OUT) ---"
 ffprobe -hide_banner "$OUT" 2>&1 | sed -n '/Input #0/,$p'
