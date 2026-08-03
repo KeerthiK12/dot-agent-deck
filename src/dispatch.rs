@@ -8,7 +8,7 @@ use crate::issue_dispatch_run::{
     remove_worktree,
 };
 use crate::scheduler::StderrNotifier;
-use crate::spawn::{SpawnRequest, spawn};
+use crate::spawn::{SpawnKind, SpawnRequest, spawn};
 
 fn sanitize_name(name: &str) -> String {
     let slug_chars: String = name
@@ -147,18 +147,26 @@ pub async fn handle_dispatch(ctx: &DispatchContext, name: &str, task: &str) -> D
     let notifier = StderrNotifier;
 
     match spawn(req, &ctx.registry, &notifier, Some(&ctx.event_tx), false).await {
-        Ok(_handle) => DispatchResult {
+        Ok(handle) => DispatchResult {
             worktree_dir: paths.worktree_dir.clone(),
             success: true,
-            // "agent", not "orchestration": this spawns ONE agent (`command:
-            // None`, no orchestration_config). This string is written straight
-            // into the caller's pane, so an agent reading it would otherwise
-            // report something to the user that never happened.
-            message: format!(
-                "dispatch: spawned isolated agent for '{}' in {}",
-                name,
-                paths.worktree_dir.display()
-            ),
+            // Report what was ACTUALLY opened, from the spawn's own verdict.
+            // `spawn` → `decide_target` branches on the dispatched worktree's
+            // `.dot-agent-deck.toml`: a repo defining `[[orchestrations]]` gets a
+            // full multi-role orchestration, anything else a single agent (PRD
+            // #220 M1.1). Hardcoding either word makes this message a lie in the
+            // other case — and it is written straight into the caller's pane, so
+            // the dispatching agent repeats it to the user verbatim.
+            message: match &handle.kind {
+                SpawnKind::Orchestration { name: orch } => format!(
+                    "dispatch: spawned isolated orchestration '{orch}' for '{name}' in {}",
+                    paths.worktree_dir.display()
+                ),
+                SpawnKind::SingleAgent => format!(
+                    "dispatch: spawned isolated agent for '{name}' in {}",
+                    paths.worktree_dir.display()
+                ),
+            },
         },
         Err(e) => {
             // `Force` on the rollback path, unlike the tab-close path: we created

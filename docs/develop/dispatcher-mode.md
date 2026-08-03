@@ -38,4 +38,4 @@ The unit's branch (`agent/dispatch-<slug>`) always survives removal, because it 
 
 ## Current limitations
 
-- The return edge (the dispatched unit sending results back to the orchestrator) is not yet implemented — tracked in follow-up PR #174. The dispatcher reports where each unit is running; it is not notified when a unit finishes.
+- The return edge (the dispatched unit sending results back to the dispatcher) is not yet implemented. The dispatcher reports where each unit is running; it is **not** notified when a unit finishes. This is Phase 2 of [PRD #220](https://github.com/vfarcic/dot-agent-deck/issues/220) itself, deferred rather than dropped. (It is *not* tracked by #174 — that is the separate *Cross-project orchestration dispatch* PRD, which **depends on** this one.)

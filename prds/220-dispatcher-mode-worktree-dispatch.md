@@ -88,31 +88,35 @@ A running orchestrator creating a worktree partway through and expecting its alr
 
 ### Phase 1: The `dispatch` verb over the existing engine
 
-- [ ] **M1.0** — Define the `dispatch` CLI subcommand (`src/main.rs:36`): args (unit/branch name, optional orchestration selector, `--task`/`--task-file`), validation, and the hook-socket round-trip to the daemon.
-- [ ] **M1.1** — Worktree creation for a user-driven unit: reuse `create_worktree` (`src/issue_dispatch_run.rs:607`) with a non-issue naming/collision scheme; spawn the isolated unit via `SpawnRequest { working_dir }` → `spawn` (`src/spawn.rs:228`). Single-agent vs orchestration chosen from the target dir's config (mirror #174's table).
-- [ ] **M1.2** — Cleanup lifecycle: worktree removal on tab close via the issue-dispatch bookkeeping (`remove_worktree`, `src/issue_dispatch_run.rs:133`), including the shared-worktree accounting for multi-role units.
+- [x] **M1.0** — Define the `dispatch` CLI subcommand (`src/main.rs:36`): args (unit/branch name, optional orchestration selector, `--task`/`--task-file`), validation, and the hook-socket round-trip to the daemon. → Shipped WITHOUT the orchestration selector: `--to` was parsed, serialized, and never read, so it would have shipped in `--help` doing nothing. Dropped; #174 adds it when cross-project targeting is real.
+- [x] **M1.1** — Worktree creation for a user-driven unit: reuse `create_worktree` (`src/issue_dispatch_run.rs:607`) with a non-issue naming/collision scheme; spawn the isolated unit via `SpawnRequest { working_dir }` → `spawn` (`src/spawn.rs:228`). Single-agent vs orchestration chosen from the target dir's config (mirror #174's table). → Single-agent-vs-orchestration comes free: `spawn` → `decide_target` already branches on the dispatched worktree's `.dot-agent-deck.toml`, so a repo defining `[[orchestrations]]` gets a full multi-role orchestration. The result message reports which, from `SpawnHandle::kind`.
+- [x] **M1.2** — Cleanup lifecycle: worktree removal on tab close via the issue-dispatch bookkeeping (`remove_worktree`, `src/issue_dispatch_run.rs:133`), including the shared-worktree accounting for multi-role units. → **Reusing #120's bookkeeping naively regressed #120.** `remove_worktree` is SHARED, and the two producers need opposite dirty-tree policies: dispatch must keep uncommitted work (a sibling of the user's own checkout, LLM-chosen name), while issue-dispatch must force-remove or the reuse-the-vacated-slot model breaks — `dispatch_decision` reads a surviving worktree as "issue already claimed" and skips that issue on every later fire, permanently. Resolved by making the policy travel with the registry entry (`WorktreeEntry { clone_dir, policy }`), because the tab-close handler in `daemon_protocol.rs` serves both producers and only ever sees a path. See also the branch-leftover note under Decisions.
 
-### Phase 2: Return-edge routing
+### Phase 2: Return-edge routing — DEFERRED
+
+**Deliberately out of this PRD's shipped scope** (maintainer call, 2026-07-28). The callback maps *dispatched unit → dispatcher pane*, but the dispatcher is the SHORT-LIVED side (an `↳ authoring (one-off)` card) while units are long-lived, and `unregister_pane` drops the callbacks when the dispatcher closes. So even with a healthy daemon, the common case is that the dispatcher is already gone when a unit finishes — which suggests completion should be reported somewhere durable rather than injected into a pane. That is a design decision, not a coding task, and is worth making properly rather than bolting on here. Phases 1/3 ship behind the experimental flag without it; the dispatcher reports where each unit is running and the user watches the tabs appear.
 
 - [ ] **M2.0** — Register a `dispatch-id → caller pane` callback at dispatch time; ride the id into the spawned unit.
 - [ ] **M2.1** — On the dispatched unit's terminal `work-done`, resolve `dispatch-id → pane` and inject via `write_to_pane_and_submit`, bypassing the `(name, cwd)` tuple lookup; survives detach/reattach.
 
+> **Tracking:** this is #220's OWN Phase 2, not #174's. #174 (cross-project orchestration dispatch) *depends on* this PRD — see Decisions — so deferring the return edge "to #174" inverts the dependency. Needs its own follow-up issue before #220 can close.
+
 ### Phase 3: The dispatcher mode
 
-- [ ] **M3.0** — Add the built-in dispatcher mode (`ModeConfig` + `seed_prompt`, `src/project_config.rs:30`) modeled on `build_schedule_authoring_mode` (`src/ui.rs:4271`); author its context file (what/when to call `dispatch`, one-unit-per-worktree, isolation is automatic, don't do the work).
-- [ ] **M3.1** — Verify the seed is delivered only on opening the dispatcher tab (scoped, zero ambient overhead) and reaches Claude/OpenCode/Pi panes uniformly.
+- [x] **M3.0** — Add the built-in dispatcher mode (`ModeConfig` + `seed_prompt`, `src/project_config.rs:30`) modeled on `build_schedule_authoring_mode` (`src/ui.rs:4271`); author its context file (what/when to call `dispatch`, one-unit-per-worktree, isolation is automatic, don't do the work). → Gated behind `features::show_dispatcher()`.
+- [ ] **M3.1** — Verify the seed is delivered only on opening the dispatcher tab (scoped, zero ambient overhead) and reaches Claude/OpenCode/Pi panes uniformly. → **PARTIAL:** verified for Claude only (`prompt/new-pane/016` — the seed text is visible in the pane and the agent acts on it). OpenCode and Pi are unverified.
 
 ### Phase 4: Cross-type spawn + tests
 
 - [ ] **M4.0** — Validate and test the mode → orchestration-tab cross-type interaction: a dispatcher *mode* tab causing new *orchestration* tabs to hydrate from daemon records (L1).
-- [ ] **M4.1** — L2 PTY-attached e2e: real dispatcher agent runs `dispatch`, worktree created, isolated orchestration up in a new tab (`.cast`-recording; model on `scheduler/dispatch/013`).
-- [ ] **M4.2** — Real-agent pre-PR test: Haiku dispatcher runs `dispatch` end to end against a real clone/worktree, asserted via a uniquely-named sentinel file.
+- [x] **M4.1** — L2 PTY-attached e2e: real dispatcher agent runs `dispatch`, worktree created, isolated orchestration up in a new tab (`.cast`-recording; model on `scheduler/dispatch/013`). → `prompt/new-pane/016` [reel]. Asserts through the worktree landing on disk; the dispatched unit's own TAB is not asserted (that overlaps M4.0). Two fidelity traps found here, both of which made an earlier version of this test incapable of exercising `dispatch` at all: the agent's `dot-agent-deck` resolved to a host-installed binary predating the verb (fixed by prepending the build-under-test's dir to the deck's PATH), and the harness `git init`s fixtures without committing, so `git worktree add` had no commit to branch from.
+- [ ] **M4.2** — Real-agent pre-PR test: Haiku dispatcher runs `dispatch` end to end against a real clone/worktree, asserted via a uniquely-named sentinel file. → Largely subsumed by M4.1, which drives a real agent through the genuine path; a sentinel-file assertion on the dispatched unit's OUTPUT is still missing.
 
 ### Phase 5: Docs, cross-version, release
 
-- [ ] **M5.0** — Docs: dispatcher-mode + `dispatch` as the recommended parallel-work flow; repoint #140's guard/warning copy at the dispatcher mode.
-- [ ] **M5.1** — Cross-version contract check (CLAUDE.md rule 12): the return-edge callback and any spawn-request field additions are additively compatible; classify per `docs/develop/versioning.md` and add a `.breaking.md` fragment only if the contract shifts.
-- [ ] **M5.2** — Changelog fragment (`dot-ai-changelog-fragment`); PR, Greptile review, merge, close #220.
+- [x] **M5.0** — Docs: dispatcher-mode + `dispatch` as the recommended parallel-work flow; repoint #140's guard/warning copy at the dispatcher mode. → `docs/develop/dispatcher-mode.md`. #140's guard copy is NOT yet repointed.
+- [ ] **M5.1** — Cross-version contract check (CLAUDE.md rule 12): the return-edge callback and any spawn-request field additions are additively compatible; classify per `docs/develop/versioning.md` and add a `.breaking.md` fragment only if the contract shifts. → Not run. Static read is non-breaking, `PROTOCOL_VERSION` unchanged: `DaemonMessage` is `#[serde(tag = "message_type")]` on the hook socket and the loop's `if let Ok(msg)` SKIPS unknown variants, so an older daemon ignores a `dispatch` message rather than closing the connection (same additive shape as the `GetSeed` precedent, which also did not move the version). Classified **feature** → `changelog.d/220.feature.md`, patch bump. The manual matrix is still the stated gate.
+- [x] **M5.2** — Changelog fragment (`dot-ai-changelog-fragment`); PR, Greptile review, merge, close #220. → Fragment `changelog.d/220.feature.md`. PR #232 (contributor: @irizzant). Merge + close pending; #220 cannot close while Phase 2 is outstanding.
 
 ## Key Files
 
@@ -133,11 +137,16 @@ A running orchestrator creating a worktree partway through and expecting its alr
 - **Return-edge loss.** If the `dispatch-id` callback is not persisted across detach/reattach, a dispatcher waiting on a unit sleeps forever. Mitigation: store the callback daemon-side (like the local work-done routing) and test the reattach path (M2.1).
 - **Teaching drift (agent ignores the seed).** An LLM may not always reach for `dispatch`. Mitigation: this is best-effort by design and safe by construction (isolation is not gated on the agent getting it right); the seed copy is explicit and the verb is the only path that isolates.
 
-## Open Questions
+## Decisions (were Open Questions)
 
-- **Verb name and surface.** `dispatch` vs `start`/`spawn`; does it live only as an agent CLI, or also as an interactive TUI action? Decide in M1 against the existing new-pane UI.
-- **Branch/worktree naming for user-driven units.** User-supplied name, derived-from-task slug, or both; where worktrees live (`.worktrees/<name>` like #120, or a sibling like `/worktree-prd`). Decide in M1.1.
-- **Standalone vs #174 Phase 1.** This PRD is scoped as the same-project precursor; confirm with the maintainer whether it ships standalone (with #174 depending on it) or is folded in as #174's first milestone.
+- **Verb name and surface → `dispatch`, agent CLI only.** No interactive TUI action; the dispatcher *mode* is the only new UI surface, and it is a Mode-cycler option rather than a new command.
+- **Branch/worktree naming → user-supplied name, sibling location.** `../<repo>-dispatch-<slug>` on branch `agent/dispatch-<slug>`, matching `/worktree-prd`'s `create.sh` rather than #120's in-repo `.worktrees/`. Rationale: a nested tree is walked by every `rg`, IDE index and file watcher in the parent, and `git clean -xdff` would remove it along with any uncommitted agent work. #120 legitimately differs because its `.worktrees/` lives inside a daemon-owned `gh repo clone`, never a checkout a human works in — so the rule is "never nest inside a human's checkout", not "always siblings".
+- **Existing branch → refuse, and say why.** An existing `agent/dispatch-<slug>` is reported as `WorktreeCreation::BranchExists` (distinct from `AlreadyClaimed`) and refused. Silent resume is riskier here than for #120 because the name is LLM-chosen, so unrelated units colliding on something like `fix-tests` is likely rather than hypothetical. **Consequence to keep in mind:** `git worktree remove` PRESERVES the branch, so a name is single-use until the branch is deleted — the branch is never removed implicitly because it may hold that unit's committed work. The refusal message names the branch and both recovery paths.
+- **Worktree removal → fail toward leaking.** Dispatch drops `--force` and gates on `git status --porcelain`; a dirty tree survives with a warning. A leaked worktree costs disk, a force-removed one costs work, and that asymmetry decides it — Ctrl+W reads as "close this view", not "destroy uncommitted work". Issue-dispatch keeps forcing (see M1.2).
+- **Standalone vs #174 Phase 1 → ships standalone; #174 depends on THIS.** Recorded explicitly because the dependency has been stated backwards more than once (in `docs/develop/dispatcher-mode.md` and in PR #232 discussion, both of which deferred #220's return edge "to #174"). #174 is *Cross-project orchestration dispatch* — a separate open PRD issue, not a PR, and not a tracker for #220's Phase 2.
+- **Experimental flag → yes.** `features::show_dispatcher()`, its own wrapper per CLAUDE.md rule 9 (not a reuse of `show_issue_dispatch_authoring`). Gates ONLY the Mode-cycler option; the `dispatch` verb and its daemon handler are ungated. Graduation tracked as `graduate-dispatcher`, to be filed at merge.
+
+## Open Questions
 - **#140 handoff — prong 1 fate.** Once distinct-cwd worktree dispatch is the norm, #140's per-tab `orchestration_id` only protects the discouraged same-cwd-two-tabs case. Decide (on #140) whether to keep it as belt-and-suspenders or trim #140 to guard + docs. Recorded here as the cross-PRD dependency; the decision lives in #140.
 - **Soft dispatch cap.** Should the daemon or the dispatcher seed impose a soft limit on concurrent dispatched worktrees per session? Decide in M1 once the authority model is concrete.
 - **Experimental flag (CLAUDE.md rule 9).** The dispatcher mode is a new user-visible surface — confirm with the maintainer at `/prd-start` whether it ships behind the `experimental` flag.
