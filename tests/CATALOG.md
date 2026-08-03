@@ -2814,7 +2814,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### mode/banner/004 — Every degraded and collapsed banner state stays inside the focused pane.
 - **Layer:** L1 (production pane render seam under `catch_unwind` at tier-boundary sizes plus `insta` text/style capture).
 - **Agent:** none (synthetic vt100 content in small-but-valid focused panes).
-- **Asserts:** tiers 2–4 render their exact block-COMMAND, full reversed line, and reversed word fallbacks entirely inside the inner area; tier 5 omits safely; all sizes retain DIM and avoid `Color::Rgb`; after decay the pane stays dim/readable with no banner while the bottom bar still carries the persistent ` COMMAND ` chip.
+- **Asserts:** nonempty 0×0, 1×1, 2×2, 1×40, and 40×1 pane renders do not panic and return the exact requested buffer size; all three release-exposed controller seam paths resolve a single axis just above `PTY_RESIZE_DIM_MAX` to the safe 24×80 parser fallback; tiers 2–4 render their exact block-COMMAND, full reversed line, and reversed word fallbacks entirely inside the inner area; tier 5 omits safely; all valid bordered sizes retain DIM and avoid `Color::Rgb`; after decay the pane stays dim/readable with no banner while the bottom bar still carries the persistent ` COMMAND ` chip.
 - **Does not assert:** the full tier-1 banner (covered by `mode/banner/001`); the transition rules that produce Collapsed (covered by `mode/banner/003`); M6 PTY/real-agent behavior.
 - **Platform coverage:** mac+linux+windows.
 
@@ -2841,6 +2841,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (one in-memory focused pane with synthetic history).
 - **Asserts:** the default PageUp/PageDown bindings move focused-agent scrollback away from/toward live output in `UiMode::Normal` without writing to the child; `[dashboard] scroll_pane_up` and `scroll_pane_down` remaps parse without warnings, disable the old defaults, and move scrollback on their replacement chords.
 - **Does not assert:** PaneInput key forwarding; help-overlay or bottom-bar discoverability; filesystem loading of `keybindings.toml`.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/scroll/003 — PaneInput snaps newly targeted panes back to live output without disabling deliberate scrolling.
+- **Layer:** L1 (in-process two-frame reconcile through two real synthetic vt100 panes; no PTY subprocess).
+- **Agent:** none (two in-memory panes with synthetic history and production focus changes).
+- **Asserts:** command-mode scrollback is nonzero before entering PaneInput and zero afterward; an unchanged PaneInput target deliberately retains its offset; moving PaneInput focus snaps only the newly targeted second pane while leaving the first at live output; an unchanged command-mode target deliberately retains its offset. Every case pins both pre- and post-reconcile offsets for both panes.
+- **Does not assert:** hardware-cursor rendering after the reset (covered by `mode/live/002`); key dispatch for entering PaneInput; real-agent output.
 - **Platform coverage:** mac+linux+windows.
 
 #### mode/live

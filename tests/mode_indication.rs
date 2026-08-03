@@ -11,14 +11,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use dot_agent_deck::agent_pty::PTY_RESIZE_DIM_MAX;
+use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::state::{SessionState, SessionStatus};
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
     BannerTier, COMMAND_BANNER_TTL, CardDensityKind, CommandBannerSignal, CommandBannerState,
-    CommandBannerVisibility, UiMode, command_banner_tier, observe_focused_agent_key_scroll,
-    observe_focused_agent_mouse_scroll, render_button_bar_for_mode_to_buffer,
+    CommandBannerVisibility, ReconcileSeamPane, UiMode, command_banner_tier,
+    observe_focused_agent_key_scroll, observe_focused_agent_mouse_scroll,
+    observe_pane_input_scrollback_reconcile, render_button_bar_for_mode_to_buffer,
     render_button_bar_to_buffer, render_button_bar_with_bindings_to_buffer,
     render_card_for_mode_to_buffer, render_card_to_buffer, render_command_banner_pane_to_buffer,
     render_focused_pane_cursor_for_mode_to_position,
@@ -601,11 +604,94 @@ fn mode_banner_003_decay_state_is_deterministic_and_rearms() {
     );
 }
 
-/// Scenario: Render freshly-expanded command banners at the block-COMMAND, reversed-line, reversed-word, and omitted fallback sizes, then render a roomy pane after banner decay. Every render must survive, stay inside the pane border, keep the focused inner area dimmed, and leave the persistent COMMAND chip as the collapsed signal; a snapshot pins all degraded states.
+/// Scenario: Render nonempty command panes at degenerate, oversized, degraded-banner, and collapsed-banner sizes. Every render must survive with the exact requested buffer dimensions; valid bordered panes must keep the banner inside the pane, retain DIM, and leave the persistent COMMAND chip as the collapsed signal, with a snapshot pinning all degraded states.
 #[spec("mode/banner/004")]
 #[test]
 fn mode_banner_004_degraded_and_collapsed_states_never_escape_the_pane() {
     const CONTENT: &[u8] = b"small pane output";
+
+    let oversized_render = EmbeddedPaneController::for_render_seam_with_focused_pane(
+        "oversized-render",
+        PTY_RESIZE_DIM_MAX + 1,
+        40,
+        CONTENT,
+    );
+    let oversized_render_size = oversized_render
+        .get_screen("oversized-render")
+        .expect("the render seam must register its focused pane")
+        .lock()
+        .expect("the render seam screen lock must remain healthy")
+        .screen()
+        .size();
+    assert_eq!(
+        oversized_render_size,
+        (24, 80),
+        "an oversized render-seam axis must use parser_init_dims' safe fallback"
+    );
+
+    let (oversized_scroll, _child_input) =
+        EmbeddedPaneController::for_scroll_seam_with_focused_pane(
+            "oversized-scroll",
+            40,
+            PTY_RESIZE_DIM_MAX + 1,
+            CONTENT,
+            false,
+        );
+    let oversized_scroll_size = oversized_scroll
+        .get_screen("oversized-scroll")
+        .expect("the scroll seam must register its focused pane")
+        .lock()
+        .expect("the scroll seam screen lock must remain healthy")
+        .screen()
+        .size();
+    assert_eq!(
+        oversized_scroll_size,
+        (24, 80),
+        "an oversized scroll-seam axis must use parser_init_dims' safe fallback"
+    );
+
+    let _second_child_input = oversized_scroll.add_scroll_seam_pane(
+        "oversized-second",
+        PTY_RESIZE_DIM_MAX + 1,
+        40,
+        CONTENT,
+    );
+    let oversized_second_size = oversized_scroll
+        .get_screen("oversized-second")
+        .expect("the second-pane seam must register its pane")
+        .lock()
+        .expect("the second-pane seam screen lock must remain healthy")
+        .screen()
+        .size();
+    assert_eq!(
+        oversized_second_size,
+        (24, 80),
+        "an oversized second-pane axis must use parser_init_dims' safe fallback"
+    );
+
+    for (width, height) in [(1, 1), (0, 0), (2, 2), (1, 40), (40, 1)] {
+        let rendered = std::panic::catch_unwind(|| {
+            render_command_banner_pane_to_buffer(
+                UiMode::Normal,
+                true,
+                CommandBannerVisibility::Expanded,
+                CONTENT,
+                width,
+                height,
+            )
+        });
+        assert!(
+            rendered.is_ok(),
+            "nonempty pane rendering must not panic at degenerate or oversized {width}x{height} dimensions"
+        );
+        let buffer = rendered.expect("checked above");
+        assert_eq!(
+            (buffer.area().width, buffer.area().height),
+            (width, height),
+            "the renderer must return the exact requested {width}x{height} buffer"
+        );
+    }
+
     let cases = [
         ("BLOCK COMMAND", 40, 5, BannerTier::BlockCommand, true),
         (
@@ -929,5 +1015,82 @@ fn mode_scroll_002_keyboard_scroll_is_semantic_and_remappable() {
     assert!(
         remapped_up.forwarded_bytes.is_empty() && remapped_down.forwarded_bytes.is_empty(),
         "command-mode keyboard scrolling must never write to the child"
+    );
+}
+
+/// Scenario: Scroll one of two synthetic panes away from live output between consecutive frames, then enter PaneInput or remain in the current mode while optionally changing focus. A newly targeted PaneInput pane must snap back to live output, while an unchanged PaneInput target and command-mode pane must deliberately retain their offsets.
+#[spec("mode/scroll/003")]
+#[test]
+fn mode_scroll_003_pane_input_target_change_snaps_scrollback_to_live_output() {
+    let resumed_typing = observe_pane_input_scrollback_reconcile(
+        UiMode::Normal,
+        ReconcileSeamPane::First,
+        Some((ReconcileSeamPane::First, 3)),
+        UiMode::PaneInput,
+        ReconcileSeamPane::First,
+    );
+    assert_eq!(
+        (
+            resumed_typing.first_before,
+            resumed_typing.first_after,
+            resumed_typing.second_before,
+            resumed_typing.second_after,
+        ),
+        (3, 0, 0, 0),
+        "entering PaneInput must snap the focused pane from verified scrollback to live output"
+    );
+
+    let unchanged_typing = observe_pane_input_scrollback_reconcile(
+        UiMode::PaneInput,
+        ReconcileSeamPane::First,
+        Some((ReconcileSeamPane::First, 3)),
+        UiMode::PaneInput,
+        ReconcileSeamPane::First,
+    );
+    assert_eq!(
+        (
+            unchanged_typing.first_before,
+            unchanged_typing.first_after,
+            unchanged_typing.second_before,
+            unchanged_typing.second_after,
+        ),
+        (3, 3, 0, 0),
+        "an unchanged PaneInput target must retain its offset so PaneInput scrolling remains possible"
+    );
+
+    let newly_focused_typing = observe_pane_input_scrollback_reconcile(
+        UiMode::PaneInput,
+        ReconcileSeamPane::First,
+        Some((ReconcileSeamPane::Second, 3)),
+        UiMode::PaneInput,
+        ReconcileSeamPane::Second,
+    );
+    assert_eq!(
+        (
+            newly_focused_typing.first_before,
+            newly_focused_typing.first_after,
+            newly_focused_typing.second_before,
+            newly_focused_typing.second_after,
+        ),
+        (0, 0, 3, 0),
+        "moving PaneInput focus must snap only the newly targeted pane to live output"
+    );
+
+    let unchanged_command = observe_pane_input_scrollback_reconcile(
+        UiMode::Normal,
+        ReconcileSeamPane::First,
+        Some((ReconcileSeamPane::First, 3)),
+        UiMode::Normal,
+        ReconcileSeamPane::First,
+    );
+    assert_eq!(
+        (
+            unchanged_command.first_before,
+            unchanged_command.first_after,
+            unchanged_command.second_before,
+            unchanged_command.second_after,
+        ),
+        (3, 3, 0, 0),
+        "an unchanged command-mode pane must retain its offset so command-mode scrolling remains possible"
     );
 }
