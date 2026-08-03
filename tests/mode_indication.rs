@@ -28,7 +28,7 @@ use dot_agent_deck::ui::{
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 use spec::spec;
 
@@ -251,22 +251,37 @@ fn render_cursor_widget(input_active: bool) -> Buffer {
     buffer
 }
 
-/// Scenario: Render the same focused terminal screen twice with its vt100 cursor parked at a known cell. PaneInput must retain today's black-on-LightGreen bold block, while command mode must not paint that solid LightGreen cursor highlight.
+/// Scenario: Render the same focused terminal screen twice with its vt100 cursor parked at a known cell. PaneInput must retain today's exact black-on-LightGreen bold block, while command mode must render no painted cursor styling of any kind.
 #[spec("mode/cursor/001")]
 #[test]
 fn mode_cursor_001_painted_cursor_respects_input_active() {
     let live = render_cursor_widget(true);
     let live_cursor = &live[(4, 2)];
-    assert_eq!(live_cursor.fg, Color::Black);
-    assert_eq!(live_cursor.bg, Color::LightGreen);
-    assert!(live_cursor.modifier.contains(Modifier::BOLD));
+    assert_eq!(
+        live_cursor.style(),
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightGreen)
+            .underline_color(Color::Reset)
+            .add_modifier(Modifier::BOLD),
+        "PaneInput must retain the exact painted block-cursor style"
+    );
 
     let command = render_cursor_widget(false);
     let command_cursor = &command[(4, 2)];
-    assert_ne!(
-        command_cursor.bg,
-        Color::LightGreen,
-        "a focused pane in command mode must not paint the solid LightGreen block cursor; got {:?}",
+    for (x, y) in [(3, 2), (5, 2), (4, 1), (4, 3)] {
+        assert_eq!(
+            command_cursor.style(),
+            command[(x, y)].style(),
+            "a focused pane in command mode must style the vt100 cursor cell exactly like neighbouring non-cursor cell ({x}, {y}); cursor={:?}, neighbour={:?}",
+            command_cursor.style(),
+            command[(x, y)].style()
+        );
+    }
+    assert_eq!(
+        command_cursor.modifier,
+        Modifier::empty(),
+        "a focused pane in command mode must render no painted cursor modifier; got {:?}",
         command_cursor.style()
     );
 }

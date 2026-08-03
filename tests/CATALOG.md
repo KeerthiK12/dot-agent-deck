@@ -2761,8 +2761,8 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### mode/cursor/001 — The painted terminal cursor appears only while pane input is active.
 - **Layer:** L1 (in-process `TerminalWidget` rendered into a `ratatui::buffer::Buffer`; no PTY, no subprocess).
 - **Agent:** none (one focused vt100 fixture rendered twice).
-- **Asserts:** with `input_active=true`, the known cursor cell retains today's exact black-on-`LightGreen` bold block styling; with `input_active=false`, the same cell has no solid `LightGreen` background, leaving the implementation free to omit the highlight or substitute a dim hollow treatment.
-- **Does not assert:** the terminal emulator's own cursor (covered by `mode/cursor/002`); a specific inactive-cursor replacement style; pane-border mode styling (covered by `theme/palette/005`).
+- **Asserts:** with `input_active=true`, the known cursor cell retains today's exact black-on-`LightGreen` bold block styling; with `input_active=false`, the same cell is styled identically to its neighbouring non-cursor cells and carries no cursor modifier, so command mode renders no painted cursor of any kind.
+- **Does not assert:** the terminal emulator's own cursor (covered by `mode/cursor/002`); pane-border mode styling (covered by `theme/palette/005`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### mode/cursor/002 — The terminal emulator cursor is hidden in command mode.
