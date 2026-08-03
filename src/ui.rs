@@ -1290,6 +1290,18 @@ impl NewPaneFormState {
 /// transient info messages don't linger past their usefulness.
 const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// PRD #341 M3 (Decision 2) — how long the big `COMMAND MODE` banner stays up
+/// after entering command mode before it decays to the persistent bottom-bar
+/// chip.
+///
+/// The banner announces the *transition*; once the user has oriented, holding it
+/// up is just occlusion over a pane they are trying to read. 2.5s is long enough
+/// to register without being in the way (the PRD's 1s starting guess was judged
+/// too short to reliably notice), and it collapses early on any bound key
+/// anyway — see [`CommandBannerState`]. Lives next to [`STATUS_MESSAGE_TTL`]
+/// because it is the same kind of knob: one named place to tune a decay.
+pub const COMMAND_BANNER_TTL: std::time::Duration = std::time::Duration::from_millis(2500);
+
 /// PRD #76 M2.20 — minimum gap between the last forwarded keystroke and an
 /// Enter keystroke that follows it on the human-typing path. Agent TUIs like
 /// claude treat a CR fused to preceding bytes as newline-in-input, not submit;
@@ -1507,6 +1519,16 @@ struct UiState {
     columns: usize,
     scroll_offset: usize,
     status_message: Option<(String, std::time::Instant)>,
+    /// PRD #341 M3 — the decay state of the big `COMMAND MODE` banner drawn over
+    /// the focused pane. Modelled on `status_message`'s `Option<(_, Instant)>`
+    /// pattern: an entry instant plus a latch, expired against
+    /// [`COMMAND_BANNER_TTL`] by the render pass rather than by a timer.
+    ///
+    /// This is the ONE copy of that state. The render path reads it through
+    /// [`CommandBannerState::visibility`] each frame and the input paths feed it
+    /// [`CommandBannerSignal`]s, so the L1 seam and the running app cannot
+    /// disagree about when the banner is up.
+    command_banner: CommandBannerState,
     dir_picker: Option<DirPickerState>,
     /// PRD #170 (unify): why `dir_picker` is open — selects which form
     /// [`transition_after_dir_pick`] builds when the directory is confirmed.
@@ -1808,6 +1830,7 @@ impl UiState {
             columns: 1,
             scroll_offset: 0,
             status_message: None,
+            command_banner: CommandBannerState::default(),
             dir_picker: None,
             dir_picker_intent: DirPickerIntent::NewPane,
             new_pane_form: None,
@@ -5351,6 +5374,76 @@ fn handle_normal_key(
         return Action::Continue;
     }
     Action::Continue
+}
+
+/// PRD #341 M3 — the command-mode bindings that [`handle_normal_key`] services
+/// *in place* and reports as [`Action::Continue`].
+///
+/// KEEP IN SYNC with the `Action::Continue` arms of [`handle_normal_key`]
+/// directly above. They are the one ambiguous case for the banner's decay rule:
+/// moving the selection and clearing the filter are bound keys that prove the
+/// user is driving the deck, but they mutate `ui` themselves and so return the
+/// SAME `Action::Continue` an entirely unbound key returns. Every other bound key
+/// returns a distinguishable `Action`, and every other resolution path in the
+/// dispatch loop claims the key before this function is ever reached.
+///
+/// `ClearFilter` on an already-empty filter is deliberately counted as bound: the
+/// user pressed a key that IS in the command-mode vocabulary, which is what the
+/// decay rule asks about, not whether that key happened to have anything to do.
+///
+/// The non-configurable `Down` / `Up` aliases are included for the same reason
+/// [`handle_normal_key`] honours them — an arrow that moves the selection proves
+/// orientation exactly as `j` / `k` do.
+fn normal_key_claims_without_action(kb: &KeybindingConfig, key: &KeyEvent) -> bool {
+    kb.matches(KbAction::MoveDown, key)
+        || kb.matches(KbAction::MoveUp, key)
+        || kb.matches(KbAction::ClearFilter, key)
+        || matches!(key.code, KeyCode::Down | KeyCode::Up)
+}
+
+/// A character key with neither Ctrl nor Alt — what a user types when they
+/// believe they are talking to the agent.
+fn is_plain_printable(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// PRD #341 M3 — classify one command-mode keystroke for the banner's decay
+/// rule, or `None` when it should move nothing.
+///
+/// This is the asymmetry the PRD exists for, so it is worth stating plainly:
+///
+/// * A key that resolved to a command-mode binding **collapses** the banner. The
+///   user is driving the deck on purpose; the announcement has done its job.
+/// * A printable key that resolved to **nothing** does the opposite — it holds
+///   the banner up, and re-asserts it if it had already collapsed. That
+///   keystroke is the exact failure this PRD exists to fix: the user believes
+///   they are typing to the agent. Removing the signal at that moment would be
+///   backwards.
+/// * Anything else (an unbound function key, an unbound chord) moves nothing. It
+///   is neither evidence of orientation nor evidence of the mistake, so the
+///   banner simply keeps whatever state it had.
+///
+/// `claimed_before_mode_handler` reports whether one of the dispatch loop's
+/// earlier resolution passes (jump-to-card, the global shortcuts, focused-pane
+/// scroll, tab cycling, mode-tab navigation) took the key. Those all resolve
+/// bindings, and some of them — the scroll keys — legitimately report
+/// `Action::Continue`, so the flag has to be carried rather than re-derived from
+/// `resolved`.
+fn command_banner_key_signal(
+    kb: &KeybindingConfig,
+    key: &KeyEvent,
+    resolved: &Action,
+    claimed_before_mode_handler: bool,
+) -> Option<CommandBannerSignal> {
+    if claimed_before_mode_handler
+        || !matches!(resolved, Action::Continue)
+        || normal_key_claims_without_action(kb, key)
+    {
+        return Some(CommandBannerSignal::CommandAction);
+    }
+    is_plain_printable(key).then_some(CommandBannerSignal::UnboundPrintable)
 }
 
 fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> Action {
@@ -10175,10 +10268,16 @@ pub fn run_tui(
                 // keyboard, where tab-cycling is Normal-mode-only). The global
                 // button_rects (which carry the inline-edit Apply/Save/Cancel
                 // buttons in those modes) stay active.
+                // PRD #341 M3: set when the hit landed on the BOTTOM BAR's own
+                // buttons, as opposed to a tab header / close affordance. Only
+                // the bottom bar collapses the banner — it is the surface whose
+                // buttons are the mouse equivalent of a command-mode binding.
+                let mut hit_bottom_bar = false;
                 let mouse_action = if !(is_down || is_up) {
                     None
                 } else {
                     let mut action = hit_test_button(&ui.button_rects, mouse.column, mouse.row);
+                    hit_bottom_bar = action.is_some();
                     if action.is_none() && !text_input_mode {
                         action = hit_test_tab_close(&ui.tab_close_rects, mouse.column, mouse.row)
                             .or_else(|| {
@@ -10189,6 +10288,18 @@ pub fn run_tui(
                 };
                 if let Some(action) = mouse_action {
                     if is_down {
+                        // PRD #341 M3: a bottom-bar button click is the mouse
+                        // equivalent of a command-mode binding — it proves the
+                        // user has oriented — so it collapses the banner. Fed
+                        // BEFORE `dispatch_action`, which may leave command mode
+                        // entirely; the decay rule is about the mode the click
+                        // was made IN, not the one it landed in.
+                        if hit_bottom_bar && ui.mode == UiMode::Normal {
+                            ui.command_banner.handle(
+                                CommandBannerSignal::BottomBarClick,
+                                std::time::Instant::now(),
+                            );
+                        }
                         let frame_area = terminal.get_frame().area();
                         let selected_id: Option<String> =
                             dashboard_focus_target(&ui, filtered.len())
@@ -10676,6 +10787,11 @@ pub fn run_tui(
             // ---------------------------------------------------------------
             let frame_area = terminal.get_frame().area();
             let mut action: Option<Action> = None;
+            // PRD #341 M3: the mode this keystroke was typed IN. Captured before
+            // any handler runs, because several of them change `ui.mode` — and
+            // the banner's decay rule is about the mode the user was in when they
+            // pressed the key, not the one they landed in.
+            let was_command_mode = ui.mode == UiMode::Normal;
 
             // PRD #40: snapshot the active keybindings for this keypress (cheap
             // HashMap clone; config is immutable for the session) so the mapper
@@ -10748,6 +10864,13 @@ pub fn run_tui(
             {
                 action = mode_tab_nav_action(&kb, &key);
             }
+
+            // PRD #341 M3: did one of the resolution passes above claim the key?
+            // Recorded here, at the boundary between "a binding took it" and "the
+            // per-mode handler gets it", because some of those passes report
+            // `Action::Continue` (the focused-pane scroll keys) and would
+            // otherwise be indistinguishable from an unbound key.
+            let claimed_before_mode_handler = action.is_some();
 
             // Mode-specific key handling (only when no shortcut claimed the key).
             if action.is_none() {
@@ -10836,6 +10959,20 @@ pub fn run_tui(
                     UiMode::CloseConfirm => handle_close_confirm_key(&mut ui.close_confirm, key),
                     UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, &mut ui),
                 });
+            }
+
+            // PRD #341 M3 — feed the command banner's decay rule, at the
+            // production boundary immediately after key resolution and before the
+            // action executes. `dispatch_action` may leave command mode entirely
+            // (in which case the next frame's `sync_mode` clears the banner), so
+            // this must read the resolution, not the aftermath.
+            if was_command_mode {
+                let resolved = action.as_ref().unwrap_or(&Action::Continue);
+                if let Some(signal) =
+                    command_banner_key_signal(&kb, &key, resolved, claimed_before_mode_handler)
+                {
+                    ui.command_banner.handle(signal, std::time::Instant::now());
+                }
             }
 
             let flow = dispatch_action(
@@ -11414,6 +11551,20 @@ fn render_frame(
         ActiveTabView::Mode { mode_name, .. } => Some(mode_name.as_str()),
     };
 
+    // PRD #341 M3: reconcile the banner against the mode this frame is about to
+    // draw, then read its decay state ONCE and thread that one value into every
+    // pane-rendering path below. Doing it here — rather than at each
+    // `render_terminal_panes` call — means every tab type asks the same question
+    // at the same instant, so a Dashboard pane and a Mode-tab pane can never
+    // disagree about whether the banner is up. `visibility` latches the TTL
+    // collapse, which is why it takes `&mut`.
+    //
+    // No tick machinery: the main loop polls with a 16ms timeout and redraws
+    // continuously, so "the TTL elapsed" becomes visible on the next frame.
+    let now = std::time::Instant::now();
+    ui.command_banner.sync_mode(ui.mode == UiMode::Normal, now);
+    let banner_visibility = ui.command_banner.visibility(now);
+
     // PRD #13: the canvas is left unpainted so the terminal's own background
     // shows through (`Color::Reset`). Filling it with an absolute color was
     // the original light-terminal bug — a black slab over a light theme.
@@ -11498,6 +11649,7 @@ fn render_frame(
                 active_mode_name,
                 focused_pane_id.as_deref(),
                 &pane_status,
+                banner_visibility,
             );
             return;
         }
@@ -11543,7 +11695,8 @@ fn render_frame(
                 &pane_status,
                 &ui.selection,
                 None,
-                ui.mode == UiMode::PaneInput,
+                ui.mode,
+                banner_visibility,
                 Some(&pane_outer_rects),
             );
         }
@@ -11633,7 +11786,8 @@ fn render_frame(
                 &pane_status,
                 &ui.selection,
                 None,
-                ui.mode == UiMode::PaneInput,
+                ui.mode,
+                banner_visibility,
                 Some(&pane_outer_rects),
             );
         }
@@ -11754,7 +11908,8 @@ fn render_frame(
             &pane_status,
             &ui.selection,
             None,
-            ui.mode == UiMode::PaneInput,
+            ui.mode,
+            banner_visibility,
             Some(&pane_outer_rects),
         );
     }
@@ -11830,6 +11985,491 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
     }
 }
 
+// ---------------------------------------------------------------------------
+// PRD #341 M3 — dim + decaying COMMAND MODE banner
+// ---------------------------------------------------------------------------
+//
+// Two independent signals share this section, and keeping them independent is
+// the whole design:
+//
+// * **The dimming** persists for the entire time the UI is in command mode. It
+//   is the steady-state "this pane is inert" cue, and it must NOT decay — the
+//   PRD is explicit that only the banner's size is transient.
+// * **The banner** announces the *transition*. Once the user has demonstrably
+//   oriented (a bound key, a bottom-bar click, or simply enough elapsed time to
+//   have read it) it collapses to the persistent bottom-bar chip, because
+//   holding it up is then just occlusion over a pane they are trying to read.
+//
+// Dimming rather than blanking is also deliberate (PRD "Why dim rather than
+// blank"): command mode is the SAFE resting state where the user decides what
+// to do next, and those decisions are driven by what the panes show. Blinding it
+// would punish the safe behaviour and push people into `PaneInput` just to
+// watch — the one mode where a mistyped key reaches an agent.
+
+/// PRD #341 M3 — an input that can move the command banner's decay state.
+///
+/// Named for what the USER did rather than for the resulting state, because the
+/// mapping between the two is the part that is easy to get backwards: a bound
+/// key collapses the banner, an unbound printable *re-asserts* it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandBannerSignal {
+    /// The UI entered command mode. Re-arms the banner and restarts the TTL.
+    EnterCommandMode,
+    /// The UI left command mode. Clears the banner entirely.
+    LeaveCommandMode,
+    /// A keystroke resolved to a command-mode binding. The user is driving the
+    /// deck on purpose, so the announcement has done its job.
+    CommandAction,
+    /// A printable keystroke resolved to nothing at all. This is the exact
+    /// failure the PRD exists to fix — the user believes they are typing to the
+    /// agent — so the signal must get LOUDER, never quieter.
+    UnboundPrintable,
+    /// A bottom-bar button was clicked. Like [`Self::CommandAction`], it proves
+    /// orientation: the user aimed at a deck affordance.
+    BottomBarClick,
+}
+
+/// PRD #341 M3 — what the command banner should look like this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandBannerVisibility {
+    /// The full banner (block letters where they fit — see [`BannerTier`]).
+    Expanded,
+    /// Decayed: the pane stays dimmed, and the persistent bottom-bar mode chip
+    /// carries the signal on its own.
+    Collapsed,
+    /// Not in command mode — no banner at all.
+    Hidden,
+}
+
+/// PRD #341 M3 — the command banner's decay state (the PRD's "Banner decay
+/// rule", verbatim).
+///
+/// Modelled on the `status_message: Option<(String, Instant)>` pattern: an
+/// instant recorded when the phase started, expired lazily against
+/// [`COMMAND_BANNER_TTL`] by whoever asks — here [`Self::visibility`], which the
+/// render pass calls once per frame. The main loop already polls with a 16ms
+/// timeout and redraws continuously, so the timed decay needs no tick machinery
+/// of its own.
+///
+/// `now` is injected rather than read from the clock so the decay is testable
+/// without sleeping; the live call sites pass the real `Instant::now()`.
+#[derive(Debug, Default)]
+pub struct CommandBannerState {
+    /// When the CURRENT expanded phase started, or `None` when not in command
+    /// mode. Doubles as "are we in command mode?" for [`Self::sync_mode`] — there
+    /// is exactly one place that clears it ([`CommandBannerSignal::LeaveCommandMode`]),
+    /// so the two facts cannot drift apart.
+    ///
+    /// It is the start of the *phase*, not of the mode: an unbound printable
+    /// re-stamps it (see [`Self::handle`]).
+    entered_at: Option<std::time::Instant>,
+    /// Latched once the banner has collapsed, so a collapse survives until the
+    /// next fresh entry (or a re-assertion). Without the latch the banner would
+    /// pop back up as soon as the collapsing key's frame passed.
+    collapsed: bool,
+}
+
+impl CommandBannerState {
+    /// Apply one [`CommandBannerSignal`].
+    pub fn handle(&mut self, signal: CommandBannerSignal, now: std::time::Instant) {
+        match signal {
+            // Re-arm on every fresh entry: a new instant AND the latch cleared.
+            CommandBannerSignal::EnterCommandMode => {
+                self.entered_at = Some(now);
+                self.collapsed = false;
+            }
+            CommandBannerSignal::LeaveCommandMode => {
+                self.entered_at = None;
+                self.collapsed = false;
+            }
+            // Orientation proven — collapse early, before the TTL.
+            CommandBannerSignal::CommandAction | CommandBannerSignal::BottomBarClick => {
+                if self.entered_at.is_some() {
+                    self.collapsed = true;
+                }
+            }
+            // The asymmetry that is the point of the whole rule: a printable key
+            // that did nothing HOLDS the banner up, and re-asserts it if it had
+            // already collapsed.
+            //
+            // The fresh instant is load-bearing. Clearing the latch alone would
+            // re-assert a banner whose entry instant is already older than the
+            // TTL, so `visibility` would collapse it again on the very next
+            // frame and the user would see nothing at all.
+            CommandBannerSignal::UnboundPrintable => {
+                if self.entered_at.is_some() {
+                    self.entered_at = Some(now);
+                    self.collapsed = false;
+                }
+            }
+        }
+    }
+
+    /// Reconcile against the live `UiMode`, emitting the entry / exit signal on a
+    /// transition. Idempotent: calling it every frame with an unchanged mode does
+    /// nothing.
+    ///
+    /// This — not a hand-edited list of transition sites — is how the running app
+    /// feeds [`CommandBannerSignal::EnterCommandMode`] /
+    /// [`CommandBannerSignal::LeaveCommandMode`]. `Action::DetachToNormal` (the
+    /// `Ctrl+D` chord, in both directions) is the transition the PRD names, but it
+    /// is one of ~50 sites that assign `ui.mode`: every dialog dismissal, every
+    /// filter/rename commit, every focus and restore path lands on `Normal` or
+    /// `PaneInput` too. A banner armed at only some of them would be missing
+    /// exactly where the user is most lost. Deriving the edge from the mode itself
+    /// cannot miss one.
+    pub fn sync_mode(&mut self, command_mode: bool, now: std::time::Instant) {
+        match (command_mode, self.entered_at.is_some()) {
+            (true, false) => self.handle(CommandBannerSignal::EnterCommandMode, now),
+            (false, true) => self.handle(CommandBannerSignal::LeaveCommandMode, now),
+            _ => {}
+        }
+    }
+
+    /// The banner's state at `now`, latching the TTL collapse as a side effect so
+    /// a later re-assertion is distinguishable from "never collapsed".
+    ///
+    /// Uses `saturating_duration_since` so a `now` behind the recorded instant
+    /// (clock games in a test, a rounding artifact) reads as "no time has passed"
+    /// rather than misbehaving.
+    pub fn visibility(&mut self, now: std::time::Instant) -> CommandBannerVisibility {
+        let Some(entered_at) = self.entered_at else {
+            return CommandBannerVisibility::Hidden;
+        };
+        if self.collapsed {
+            return CommandBannerVisibility::Collapsed;
+        }
+        if now.saturating_duration_since(entered_at) >= COMMAND_BANNER_TTL {
+            self.collapsed = true;
+            return CommandBannerVisibility::Collapsed;
+        }
+        CommandBannerVisibility::Expanded
+    }
+}
+
+/// PRD #341 M3 — which rung of the narrow-pane fallback ladder a pane's inner
+/// area can afford.
+///
+/// Five-row block letters need roughly 60 columns and 7 rows, and panes are
+/// frequently far smaller (a Dashboard pane column at 67% of an 80-column
+/// terminal, split across two tiled panes, is nowhere near). Rather than let the
+/// banner clip or overrun the border, the degradation is explicit and — per the
+/// PRD — decided by a pure function so the choice is testable independently of
+/// rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BannerTier {
+    /// Block-letter `COMMAND MODE` plus the `Ctrl+D to type` subtitle.
+    BlockCommandModeWithSubtitle,
+    /// Block-letter `COMMAND` alone.
+    BlockCommand,
+    /// One reversed line: ` COMMAND MODE — Ctrl+D to type `.
+    SingleLineWithSubtitle,
+    /// One reversed word: ` COMMAND `.
+    SingleWord,
+    /// Nothing — the dimming and the M2 bottom-bar chip carry the signal.
+    Omitted,
+}
+
+impl BannerTier {
+    /// The smallest pane inner area this tier is willing to render into.
+    ///
+    /// The ink is centred inside it and never exceeds it — block `COMMAND MODE`
+    /// is 57 columns of glyphs inside the 60 this tier asks for — so "the
+    /// selected tier fits" follows from `w <= width && h <= height` alone. The
+    /// thresholds are the PRD's own sizes ("roughly 60 columns and 7 rows"), with
+    /// the slack deliberately left as breathing room from the border.
+    ///
+    /// The two single-line tiers demand **two** rows for a one-row line. A pane
+    /// with a single row of inner area is degenerate — the line would sit flush
+    /// between two borders with the entire pane content erased — so those tiers
+    /// decline it and the ladder falls through to [`Self::Omitted`], where the
+    /// dimming and the bottom-bar chip still name the mode.
+    pub fn rendered_size(self) -> (u16, u16) {
+        match self {
+            Self::BlockCommandModeWithSubtitle => (60, 7),
+            Self::BlockCommand => (40, 5),
+            Self::SingleLineWithSubtitle => (31, 2),
+            Self::SingleWord => (9, 2),
+            Self::Omitted => (0, 0),
+        }
+    }
+}
+
+/// The ladder, richest rung first. [`command_banner_tier`] walks it in order and
+/// takes the first rung that fits.
+///
+/// Monotonicity — "a wider or taller area must never select a *poorer* rung" —
+/// is a property of this structure, not of the thresholds. Growing an area can
+/// only ever ADD rungs to the set that fit (each rung's predicate is
+/// `w <= width && h <= height`, monotone in both arguments), and the answer is
+/// the first fitting rung in a fixed order, so the answer can only improve. A
+/// hand-written `if` chain has to re-earn that at every branch; this cannot lose
+/// it. [`BannerTier::Omitted`] requires `0x0`, so the search always terminates.
+const BANNER_LADDER: [BannerTier; 5] = [
+    BannerTier::BlockCommandModeWithSubtitle,
+    BannerTier::BlockCommand,
+    BannerTier::SingleLineWithSubtitle,
+    BannerTier::SingleWord,
+    BannerTier::Omitted,
+];
+
+/// PRD #341 M3 — pick the banner tier for a pane's **inner** area (the area
+/// inside the border, i.e. what `Block::inner` returns).
+///
+/// Total function: every size, including degenerate ones like `0x0` or `200x1`,
+/// maps to a tier, and the tier always fits.
+pub fn command_banner_tier(width: u16, height: u16) -> BannerTier {
+    BANNER_LADDER
+        .into_iter()
+        .find(|tier| {
+            let (w, h) = tier.rendered_size();
+            w <= width && h <= height
+        })
+        .unwrap_or(BannerTier::Omitted)
+}
+
+/// Rows in one block glyph.
+const BLOCK_ROWS: usize = 5;
+
+/// Blank columns between two adjacent block glyphs.
+const BLOCK_GLYPH_GAP: u16 = 1;
+
+/// PRD #341 M3b — a hand-rolled 5-row block font covering exactly the distinct
+/// glyphs in "COMMAND MODE" (C, O, M, A, N, D, E) plus a word space.
+///
+/// No text renderer exists in this repo — `src/ascii_art.rs` is LLM-generated
+/// idle art, not a font — and this is deliberately NOT a general one either: it
+/// is a private lookup table for one string. Each glyph is a fixed-width bitmap
+/// where `#` is an inked cell and `.` is background; the word space is a
+/// narrower all-background glyph so "COMMAND MODE" reads as two words without
+/// costing a full letter's width.
+const BLOCK_FONT: [(char, [&str; BLOCK_ROWS]); 8] = [
+    ('C', ["####", "#...", "#...", "#...", "####"]),
+    ('O', ["####", "#..#", "#..#", "#..#", "####"]),
+    ('M', ["#..#", "####", "####", "#..#", "#..#"]),
+    ('A', [".##.", "#..#", "####", "#..#", "#..#"]),
+    ('N', ["#..#", "##.#", "#.##", "#..#", "#..#"]),
+    ('D', ["###.", "#..#", "#..#", "#..#", "###."]),
+    ('E', ["####", "#...", "###.", "#...", "####"]),
+    (' ', ["..", "..", "..", "..", ".."]),
+];
+
+/// The bitmap for `ch`, or `None` for a character the font does not cover.
+/// Unknown characters are skipped rather than substituted — the font's whole
+/// input is two `const` strings, so an unknown character is a code change, not
+/// user data.
+fn block_glyph(ch: char) -> Option<&'static [&'static str; BLOCK_ROWS]> {
+    BLOCK_FONT
+        .iter()
+        .find(|(c, _)| *c == ch)
+        .map(|(_, rows)| rows)
+}
+
+/// How many columns `text` occupies when drawn with [`draw_block_text`].
+fn block_text_width(text: &str) -> u16 {
+    let mut width = 0u16;
+    for (index, rows) in text.chars().filter_map(block_glyph).enumerate() {
+        if index > 0 {
+            width = width.saturating_add(BLOCK_GLYPH_GAP);
+        }
+        width = width.saturating_add(rows[0].len() as u16);
+    }
+    width
+}
+
+/// The banner's style: `REVERSED | BOLD` and nothing else.
+///
+/// PRD #13 / Decision "light & dark safety": no absolute colour at all. Reversing
+/// against whatever foreground/background the user's theme provides is legible on
+/// light and dark terminals alike, and `REVERSED` is universally supported — which
+/// is what keeps the design from depending on `Modifier::DIM`, the one modifier
+/// some terminals ignore. Where DIM is dropped the banner and the bottom-bar chip
+/// still carry the mode on their own.
+///
+/// Built from [`Style::reset`] so the banner CLEARS the dimming it is drawn over
+/// (and any styling the agent's own output left in those cells) instead of
+/// inheriting it — a `REVERSED | DIM` plaque is exactly the muted thing this
+/// banner must not be.
+fn banner_style() -> Style {
+    Style::reset().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+}
+
+/// Stamp one banner cell, replacing whatever was there.
+fn put_banner_cell(buf: &mut Buffer, x: u16, y: u16, symbol: &str) {
+    if let Some(cell) = buf.cell_mut((x, y)) {
+        cell.set_symbol(symbol);
+        cell.set_style(banner_style());
+    }
+}
+
+/// Stamp `text` starting at `(x, y)`, one cell per character.
+fn put_banner_text(buf: &mut Buffer, x: u16, y: u16, text: &str) {
+    for (offset, ch) in text.chars().enumerate() {
+        let Ok(offset) = u16::try_from(offset) else {
+            return;
+        };
+        put_banner_cell(
+            buf,
+            x.saturating_add(offset),
+            y,
+            ch.encode_utf8(&mut [0; 4]),
+        );
+    }
+}
+
+/// Clear one cell of a block word's bounding box to a dimmed blank.
+///
+/// Keeps `Modifier::DIM` and no colour of its own, so a cleared cell is still
+/// part of the dimmed pane rather than a bright hole punched in it.
+fn clear_block_cell(buf: &mut Buffer, x: u16, y: u16) {
+    if let Some(cell) = buf.cell_mut((x, y)) {
+        cell.set_symbol(" ");
+        cell.set_style(Style::reset().add_modifier(Modifier::DIM));
+    }
+}
+
+/// Draw `text` in block letters with its top-left corner at `(x, y)`.
+///
+/// The word claims its whole bounding box before any ink lands: the counters of
+/// an `O`, the notch of a `C` and the columns between two glyphs are all part of
+/// the letterform, and pane text showing through them turns the word into
+/// something that reads as corruption rather than as `COMMAND` — the opposite of
+/// the "unmistakable" this PRD is for. It is a narrow exception to "dim, never
+/// erase": the banner only ever claims the cells it is itself drawn on, and
+/// [`command_banner_tier`] has already guaranteed the rest of the pane — the
+/// content the user is reading to decide what to do next — stays visible around
+/// it.
+fn draw_block_text(buf: &mut Buffer, x: u16, y: u16, text: &str) {
+    for row in 0..BLOCK_ROWS as u16 {
+        for col in 0..block_text_width(text) {
+            clear_block_cell(buf, x.saturating_add(col), y.saturating_add(row));
+        }
+    }
+
+    let mut cursor = x;
+    for (index, rows) in text.chars().filter_map(block_glyph).enumerate() {
+        if index > 0 {
+            cursor = cursor.saturating_add(BLOCK_GLYPH_GAP);
+        }
+        for (row, pixels) in rows.iter().enumerate() {
+            for (col, pixel) in pixels.bytes().enumerate() {
+                if pixel == b'#' {
+                    put_banner_cell(
+                        buf,
+                        cursor.saturating_add(col as u16),
+                        y.saturating_add(row as u16),
+                        " ",
+                    );
+                }
+            }
+        }
+        cursor = cursor.saturating_add(rows[0].len() as u16);
+    }
+}
+
+/// The banner's block-letter phrase (tier 1).
+const BANNER_PHRASE: &str = "COMMAND MODE";
+/// The banner's block-letter word (tier 2), when the phrase no longer fits.
+const BANNER_WORD: &str = "COMMAND";
+/// The subtitle under the tier-1 block letters — the way OUT of command mode,
+/// which is the question issue #88 recorded users asking out loud.
+const BANNER_SUBTITLE: &str = "Ctrl+D to type";
+/// Tier 3: the whole announcement on one reversed line.
+const BANNER_LINE: &str = " COMMAND MODE — Ctrl+D to type ";
+/// Tier 4: the last thing to go, and deliberately the same word as the
+/// bottom-bar chip so the two read as one vocabulary.
+const BANNER_WORD_LINE: &str = " COMMAND ";
+
+/// Draw one reversed line centred in `inner`.
+fn draw_centred_banner_line(buf: &mut Buffer, inner: Rect, text: &str) {
+    let width = text.chars().count() as u16;
+    let x = inner.x + inner.width.saturating_sub(width) / 2;
+    let y = inner.y + inner.height.saturating_sub(1) / 2;
+    put_banner_text(buf, x, y, text);
+}
+
+/// PRD #341 M3 — draw the command banner centred in a focused pane's `inner`
+/// area, at the richest tier that area can afford.
+///
+/// Every tier is centred within `inner` and sized from
+/// [`BannerTier::rendered_size`], which [`command_banner_tier`] has already
+/// checked against `inner`, so the banner cannot clip, cannot overrun the
+/// border, and cannot panic on a small-but-valid pane (`render/layout/005` is the
+/// house precedent for that last one). `put_banner_cell` is bounds-checked on top
+/// of that.
+fn draw_command_banner(buf: &mut Buffer, inner: Rect) {
+    match command_banner_tier(inner.width, inner.height) {
+        BannerTier::BlockCommandModeWithSubtitle => {
+            // Block letters, one blank row, then the subtitle.
+            let block_width = block_text_width(BANNER_PHRASE);
+            let total_height = BLOCK_ROWS as u16 + 2;
+            let x = inner.x + inner.width.saturating_sub(block_width) / 2;
+            let y = inner.y + inner.height.saturating_sub(total_height) / 2;
+            draw_block_text(buf, x, y, BANNER_PHRASE);
+            let subtitle_width = BANNER_SUBTITLE.chars().count() as u16;
+            put_banner_text(
+                buf,
+                inner.x + inner.width.saturating_sub(subtitle_width) / 2,
+                y + BLOCK_ROWS as u16 + 1,
+                BANNER_SUBTITLE,
+            );
+        }
+        BannerTier::BlockCommand => {
+            let block_width = block_text_width(BANNER_WORD);
+            let x = inner.x + inner.width.saturating_sub(block_width) / 2;
+            let y = inner.y + inner.height.saturating_sub(BLOCK_ROWS as u16) / 2;
+            draw_block_text(buf, x, y, BANNER_WORD);
+        }
+        BannerTier::SingleLineWithSubtitle => draw_centred_banner_line(buf, inner, BANNER_LINE),
+        BannerTier::SingleWord => draw_centred_banner_line(buf, inner, BANNER_WORD_LINE),
+        BannerTier::Omitted => {}
+    }
+}
+
+/// PRD #341 M3 — the command-mode treatment of ONE focused pane: dim its inner
+/// area, then draw the banner over it if it has not decayed.
+///
+/// The caller has already established both gates — command mode, and this pane
+/// being the focused one (Decision 4: the focused pane only, never every pane) —
+/// so this function does not re-check them. What it does guarantee is the
+/// ordering the PRD requires: the dim is applied to the WHOLE inner area
+/// unconditionally, and the banner is a separate, later decision. `Collapsed`
+/// therefore removes only the banner; the pane stays dimmed for as long as the
+/// user is in command mode.
+///
+/// The content underneath is dimmed, never erased. `Modifier::DIM` attenuates the
+/// cells that are already there, so the user can still read which agent is
+/// mid-work and which one they are about to close — the decisions command mode
+/// exists to make.
+fn render_command_mode_overlay(
+    buf: &mut Buffer,
+    pane_rect: Rect,
+    visibility: CommandBannerVisibility,
+) {
+    let inner = Rect {
+        x: pane_rect.x.saturating_add(1),
+        y: pane_rect.y.saturating_add(1),
+        width: pane_rect.width.saturating_sub(2),
+        height: pane_rect.height.saturating_sub(2),
+    }
+    .intersection(*buf.area());
+    if inner.is_empty() {
+        return;
+    }
+
+    for y in inner.y..inner.y.saturating_add(inner.height) {
+        for x in inner.x..inner.x.saturating_add(inner.width) {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.modifier.insert(Modifier::DIM);
+            }
+        }
+    }
+
+    if visibility == CommandBannerVisibility::Expanded {
+        draw_command_banner(buf, inner);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_terminal_panes(
     frame: &mut Frame,
@@ -11847,13 +12487,25 @@ fn render_terminal_panes(
     pane_status: &HashMap<&str, SessionStatus>,
     selection: &Option<TextSelection>,
     visual_focus_id: Option<&str>,
-    // Issue #88 follow-up: is the UI in `PaneInput` (do keystrokes reach the
-    // focused pane right now)? Threaded to `TerminalWidget::with_input_active`
-    // so the Cyan `focused` accent appears ONLY when the pane is actually live.
-    // In command mode the focused pane's border falls through to its agent's
-    // status colour and thickens instead, which is what makes the mode visible
-    // on a full-screen mode tab where nothing else on screen changes.
-    input_active: bool,
+    // Issue #88 follow-up / PRD #341 M1+M3: the live `UiState::mode`. Two
+    // different questions are asked of it here, and they are NOT complements:
+    //
+    // * `input_active` (`mode == PaneInput`) — do keystrokes reach the focused
+    //   pane right now? Threaded to `TerminalWidget::with_input_active` so the
+    //   Cyan `focused` accent and the painted cursor appear ONLY when the pane is
+    //   actually live; in command mode the border falls through to the agent's
+    //   status colour and thickens instead, which is what makes the mode visible
+    //   on a full-screen mode tab where nothing else on screen changes.
+    // * command mode (`mode == Normal`) — should the focused pane be dimmed and
+    //   the banner drawn? Every OTHER mode (a modal, an inline filter/rename row)
+    //   is also not `PaneInput`, but those already cover the screen or own the
+    //   bottom row; dimming a pane behind them would be noise, not signal.
+    mode: UiMode,
+    // PRD #341 M3: the banner's decay state for this frame, from the single
+    // `UiState::command_banner`. Deliberately a SEPARATE input from `mode`: the
+    // dimming is gated by mode and focus alone and persists for the whole time in
+    // command mode, while only this controls whether the banner is drawn over it.
+    banner: CommandBannerVisibility,
     // PRD #84: per-pane OUTER rects (aligned 1:1 with `pane_ids`) precomputed by
     // `compute_frame_layout` — the SAME rects `resize_panes_to_layout` sized the
     // PTYs to this frame. `Some` => draw into exactly those; `None` => recompute
@@ -11865,6 +12517,8 @@ fn render_terminal_panes(
     if pane_ids.is_empty() {
         return None;
     }
+    let input_active = mode == UiMode::PaneInput;
+    let command_mode = mode == UiMode::Normal;
     let focused_id = visual_focus_id
         .map(|s| s.to_string())
         .or_else(|| ctrl.focused_pane_id());
@@ -12020,6 +12674,19 @@ fn render_terminal_panes(
         }
     }
 
+    // PRD #341 M3: dim the focused pane and, until it decays, draw the COMMAND
+    // MODE banner over it.
+    //
+    // Gated on `command_mode` AND on there being a focused pane, independently of
+    // `banner` — Decision 4 scopes both treatments to the focused pane, and the
+    // dimming must persist for the entire time in command mode while only the
+    // banner decays. Drawn AFTER the panes (so it lands on real content) and
+    // BEFORE the selection highlight (so an active text selection stays crisp
+    // rather than being dimmed along with everything else).
+    if command_mode && let Some(rect) = focused_pane_rect {
+        render_command_mode_overlay(frame.buffer_mut(), rect, banner);
+    }
+
     // Render selection highlight over the focused pane.
     if let Some(sel) = selection
         && let Some(rect) = focused_pane_rect
@@ -12084,6 +12751,10 @@ fn render_mode_tab(
     // `render_frame` into both `render_terminal_panes` calls below, so mode-tab
     // panes get the same status-colored borders as the dashboard's panes.
     pane_status: &HashMap<&str, SessionStatus>,
+    // PRD #341 M3: the banner decay state `render_frame` read once for this
+    // frame, forwarded rather than re-derived so a Mode tab and a Dashboard pane
+    // cannot disagree about whether the banner is up.
+    banner: CommandBannerVisibility,
 ) {
     // PRD #83: `focused_pane_id` is keyed by stable pane id. `None` (or an
     // id that isn't one of this tab's side panes) means the agent pane is
@@ -12113,7 +12784,8 @@ fn render_mode_tab(
             pane_status,
             &ui.selection,
             agent_visual_focus,
-            ui.mode == UiMode::PaneInput,
+            ui.mode,
+            banner,
             // Mode-tab panes recompute their rects (out of the Cards finding's
             // scope); the agent pane is a single Stacked pane filling agent_area.
             None,
@@ -12135,7 +12807,8 @@ fn render_mode_tab(
             pane_status,
             &ui.selection,
             side_visual_focus.as_deref(),
-            ui.mode == UiMode::PaneInput,
+            ui.mode,
+            banner,
             // Mode side panes recompute via pane_stack_rects (Tiled) — same
             // split as the `side_pane_rects` above; out of the Cards finding's scope.
             None,
@@ -15697,8 +16370,12 @@ pub fn render_focused_pane_cursor_for_mode_to_position(
                 &None,
                 Some(PANE_ID),
                 // The one input the seam varies: exactly what `render_frame`
-                // passes (`ui.mode == UiMode::PaneInput`).
-                mode == UiMode::PaneInput,
+                // passes (`ui.mode`).
+                mode,
+                // PRD #341 M3: irrelevant to the cursor question — the banner
+                // never draws a cursor — so pin the state a pane that has never
+                // been in command mode carries.
+                CommandBannerVisibility::Hidden,
                 None,
             );
         })
@@ -15706,6 +16383,74 @@ pub fn render_focused_pane_cursor_for_mode_to_position(
 
     let backend = terminal.backend();
     backend.cursor_visible().then(|| backend.cursor_position())
+}
+
+/// PRD #341 M3 L1 seam: render ONE embedded pane through the real
+/// [`render_terminal_panes`] path with `content` already on its screen, and hand
+/// back the completed buffer.
+///
+/// The three gating inputs are all explicit and all independent, which is the
+/// point of the seam:
+///
+/// * `mode` — the live `UiState::mode`. Command mode dims; `PaneInput` does not.
+/// * `focused` — is this THE focused pane? Decision 4 scopes the dimming and the
+///   banner to the focused pane only, never every pane.
+/// * `visibility` — the banner's decay state. It gates the BANNER only; the
+///   dimming ignores it entirely.
+///
+/// Passing `Expanded` with `PaneInput`, or with `focused = false`, is therefore a
+/// meaningful thing to ask for: both must still come back undimmed and
+/// bannerless. A seam that folded the three into one flag could not express the
+/// question.
+///
+/// The pane fills the buffer, so its inner area is exactly `width - 2` by
+/// `height - 2` — the same inner area [`command_banner_tier`] is asked about.
+#[doc(hidden)]
+pub fn render_command_banner_pane_to_buffer(
+    mode: UiMode,
+    focused: bool,
+    visibility: CommandBannerVisibility,
+    content: &[u8],
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    const PANE_ID: &str = "1";
+    // `render_terminal_panes` resolves the focused pane as
+    // `visual_focus_id.or_else(|| ctrl.focused_pane_id())`, and the seam's
+    // controller focuses its only pane. Naming an id no pane carries is how the
+    // seam asks for "this pane is NOT the focused one" without the fallback
+    // quietly focusing it anyway.
+    const NO_PANE: &str = "\u{0}unfocused";
+
+    let rows = height.saturating_sub(2);
+    let cols = width.saturating_sub(2);
+    let ctrl =
+        EmbeddedPaneController::for_render_seam_with_focused_pane(PANE_ID, rows, cols, content);
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            render_terminal_panes(
+                frame,
+                Some(&ctrl),
+                area,
+                &[PANE_ID.to_string()],
+                PaneLayout::Stacked,
+                &HashMap::new(),
+                &HashMap::new(),
+                &None,
+                Some(if focused { PANE_ID } else { NO_PANE }),
+                mode,
+                visibility,
+                None,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
 }
 
 /// PRD #341 M5 — what one scroll input did to the focused agent pane: where our

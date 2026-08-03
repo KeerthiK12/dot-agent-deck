@@ -1,0 +1,95 @@
+---
+source: tests/mode_indication.rs
+expression: snapshot
+---
+BLOCK COMMAND (42x7)
+PLAIN
+┏1━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃sma                                     ┃
+┃                                        ┃
+┃                                        ┃
+┃                                        ┃
+┃                                        ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+STYLED
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┏1━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃sma" [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"    " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"    " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"   " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"    ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃   " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"    " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"    " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"    " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"   ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃   " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"    " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"    " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"    " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"    " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"   ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃   " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"    " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"   ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃   " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"    " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"    " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"  " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]" " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]"   " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"    ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+
+SINGLE LINE (33x4)
+PLAIN
+┏1━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ COMMAND MODE — Ctrl+D to type ┃
+┃                               ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+STYLED
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┏1━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃" [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" COMMAND MODE — Ctrl+D to type " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                               ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+
+SINGLE WORD (11x4)
+PLAIN
+┏1━━━━━━━━┓
+┃ COMMAND ┃
+┃e output ┃
+┗━━━━━━━━━┛
+STYLED
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┏1━━━━━━━━┓"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃" [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).bold().reversed()]" COMMAND " [Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃e output ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┗━━━━━━━━━┛"
+
+OMITTED (10x4)
+PLAIN
+┏1━━━━━━━┓
+┃ne outpu┃
+┃t       ┃
+┗━━━━━━━━┛
+STYLED
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┏1━━━━━━━┓"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃ne outpu┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃t       ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┗━━━━━━━━┛"
+
+COLLAPSED AFTER DECAY
+PLAIN
+┏1━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃small pane output                                               ┃
+┃                                                                ┃
+┃                                                                ┃
+┃                                                                ┃
+┃                                                                ┃
+┃                                                                ┃
+┃                                                                ┃
+┃                                                                ┃
+┃                                                                ┃
+┃                                                                ┃
+┃                                                                ┃
+┃                                                                ┃
+┃                                                                ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+STYLED
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┏1━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃small pane output                                               ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                                                                ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                                                                ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                                                                ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                                                                ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                                                                ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                                                                ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                                                                ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                                                                ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                                                                ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                                                                ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                                                                ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┃                                                                ┃"
+[Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset).dim()]"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+
+PERSISTENT CHIP
+ COMMAND  [Back to Pane Ctrl+D] [New Pane Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?] [Quit Ctrl+C]
+[Filter /] [Rename r] [Generate g] [Scheduled Tasks s]
