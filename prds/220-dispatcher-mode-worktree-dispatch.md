@@ -31,6 +31,55 @@ Skills are deliberately **not** used to carry this knowledge. This repo does not
 
 **The principle — isolation is deterministic, never a judgment call.** The agent declares intent ("this is a line of work; start it"); the verb *always* isolates work in a worktree. Whether-to-isolate is never an LLM decision. The payoff is that a mis-timed or over-eager dispatch produces a redundant, cleanable worktree — never the cross-delivery corruption of #140. Getting the *timing* wrong costs disk, not correctness. Worktree selection is therefore always a **pre-spawn** decision.
 
+## Design record — intended dispatcher behaviour (2026-08-03)
+
+Captured during review of PR #232 (the implementation). The shipped seed prompt reads as a **work decomposer**, which is not what this PRD asked for, and the difference is large enough that it needs settling with the contributor before further changes. Recorded here so the reasoning survives the session.
+
+### Canonical walkthrough
+
+The dispatcher is an **ordinary conversational agent that additionally knows the `dispatch` verb**. It is not a planner.
+
+```
+Me:    Fetch all open PRDs.
+Agent: (does the work and presents them, like any normal agent)
+Me:    I want to work on PRD 220 by executing the /prd-full skill.
+Agent: calls `dot-agent-deck dispatch prd-220 --task "Execute the /prd-full skill"`
+       → worktree created, orchestration started in it, orchestrator gets the prompt
+Me:    (may keep talking and dispatch more, or close the pane with Ctrl+W)
+```
+
+**The invariant, and the whole feature:** a worktree is created, an isolated orchestration (or single agent) starts in it, and the orchestrator receives one additional prompt. *What* that prompt says is entirely the user's business — the dispatcher composes it from the conversation. Two users share nothing beyond this invariant.
+
+### Consequences
+
+- **Starting the unit should be mechanically identical to the interactive `Ctrl+n` path, minus the dialog, plus the injected prompt.** The fix for the gap below is therefore **parity**, not a new mechanism: share the interactive composition rather than build a second one. This is also why a `--intent` CLI flag was considered and **rejected** — `--task` already carries the user's intent; nothing new needs to cross the CLI boundary. What is missing is daemon-side access to composition that currently lives TUI-side.
+- **"A normal agent in the worktree" is already available and needs no flag.** `decide_target` falls back to `SpawnTarget::SingleAgent` when the target dir has no `[[orchestrations]]`, so the shape is config-driven per repo.
+- **The dispatcher is just a pane.** It needs no lifecycle or "done" concept: it owns no worktrees (cleanup is keyed to each dispatched unit's own tab close via `worktree_of_record`), has nothing to summarise without a return edge, and is not in `orchestrator_pane_ids` so `work-done --done` does not apply. A done-signal whose only effect is closing the pane is ceremony — `Ctrl+W` already does it. The seed should say nothing about finishing or being one-off.
+- **Several dispatches are normal, and are not decomposition.** Working on 3 PRDs in parallel means 3 dispatches of 3 things the user named. No unit-splitting judgment is involved.
+
+### Seed-scope principle (applies to every mode seed, not just this one)
+
+**A seed teaches Agent Deck mechanics, not work methodology.** Test: *would this sentence still be needed if the user's work were of a completely different kind?* If yes, it is mechanics and belongs; if no, it is the deck being opinionated about someone else's workflow.
+
+Precedent confirms this is the existing convention — both schedule-authoring seeds are purely mechanical (which CLI to use and why it is validated/atomic, which flags do not apply, confirm fields before writing, where results surface). Neither offers any opinion on how to organise work. The dispatcher seed is the outlier.
+
+Measured against it, the shipped seed should **keep**: the `dispatch` syntax; that `--task` text must be self-contained (a consequence of process isolation); the sibling worktree layout; fire-and-forget with no return edge; and (worth adding) that a dispatch name is single-use until its branch is deleted. It should **cut**: "decompose a task into independent units", "Break it into independent, parallel-ready units", "Each unit MUST be independent", "Keep the number of units reasonable (2-6)", and "NEVER do the work yourself. You ONLY decompose and dispatch" — that last one is not merely methodology but actively restrictive, since it forbids the pane from doing anything else the user asks (it would forbid step 1 of the walkthrough above).
+
+On the "2-6 units" line specifically: "too many units overwhelm the system" is a *deck* claim, so if it is real it belongs in code as an enforced limit, not as prose advice to a model. See the open soft-dispatch-cap question.
+
+### Known gap: the orchestrator gets no protocol (→ #222)
+
+A dispatched orchestrator currently receives **only** the `--task` text. It is never told it is an orchestrator, what roles exist, or how to delegate:
+
+- `prepare_orchestrator_prompt` (writes `.dot-agent-deck/orchestrator-context.md` and sends the one-line pointer to it) has exactly **one** caller — `src/ui.rs`, the interactive new-pane path. The daemon spawn path never calls it.
+- `prompt_template` appears **nowhere** in `src/spawn.rs`; `RoleSpawn` carries only `role_index`, `role_name`, `command`, `is_start_role`. So per-role prompt templates are dropped on this path too.
+
+`issue_dispatch` (#120) has the identical defect, since `dispatch` reuses that engine — this is exactly #222's "prompt order" parity item. Two implementation notes for whoever does it: nothing here is a *system* prompt (it is all PTY-typed user input, which is why combining protocol + intent into one delivery is easy), and multi-line prompts do not submit reliably through a PTY — so the shape is a combined context **file** plus a one-line pointer, following `compose_worker_task_file`, not string concatenation.
+
+### Open question for the contributor (blocking further seed work)
+
+Whether the decomposer framing was deliberate, and how far their model differs from the walkthrough above. Asked on PR #232. This is deliberately *not* being resolved unilaterally: the technical shape is a maintainer call, but the contributor's intent is not knowable without asking, and guessing risks building two different features. Also unresolved, and dependent on the answer: whether `dispatcher` should stay in `is_authoring_selected()` — the "↳ authoring (one-off)" hint is correct for the schedule modes (whose seeds say the pane existed only to create the schedule) but misleading for a dispatcher that has continued purpose.
+
 ## Scope
 
 ### In Scope
@@ -147,6 +196,9 @@ A running orchestrator creating a worktree partway through and expecting its alr
 - **Experimental flag → yes.** `features::show_dispatcher()`, its own wrapper per CLAUDE.md rule 9 (not a reuse of `show_issue_dispatch_authoring`). Gates ONLY the Mode-cycler option; the `dispatch` verb and its daemon handler are ungated. Graduation tracked as `graduate-dispatcher`, to be filed at merge.
 
 ## Open Questions
+
+- **Seed scope — decomposer vs verb-teacher.** BLOCKING further seed work; asked on PR #232. See the Design record above for the full reasoning and the walkthrough the seed should match.
+- **`is_authoring_selected()` membership.** Whether `dispatcher` belongs in the throwaway-authoring family with the schedule modes. Depends on the answer above.
 - **#140 handoff — prong 1 fate.** Once distinct-cwd worktree dispatch is the norm, #140's per-tab `orchestration_id` only protects the discouraged same-cwd-two-tabs case. Decide (on #140) whether to keep it as belt-and-suspenders or trim #140 to guard + docs. Recorded here as the cross-PRD dependency; the decision lives in #140.
-- **Soft dispatch cap.** Should the daemon or the dispatcher seed impose a soft limit on concurrent dispatched worktrees per session? Decide in M1 once the authority model is concrete.
-- **Experimental flag (CLAUDE.md rule 9).** The dispatcher mode is a new user-visible surface — confirm with the maintainer at `/prd-start` whether it ships behind the `experimental` flag.
+- **Soft dispatch cap.** Should the daemon or the dispatcher seed impose a soft limit on concurrent dispatched worktrees per session? Decide in M1 once the authority model is concrete. Note the shipped seed currently states a 2-6 range as prose advice with nothing enforcing it — if the limit is real it belongs in code.
+- ~~**Experimental flag (CLAUDE.md rule 9).**~~ Decided — see Decisions.
