@@ -52,14 +52,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L1 (ratatui `TestBackend` + `insta`).
 - **Agent:** none.
 - **Asserts:** with three session cards and a `Tab::Dashboard` whose `selected_session_id` points at the second card (`sess-beta`), `ui::sync_and_derive_selection` derives index 1 (not 0); the rendered snapshot shows the `▸` selection marker and highlighted border on the second card while the first and third stay unselected.
-- **Does not assert:** keyboard-driven selection movement (`dashboard/selection/*`); absolute-time clocks (`Last:` is rendered against a fixed test clock).
+- **Does not assert:** keyboard-driven selection movement (`dashboard/selection/*`); elapsed-time rollover behavior (the fixture uses one current instant for all three cards).
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/pane/006 — Card row shows `Dir:` (working directory basename), `Last:` (elapsed since last activity), `Tools:` (tool count), `Prmt:` (latest user prompts).
-- **Layer:** L1.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`).
 - **Agent:** none.
-- **Asserts:** rendered card snapshot has all four labels in order with the supplied fixture data.
-- **Does not assert:** absolute-time clocks (`Last:` is rendered against a fixed test clock).
+- **Asserts:** an over-long working-directory basename renders with all four fields retained; `Dir:` owns the full inner content width and truncates with an ellipsis immediately before the right border, while `Last:` / `Tools:` live in the bottom border. A second 14-column render proves a newline in `abc\ndef` costs no terminal cell, so all six visible prompt cells render as `abcdef` without an ellipsis.
+- **Does not assert:** the card-stats degradation thresholds (covered by `dashboard/card-stats/002` and `/004`); elapsed-time rollovers beyond the fixture's stable one-hour display.
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/pane/007 — A Pi pane's card renders the Pi agent-type identity (PRD #201 M2.2).
@@ -121,6 +121,43 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** a fully-populated session card (3 prompts + 3 tools) rendered at each tier's own `rendered_height` in an 80-column wide viewport has zero blank inner rows between its last content line and the bottom border on Compact, Normal, and Spacious — reserved card height equals rendered content height.
 - **Does not assert:** the exact `card_height` value per tier (covered by `card_height_001_content_derived_values`); the mid-card blank separator line on Normal/Spacious (intentional content, not a trailing row).
 - **Platform coverage:** mac+linux+windows.
+
+#### dashboard/card-stats
+
+##### dashboard/card-stats/001 — A wide card renders its full Last/Tools stats at the bottom-right border.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`).
+- **Agent:** none (synthetic Thinking-session fixture).
+- **Asserts:** a comfortably wide live card right-aligns `Last: 1h  Tools: 14` in its bottom border, and neither counter appears on an inner content row; the complete character buffer is snapshotted. A wide placeholder `No agent` card also retains its full Last/Tools counters in the bottom border.
+- **Does not assert:** narrow-width degradation (covered by `/002` and `/004`); border title colors.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/card-stats/002 — A 20-column card degrades its stats label without damaging border corners.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`).
+- **Agent:** none (synthetic Thinking-session fixture).
+- **Asserts:** with 18 usable bottom-border cells, the card selects `1h · 14 tools`, preserves both bottom corner glyphs, and renders no dedicated stats content row; the complete character buffer is snapshotted.
+- **Does not assert:** widths below the shortest form or the complete transition sweep (covered by `/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/card-stats/003 — Crossing the former 60-column breakpoint is structurally inert.
+- **Layer:** L1 (ratatui `TestBackend`, comparative buffer inspection).
+- **Agent:** none (the same synthetic session rendered on both sides of the old breakpoint).
+- **Asserts:** real Normal-density card renders with 59 and 61 inner columns expose the same `Dir:` / `Prmt:` / `Last:` / `Tools:` labels and keep those labels on the same rows.
+- **Does not assert:** production density selection, because the available L1 render seams require the caller to supply a density; exact horizontal truncation or full-buffer equality, since changing width legitimately changes available text cells.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/card-stats/004 — The stats-label degradation ladder transitions at exact display widths.
+- **Layer:** L1 pure-data unit test over the hidden-public label selector.
+- **Agent:** none.
+- **Asserts:** the reference input selects no label below 9 cells, `2m · 14` from 9, `2m · 14 tools` from 15, and `Last: 2m  Tools: 14` from 21 onward, with both sides of the exact transitions pinned. Property sweeps over `1h 5m`/1234, a six-digit tool count, empty elapsed text, and Unicode/combining text prove every result fits its display-column budget and is the first, widest fitting form.
+- **Does not assert:** ratatui title placement or styling (covered by `/001` and `/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/card-stats/005 — A real interactive Haiku card keeps its height while opening its pane narrows the card and degrades the bottom-border counters. [reel]
+- **Layer:** L2 PTY-attached (the real `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, with recording enabled for a `full-stream.cast`).
+- **Agent:** REAL interactive Claude Code on `claude-haiku-4-5-20251001`, with onboarding/project trust seeded and `--allowedTools Bash`; no `-p`. A second real client on the observer's daemon performs the ordinary Ctrl+N flow and types the prefix-only prompt after Claude's native editor becomes ready; the recorded client observes the live card and later attaches that same daemon pane on demand.
+- **Asserts:** the sentinel response and native Thinking/Working/Idle plus Bash hook prove the genuine spawn → agent → work path; at one fixed 68×16 recording size, the unattached card shows a nonzero, right-aligned full `Last: … Tools: …` label only in its bottom border, then attaching the real pane narrows the dashboard and selects the shorter `… · … tools` rung while preserving `└`/`┘`, the tool count, the `Dir:`/`Prmt:`/`Bash` row offsets, and card height.
+- **Does not assert:** exact Claude prose beyond the discovered sentinel filename; exact elapsed-time text; multiple cards or density changes caused by terminal height.
+- **Platform coverage:** mac+linux.
 
 #### dashboard/selection
 

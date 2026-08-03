@@ -82,29 +82,33 @@ const MOD_KEY: &str = "Ctrl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardDensity {
-    Compact,  // wide 5 / narrow 6 rows: 1 prompt, 1 tool
-    Normal,   // wide 8 / narrow 9 rows: 1 prompt, 3 tools
-    Spacious, // wide 10 / narrow 11 rows: 3 prompts, 3 tools
+    Compact,  // 5 rows: 1 prompt, 1 tool
+    Normal,   // 8 rows: 1 prompt, 3 tools
+    Spacious, // 10 rows: 3 prompts, 3 tools
 }
 
 impl CardDensity {
     /// Card height in rows, derived from the exact lines `render_session_card`
     /// emits so reserved height never drifts from rendered content:
-    ///   Dir (1) + prompts + [narrow: inline stats line] + [non-compact: blank
-    ///   separator] + tools, plus 2 rows for the top/bottom border.
+    ///   Dir (1) + prompts + [non-compact: blank separator] + tools, plus 2
+    ///   rows for the top/bottom border.
     ///
-    /// Resulting heights — wide: Compact 5, Normal 8, Spacious 10;
-    /// narrow: 6 / 9 / 11.
-    fn card_height(self, wide: bool) -> u16 {
+    /// Resulting heights: Compact 5, Normal 8, Spacious 10.
+    ///
+    /// Height is a function of density ALONE — PRD #339 moved the `Last` /
+    /// `Tools` counters onto the bottom border, deleting the card-width axis
+    /// that used to add a stats row (and a sixth height) to narrow cards. Any
+    /// future line `render_session_card` gains must be added here in the same
+    /// change, or cards overlap / leave a blank tail row.
+    fn card_height(self) -> u16 {
         let prompts = self.max_prompts() as u16;
         let tools = self.max_tools() as u16;
-        let stats_line = if wide { 0 } else { 1 };
         let separator = if matches!(self, CardDensity::Compact) {
             0
         } else {
             1
         };
-        (1 + prompts + stats_line + separator + tools) + 2 // +2 top/bottom border
+        (1 + prompts + separator + tools) + 2 // +2 top/bottom border
     }
 
     fn max_tools(self) -> usize {
@@ -122,19 +126,14 @@ impl CardDensity {
     }
 }
 
-fn choose_density(
-    total_cards: usize,
-    cols: usize,
-    available_height: u16,
-    wide: bool,
-) -> CardDensity {
+fn choose_density(total_cards: usize, cols: usize, available_height: u16) -> CardDensity {
     let total_card_rows = total_cards.div_ceil(cols);
     for density in [
         CardDensity::Spacious,
         CardDensity::Normal,
         CardDensity::Compact,
     ] {
-        let needed = total_card_rows as u16 * density.card_height(wide);
+        let needed = total_card_rows as u16 * density.card_height();
         if needed <= available_height {
             return density;
         }
@@ -4670,26 +4669,131 @@ fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
     }
 }
 
-fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
+/// Truncate `input` so its rendered width — including the trailing `…` when one
+/// is added — is at most `max_width` **terminal columns**.
+///
+/// Every caller's budget is a slice of a rectangle's width (`inner.width - 6`
+/// for the card's `Dir:` and `Prmt:` lines), so the budget is measured in cells,
+/// not scalar values. Counting `char`s instead under-counts wide characters — a
+/// four-scalar CJK basename is eight columns, so a six-cell budget accepted it
+/// unchanged and ratatui then bare-clipped it at the right edge with no `…`,
+/// violating PRD #339's "always ellipsizes" criterion — and over-counts
+/// zero-width ones, replacing a fitting combining sequence with a lone `…`.
+///
+/// Mirrors `tab_layout::truncate_to_cap`: accumulate `UnicodeWidthChar` per
+/// character and stop before the first one that would overflow. The `…` column
+/// is reserved **only** when the input actually overflows, so a string that
+/// exactly fills the budget is returned whole. For single-width input (all
+/// ASCII text on a card) this is identical, character for character, to the
+/// former char-count implementation.
+///
+/// Known limitation: iteration is per `char`, so a grapheme *cluster* — an emoji
+/// ZWJ sequence, or a base character followed by combining marks — can still be
+/// split at the cut point. Measuring clusters needs `unicode-segmentation`,
+/// which this crate deliberately does not depend on; the total width stays
+/// correct either way, so the failure mode is a cosmetically odd final glyph,
+/// never an overrun. Since the total below is summed the same way, a cluster is
+/// also *over*-counted against the budget — a ZWJ sequence ratatui draws in two
+/// cells measures four here — so such input ellipsizes a little early. That
+/// errs in the safe direction and keeps one rule for both decisions.
+///
+/// Control characters measure **zero** columns, and deliberately so: ratatui
+/// 0.30's `Span::styled_graphemes` drops every grapheme containing a
+/// `char::is_control` before it reaches a cell, so such a character occupies no
+/// column on screen. `UnicodeWidthStr::width` disagrees — it counts a `\n` as
+/// one column — so the total below is summed with the same per-character rule
+/// the fill loop uses rather than with the string-level algorithm. Using both
+/// measures is what made `"abc\ndef"` (six rendered cells) get truncated inside
+/// a six-cell budget.
+fn truncate_with_ellipsis(input: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    // The single per-character width rule governing both decisions below.
+    let cell_width = |c: char| UnicodeWidthChar::width(c).unwrap_or(0);
+
+    if max_width == 0 {
         return String::new();
     }
-    let char_count = input.chars().count();
-    if char_count <= max_chars {
+    if input.chars().map(cell_width).sum::<usize>() <= max_width {
         return input.to_string();
     }
-    let keep = max_chars.saturating_sub(1);
-    let mut out: String = input.chars().take(keep).collect();
+    // Overflow confirmed, so one column now belongs to the `…`.
+    let budget = max_width - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in input.chars() {
+        let w = cell_width(c);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
     out.push('…');
     out
 }
 
+/// Pick the widest `Last`/`Tools` form that fits a card's bottom border, or
+/// `None` when even the shortest form would overrun the corner glyphs.
+///
+/// `usable_width` is `area.width - 2` — the cells between `└` and `┘`. Every
+/// form carries one leading and one trailing space, mirroring the ` ● Thinking `
+/// status badge, so the title never touches a corner.
+///
+/// PRD #339 pins the ladder — widest form first, each rung shorter than the
+/// last. Against the reference label (`last = "2m"`, `tools = 14`) the rungs
+/// measure 21 / 15 / 9 display columns:
+///
+/// | rung | form                     | reference width |
+/// |------|--------------------------|-----------------|
+/// | 1    | ` Last: 2m  Tools: 14 `  | 21              |
+/// | 2    | ` 2m · 14 tools `        | 15              |
+/// | 3    | ` 2m · 14 `              | 9               |
+/// | 4    | omitted (`None`)         | —               |
+///
+/// Those numbers describe the reference input only; they are NOT thresholds.
+/// The single rule is the measured **display** width (unicode columns — `·` is
+/// two bytes but one column) of the form actually being rendered: pick the
+/// widest rung whose own width fits `usable_width`. A longer elapsed string or
+/// tool count widens a rung, and the fit check catches that on its own — with
+/// `last = "1h 5m"` and `tools = 1234`, rung 1 measures 26 columns and a
+/// 22-cell border degrades to ` 1h 5m · 1234 tools ` instead of overrunning.
+///
+/// Deliberately no per-rung minimum-width floor: a floor is stricter than the
+/// fit check exactly when `form.width() < min_width`, i.e. precisely when the
+/// form fits and we would reject it anyway. Floors add no overrun protection —
+/// they only suppress forms that would otherwise fit, and any constant is
+/// calibrated to one reference input and wrong for every other one.
+///
+/// Returning `None` rather than a clipped form is correct: a border title is
+/// drawn over the border cells, so an oversized one silently eats the corner
+/// glyphs (`└`/`┘`) and the card stops looking like a card. Dropping the stats
+/// entirely degrades to a clean, if less informative, frame.
+#[doc(hidden)]
+pub fn card_stats_border_label(usable_width: u16, last: &str, tools: usize) -> Option<String> {
+    use unicode_width::UnicodeWidthStr;
+
+    // Pick the widest form whose display width fits the usable cells.
+    [
+        format!(" Last: {last}  Tools: {tools} "),
+        format!(" {last} · {tools} tools "),
+        format!(" {last} · {tools} "),
+    ]
+    .into_iter()
+    .find(|form| form.width() <= usable_width as usize)
+}
+
 /// Truncate a sequence of styled title segments to `max_chars` total characters,
 /// appending a single `…` (in the last surviving segment's style) when they
-/// don't all fit. Produces the SAME character sequence as
-/// [`truncate_with_ellipsis`] on the concatenated text — so text-only snapshots
-/// are unchanged — but preserves each segment's style, letting the coloured
+/// don't all fit, while preserving each segment's style — letting the coloured
 /// agent-type badge (PRD #20 M5) keep its registry colour even on a narrow card.
+///
+/// For single-width text this produces the same character sequence as
+/// [`truncate_with_ellipsis`] on the concatenated input, so text-only snapshots
+/// of the title match the plain truncator. The two diverge on wide or zero-width
+/// characters: this one still budgets `char`s, whereas `truncate_with_ellipsis`
+/// budgets display columns. Titles are the pre-existing char-counted surface and
+/// PRD #339 did not touch them; converting them is a separate change.
 fn truncate_styled_segments(
     segments: Vec<(String, Style)>,
     max_chars: usize,
@@ -11883,13 +11987,10 @@ fn render_frame(
     let cols = grid_columns(dashboard_area.width);
 
     // Choose card density based on available vertical space
-    // wide = true when each column has inner width >= 60 (card border takes 2 chars)
-    let col_width = dashboard_area.width / cols.max(1) as u16;
-    let wide = col_width.saturating_sub(2) >= 60;
     // 1 row for title + 1 row for stats bar at bottom of dashboard
     let available_for_density = dashboard_area.height.saturating_sub(2);
-    let density = choose_density(sessions.len(), cols, available_for_density, wide);
-    let card_height = density.card_height(wide);
+    let density = choose_density(sessions.len(), cols, available_for_density);
+    let card_height = density.card_height();
 
     // Update idle art state machine
     update_idle_art(
@@ -15693,7 +15794,22 @@ fn render_session_card(
         Style::default().fg(status_color)
     };
 
-    let block = Block::default()
+    // PRD #339: `Last` / `Tools` ride the bottom border instead of a content
+    // row. Border cells are paid for by `Borders::ALL` either way, so the
+    // counters cost zero rows and card height stops depending on card width.
+    // Bottom-RIGHT mirrors the top-right status badge: volatile live state hugs
+    // the right edge while `Dir:` / `Prmt:` / tool lines own the left rail.
+    //
+    // The border reads `Last: 2m`, not `Last: 2m ago` — four columns of suffix
+    // are expensive there, and the `Last:` label already says "time since".
+    let elapsed = format_elapsed(session.last_activity);
+    let stats_title = card_stats_border_label(
+        area.width.saturating_sub(2),
+        &elapsed,
+        session.tool_count as usize,
+    );
+
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(Line::from(title_spans))
@@ -15702,6 +15818,13 @@ fn render_session_card(
             Line::from(Span::styled(status_text, status_style))
                 .alignment(ratatui::layout::Alignment::Right),
         );
+    // Omitted entirely when even the shortest form would overrun the corners.
+    if let Some(stats) = stats_title {
+        block = block.title_bottom(
+            Line::from(Span::styled(stats, text_primary()))
+                .alignment(ratatui::layout::Alignment::Right),
+        );
+    }
 
     // PRD #13 Option A: selection is cued by the `▸ ` title prefix and the
     // Magenta+BOLD border above (the `selected` palette accent, PRD #155) — no
@@ -15713,7 +15836,6 @@ fn render_session_card(
     frame.render_widget(block, area);
 
     let w = inner.width as usize;
-    let wide = w >= 60;
 
     let cwd_display = session
         .cwd
@@ -15722,37 +15844,19 @@ fn render_session_card(
         .map(|n| n.to_string_lossy())
         .unwrap_or_else(|| "—".into());
 
-    let elapsed = format_elapsed(session.last_activity);
-
     let mut lines: Vec<Line<'_>> = Vec::new();
 
-    if wide {
-        let right_spans = vec![
-            Span::styled("Last: ", text_primary()),
-            Span::raw(format!("{}  ", elapsed)),
-            Span::styled("Tools: ", text_primary()),
-            Span::raw(session.tool_count.to_string()),
-        ];
-        let right_len: usize = right_spans.iter().map(|s| s.width()).sum();
-        let dir_label_len = 6; // "Dir:  "
-        let max_dir = w.saturating_sub(right_len + dir_label_len + 1);
-
-        let dir_display = truncate_with_ellipsis(cwd_display.as_ref(), max_dir);
-
-        lines.push(padded_line(
-            vec![
-                Span::styled("Dir:  ", text_primary()),
-                Span::raw(dir_display),
-            ],
-            right_spans,
-            w,
-        ));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("Dir:  ", text_primary()),
-            Span::raw(cwd_display),
-        ]));
-    }
+    // PRD #339: with the counters on the border, `Dir:` gets the whole inner
+    // width at every card width — one un-branched form, always ellipsized (the
+    // old narrow branch bare-clipped the path with no `…`).
+    let dir_label_len = 6; // "Dir:  "
+    lines.push(Line::from(vec![
+        Span::styled("Dir:  ", text_primary()),
+        Span::raw(truncate_with_ellipsis(
+            cwd_display.as_ref(),
+            w.saturating_sub(dir_label_len),
+        )),
+    ]));
 
     if is_placeholder {
         lines.push(Line::from(Span::styled(
@@ -15770,15 +15874,6 @@ fn render_session_card(
                 Span::raw(display),
             ]));
         }
-    }
-
-    if !wide {
-        lines.push(Line::from(vec![
-            Span::styled("Last: ", text_primary()),
-            Span::raw(format!("{}  ", elapsed)),
-            Span::styled("Tools: ", text_primary()),
-            Span::raw(session.tool_count.to_string()),
-        ]));
     }
 
     if density != CardDensity::Compact {
@@ -15807,21 +15902,6 @@ fn render_session_card(
         let art_widget = Paragraph::new(art_lines);
         frame.render_widget(art_widget, inner);
     }
-}
-
-/// Build a single line with left-aligned and right-aligned span groups,
-/// padded with spaces to fill `width`.
-fn padded_line<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Line<'a> {
-    let left_len: usize = left.iter().map(|s| s.width()).sum();
-    let right_len: usize = right.iter().map(|s| s.width()).sum();
-    let gap = width.saturating_sub(left_len + right_len);
-
-    let mut spans = left;
-    if gap > 0 {
-        spans.push(Span::raw(" ".repeat(gap)));
-    }
-    spans.extend(right);
-    Line::from(spans)
 }
 
 fn flash_dot(status: &SessionStatus, tick: u64) -> &'static str {
@@ -15901,28 +15981,34 @@ fn status_style(status: &SessionStatus) -> (&str, Style) {
     }
 }
 
+/// Time since `last_activity` in the compact form the card's bottom border
+/// renders (PRD #339): `0s`, `3s`, `1m 30s`, `1m`, `1h 5m`, `1h`.
+///
+/// No ` ago` suffix — four columns of it are expensive on a border, and the
+/// `Last:` label already says "time since". [`render_session_card`] is the only
+/// caller, so there is one form and one function.
 fn format_elapsed(last_activity: DateTime<Utc>) -> String {
     let now = Utc::now();
     let delta = now.signed_duration_since(last_activity);
     let total_secs = delta.num_seconds().max(0);
 
     if total_secs < 60 {
-        format!("{}s ago", total_secs)
+        format!("{}s", total_secs)
     } else if total_secs < 3600 {
         let mins = total_secs / 60;
         let secs = total_secs % 60;
         if secs == 0 {
-            format!("{}m ago", mins)
+            format!("{}m", mins)
         } else {
-            format!("{}m {}s ago", mins, secs)
+            format!("{}m {}s", mins, secs)
         }
     } else {
         let hours = total_secs / 3600;
         let mins = (total_secs % 3600) / 60;
         if mins == 0 {
-            format!("{}h ago", hours)
+            format!("{}h", hours)
         } else {
-            format!("{}h {}m ago", hours, mins)
+            format!("{}h {}m", hours, mins)
         }
     }
 }
@@ -16116,14 +16202,14 @@ impl From<CardDensityKind> for CardDensity {
 }
 
 impl CardDensityKind {
-    /// Rendered card height in rows at this density. `wide = true`
-    /// matches the in-process layout's "card is wide enough to show
-    /// the stats row inline" branch; the L1 snapshot test uses this
-    /// to size its `TestBackend` rather than hardcoding the value
-    /// (M2.1 reviewer S3).
+    /// Rendered card height in rows at this density. The L1 snapshot
+    /// tests use this to size their `TestBackend` rather than
+    /// hardcoding the value (M2.1 reviewer S3). Since PRD #339 the
+    /// height depends on density alone — card width no longer enters
+    /// the calculation.
     #[doc(hidden)]
-    pub fn rendered_height(self, wide: bool) -> u16 {
-        CardDensity::from(self).card_height(wide)
+    pub fn rendered_height(self) -> u16 {
+        CardDensity::from(self).card_height()
     }
 }
 
@@ -16389,11 +16475,7 @@ pub fn render_dashboard_cards_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    // `render_session_card` computes `wide` from the inner width (full
-    // width minus the two border columns); mirror that so the card height
-    // we size the buffer with matches what the renderer actually draws.
-    let wide = (width as usize).saturating_sub(2) >= 60;
-    let card_height = density.rendered_height(wide);
+    let card_height = density.rendered_height();
     let height = card_height.saturating_mul(cards.len() as u16).max(1);
 
     let backend = TestBackend::new(width, height);
@@ -19365,12 +19447,14 @@ mod tests {
     #[test]
     fn test_format_elapsed() {
         let now = Utc::now();
-        assert_eq!(format_elapsed(now), "0s ago");
-        assert_eq!(format_elapsed(now - Duration::seconds(3)), "3s ago");
-        assert_eq!(format_elapsed(now - Duration::seconds(90)), "1m 30s ago");
-        assert_eq!(format_elapsed(now - Duration::seconds(60)), "1m ago");
-        assert_eq!(format_elapsed(now - Duration::seconds(3900)), "1h 5m ago");
-        assert_eq!(format_elapsed(now - Duration::seconds(3600)), "1h ago");
+        // PRD #339: compact form, no ` ago` suffix — the card's bottom border
+        // is the only surface that renders this.
+        assert_eq!(format_elapsed(now), "0s");
+        assert_eq!(format_elapsed(now - Duration::seconds(3)), "3s");
+        assert_eq!(format_elapsed(now - Duration::seconds(90)), "1m 30s");
+        assert_eq!(format_elapsed(now - Duration::seconds(60)), "1m");
+        assert_eq!(format_elapsed(now - Duration::seconds(3900)), "1h 5m");
+        assert_eq!(format_elapsed(now - Duration::seconds(3600)), "1h");
     }
 
     #[test]
@@ -23164,64 +23248,57 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn test_choose_density_wide() {
-        // Wide layout (no extra stats line)
+    fn test_choose_density() {
         // Spacious=10, Normal=8, Compact=5
 
         // 1 session, 1 col, plenty of height -> Spacious
-        assert_eq!(choose_density(1, 1, 20, true), CardDensity::Spacious);
+        assert_eq!(choose_density(1, 1, 20), CardDensity::Spacious);
 
         // 2 sessions, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(2, 2, 10, true), CardDensity::Spacious);
+        assert_eq!(choose_density(2, 2, 10), CardDensity::Spacious);
 
         // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
-        assert_eq!(choose_density(2, 2, 9, true), CardDensity::Normal);
+        assert_eq!(choose_density(2, 2, 9), CardDensity::Normal);
 
         // 4 sessions, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
-        assert_eq!(choose_density(4, 2, 16, true), CardDensity::Normal);
+        assert_eq!(choose_density(4, 2, 16), CardDensity::Normal);
 
         // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*5=10 fits)
-        assert_eq!(choose_density(4, 2, 15, true), CardDensity::Compact);
+        assert_eq!(choose_density(4, 2, 15), CardDensity::Compact);
 
         // Many sessions, small screen -> Compact
-        assert_eq!(choose_density(10, 1, 20, true), CardDensity::Compact);
+        assert_eq!(choose_density(10, 1, 20), CardDensity::Compact);
 
         // Edge: 0 sessions -> Spacious (0 rows needed)
-        assert_eq!(choose_density(0, 1, 10, true), CardDensity::Spacious);
+        assert_eq!(choose_density(0, 1, 10), CardDensity::Spacious);
     }
 
     #[test]
-    fn test_choose_density_narrow() {
-        // Narrow layout: each mode needs 1 extra row for stats line
-        // Spacious=11, Normal=9, Compact=6
+    fn test_choose_density_boundaries() {
+        // Density is a function of card count, columns, and height only.
+        // Spacious=10, Normal=8, Compact=5.
 
-        // 1 session, height 11 -> Spacious (1*11=11)
-        assert_eq!(choose_density(1, 1, 11, false), CardDensity::Spacious);
+        // 1 session, height 11 -> Spacious (1*10=10)
+        assert_eq!(choose_density(1, 1, 11), CardDensity::Spacious);
 
-        // 1 session, height 10 -> Normal (1*9=9 fits)
-        assert_eq!(choose_density(1, 1, 10, false), CardDensity::Normal);
+        // 1 session, height 10 -> Spacious (1*10=10)
+        assert_eq!(choose_density(1, 1, 10), CardDensity::Spacious);
 
-        // 2 sessions, 1 col, height 18 -> Normal (2*9=18)
-        assert_eq!(choose_density(2, 1, 18, false), CardDensity::Normal);
+        // 2 sessions, 1 col, height 18 -> Normal (2*8=16)
+        assert_eq!(choose_density(2, 1, 18), CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 17 -> Compact (2*6=12 fits)
-        assert_eq!(choose_density(2, 1, 17, false), CardDensity::Compact);
+        // 2 sessions, 1 col, height 17 -> Normal (2*8=16)
+        assert_eq!(choose_density(2, 1, 17), CardDensity::Normal);
     }
 
     /// Acceptance criterion 1: `card_height` is derived from rendered content,
-    /// so it returns exactly Compact=5 / Normal=8 / Spacious=10 (wide) and
-    /// 6 / 9 / 11 (narrow). Locks the six values against future drift.
+    /// so it returns exactly Compact=5 / Normal=8 / Spacious=10. Locks the
+    /// three density-derived values against future drift.
     #[test]
     fn card_height_001_content_derived_values() {
-        // Wide layout (no inline stats line).
-        assert_eq!(CardDensity::Compact.card_height(true), 5);
-        assert_eq!(CardDensity::Normal.card_height(true), 8);
-        assert_eq!(CardDensity::Spacious.card_height(true), 10);
-
-        // Narrow layout (+1 row for the inline stats line on every tier).
-        assert_eq!(CardDensity::Compact.card_height(false), 6);
-        assert_eq!(CardDensity::Normal.card_height(false), 9);
-        assert_eq!(CardDensity::Spacious.card_height(false), 11);
+        assert_eq!(CardDensity::Compact.card_height(), 5);
+        assert_eq!(CardDensity::Normal.card_height(), 8);
+        assert_eq!(CardDensity::Spacious.card_height(), 10);
     }
 
     /// Review finding S1: the card grid must re-clamp a stale scroll offset

@@ -32,8 +32,8 @@ The **only contract** between the two is the manifest.
 
 | Field | Meaning |
 | --- | --- |
-| `title` | The card's bold headline. In the repo flow this is the `test.md` H1 (catalog id + headline). |
-| `description` | The card's dim, word-wrapped body. In the repo flow this is the test's `## Scenario` paragraph. |
+| `title` | The card's bold centred headline. In the repo flow this is the `test.md` H1 (catalog id + headline). |
+| `description` | The card's body — bright, left-aligned, one line per sentence. In the repo flow this is the test's `## Scenario` paragraph. |
 | `clip` | Path to the recording shown after the card: an existing `.cast` (asciinema v2), `.gif`, or `.mp4`. Resolved relative to the engine's current working directory. |
 
 The `clip` format is intentionally open — a cast renderer (`agg`) is just one optional front-end, so an already-rendered `gif`/`mp4` can be fed straight in. The engine rejects a manifest that breaks any of these rules (not a non-empty array, an entry that is not an object, an empty/missing field, a `clip` whose extension is not `.cast`/`.gif`/`.mp4`, or a `clip` file that does not exist) with a specific message and a non-zero exit.
@@ -133,6 +133,22 @@ The adapter builds the manifest from this repo's conventions, then forwards `--o
 It selects the e2e `#[spec]` tests this branch added/changed (diff vs `main`), reads each one's title (`test.md` H1) and `## Scenario` description, orders by catalog id, points each entry at its `full-stream.cast`, and invokes the engine. The `build.sh select` and `build.sh assemble` subcommands expose the two halves (the git-diff selection and the pure manifest assembly) for inspection — see the [adapter SKILL.md](../../.claude/skills/demo-reel-adapter/SKILL.md).
 
 > **Casts only exist for recorded runs.** Per-test casts are written only on test **failure** or when `DOT_AGENT_DECK_RECORD=1` is set (PRD #77), and they are local-only — never produced in CI. To build a reel for *passing* tests, run the e2e suite with `DOT_AGENT_DECK_RECORD=1` first so the casts under `.dot-agent-deck/recordings/<test>/full-stream.cast` are populated. Without casts, the adapter finds nothing in scope and clean-skips.
+
+## Verify the artifact before publishing
+
+An unlisted YouTube link goes in the PR body **and** the changelog fragment, so a bad reel is a published bad reel. PRD #339's first attempt ([`HYXKJokZ8JI`](https://youtu.be/HYXKJokZ8JI)) shipped with three independent defects — a mid-recording terminal resize, a 10.4x playback stretch, and a portrait canvas — every one of which the four checks below would have caught in under a minute. Two are now warnings the engine prints on every run; run through all four anyway before you publish.
+
+1. **The cast header matches the size actually used.** `head -1 <cast>` and compare `width`/`height` against what the test set. Then check nothing addresses a column past it — the engine warns automatically, because a v2 cast has one fixed size and no resize event, so a mid-recording resize silently hard-wraps every earlier frame into garbage.
+2. **The re-timing ratio is sane.** The engine prints `clip N: re-timed <a>s -> <b>s (<r>x)` per clip; `retime.sh` bounds `r` by `MAX_STRETCH`, so a ratio far above it means a tunable (or `CLIP_SPEED`) was overridden.
+3. **The reel duration is about (card holds) + (clip durations).** `ffprobe -v error -show_entries format=duration -of csv=p=0 reel.mp4` against `CARD_HOLD` (4s) per entry plus each clip's re-timed length. A 15s clip inside a 161s video is the shape of the PRD #339 bug.
+4. **Extract a frame and look at it.** No check substitutes for seeing it:
+
+   ```sh
+   ffmpeg -y -ss 20 -i reel.mp4 -frames:v 1 -update 1 /tmp/frame.png   # a clip frame
+   ffmpeg -y -ss 2  -i reel.mp4 -frames:v 1 -update 1 /tmp/card.png    # a card frame
+   ```
+
+   The terminal should **fill** the frame. Black bars either side mean the recording is too portrait for the 16:9 canvas (see the [adapter's recording discipline](../../.claude/skills/demo-reel-adapter/SKILL.md#recording-discipline-for-a-reel-marked-test)); the engine fits and never crops, so that can only be fixed by re-recording at roughly 4x as many terminal columns as rows.
 
 ### Smoke tests
 

@@ -962,7 +962,7 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
     let session = selected_card_fixture();
     let width = 80;
     let density = CardDensityKind::Normal;
-    let height = density.rendered_height(true);
+    let height = density.rendered_height();
     let command = render_card_for_mode_to_buffer(
         &session,
         Some("mode-card"),

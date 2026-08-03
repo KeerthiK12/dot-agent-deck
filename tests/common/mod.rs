@@ -103,6 +103,7 @@ pub struct TuiDeckBuilder {
     keybindings_toml: Option<String>,
     claude_trust_paths: Vec<String>,
     claude_trust_workdir: bool,
+    suppress_success_recording: bool,
 }
 
 impl TuiDeckBuilder {
@@ -225,6 +226,16 @@ impl TuiDeckBuilder {
     /// back symlink-resolved and the trust key is matched verbatim.
     pub fn with_claude_trust_workdir(mut self) -> Self {
         self.claude_trust_workdir = true;
+        self
+    }
+
+    /// Keep this client out of the successful-run recording artifact even when
+    /// `DOT_AGENT_DECK_RECORD=1`. Multi-client scenarios use one primary deck
+    /// as the viewer-facing cast and secondary decks only as real control
+    /// surfaces; letting every client dump under the shared test-function name
+    /// would make the last drop nondeterministically overwrite the primary cast.
+    pub fn without_success_recording(mut self) -> Self {
+        self.suppress_success_recording = true;
         self
     }
 
@@ -370,6 +381,7 @@ impl TuiDeck {
             keybindings_toml: None,
             claude_trust_paths: Vec::new(),
             claude_trust_workdir: false,
+            suppress_success_recording: false,
         }
     }
 
@@ -720,7 +732,8 @@ impl TuiDeck {
             })
             .expect("spawn reader thread");
 
-        let record_on_success = std::env::var_os("DOT_AGENT_DECK_RECORD").is_some();
+        let record_on_success = std::env::var_os("DOT_AGENT_DECK_RECORD").is_some()
+            && !builder.suppress_success_recording;
 
         Ok(TuiDeck {
             pty_master: pair.master,
