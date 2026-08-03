@@ -1,6 +1,6 @@
 # PRD #341: Make Command vs PaneInput mode unmistakable
 
-**Status**: Not started
+**Status**: Implemented — PR pending
 **Priority**: High
 **Created**: 2026-08-02
 
@@ -118,7 +118,7 @@ No. CLAUDE.md rule 9 requires the question be asked for a new user-visible surfa
 
 - In command mode, no cursor of any kind renders in the focused pane — neither the painted block nor the terminal's own.
 - In PaneInput, the cursor renders exactly as it does today.
-- The current mode is stated in words, in the same screen position, at all times, on every tab.
+- The current mode is stated in words, in the same screen position, on every tab, whenever the bottom bar is showing its buttons. The two inline input modes — `Filter` and `Rename` — are an explicit exception: their bar row *is* the input field, so the `/ ` or `Rename: ` prompt and its cursor own that position instead. Neither `COMMAND` nor `TYPING` would be accurate there, and the visible prompt plus the user's own echoed text already makes the destination of keystrokes unambiguous. Amended 2026-08-03 after code review (finding 4) established that the original "at all times" wording and the shipped implementation could not both be read literally; the exception is deliberate, not a gap.
 - Entering command mode produces a change large enough to notice without looking for it, on every tab type — verified on Dashboard, Orchestration, and Mode tabs.
 - Pane content remains readable in command mode; you can still tell what each agent is doing and which one you are about to close.
 - The banner collapses immediately when a command-mode binding is executed, and does *not* collapse on unbound printable keys.
@@ -127,13 +127,13 @@ No. CLAUDE.md rule 9 requires the question be asked for a new user-visible surfa
 
 ## Milestones
 
-- [ ] **M1 — Cursors respect mode.** Both cursor paths gated on `input_active`; the contradiction with the border policy is gone.
-- [ ] **M2 — Persistent mode chip.** Current mode named in a fixed position in the bottom bar, on every tab.
-- [ ] **M3 — Dim + decaying banner.** Focused pane dims in command mode; banner renders, decays per the rule above, and degrades correctly at narrow sizes.
-- [ ] **M4 — Mode-aware deck selection.** Selection accent de-emphasised in PaneInput so the Dashboard tab gets a signal where the user's attention is.
-- [ ] **M5 — Agent-pane scroll in command mode.** Command mode is a real read-only inspect mode, consistent with side panes.
-- [ ] **M6 — Test coverage.** L1 snapshots for every new surface; at least one PTY-attached L2 test plus a real-agent (Haiku) scenario per rule 4; `/// Scenario:` comments and `tests/CATALOG.md` entries.
-- [ ] **M7 — Docs and changelog.** `docs/keyboard-shortcuts.md` updated for the scroll change and mode vocabulary; changelog fragment added.
+- [x] **M1 — Cursors respect mode.** Both cursor paths gated on `input_active`; the contradiction with the border policy is gone.
+- [x] **M2 — Persistent mode chip.** Current mode named in a fixed position in the bottom bar, on every tab.
+- [x] **M3 — Dim + decaying banner.** Focused pane dims in command mode; banner renders, decays per the rule above, and degrades correctly at narrow sizes.
+- [x] **M4 — Mode-aware deck selection.** Selection accent de-emphasised in PaneInput so the Dashboard tab gets a signal where the user's attention is.
+- [x] **M5 — Agent-pane scroll in command mode.** Command mode is a real read-only inspect mode, consistent with side panes.
+- [x] **M6 — Test coverage.** L1 snapshots for every new surface; at least one PTY-attached L2 test plus a real-agent (Haiku) scenario per rule 4; `/// Scenario:` comments and `tests/CATALOG.md` entries.
+- [x] **M7 — Docs and changelog.** `docs/keyboard-shortcuts.md` updated for the scroll change and mode vocabulary; changelog fragment added.
 
 ## Risks
 
@@ -152,6 +152,22 @@ No. CLAUDE.md rule 9 requires the question be asked for a new user-visible surfa
 5. Does M4's de-emphasis risk making the Dashboard feel dead in PaneInput, where the user may still want to track which card is selected?
 
 ## Work Log
+
+### 2026-08-03 — All milestones implemented; review and e2e gate green
+
+M1–M7 landed across nine feature/fix commits and six test commits. `cargo test-fast` 1442 passing; the full `DOT_AGENT_DECK_RECORD=1 cargo test-e2e` tier 2803/2803 passing with no retries.
+
+Open questions 1–5 were resolved with the user before implementation: vocabulary `COMMAND` / `TYPING`; banner TTL **2.5s** rather than the PRD's 1s guess (1s was judged too short to reliably register); no burst-of-unbound-keys escalation (out of scope, the hold/re-assert behaviour is in); banner and dimming on the focused pane only; and M4 de-emphasises the accent while keeping the `▸ ` marker so the card stays identifiable.
+
+Three findings came out of implementation that the PRD had not anticipated. **The real-agent e2e test earned rule 4's cost**: it found that scrolling back in command mode and returning with `Ctrl+D` left the pane scrolled away from live output, and because cursor placement requires `scrollback() == 0`, no cursor rendered at all — typing mode, cursorless, stale output. Neither M1 nor M5 was wrong alone; the gap existed only because M5 made command-mode scrolling possible. Fixed by a per-frame reconcile keyed on `(mode, focused pane)` rather than on `Ctrl+D`, since ~50 sites assign `ui.mode`. **Code review found the banner's mode edge was observed only at render time**, so a same-drain round-trip (a `Ctrl+D` key repeat, or a double-click on `[Back to Pane]`) never armed the fresh entry; the edge is now observed inside the input drain and the edge memory was split off `entered_at`. **Review also found `PaneInput` with no focused pane left the UI lying** — chip reading ` TYPING `, a cursor possibly painted, keystrokes silently dropped — now resolved by dropping to command mode, the honest state.
+
+Two accepted trade-offs worth carrying forward: at 80 columns the button bar now takes three rows rather than two (arithmetically forced — ten default buttons need 154 cells across two rows and 80 columns with a chip offers 150; a first-row-only indent did reclaim the row at 40–62 columns), and the chip is omitted in the `Filter` / `Rename` inline input modes, which is why the mode-label success criterion was amended above.
+
+Two follow-ups deliberately left out of scope: the wheel's missing pointer hit-test (pre-existing — the pre-M5 arm was never gated on pointer position, and the deck has no wheel scroll region to shadow — but `pane_relative_coords` saturating-subtracts, so a pointer outside the pane forwards clamped, fictional coordinates to the child), and `wire_stream_pane`'s unvalidated parser dimensions on the shipped spawn path (contained in practice by `guarded_parser_feed`).
+
+Security audit: clean apart from one Low finding (release-exposed seams passed caller-controlled dimensions straight to `vt100::Parser::new`), fixed by routing through the existing `parser_init_dims` and `guarded_parser_feed`. Rule 12 verified — no daemon, protocol, hook or orchestration impact; `PROTOCOL_VERSION` unchanged at 6; patch-level, no `.breaking.md` fragment.
+
+Left to manual validation: whether `Modifier::DIM` renders visibly dimmer on the terminals we care about (headless evidence proves the app emits SGR 2 and tmux preserves it, but not that a given emulator draws it differently), whether the 2.5s TTL feels right in use, and the cross-tab behaviour on Orchestration and Mode tabs — the L2 tests cover the Dashboard layout only.
 
 ### 2026-08-02 — Created
 

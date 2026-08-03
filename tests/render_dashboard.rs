@@ -14,8 +14,8 @@ use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, 
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
-    CardDensityKind, card_stats_border_label, render_card_to_buffer,
-    render_config_gen_prompt_to_buffer, render_dashboard_cards_to_buffer,
+    CardDensityKind, UiMode, card_stats_border_label, render_card_for_mode_to_buffer,
+    render_card_to_buffer, render_config_gen_prompt_to_buffer, render_dashboard_cards_to_buffer,
     render_quit_confirm_to_buffer, render_star_prompt_to_buffer, render_stats_bar_to_buffer,
     render_stop_confirm_to_buffer, sync_and_derive_selection,
 };
@@ -483,6 +483,10 @@ fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
 
 /// Build a placeholder ("No agent") card fixture with a current activity time;
 /// its compact Last/Tools counters use the same bottom-border path as live cards.
+///
+/// PRD #341 M4 made the selection accent mode-dependent, so the mode is passed
+/// explicitly: `UiMode::Normal` — command mode, where the keyboard drives the deck
+/// and the accent renders at full strength.
 fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
     let now = chrono::Utc::now();
     let placeholder = SessionState {
@@ -504,13 +508,14 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
     let height = density.rendered_height();
-    render_card_to_buffer(
+    render_card_for_mode_to_buffer(
         &placeholder,
         None,
         None,
         density,
         0,
         selected,
+        UiMode::Normal,
         width,
         height,
     )
@@ -539,7 +544,8 @@ fn contrast_001_overlays_reference_frame() {
 }
 
 /// Scenario: Render the five overlay seams plus a session card in both the
-/// unselected and SELECTED states, then assert two terminal-relative
+/// unselected and SELECTED states, in **command mode** (`UiMode::Normal`, where
+/// the keyboard drives the deck), then assert two terminal-relative
 /// properties. (a) NO rendered cell across any surface has a `Color::Rgb(..)`
 /// background — backgrounds must be `Color::Reset` so the terminal's own
 /// background shows through. (b) Selection is cued the PRD #155 Option-A way —
@@ -577,7 +583,8 @@ fn guard_001_no_absolute_backgrounds() {
     //     be Color::Magenta + Modifier::BOLD. Magenta is the dedicated
     //     `selected` accent role; it deliberately does not reuse the working
     //     status green or the focused-pane cyan. (The unselected placeholder
-    //     border is a dimmed terminal foreground.)
+    //     border is a dimmed terminal foreground.) PRD #341 M4: BOLD is the
+    //     command-mode strength — `mode/deck/001` owns the PaneInput recipe.
     let border_style = |buf: &ratatui::buffer::Buffer| {
         let y = buf.area().height / 2;
         let cell = &buf[(0, y)];
@@ -1137,11 +1144,13 @@ fn palette_002_pane_border_matches_deck_status_color() {
     }
 }
 
-/// Scenario: Render a SELECTED deck card and assert its border is the dedicated
-/// `selected` accent role — Color::Magenta + Modifier::BOLD — plus the `▸ `
-/// title marker, and that this color is NOT a status color (≠ green) and NOT
-/// the focused accent (≠ cyan). This pins the Option-A rule that selection is
-/// conveyed by a non-status accent that never collides with the palette.
+/// Scenario: Render a SELECTED deck card in **command mode** (`UiMode::Normal`)
+/// and assert its border is the dedicated `selected` accent role —
+/// Color::Magenta + Modifier::BOLD — plus the `▸ ` title marker, and that this
+/// color is NOT a status color (≠ green) and NOT the focused accent (≠ cyan).
+/// This pins the Option-A rule that selection is conveyed by a non-status accent
+/// that never collides with the palette, at the full strength command mode gets
+/// (PRD #341 M4 de-emphasises the same accent in PaneInput — `mode/deck/001`).
 #[spec("theme/palette/003")]
 #[test]
 fn palette_003_selected_card_border_is_magenta_bold_marker() {
@@ -1149,13 +1158,14 @@ fn palette_003_selected_card_border_is_magenta_bold_marker() {
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
     let height = density.rendered_height();
-    let buffer = render_card_to_buffer(
+    let buffer = render_card_for_mode_to_buffer(
         &session,
         Some("example-agent"),
         Some(1),
         density,
         0,    // animation tick
         true, // SELECTED
+        UiMode::Normal,
         width,
         height,
     );
