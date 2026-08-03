@@ -693,10 +693,6 @@
         }
       }
     },
-    "path:gcloud#google-cloud-sdk": {
-      "last_modified": "2026-08-03T01:49:17Z",
-      "resolved": "path:/tmp/renovate/repos/github/vfarcic/dot-agent-deck/gcloud?lastModified=1785721757&narHash=sha256-hKkmMLmAfta5yR7fHMrfMRGcGsAPWhoMmt3byqDR%2BN4%3D#google-cloud-sdk"
-    },
     "ripgrep@15.2.0": {
       "last_modified": "2026-08-01T16:34:20Z",
       "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#ripgrep",
