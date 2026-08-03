@@ -4,28 +4,83 @@
 //!
 //! Exercises the full user-visible path: launch the deck with the experimental
 //! flag ON, open the new-pane form, select the "dispatcher" authoring option,
-//! submit, and verify the dispatcher tab surfaces live on the attached TUI
-//! with a real Claude agent running inside it.
+//! submit, give the seeded agent a goal, and verify it really dispatches — the
+//! daemon creates the sibling git worktree the feature promises.
 //!
 //! Marked [reel] — this is the genuine spawn → agent → work path (CLAUDE.md
 //! rule 4). The agent receives the dispatcher seed prompt via gated delivery,
-//! so it genuinely starts and the deck shows its status transition (Working).
+//! decomposes the goal, and invokes `dot-agent-deck dispatch` itself; the
+//! assertion is on the resulting worktree, so nothing here is a stand-in.
 
 mod common;
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::TuiDeck;
 use spec::spec;
 
+/// Removes a dispatch worktree on drop, including on panic.
+///
+/// Dispatch worktrees are SIBLINGS of the fixture dir, so they land outside the
+/// harness tempdir and its `TempDir` drop never touches them — without this every
+/// run of this test leaves a `/tmp/.tmpXXXX-dispatch-probe-unit` behind forever.
+struct SiblingWorktreeGuard(PathBuf);
+
+impl Drop for SiblingWorktreeGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// PATH for the spawned deck (→ daemon → agents) with the freshly-built
+/// `dot-agent-deck` binary's dir prepended to the host PATH.
+///
+/// Without this the seeded dispatcher agent runs whatever `dot-agent-deck`
+/// happens to be installed on the host, which predates the `dispatch` verb — the
+/// agent then reports "dispatch doesn't exist as a subcommand" and the test
+/// silently proves nothing about the feature. The rest of the host PATH is kept
+/// so `git` and `claude` still resolve. Mirrors
+/// `e2e_issue_dispatch_real.rs::path_with_binary_dir`.
+fn path_with_binary_dir() -> String {
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let bindir = Path::new(bin).parent().expect("binary path has a parent");
+    format!(
+        "{}:{}",
+        bindir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// Give the fixture repo an initial commit.
+///
+/// The harness `git init`s the copied fixture but never commits, leaving an
+/// unborn HEAD — and `git worktree add` cannot create a worktree from that. A
+/// dispatch in such a repo fails on worktree creation, so without this the
+/// dispatch path is unreachable no matter what the agent does.
+fn commit_fixture_repo(dir: &Path) {
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git available");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+    };
+    run(&["config", "user.email", "deck-test@example.com"]);
+    run(&["config", "user.name", "Deck Test"]);
+    run(&["add", "-A"]);
+    run(&["commit", "-qm", "fixture baseline"]);
+}
+
 /// Scenario: Launch the deck in the minimal fixture with the experimental flag
 /// ON and real Claude credentials imported. Open the new-pane form (Ctrl+N →
 /// Space confirms the dir), cycle the Mode field to the experimental "dispatcher"
-/// option (the last cycler slot after `schedule: issues`), click [Submit], and
-/// assert the dispatcher tab surfaces live as a mode tab on the tab strip with
-/// a running agent inside. The agent receives the dispatcher seed prompt
-/// (decompose work → call `dot-agent-deck dispatch`), starts genuinely, and
-/// transitions through the Working status — proving the full user-visible path.
+/// option (the last cycler slot after `schedule: issues`), and click [Submit] —
+/// the dispatcher tab must surface live on the tab strip. Then type a goal asking
+/// for one unit named `probe-unit`; the seeded agent runs
+/// `dot-agent-deck dispatch probe-unit` itself and the daemon creates the sibling
+/// worktree `../<repo>-dispatch-probe-unit`, which the test waits for on disk.
 #[spec("prompt/new-pane/016")]
 #[test]
 fn dispatcher_001_opens_mode_tab_with_real_agent() {
@@ -34,27 +89,35 @@ fn dispatcher_001_opens_mode_tab_with_real_agent() {
     let deck = TuiDeck::builder()
         .with_imported_claude_credentials()
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        // The branch build must win over any host-installed `dot-agent-deck`, or
+        // the agent cannot see the `dispatch` verb at all.
+        .with_env("PATH", path_with_binary_dir())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
+
+    // `git worktree add` needs a real commit to branch from.
+    commit_fixture_repo(deck.workdir());
 
     // Trust the fixture working directory so the daemon-spawned interactive
     // claude clears its first-run onboarding + per-folder trust gates without a
     // human keystroke and the injected dispatcher seed prompt is received.
-    let workdir = deck.workdir().to_string_lossy().into_owned();
-    let home = deck.workdir().join("home");
-    let claude_json_path = home.join(".claude.json");
-    let raw = std::fs::read_to_string(&claude_json_path).expect("read .claude.json");
-    let mut cfg: serde_json::Value = serde_json::from_str(&raw).expect("parse .claude.json");
-    cfg["projects"][&workdir] = serde_json::json!({
-        "hasTrustDialogAccepted": true,
-        "hasCompletedProjectOnboarding": true,
-        "projectOnboardingSeenCount": 1,
-    });
-    std::fs::write(
-        &claude_json_path,
-        serde_json::to_string_pretty(&cfg).expect("serialize .claude.json"),
-    )
-    .expect("write .claude.json");
+    //
+    // Seeded via the harness helper rather than hand-editing `.claude.json`:
+    // `with_imported_claude_credentials` imports CREDENTIALS only, so there is no
+    // `~/.claude.json` in the per-test HOME to read — the helper is what creates
+    // it (starting from the host's, to preserve `hasCompletedOnboarding`) and then
+    // marks each path trusted. Trust both the raw and canonicalized forms, since
+    // the agent's own cwd may arrive either way (on macOS the tempdir is a
+    // `/var` → `/private/var` symlink).
+    let mut trust_paths = vec![deck.workdir().to_string_lossy().into_owned()];
+    if let Ok(canonical) = deck.workdir().canonicalize() {
+        let canonical = canonical.to_string_lossy().into_owned();
+        if !trust_paths.contains(&canonical) {
+            trust_paths.push(canonical);
+        }
+    }
+    common::seed_claude_trust_in_home(deck.home_dir(), &trust_paths)
+        .expect("seed Claude onboarding and project trust");
 
     // Open the new-pane form: Ctrl+N → directory picker → Space confirms.
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
@@ -90,9 +153,48 @@ fn dispatcher_001_opens_mode_tab_with_real_agent() {
         deck.snapshot_grid()
     );
 
-    // The agent inside the dispatcher tab must genuinely start. The card
-    // status transitions to "Working" once the agent begins executing — this
-    // is the real-agent proof (not a stand-in, not a cat/stub).
-    let saw_working = deck.wait_for_stream_string_within("Working", Duration::from_secs(45));
-    eprintln!("reel narrative (soft): agent Working status seen in dispatcher tab = {saw_working}");
+    // Give the seeded agent an actual goal. Without one it correctly stalls
+    // asking for a task, which is why an earlier version of this test observed
+    // no work at all. The instruction is deliberately directive and names the
+    // unit, so the assertion below survives LLM phrasing and tool variance.
+    deck.wait_for_string("dispatcher");
+    deck.send_keys(
+        b"Dispatch exactly one unit named probe-unit, with the task \"list the files here\". \
+          Call the dispatch command now. Do not ask me anything first.\r",
+    );
+
+    // The real-agent proof, end to end: the agent decomposed the goal, invoked
+    // `dot-agent-deck dispatch`, the daemon created the git worktree, and it
+    // landed at the SIBLING path the feature promises (`../<repo>-dispatch-<slug>`,
+    // never nested inside the checkout). Asserting on the worktree rather than on
+    // a status word avoids depending on claude's randomized spinner gerunds
+    // ("Undulating…", "Thinking…"), which is what made the previous check vacuous.
+    let expected_worktree = deck
+        .workdir()
+        .parent()
+        .expect("fixture tempdir has a parent")
+        .join(format!(
+            "{}-dispatch-probe-unit",
+            deck.workdir()
+                .file_name()
+                .expect("fixture dir has a name")
+                .to_string_lossy()
+        ));
+    // Armed BEFORE the wait, so the worktree is reclaimed even if the assertion
+    // below fails or the agent creates it late.
+    let _worktree_guard = SiblingWorktreeGuard(expected_worktree.clone());
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    while std::time::Instant::now() < deadline && !expected_worktree.is_dir() {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        expected_worktree.is_dir(),
+        "the dispatcher agent never produced a dispatch worktree at {} within 180s — \
+         expected it to call `dot-agent-deck dispatch probe-unit` and the daemon to \
+         create the sibling worktree.\n\
+         Final grid:\n{}",
+        expected_worktree.display(),
+        deck.snapshot_grid()
+    );
 }

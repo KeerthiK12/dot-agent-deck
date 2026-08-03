@@ -30,8 +30,12 @@ Every `dispatch` call creates its work in a dedicated Git worktree at `../<repo>
 
 ## Cleanup
 
-Closing the pane (tab) that holds the dispatcher session automatically removes any worktrees created by that session. No manual cleanup is needed.
+Cleanup is keyed to the **dispatched unit's own tab**, not the dispatcher's. Closing a unit's tab removes that unit's worktree (the repo itself is always preserved). Closing the dispatcher tab removes nothing — it never owned a worktree.
+
+Removal deliberately **refuses to discard uncommitted work**: if the unit's worktree still has uncommitted changes, it is left on disk and a warning is logged, so you can recover the work. A leaked worktree costs disk; a force-removed one costs work.
+
+The unit's branch (`agent/dispatch-<slug>`) always survives removal, because it may hold the unit's committed work. That means dispatching the **same name again** is refused, naming the leftover branch and telling you how to proceed — delete the branch with `git branch -D agent/dispatch-<slug>` once you are done with it, or dispatch under a different name.
 
 ## Current limitations
 
-- The return edge (the dispatched unit sending results back to the orchestrator) is not yet implemented — tracked in follow-up PR #174.
+- The return edge (the dispatched unit sending results back to the orchestrator) is not yet implemented — tracked in follow-up PR #174. The dispatcher reports where each unit is running; it is not notified when a unit finishes.

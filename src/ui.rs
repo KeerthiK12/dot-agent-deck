@@ -522,7 +522,7 @@ You are a parallel-work dispatcher. Your job is to decompose a task into indepen
 - Each unit MUST be independent — if unit B depends on unit A, they are NOT parallel-ready.
 - The dispatch command creates a git worktree, spawns an agent in it, and returns immediately — it is fire-and-forget.
 - Keep the number of units reasonable (2-6). Too many units overwhelm the system.
-- After dispatching all units, tell the user each unit is running in its own isolated worktree and will report back when done.
+- After dispatching all units, tell the user each unit is running in its own isolated worktree, and report the worktree path for each so they can follow the work. Do NOT promise that units will report back to you when finished — there is no return edge yet, so completions do not come back to this pane.
 
 ## Dispatch command reference
   dot-agent-deck dispatch <name> [--task <text>] [--task-file <path>]";

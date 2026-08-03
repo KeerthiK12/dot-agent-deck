@@ -983,12 +983,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** launch wrapping (covered by `codex/spawn/*` and `codex/live/001`) or custom command arguments.
 - **Platform coverage:** mac+linux.
 
-##### prompt/new-pane/016 — Selecting the experimental "dispatcher" authoring option in the new-pane form opens a live dispatcher mode tab with a real Claude agent receiving the dispatcher seed prompt, and the tab surfaces live on the attached TUI's tab strip with the agent transitioning through Working status (PRD #220). [reel]
-- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness with imported Claude credentials — records a `full-stream.cast`).
-- **Agent:** Claude Code (interactive `claude` with Haiku, real Anthropic API — the agent receives the dispatcher seed prompt via gated delivery, genuinely starts, and transitions through Working status).
-- **Asserts:** the dispatcher tab labelled "dispatcher" surfaces LIVE on the tab strip within 60s of form submission; the agent genuinely starts (Working status observed, soft signal).
-- **Does not assert:** the dispatched-unit tab (relying on the agent to call `dot-agent-deck dispatch` would be LLM-dependent); exact prompt delivery content; agent lifetime beyond the Working transition.
+##### prompt/new-pane/016 — Selecting the experimental "dispatcher" authoring option in the new-pane form opens a live dispatcher mode tab whose real Claude agent, given a goal, invokes `dot-agent-deck dispatch` itself and the daemon creates the promised sibling git worktree (PRD #220). [reel]
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness with imported Claude credentials — records a `full-stream.cast`). The freshly-built binary's dir is prepended to the PATH the deck → daemon → agents inherit, so the agent's `dot-agent-deck dispatch` resolves to the build under test rather than a host-installed binary that predates the verb.
+- **Agent:** Claude Code (interactive `claude`, real Anthropic API — receives the dispatcher seed prompt via gated delivery, decomposes the typed goal, and runs the `dispatch` verb itself; no stand-in).
+- **Asserts:** the dispatcher tab labelled "dispatcher" surfaces LIVE on the tab strip within 60s of form submission; then, after a directive one-unit goal is typed into the pane, the sibling worktree `../<repo>-dispatch-probe-unit` appears on disk within 180s — proving agent → `dispatch` CLI → daemon → `git worktree add` end to end, at the sibling (never nested) path.
+- **Does not assert:** the dispatched unit's own tab or its agent's output; the return edge (deferred to #174); cleanup on tab close (covered by `src/dispatch.rs` unit tests).
 - **Platform coverage:** mac+linux.
+- **Note:** the fixture repo is given an initial commit by the test — the harness `git init`s fixtures but never commits, and `git worktree add` cannot branch from an unborn HEAD.
 
 ### Focus / navigation
 
