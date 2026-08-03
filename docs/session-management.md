@@ -21,14 +21,12 @@ Each session card shows the agent's current state:
 Cards also display:
 
 - **Title row** — card number, the pane's display name (or `agent_type · session_id` if it hasn't been renamed), an animated status dot, and the status label
-- **`Dir:`** — the working directory (basename), spanning the card's full inner width and ellipsized with `…` when the name is too long to fit
+- **`Dir:`** — the working directory (basename), shortened with `…` when it doesn't fit
 - **`Prmt:`** — the most recent user prompt(s)
 - **Recent tool calls** — the last commands the agent ran
-- **`Last:` and `Tools:`** — elapsed time since the agent's last activity and the total tool-call count, written into the card's **bottom-right border** rather than onto a content row
+- **`Last:` and `Tools:`** — elapsed time since the agent's last activity and the total tool-call count, shown in the card's bottom-right border. Narrow cards abbreviate them to `2m · 14 tools`, then `2m · 14`; the very narrowest omit them.
 
 ![Single agent card showing directory, last activity, tool count, recent prompt, and recent tool calls](/img/session-management-card.jpg)
-
-Putting the two counters in the border is what keeps them free: border cells are drawn whether or not anything is written into them, so `Last` and `Tools` cost zero content rows and never compete with `Dir:` for horizontal space. They shrink rather than push anything aside — a card with room shows `Last: 2m  Tools: 14`, a narrower one degrades to `2m · 14 tools` and then to `2m · 14`, and the very narrowest cards drop the counters entirely instead of overrunning the card's corners. Because of this, a card's height depends only on its density (below) and never on how wide it is: narrowing a card truncates its text but never restructures it.
 
 How many prompts and tool calls fit on a card depends on the auto-chosen density, which Agent Deck picks based on how many cards are on the dashboard and how much room is available:
 
