@@ -16545,6 +16545,13 @@ const SCROLL_SEAM_COLS: u16 = 20;
 const SCROLL_SEAM_HISTORY_LINES: usize = 60;
 const SCROLL_SEAM_PANE_ID: &str = "1";
 
+/// The scrolled-off output every scroll-seam pane starts with.
+fn scroll_seam_history() -> String {
+    (0..SCROLL_SEAM_HISTORY_LINES)
+        .map(|i| format!("line {i}\r\n"))
+        .collect()
+}
+
 /// Build the M5 seam's focused pane: a real vt100 parser carrying
 /// [`SCROLL_SEAM_HISTORY_LINES`] of scrolled-off output, parked at
 /// `initial_scrollback`, plus the recorder standing in for the child.
@@ -16556,9 +16563,7 @@ fn scroll_seam_pane(
     crate::embedded_pane::SeamChildInput,
     usize,
 ) {
-    let history: String = (0..SCROLL_SEAM_HISTORY_LINES)
-        .map(|i| format!("line {i}\r\n"))
-        .collect();
+    let history = scroll_seam_history();
     let (ctrl, mut child_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
         SCROLL_SEAM_PANE_ID,
         SCROLL_SEAM_ROWS,
@@ -16574,7 +16579,7 @@ fn scroll_seam_pane(
         ctrl.scroll_pane(SCROLL_SEAM_PANE_ID, initial_scrollback as isize);
     }
     let _ = child_input.drain_bytes();
-    let before = scroll_seam_scrollback(&ctrl);
+    let before = scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID);
     assert_eq!(
         before, initial_scrollback,
         "the seam's pane must hold enough history to park at initial_scrollback"
@@ -16582,11 +16587,11 @@ fn scroll_seam_pane(
     (ctrl, child_input, before)
 }
 
-/// The focused pane's current vt100 scrollback offset.
-fn scroll_seam_scrollback(ctrl: &EmbeddedPaneController) -> usize {
-    ctrl.get_screen(SCROLL_SEAM_PANE_ID)
+/// A seam pane's current vt100 scrollback offset (0 = live output).
+fn scroll_seam_scrollback(ctrl: &EmbeddedPaneController, pane_id: &str) -> usize {
+    ctrl.get_screen(pane_id)
         .and_then(|screen| screen.lock().ok().map(|p| p.screen().scrollback()))
-        .expect("the seam's focused pane always has a screen")
+        .expect("the seam's panes always have a screen")
 }
 
 /// PRD #341 M5 L1 seam: send ONE wheel event over the focused agent pane and
@@ -16613,7 +16618,7 @@ pub fn observe_focused_agent_mouse_scroll(
 
     FocusedPaneScrollObservation {
         scrollback_before,
-        scrollback_after: scroll_seam_scrollback(&ctrl),
+        scrollback_after: scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID),
         forwarded_bytes: child_input.drain_bytes(),
     }
 }
@@ -16641,8 +16646,135 @@ pub fn observe_focused_agent_key_scroll(
 
     FocusedPaneScrollObservation {
         scrollback_before,
-        scrollback_after: scroll_seam_scrollback(&ctrl),
+        scrollback_after: scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID),
         forwarded_bytes: child_input.drain_bytes(),
+    }
+}
+
+/// The second pane the M6 reconcile seam adds next to [`SCROLL_SEAM_PANE_ID`].
+const RECONCILE_SEAM_SECOND_PANE_ID: &str = "2";
+
+/// PRD #341 M6 — which of the reconcile seam's two panes a step acts on.
+///
+/// The seam owns the ids rather than taking `&str`, so a test cannot name a pane
+/// the fixture does not have, and "the pane focus starts on" versus "the other
+/// one" reads as such at the call site.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileSeamPane {
+    /// The pane the fixture starts with focus on.
+    First,
+    /// The other pane, unfocused until something focuses it.
+    Second,
+}
+
+/// PRD #341 M6 — where the reconcile seam's two panes were looking immediately
+/// before the frame under test, and where they were looking after it.
+///
+/// BOTH panes are reported because the reconcile resets at most the ONE pane the
+/// user is typing into: "the incoming pane snapped back" is half the claim and "the
+/// one we left alone stayed put" is the other half. The `*_before` numbers are what
+/// makes an `*_after` of 0 mean anything — without them, a pane that never scrolled
+/// reads exactly like a pane that scrolled and was correctly snapped back.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PaneInputScrollbackObservation {
+    /// [`ReconcileSeamPane::First`]'s scrollback offset just before the second
+    /// reconcile (0 = live output).
+    pub first_before: usize,
+    /// `First`'s offset after it.
+    pub first_after: usize,
+    /// [`ReconcileSeamPane::Second`]'s offset just before the second reconcile.
+    pub second_before: usize,
+    /// `Second`'s offset after it.
+    pub second_after: usize,
+}
+
+/// Resolve a seam pane to the id its fixture registered it under.
+fn reconcile_seam_pane_id(pane: ReconcileSeamPane) -> &'static str {
+    match pane {
+        ReconcileSeamPane::First => SCROLL_SEAM_PANE_ID,
+        ReconcileSeamPane::Second => RECONCILE_SEAM_SECOND_PANE_ID,
+    }
+}
+
+/// Move focus through the production [`PaneController::focus_pane`] — the same call
+/// `Action::Focus` makes — so the seam cannot focus a pane in a way the app never
+/// would (e.g. leaving two panes focused, which would make
+/// `focused_pane_id`'s answer arbitrary).
+fn focus_reconcile_seam_pane(ctrl: &EmbeddedPaneController, pane: ReconcileSeamPane) {
+    ctrl.focus_pane(reconcile_seam_pane_id(pane))
+        .expect("the reconcile seam registers both of its panes");
+}
+
+/// PRD #341 M6 L1 seam: run [`reconcile_pane_input_scrollback`] over TWO
+/// consecutive frames and report what the second one did to the panes' scrollback.
+///
+/// The reconcile is a per-frame edge detector on the `(mode, focused pane)` pair, so
+/// a single call can answer nothing: every question M6 asks is about what THIS frame
+/// does given what the previous one recorded. Hence the shape —
+///
+/// 1. `first_mode` / `first_focus` establish the remembered target by running a real
+///    reconcile — not by writing `UiState::last_pane_input_target` by hand, which
+///    would let the seam disagree with the app about what a frame records.
+/// 2. `scroll_between` then optionally parks one pane `n` lines back in history,
+///    which is exactly when a user scrolls: while the previous frame's mode is still
+///    in force.
+/// 3. `second_mode` / `second_focus` are the frame under test. A `second_focus` that
+///    differs from `first_focus` moves focus the way the app does, so "focus walked
+///    onto a pane someone left scrolled" is expressible without ever leaving
+///    `PaneInput`.
+/// 4. The reconcile runs again and both panes' offsets come back.
+///
+/// The seam calls the real `reconcile_pane_input_scrollback` twice and holds NO copy
+/// of its comparison rule — so if what counts as "the user just started typing here"
+/// changes, what this seam reports changes with it.
+#[doc(hidden)]
+pub fn observe_pane_input_scrollback_reconcile(
+    first_mode: UiMode,
+    first_focus: ReconcileSeamPane,
+    scroll_between: Option<(ReconcileSeamPane, usize)>,
+    second_mode: UiMode,
+    second_focus: ReconcileSeamPane,
+) -> PaneInputScrollbackObservation {
+    // Pane one is the M5 fixture verbatim — same history, same inert backend, parked
+    // at live output. Pane two is the same fixture pane, added unfocused.
+    let (ctrl, _first_child_input, _) = scroll_seam_pane(false, 0);
+    let _second_child_input = ctrl.add_scroll_seam_pane(
+        RECONCILE_SEAM_SECOND_PANE_ID,
+        SCROLL_SEAM_ROWS,
+        SCROLL_SEAM_COLS,
+        scroll_seam_history().as_bytes(),
+    );
+
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+
+    focus_reconcile_seam_pane(&ctrl, first_focus);
+    ui.mode = first_mode;
+    reconcile_pane_input_scrollback(&mut ui, &ctrl);
+
+    if let Some((pane, lines)) = scroll_between {
+        let pane_id = reconcile_seam_pane_id(pane);
+        ctrl.scroll_pane(pane_id, lines as isize);
+        assert_eq!(
+            scroll_seam_scrollback(&ctrl, pane_id),
+            lines,
+            "the seam's panes must hold enough history to park at scroll_between"
+        );
+    }
+
+    focus_reconcile_seam_pane(&ctrl, second_focus);
+    let first_before = scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID);
+    let second_before = scroll_seam_scrollback(&ctrl, RECONCILE_SEAM_SECOND_PANE_ID);
+
+    ui.mode = second_mode;
+    reconcile_pane_input_scrollback(&mut ui, &ctrl);
+
+    PaneInputScrollbackObservation {
+        first_before,
+        first_after: scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID),
+        second_before,
+        second_after: scroll_seam_scrollback(&ctrl, RECONCILE_SEAM_SECOND_PANE_ID),
     }
 }
 

@@ -502,6 +502,35 @@ impl EmbeddedPaneController {
         (controller, SeamChildInput { rx })
     }
 
+    /// PRD #341 M6 — add ONE more inert seam pane, UNFOCUSED, to a controller
+    /// already built by [`Self::for_scroll_seam_with_focused_pane`].
+    ///
+    /// The M6 scrollback reconcile keys on the `(mode, focused pane id)` PAIR, so
+    /// its most interesting case — focus moving to an already-scrolled OTHER pane
+    /// while `PaneInput` never lifts — cannot be posed against a one-pane
+    /// controller at all. This adds the second pane through the same
+    /// [`Self::seam_pane`] body the constructors use, so there is still exactly one
+    /// place an inert pane is built.
+    ///
+    /// Child mouse reporting is left off: the reconcile never consults
+    /// `mouse_mode`, only `screen`, `is_focused` and `name`. The child-input channel
+    /// comes back for symmetry with
+    /// [`Self::for_scroll_seam_with_focused_pane`] — a caller that wants to prove
+    /// nothing at all reached THIS pane's agent can, and holding it keeps the pane's
+    /// writes from failing as "detached" for the wrong reason.
+    #[doc(hidden)]
+    pub fn add_scroll_seam_pane(
+        &self,
+        pane_id: &str,
+        rows: u16,
+        cols: u16,
+        bytes: &[u8],
+    ) -> SeamChildInput {
+        let (pane, rx) = Self::seam_pane(pane_id, rows, cols, bytes, false, false);
+        self.panes.lock().unwrap().insert(pane_id.to_string(), pane);
+        SeamChildInput { rx }
+    }
+
     /// Shared body of the two L1 seam constructors: one focused pane whose vt100
     /// screen has already consumed `bytes`, with no daemon behind it.
     ///
@@ -510,11 +539,6 @@ impl EmbeddedPaneController {
     /// no pane — so a seam that renders the real pane path needs a pane that
     /// exists. It is also `#[cfg(test)]`, hence unreachable from the integration
     /// tests that drive the `pub` L1 seams in `ui.rs`.
-    ///
-    /// The backend is inert apart from the returned input channel: no I/O task and
-    /// no resize task are spawned, and nothing reaches a socket. Rendering only
-    /// ever reads `screen` / `is_focused` / `name`, and scrolling only ever reads
-    /// `screen` / `mouse_mode`, which is the whole point of the seams.
     fn seam_with_focused_pane(
         pane_id: &str,
         rows: u16,
@@ -522,9 +546,32 @@ impl EmbeddedPaneController {
         bytes: &[u8],
         mouse_mode_enabled: bool,
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<StreamCmd>) {
-        let daemon_path = render_only_socket_path();
-        let controller = Self::new(daemon_path.clone(), render_only_runtime());
+        let controller = Self::new(render_only_socket_path(), render_only_runtime());
+        let (pane, input_rx) =
+            Self::seam_pane(pane_id, rows, cols, bytes, mouse_mode_enabled, true);
+        controller
+            .panes
+            .lock()
+            .unwrap()
+            .insert(pane_id.to_string(), pane);
+        (controller, input_rx)
+    }
 
+    /// One inert seam pane: a real vt100 parser that has already consumed `bytes`,
+    /// behind a backend with nothing live in it.
+    ///
+    /// The backend is inert apart from the returned input channel: no I/O task and
+    /// no resize task are spawned, and nothing reaches a socket. Rendering only
+    /// ever reads `screen` / `is_focused` / `name`, and scrolling only ever reads
+    /// `screen` / `mouse_mode`, which is the whole point of the seams.
+    fn seam_pane(
+        pane_id: &str,
+        rows: u16,
+        cols: u16,
+        bytes: &[u8],
+        mouse_mode_enabled: bool,
+        focused: bool,
+    ) -> (Pane, tokio::sync::mpsc::UnboundedReceiver<StreamCmd>) {
         let mut parser = vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES);
         parser.process(bytes);
 
@@ -540,25 +587,20 @@ impl EmbeddedPaneController {
                 io_task: None,
                 io_state: Arc::new(AtomicU8::new(IO_FINISHED)),
                 runtime: render_only_runtime(),
-                daemon_path,
+                daemon_path: render_only_socket_path(),
                 resize_tx,
                 resize_task: None,
                 lost: Arc::new(Mutex::new(None)),
             },
             screen: Arc::new(Mutex::new(parser)),
             name: pane_id.to_string(),
-            is_focused: true,
+            is_focused: focused,
             command: None,
             cwd: None,
             mouse_mode: Arc::new(AtomicBool::new(mouse_mode_enabled)),
             hyperlinks: Arc::new(Mutex::new(HyperlinkMap::new())),
         };
-        controller
-            .panes
-            .lock()
-            .unwrap()
-            .insert(pane_id.to_string(), pane);
-        (controller, input_rx)
+        (pane, input_rx)
     }
 
     /// Access the vt100 screen for a pane (used by the terminal widget for rendering).
