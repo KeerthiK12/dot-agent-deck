@@ -1491,6 +1491,13 @@ struct UiState {
     /// focused on return). Without this, switching away and back re-armed the
     /// highlight a tab switch had cleared (violating SC1).
     last_focused_pane_id: Option<String>,
+    /// PRD #341 M6: which pane the user was typing into as of the previous
+    /// [`reconcile_pane_input_scrollback`] frame — `Some(pane_id)` while `mode ==
+    /// PaneInput` with a focused pane, `None` otherwise. A change in this value is
+    /// the "you are now typing into THIS pane" edge that snaps the pane back to
+    /// live output, so a pane scrolled in command mode can't be resumed into a
+    /// cursorless view of stale history.
+    last_pane_input_target: Option<String>,
     /// PRD #113 design revision (2026-06-13): the last *active* selection of the
     /// CURRENTLY-ACTIVE deck, remembered across tab switches so Enter can RESTORE
     /// it when the deck is inactive (no live highlight) instead of jumping to
@@ -1817,6 +1824,7 @@ impl UiState {
             // first-launch UX is unchanged.
             selected_index: Some(0),
             last_focused_pane_id: None,
+            last_pane_input_target: None,
             // PRD #113 revision: defaults to card 0 so first-launch Enter (before
             // anything has been selected) targets the first card, unchanged.
             last_active_selection: Some(0),
@@ -5142,6 +5150,52 @@ fn reconcile_dashboard_selection(
     {
         ui.selected_index = Some(idx);
     }
+}
+
+/// PRD #341 M6 — a pane you are TYPING into must be showing live output.
+///
+/// M5 made command mode scroll the focused pane's scrollback; M1 gates both the
+/// painted cursor and the hardware cursor on `scrollback() == 0`. Between them
+/// they opened a hole the real-agent journey (`mode/live/002`) walks straight
+/// into: scroll back in command mode, `Ctrl+D` to resume typing, and the pane is
+/// still parked in history — so the chip says ` TYPING ` while *no* cursor of any
+/// kind renders, and the keystrokes go to a live agent the user cannot see. That
+/// is exactly the mode/reality contradiction this PRD exists to remove, inverted.
+///
+/// The fix snaps the pane back to live output, which is what every terminal does
+/// when you type. It is done HERE — a per-frame reconcile against the live
+/// `(mode, focused pane)` pair — and not on `Action::DetachToNormal`, for the same
+/// reason [`CommandBannerState::sync_mode`] derives its edge from the mode rather
+/// than from a hand-listed set of actions: `Ctrl+D` is only one of ~50 sites that
+/// assign `ui.mode`, and `Action::Focus`, `ModeTabFocus`, `OrchestrationFocus`,
+/// the tab-switch focus restore and every dialog dismissal all reach `PaneInput`
+/// too. A reset wired to one action would be missing from all the others.
+///
+/// Keying on the *pair* also covers moving focus between panes while already in
+/// `PaneInput` — the incoming pane may have been left scrolled from an earlier
+/// visit — and, because it fires only on a transition, it leaves the two places
+/// scrolling is legitimate untouched: command mode (the whole point of M5) and a
+/// wheel scroll over a focused non-mouse-mode pane in `PaneInput`, which stays put
+/// until the next keystroke resets it (`Action::ForwardToPane`).
+///
+/// The reset is unconditional rather than guarded on a nonzero offset: setting an
+/// already-zero offset to zero costs a lock and a store, and the guard is one more
+/// thing that can drift out of step with the cursor precondition it exists to
+/// satisfy.
+fn reconcile_pane_input_scrollback(ui: &mut UiState, pane: &dyn PaneController) {
+    let typing_into = match ui.mode {
+        UiMode::PaneInput => pane.focused_pane_id(),
+        _ => None,
+    };
+    if typing_into == ui.last_pane_input_target {
+        return;
+    }
+    if let Some(pane_id) = typing_into.as_deref()
+        && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+    {
+        embedded.reset_scrollback(pane_id);
+    }
+    ui.last_pane_input_target = typing_into;
 }
 
 /// PRD #83 M2 — switch to `target_index` while preserving per-tab focus.
@@ -9693,6 +9747,14 @@ pub fn run_tui(
             focused_pane_now.as_deref(),
             &filtered_ids,
         );
+
+        // PRD #341 M6: before laying out or drawing anything, make sure the pane
+        // we are about to paint a cursor into is looking at LIVE output. Runs
+        // once per iteration, ahead of the single `terminal.draw` below, so the
+        // very first frame after a mode/focus change into `PaneInput` already
+        // shows the live tail — the user never sees a typing chip over stale,
+        // cursorless history.
+        reconcile_pane_input_scrollback(&mut ui, &*pane);
 
         let term_width = terminal.get_frame().area().width;
         let has_embedded_panes = pane
