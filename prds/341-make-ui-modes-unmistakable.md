@@ -118,7 +118,7 @@ No. CLAUDE.md rule 9 requires the question be asked for a new user-visible surfa
 
 - In command mode, no cursor of any kind renders in the focused pane — neither the painted block nor the terminal's own.
 - In PaneInput, the cursor renders exactly as it does today.
-- The current mode is stated in words, in the same screen position, at all times, on every tab.
+- The current mode is stated in words, in the same screen position, on every tab, whenever the bottom bar is showing its buttons. The two inline input modes — `Filter` and `Rename` — are an explicit exception: their bar row *is* the input field, so the `/ ` or `Rename: ` prompt and its cursor own that position instead. Neither `COMMAND` nor `TYPING` would be accurate there, and the visible prompt plus the user's own echoed text already makes the destination of keystrokes unambiguous. Amended 2026-08-03 after code review (finding 4) established that the original "at all times" wording and the shipped implementation could not both be read literally; the exception is deliberate, not a gap.
 - Entering command mode produces a change large enough to notice without looking for it, on every tab type — verified on Dashboard, Orchestration, and Mode tabs.
 - Pane content remains readable in command mode; you can still tell what each agent is doing and which one you are about to close.
 - The banner collapses immediately when a command-mode binding is executed, and does *not* collapse on unbound printable keys.
