@@ -67,6 +67,7 @@ The fastest way to get an orchestration config is to let an agent generate it fr
 
 The generated file includes both `[[modes]]` and `[[orchestrations]]`. You can remove either section if you only need one.
 
+To write the config by hand, use the [configuration reference](#configuration-reference) later on this page as a guide. `dot-agent-deck init` generates a modes-only starter template — it does not include an orchestration block.
 
 ## Starting an orchestration tab
 
