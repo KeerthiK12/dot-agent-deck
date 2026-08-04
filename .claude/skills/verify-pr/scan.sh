@@ -155,6 +155,24 @@ echo "--- CI CHECKS (gh pr checks) ---"
 # an error for this script.
 gh pr checks "$pr" 2>&1 || true
 
+# Workflow runs held for approval. GitHub withholds Actions runs on a fork PR
+# from a first-time contributor until a maintainer approves them, so a PR can
+# look "checked" (only `label` / a review bot ran) while every real CI job —
+# Windows, macOS, `cargo audit` — never executed. Measured on #334: CI and Docs
+# sat at `action_required` on every head commit for two days and nobody noticed,
+# which made a local Linux-only run the sole verification. Phase 1b decides
+# whether approving them is safe.
+head_sha=$(printf '%s\n' "$meta" | sed -n 's/^PR_HEAD_SHA=//p')
+awaiting=$(gh api "repos/{owner}/{repo}/actions/runs?head_sha=${head_sha}" \
+  --jq '[.workflow_runs[] | select(.conclusion == "action_required" or .status == "action_required")] | length' 2>/dev/null || echo unknown)
+echo "WORKFLOWS_AWAITING_APPROVAL=${awaiting:-unknown}"
+if [ "${awaiting:-0}" != "0" ] && [ "${awaiting:-unknown}" != "unknown" ]; then
+  echo "--- RUNS AWAITING APPROVAL (id / name) ---"
+  gh api "repos/{owner}/{repo}/actions/runs?head_sha=${head_sha}" \
+    --jq '.workflow_runs[] | select(.conclusion == "action_required" or .status == "action_required") | "  \(.id)\t\(.name)"' 2>/dev/null || true
+  echo "APPROVE_WITH=gh api --method POST repos/{owner}/{repo}/actions/runs/<run_id>/approve"
+fi
+
 # Rule 8: the findings live ONLY in the inline review comments. A green
 # `Greptile Review` check-run is NOT the review.
 inline=$(gh api "repos/{owner}/{repo}/pulls/${pr}/comments" --paginate --jq '.[].id' 2>/dev/null | wc -l | tr -d ' ')

@@ -24,7 +24,7 @@ A PR number, `#number`, or PR URL. If none was given, ask — do not guess from 
 
 1. **Read before you run.** Some paths in this repo execute code the moment you work in a checkout of them. Phase 0 exists to find them, and its verdict gates Phase 2.
 2. **Never push to the contributor's branch and never merge as part of this skill.** The deliverable is a recommendation. Merging is the user's action, on their say-so.
-3. **Never post to GitHub.** The report is local. If the user later wants it sent, that is a separate, explicitly-confirmed action.
+3. **Never post to GitHub.** The report is local. If the user later wants it sent, that is a separate, explicitly-confirmed action. Approving a held workflow run (Phase 1b) is the one GitHub write this skill makes — it publishes no content and it is gated on the Phase 0 safety verdict.
 4. **Never present a skipped check as a passed one.** Every `SKIPPED` / `BLOCKED` / `ATTENTION` row from `checks.sh` appears in the report, with its reason.
 5. **A single e2e failure is not a verdict.** Rule 6's isolation rerun comes first (Phase 5).
 6. **Nothing learned here goes to global memory** (rule 13). Durable findings belong in the repo; PR-specific ones belong in the report.
@@ -37,13 +37,15 @@ bash .claude/skills/verify-pr/scan.sh <pr-number>
 
 Runs from the main checkout and creates nothing. It emits PR metadata, the changed files classified into buckets, the current CI check states, and the count of inline review comments.
 
-Act on three of its outputs:
+Act on four of its outputs:
 
 **`READ_DIFF_BEFORE_RUNNING`** — non-`none` means the PR touches paths that run outside the test command: `.claude/**` (agent hooks and settings — these run as *you*, with your credentials, as soon as you work in that worktree), `.github/**` (runs in CI with repository secrets), `build.rs`, `.cargo/**`, `xtask/**`, `scripts/**`, `devbox.json`. Read those files' full diff now, via `gh pr diff`, from the main checkout. Work through section I of `checklist.md`. If anything looks like it is trying to execute something on the reviewer's machine or exfiltrate a secret, **stop, report it, and do not create the worktree.**
 
 **`PR_AUTHOR_ASSOCIATION`** — for `NONE`, `FIRST_TIME_CONTRIBUTOR`, or `CONTRIBUTOR`, read the **whole** diff before Phase 2, not just the flagged buckets. Test code runs under `cargo nextest`, so for an untrusted author Phase 3's read comes before Phase 2's run. For `MEMBER` / `OWNER` / `COLLABORATOR` and for Renovate, the normal phase order applies.
 
 **`PR_DRAFT` / `PR_STATE`** — a draft or closed PR still verifies fine, but say so in the report; a draft verdict is advice, not a merge decision.
+
+**`WORKFLOWS_AWAITING_APPROVAL`** — non-zero means GitHub is holding this PR's CI runs pending maintainer approval, so no real CI job has run. The scan lists each held run's id. Phase 1b decides whether releasing them is safe and, if so, releases them.
 
 Then read what the existing reviewers already found, per rule 8:
 
@@ -70,6 +72,39 @@ Read its output before continuing:
 - `BRANCH_NAME` — normally the PR's own head-branch name, which lets `/tag-release`'s cleanup detection find this worktree automatically after the PR merges, squash merges included. It falls back to `pr-<n>-verify` when the name is already taken locally.
 
 Re-running on a PR that has been pushed to since: `setup.sh <n> --force`.
+
+## Phase 1b — Release the held CI runs
+
+**`WORKFLOWS_AWAITING_APPROVAL` from Phase 0 is non-zero.** GitHub withholds Actions runs on a fork PR from an outside contributor until a maintainer approves them, so the PR can look checked while every job that matters never ran. Do this now, before Phase 2, so CI runs alongside the local suite and its results are in hand by Phase 6.
+
+**Why this is not optional.** CI is not a duplicate of `checks.sh` — it is the only source for things the local run *cannot* produce: `build-macos` and `build-windows` each do a real `cargo build` + `clippy -D warnings` + `cargo nextest run` on the real OS, and `security` runs `cargo audit`. Locally, `windows-cross` is a type-check proxy that fails outright on machines without an MSVC cross-toolchain, and there is no macOS proxy at all. Measured on #334: `CI` and `Docs` sat at `action_required` on every head commit for two days, so a Linux-only local run was the sole verification of a PR that was otherwise reported as green.
+
+**The safety bar here is higher than Phase 0's.** Phase 0 asks "is it safe to check this out on my machine?" Approving asks "is it safe to execute this in CI, where repository secrets live?" Two things follow:
+
+- For a `pull_request` event the workflow *definitions* come from the base branch, so a fork's edit to `.github/**` does not take effect in the run you are approving. It still ships on merge, so a malicious workflow edit is a blocking finding — just not an approval blocker. A `pull_request_target` or `workflow_run` trigger added by the PR is different and is an immediate stop.
+- What the fork *does* control is code CI executes: `build.rs`, `.cargo/config.toml`, proc-macro crates, `xtask/**`, `scripts/**`, `devbox.json`, and — easy to forget — **test code**, because CI runs `cargo nextest run`.
+
+Before approving, confirm against the diff you already read:
+
+- [ ] No outbound network to a host the project does not already talk to, and no `curl`/`wget` piped to a shell.
+- [ ] Nothing reads `${{ secrets.* }}`, `GITHUB_TOKEN`, or the ambient env and forwards it anywhere.
+- [ ] No new third-party action, and no existing one repinned to a mutable tag instead of a SHA.
+- [ ] No obfuscated payload (base64 blobs, `eval` of downloaded text) in any of the executed paths above.
+- [ ] Nothing writes to the repository or to release infrastructure.
+
+This repo's `ci.yml` grants only `contents: read` and `pull-requests: read`, which limits the blast radius. Treat that as mitigating, not as a substitute for the checklist.
+
+**If it passes**, approve every held run by id:
+
+```bash
+gh api --method POST repos/{owner}/{repo}/actions/runs/<run_id>/approve
+```
+
+Then carry on to Phase 2 and read the results in Phase 6 (`gh pr checks <n>`). Record each job's conclusion in the report, and drop the corresponding lines from **NOT verified** only for jobs that actually went green.
+
+**If it fails**, do not approve. That is a **DO NOT MERGE** finding: name the file, line, and mechanism, and say plainly that CI was left unapproved on purpose. Approving to "see what happens" is the one thing this phase must never do.
+
+Every head commit gets its own held runs, so a contributor's follow-up push — or your own, per rule 2's exception — needs this phase again.
 
 ## Phase 2 — Run every automated gate
 
@@ -158,6 +193,11 @@ Template:
 |---|---|---|---|
 <one row per row of summary.tsv, SKIPPED and BLOCKED included>
 
+## CI
+<per-job conclusions from `gh pr checks`, or "held for approval — released in Phase 1b" /
+"not approved, see blocking findings". Name the jobs the local run cannot replace:
+build-macos, build-windows, security (cargo audit).>
+
 ## Blocking findings
 <file:line, what breaks, and the inputs/state that trigger it. "None" if none.>
 
@@ -171,8 +211,11 @@ Template:
 <findings from the inline comments, and whether the author answered them. Do not duplicate them above.>
 
 ## NOT verified
-<macOS and Windows beyond the type-check; skipped real-agent tests; the rule 12
-cross-version test if it was not run; anything --no-e2e or --only skipped.>
+<skipped real-agent tests; the rule 12 cross-version test if it was not run;
+anything --no-e2e or --only skipped. macOS and Windows belong here ONLY while
+their CI jobs have not gone green — once Phase 1b released the runs and
+build-macos / build-windows / security passed, report them as verified by CI
+instead, and say so.>
 ```
 
 ## Phase 7 — Close out
