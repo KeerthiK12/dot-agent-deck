@@ -155,6 +155,14 @@ bash .claude/skills/verify-pr/checks.sh --dir ../dot-agent-deck-pr-<n>-base --on
 
 Fails at the merge-base too → not this PR's defect. Say so, and note that `main` needs a fix.
 
+**Merge-base is not `main`.** `--baseline` pins the **merge-base**, which is the right comparison for "did this PR introduce the failure?" It is *not* the right one for "is this already broken on today's `main`?" — on a stale PR those differ by however far `main` has moved, and after a sibling PR merges they can differ by the very change you are attributing. To rebaseline the existing worktree onto current `main`, reset it rather than creating another:
+
+```bash
+git -C ../dot-agent-deck-pr-<n>-base reset --hard origin/main
+```
+
+Do **not** hand-roll a worktree under the scratchpad to get a second baseline. A cargo `target/` is multi-GB and the scratchpad is typically a tmpfs, so the build dies at link time with a misleading `linking with 'cc' failed`, and the space it does consume comes out of the RAM the compile needs (CLAUDE.md rule 14). Every worktree belongs at a disk-backed `../<repo>-<suffix>` sibling.
+
 **Flakes.** The e2e tier is flaky-tolerant by design (rule 5), and timing-sensitive tests here have failed on one platform and passed on two others in the same run. Per rule 6, rerun the single failing test in isolation first:
 
 ```bash
