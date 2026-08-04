@@ -17,6 +17,8 @@ Defined in `[[modes.panes]]`. These run immediately when the mode activates and 
 
 By default (`watch = true`), persistent pane commands are re-executed every 10 seconds via the built-in `dot-agent-deck watch` subcommand. Write plain commands without watch/follow flags — the system handles refresh automatically. Set `watch = false` for commands that stream on their own (e.g., `kubectl get pods -w`, `tail -f`).
 
+Output appears as the command produces it, so a slow or long-running command paints progressively instead of staying blank until it finishes.
+
 ### Reactive Panes
 
 Driven by `[[modes.rules]]`. Reactive panes start empty and populate when the agent executes a command matching a rule's regex `pattern`.
@@ -207,4 +209,4 @@ A built-in command that re-executes a shell command at a fixed interval with cle
 dot-agent-deck watch --interval 2 "kubectl get pods"
 ```
 
-The command clears the screen between executions and displays a header line showing the interval and command. Press `Ctrl+C` to stop.
+The command clears the screen between executions and shows output as it is produced. Press `Ctrl+C` to stop.

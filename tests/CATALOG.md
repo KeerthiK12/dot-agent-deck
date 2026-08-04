@@ -1088,6 +1088,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** which gate path fires (SessionStart fast path vs the slow-path fallback) — only that delivery is gated on readiness, not ungated/immediate; the serde round-trip of `seed_prompt` (covered by a coder unit test).
 - **Platform coverage:** mac+linux.
 
+##### tabs/mode/006 — A persistent side pane keeping the default `watch = true` shows its command's output while the command is still running (issue #367).
+- **Layer:** L2.
+- **Agent:** none (fixture whose single mode has one persistent pane running `printf …; sleep 600` under the default watch wrapper).
+- **Asserts:** a sentinel assembled at runtime by the command — so it cannot appear in the command line the pane's shell echoes — is visible in the side pane although the command never exits; the echoed wrapper invocation is gone from the pane, proving the watcher cleared the screen ahead of its first output rather than after process exit.
+- **Does not assert:** the 10s re-run interval; the ordering of interleaved stdout/stderr; the buffer-then-clear internals (covered by `watch::tests` unit tests).
+- **Platform coverage:** mac+linux.
+
 #### tabs/orchestration
 
 ##### tabs/orchestration/001 — Selecting an orchestration on the new-pane form opens one pane per role with the orchestrator's pane in focus.
