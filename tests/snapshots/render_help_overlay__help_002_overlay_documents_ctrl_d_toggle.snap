@@ -36,15 +36,15 @@ expression: buf
    │  1-9                jump to pane n                                                                  │    
    │  enter              focus selected pane             j / down        select next                     │    
    │  ctrl+w             close selected pane (confirms)  k / up          select previous                 │    
-   │  /                  filter sessions                 l / right / enter   enter directory             │    
-   │  esc                clear filter                    h / left / bksp     go up one level             │    
-   │  r                  rename session                  space           confirm current directory       │    
-   │  g                  generate .dot-agent-deck.toml   /               filter (case-insensitive)       │    
-   │  y / n              approve / deny permission       esc             clear filter (twice = close)    │    
-   │  s                  scheduled tasks manager         q               cancel                          │    
-   │  pageup / pagedown  scroll focused pane                                                             │    
-   │  ?                  toggle this help                session                                         │    
-   │                                                                                                     │    
+   │  ctrl+l             toggle orch tab split ratio     l / right / enter   enter directory             │    
+   │  /                  filter sessions                 h / left / bksp     go up one level             │    
+   │  esc                clear filter                    space           confirm current directory       │    
+   │  r                  rename session                  /               filter (case-insensitive)       │    
+   │  g                  generate .dot-agent-deck.toml   esc             clear filter (twice = close)    │    
+   │  y / n              approve / deny permission       q               cancel                          │    
+   │  s                  scheduled tasks manager                                                         │    
+   │  pageup / pagedown  scroll focused pane             session                                         │    
+   │  ?                  toggle this help                                                                │    
    │                                                     panes auto-saved continuously.                  │    
    │                                                     restored automatically on launch.               │    
    │  [close]                                                                                            │    
