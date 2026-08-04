@@ -94,14 +94,25 @@ const DEVIN_HOOK_EVENTS: &[&str] = &[
     "PostCompaction",
 ];
 
-/// Devin CLI's user config directory, resolved the way Devin documents it:
-/// `~/.config/devin` on Unix, `%APPDATA%\devin` on Windows.
+/// Devin CLI's user config directory: the literal `~/.config/devin` Devin
+/// documents.
 ///
 /// `$XDG_CONFIG_HOME` is deliberately NOT consulted. Devin documents the literal
 /// `~/.config/devin/config.json`, and honouring XDG here would write hooks to a
 /// path Devin may not read — which is worse than not installing them, because it
 /// looks like success and silently delivers nothing (the same reasoning
 /// [`crate::codex_hooks_manage`] applies to guessing a Windows Codex home).
+///
+/// **Windows: deliberately a no-op, not an oversight.** This returns `None` off
+/// Unix, so every caller degrades to a documented skip — exactly what
+/// [`crate::codex_hooks_manage`]'s `codex_home` does, and for the same reason:
+/// the path we would have to guess belongs to a *third-party* tool, and Devin —
+/// not this project — decides where its config lives on Windows. Writing hooks
+/// into a location Devin does not read would look like success while delivering
+/// nothing, and the POSIX quoting [`shell_quote_if_needed`] applies to the hook
+/// command is not what Windows command parsing expects either. Native Windows
+/// support for the deck is itself still open (#42); today Windows users run
+/// under WSL, where the Unix branch below is the correct one.
 ///
 /// Returns `None` when no real home resolves, so a guarded caller never writes
 /// into a throwaway `/tmp` config.
@@ -111,11 +122,9 @@ pub fn devin_config_dir() -> Option<PathBuf> {
         let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
         Some(PathBuf::from(home).join(".config").join("devin"))
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
-        // `%APPDATA%` via the known-folder API — the same resolution
-        // `platform::paths::config_dir` uses for the deck's own config root.
-        dirs::config_dir().map(|config| config.join("devin"))
+        None
     }
 }
 
@@ -124,18 +133,37 @@ fn config_path(config_dir: &Path) -> PathBuf {
     config_dir.join("config.json")
 }
 
-/// Whether `devin` is on `PATH`, used to guard the startup auto-install so the
-/// deck never creates a Devin config directory on a machine without Devin.
+/// Whether an executable `devin` is on `PATH`, used to guard the startup
+/// auto-install so the deck never creates a Devin config directory on a machine
+/// without Devin.
+///
+/// Only Unix names are probed, matching [`devin_config_dir`]'s Unix-only scope:
+/// off Unix there is no config dir to install into, so a Windows-shaped lookup
+/// would be dead weight. The executable bit is checked rather than mere
+/// existence, mirroring [`crate::codex_hooks_manage`]'s equivalent probe — a
+/// non-executable file named `devin` on `PATH` is not an agent we can launch.
 fn devin_present_on_path() -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
-    let names: &[&str] = if cfg!(windows) {
-        &["devin.exe", "devin.cmd", "devin.bat", "devin"]
-    } else {
-        &["devin"]
-    };
-    std::env::split_paths(&path).any(|dir| names.iter().any(|name| dir.join(name).is_file()))
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join("devin");
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            return false;
+        };
+        if !meta.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            meta.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    })
 }
 
 /// Whether a command string is a deck-authored Devin hook, by EXACT signature.
