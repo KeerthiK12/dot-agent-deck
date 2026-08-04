@@ -393,18 +393,26 @@ impl TuiDeck {
         // followed by `set_permissions(0o700)` had a small umask-derived
         // 0o755 window between creation and chmod — closed here by
         // asking tempfile to apply 0o700 at creation.
+        //
+        // Issue #322: created *inside* `harness_temp_root()` so it is covered by
+        // the process-exit cleanup and by `cargo xtask clean-e2e-tmp`. This is
+        // the harness's largest tempdir by far — it holds the seeded agent HOME,
+        // observed at 276 MB — so leaving it at the top of `/tmp` was what
+        // actually filled a RAM-backed tmpfs.
         let tempdir = {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 tempfile::Builder::new()
                     .permissions(std::fs::Permissions::from_mode(0o700))
-                    .tempdir()
+                    .tempdir_in(harness_temp_root())
                     .expect("create per-test tempdir")
             }
             #[cfg(not(unix))]
             {
-                tempfile::tempdir().expect("create per-test tempdir")
+                tempfile::Builder::new()
+                    .tempdir_in(harness_temp_root())
+                    .expect("create per-test tempdir")
             }
         };
         let work = tempdir.path().to_path_buf();
@@ -2344,12 +2352,29 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
     // from M2.1 Nit 3's "silent skip" to a hard refuse on any
     // non-regular entry (symlinks/sockets/FIFOs), so this branch
     // already shares the credential-side stance on symlinks.
+    // Issue #322: skipped by default. This is a recursive copy of the host's
+    // entire plugin tree — 11 MB on this repo's dev machine, nearly all of it
+    // the `marketplaces/` clone cache — paid once per seeded HOME. With dozens
+    // of tests running concurrently it is a real share of the suite's PEAK temp
+    // demand, and peak is what exhausts a RAM-backed `/tmp`. No test references
+    // host plugin state; the agents are driven by directive prompts. Set
+    // `DAD_E2E_IMPORT_CLAUDE_PLUGINS=1` to restore the copy when debugging a
+    // case that turns out to depend on it.
     let src_plugins = src_root.join("plugins");
-    if src_plugins.is_dir() {
+    if import_claude_plugins_enabled() && src_plugins.is_dir() {
         require_regular_dir_no_symlink(&src_plugins, "~/.claude/plugins")?;
         copy_dir_recursively(&src_plugins, &dst_root.join("plugins"))?;
     }
     Ok(())
+}
+
+/// Whether to copy the host's `~/.claude/plugins` into each seeded HOME.
+/// Off by default — see the note in [`import_claude_credentials`].
+fn import_claude_plugins_enabled() -> bool {
+    matches!(
+        std::env::var("DAD_E2E_IMPORT_CLAUDE_PLUGINS").as_deref(),
+        Ok("1" | "true" | "yes")
+    )
 }
 
 /// Seed the per-test HOME's `~/.claude.json` so a daemon-spawned interactive
@@ -2911,13 +2936,10 @@ pub fn write_hook_line(socket: &Path, json_line: &str) -> std::io::Result<()> {
 use std::sync::OnceLock;
 
 #[allow(dead_code)]
-static LOCK_DIR_GUARD: OnceLock<tempfile::TempDir> = OnceLock::new();
+static LOCK_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Idempotent setup hook for legacy daemon-spawning tests. Creates the
-/// per-binary lock-dir tempdir on first call; subsequent calls are
-/// no-ops.
-#[allow(dead_code)]
 /// Endpoint env vars that point a process at a *specific* deck's daemon.
+#[allow(dead_code)]
 const DECK_ENDPOINT_VARS: [&str; 4] = [
     "DOT_AGENT_DECK_SOCKET",
     "DOT_AGENT_DECK_ATTACH_SOCKET",
@@ -2969,23 +2991,30 @@ fn detach_from_any_live_deck() {
     });
 }
 
+/// Idempotent setup hook for legacy daemon-spawning tests. Creates the
+/// per-process lock dir on first call; subsequent calls are no-ops.
 pub fn init_test_env() {
     detach_from_any_live_deck();
-    LOCK_DIR_GUARD.get_or_init(|| {
-        tempfile::Builder::new()
-            .prefix("dot-agent-deck-test-lock-")
-            .tempdir()
-            .expect("create per-binary lock-dir tempdir")
+    LOCK_DIR.get_or_init(|| {
+        // A plain subdirectory of the harness root rather than its own
+        // `TempDir`: this has to stay alive for the whole process, and a
+        // process-lifetime `TempDir` can only live in a `static`, which is
+        // exactly the leak that issue #322 traced. The harness root's
+        // `atexit` hook removes it instead.
+        let dir = harness_temp_root().join("daemon-lock");
+        std::fs::create_dir_all(&dir).expect("create per-process lock dir");
+        harden_dir_0700(&dir);
+        dir
     });
 }
 
-/// Path to the per-binary lock-dir tempdir, for passing to
+/// Path to the per-process lock dir, for passing to
 /// `dot_agent_deck::daemon::Daemon::with_lock_dir_override` (in-process
 /// tests) or to `Command::env` for subprocess-based tests. Returns
 /// `None` if [`init_test_env`] was never called.
 #[allow(dead_code)]
 pub fn lock_dir_path() -> Option<PathBuf> {
-    LOCK_DIR_GUARD.get().map(|d| d.path().to_path_buf())
+    LOCK_DIR.get().cloned()
 }
 
 /// Race-safe `tempfile::tempdir()` wrapper: re-applies 0o700 after
@@ -3000,15 +3029,195 @@ pub fn lock_dir_path() -> Option<PathBuf> {
 /// unchanged.
 #[allow(dead_code)]
 pub fn race_safe_tempdir() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("create tempdir");
+    let dir = tempfile::Builder::new()
+        .tempdir_in(harness_temp_root())
+        .expect("create tempdir");
+    harden_dir_0700(dir.path());
+    dir
+}
+
+/// Re-apply 0o700 to a harness-created directory.
+///
+/// Factored out of [`race_safe_tempdir`] so the harness root and the lock dir
+/// get the same treatment. The lock dir previously skipped it and was left at
+/// the umask default — on this repo's machine 474 of 521 leftovers were
+/// `drwxrwxr-x`, i.e. world-traversable (issue #358).
+///
+/// Unix-only: Windows has no POSIX mode bits and no umask race to close, so
+/// the chmod is skipped there (the ACL equivalent is deferred to #163/#164).
+fn harden_dir_0700(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("chmod tempdir to 0o700");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod harness dir to 0o700");
     }
-    dir
+    #[cfg(not(unix))]
+    let _ = path;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #322 — one harness-owned temp root per test process
+// ---------------------------------------------------------------------------
+//
+// Every temp dir the harness creates nests under a single per-process root, so
+// that:
+//
+//   * a process exiting normally removes the whole tree via the `atexit(3)`
+//     hook below — including state that outlives any individual `TempDir`;
+//   * a process that is SIGKILLed (nextest's `slow-timeout terminate-after`,
+//     or a killed run) leaves behind exactly ONE directory, under a name this
+//     repo owns, which `cargo xtask clean-e2e-tmp` can reap without guessing;
+//   * leftovers are distinguishable from other tooling's. The `tempfile`
+//     crate's default prefix is `.tmp`, so bare `/tmp/.tmp*` dirs belong to
+//     every Rust program on the machine — a reaper globbing those could delete
+//     a live temp dir owned by something else entirely.
+//
+// Why `atexit` and not a `Drop` guard: the lock dir this replaces was held in a
+// `static OnceLock<TempDir>`, and Rust does not drop statics at process exit,
+// so its `TempDir::drop` never ran. nextest runs one process per TEST, so that
+// leaked one directory per test even on a fully GREEN run — measured at 13 dirs
+// from 56 passing tests, and 6,667 accumulated on the dev machine over eight
+// days. `atexit` runs on the normal-exit path libtest takes through
+// `std::process::exit`, which a static's destructor does not.
+//
+// The prefix is kept short deliberately: these paths hold Unix domain sockets,
+// which cap at ~108 bytes, and the root adds a nesting level to every one.
+
+static HARNESS_TEMP_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Free space the e2e tier wants on the temp filesystem before it starts, in
+/// MB. Peak demand is what matters: each concurrent test wants a couple hundred
+/// MB for its seeded HOME and dozens run at once, so the suite needs GBs of
+/// headroom even though no single test does. Override with
+/// `DAD_E2E_MIN_FREE_MB`; `0` disables the check.
+#[cfg(all(unix, feature = "e2e"))]
+const E2E_MIN_FREE_MB: u64 = 2048;
+
+/// Space available to this user on the filesystem holding `path`.
+#[cfg(all(unix, feature = "e2e"))]
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated path and `st` is a
+    // correctly-sized, zeroed `statvfs` that the call fills in.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    // `f_bavail` (not `f_bfree`) is what an unprivileged process can actually use.
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+/// The explicit fail-fast message, kept separate from the `statvfs` call so it
+/// can be asserted on without depending on the machine's actual free space.
+#[cfg(all(unix, feature = "e2e"))]
+fn insufficient_temp_space_message(free_mb: u64, need_mb: u64, path: &Path) -> String {
+    format!(
+        "e2e needs ~{need_mb} MB free in {}; found {free_mb} MB.\n\n\
+         This is almost certainly why tests are failing: the harness cannot create \
+         its per-test temp dirs, which surfaces as unrelated-looking assertion \
+         failures (agents never becoming input-ready, `git init` failing, daemons \
+         never booting) rather than an out-of-space error.\n\n\
+         Interrupted runs leave their temp roots behind — nextest SIGKILLs a test \
+         that trips `slow-timeout terminate-after`, and a killed process never runs \
+         its cleanup. Reclaim them with:\n\n    \
+         cargo xtask clean-e2e-tmp --apply\n\n\
+         Set DAD_E2E_MIN_FREE_MB to change this threshold, or 0 to disable it.",
+        path.display(),
+    )
+}
+
+/// Fail-fast pre-flight: `Some(message)` when the temp filesystem is too full
+/// for the e2e tier to run meaningfully. `None` when there is room, when the
+/// check is disabled, or when free space cannot be determined.
+#[cfg(all(unix, feature = "e2e"))]
+fn temp_space_problem(path: &Path) -> Option<String> {
+    let need_mb = std::env::var("DAD_E2E_MIN_FREE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(E2E_MIN_FREE_MB);
+    if need_mb == 0 {
+        return None;
+    }
+    let free_mb = free_bytes(path)? / (1024 * 1024);
+    (free_mb < need_mb).then(|| insufficient_temp_space_message(free_mb, need_mb, path))
+}
+
+/// Per-process root owning every temp dir this test process creates.
+fn harness_temp_root() -> &'static Path {
+    HARNESS_TEMP_ROOT
+        .get_or_init(|| {
+            // Checked here because this is the one choke point every harness
+            // temp dir passes through, so no test can start doing real work
+            // against an exhausted filesystem without first seeing why.
+            #[cfg(all(unix, feature = "e2e"))]
+            if let Some(msg) = temp_space_problem(&std::env::temp_dir()) {
+                panic!("{msg}");
+            }
+            // `std::env::temp_dir()` reports `TMPDIR` without creating it, and
+            // a `TMPDIR` under `target/` vanishes on `cargo clean`. Create it
+            // so a cleaned checkout self-heals instead of failing every test on
+            // a missing directory.
+            let base = std::env::temp_dir();
+            std::fs::create_dir_all(&base)
+                .unwrap_or_else(|e| panic!("create temp base {}: {e}", base.display()));
+            let root = tempfile::Builder::new()
+                .prefix(&format!("dad-tests-{}-", std::process::id()))
+                .tempdir_in(&base)
+                .expect("create harness temp root")
+                .keep();
+            harden_dir_0700(&root);
+            register_temp_root_cleanup();
+            root
+        })
+        .as_path()
+}
+
+/// Register the process-exit hook that removes [`harness_temp_root`].
+#[cfg(unix)]
+fn register_temp_root_cleanup() {
+    extern "C" fn cleanup() {
+        let Some(root) = HARNESS_TEMP_ROOT.get() else {
+            return;
+        };
+        // Retried: a daemon or agent this test spawned can outlive the test
+        // body by a moment and keep writing into the tree, so the first sweep
+        // can lose a race and fail with ENOTEMPTY. Retrying costs nothing on
+        // the overwhelmingly common first-try success.
+        let mut last_err = None;
+        for _ in 0..3 {
+            match std::fs::remove_dir_all(root) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        // Deliberately loud. Swallowing this is what let the original leak run
+        // for eight days unnoticed; a warning here names the directory that is
+        // about to be left behind and how to reclaim it.
+        if let Some(e) = last_err {
+            eprintln!(
+                "[harness] WARNING: could not remove temp root {} ({e}). \
+                 Reclaim with `cargo xtask clean-e2e-tmp --apply`.",
+                root.display(),
+            );
+        }
+    }
+    // SAFETY: `atexit` takes an `extern "C" fn()`. `cleanup` only reads an
+    // already-initialised `OnceLock` and calls `remove_dir_all`, discarding the
+    // result — neither unwinds, so no panic can cross the FFI boundary.
+    unsafe {
+        libc::atexit(cleanup);
+    }
+}
+
+/// No-op on Windows: there is no `atexit` binding in scope there, and the L2
+/// suite that produces these leftovers is Unix-gated. A Windows run leaks its
+/// root until the reaper is invoked.
+#[cfg(not(unix))]
+fn register_temp_root_cleanup() {}
 
 // ---------------------------------------------------------------------------
 // PRD #127 Phase 1 — headless `daemon serve` harness
@@ -4570,6 +4779,175 @@ impl BroadcastEventLog {
 mod harness_unit_tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // Issue #322 — harness temp-root containment and cleanup
+    // -----------------------------------------------------------------------
+
+    /// Marks the root on stdout so the re-run below can capture it.
+    const ROOT_MARKER: &str = "harness-temp-root=";
+
+    /// The host plugin-tree copy stays off unless explicitly asked for: it is
+    /// ~11 MB per seeded HOME and nothing in the suite depends on it.
+    #[test]
+    fn claude_plugin_import_is_off_unless_explicitly_enabled() {
+        let prev = std::env::var_os("DAD_E2E_IMPORT_CLAUDE_PLUGINS");
+        // SAFETY: nextest runs one test per process, so this is single-threaded;
+        // the var is restored before returning.
+        unsafe { std::env::remove_var("DAD_E2E_IMPORT_CLAUDE_PLUGINS") };
+        let off_by_default = import_claude_plugins_enabled();
+        unsafe { std::env::set_var("DAD_E2E_IMPORT_CLAUDE_PLUGINS", "1") };
+        let on_when_asked = import_claude_plugins_enabled();
+        unsafe { std::env::set_var("DAD_E2E_IMPORT_CLAUDE_PLUGINS", "0") };
+        let off_when_zero = import_claude_plugins_enabled();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DAD_E2E_IMPORT_CLAUDE_PLUGINS", v) },
+            None => unsafe { std::env::remove_var("DAD_E2E_IMPORT_CLAUDE_PLUGINS") },
+        }
+        assert!(!off_by_default, "plugin copy must default to off");
+        assert!(on_when_asked, "=1 must re-enable the copy");
+        assert!(!off_when_zero, "=0 must leave it off");
+    }
+
+    /// The pre-flight message names the real cause and the one command that
+    /// fixes it — the whole point is that a tmpfs-exhaustion run stops looking
+    /// like a product regression.
+    #[cfg(all(unix, feature = "e2e"))]
+    #[test]
+    fn insufficient_space_message_names_the_cause_and_the_remedy() {
+        let msg = insufficient_temp_space_message(312, 2048, Path::new("/tmp"));
+        assert!(msg.contains("312 MB"), "missing actual free space: {msg}");
+        assert!(msg.contains("2048 MB"), "missing required space: {msg}");
+        assert!(msg.contains("/tmp"), "missing the filesystem: {msg}");
+        assert!(
+            msg.contains("cargo xtask clean-e2e-tmp --apply"),
+            "missing the remedy: {msg}",
+        );
+    }
+
+    /// A zero threshold disables the check, so a contributor whose temp
+    /// filesystem is small on purpose is never blocked by it.
+    #[cfg(all(unix, feature = "e2e"))]
+    #[test]
+    fn zero_threshold_disables_the_preflight_check() {
+        // SAFETY: single-threaded test process (nextest runs one test per
+        // process); the var is restored before returning.
+        let prev = std::env::var_os("DAD_E2E_MIN_FREE_MB");
+        unsafe { std::env::set_var("DAD_E2E_MIN_FREE_MB", "0") };
+        let verdict = temp_space_problem(Path::new("/"));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DAD_E2E_MIN_FREE_MB", v) },
+            None => unsafe { std::env::remove_var("DAD_E2E_MIN_FREE_MB") },
+        }
+        assert!(verdict.is_none(), "zero threshold should disable the check");
+    }
+
+    /// An impossibly large threshold trips the check, proving it actually reads
+    /// the filesystem rather than always returning `None`.
+    #[cfg(all(unix, feature = "e2e"))]
+    #[test]
+    fn an_unmeetable_threshold_trips_the_preflight_check() {
+        let prev = std::env::var_os("DAD_E2E_MIN_FREE_MB");
+        // SAFETY: as above — single-threaded, restored before returning.
+        unsafe { std::env::set_var("DAD_E2E_MIN_FREE_MB", "1000000000") };
+        let verdict = temp_space_problem(&std::env::temp_dir());
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DAD_E2E_MIN_FREE_MB", v) },
+            None => unsafe { std::env::remove_var("DAD_E2E_MIN_FREE_MB") },
+        }
+        assert!(
+            verdict.is_some_and(|m| m.contains("clean-e2e-tmp")),
+            "a 1 PB requirement should always trip the check",
+        );
+    }
+
+    /// Every harness tempdir nests under the one per-process root, so a killed
+    /// run leaves a single reapable directory instead of scattered `/tmp/.tmp*`
+    /// dirs that are indistinguishable from any other Rust program's.
+    ///
+    /// Doubles as the child of
+    /// [`harness_temp_root_is_removed_when_the_process_exits_normally`], which
+    /// re-runs this test and reads the root off the marker line below.
+    #[test]
+    fn race_safe_tempdir_nests_under_the_harness_root() {
+        let dir = race_safe_tempdir();
+        assert!(
+            dir.path().starts_with(harness_temp_root()),
+            "{} is not under the harness root {}",
+            dir.path().display(),
+            harness_temp_root().display(),
+        );
+        println!("{ROOT_MARKER}{}", harness_temp_root().display());
+    }
+
+    /// The lock dir is contained by the root and hardened to 0o700 like every
+    /// other harness dir. It previously used a bare `tempfile::Builder` with no
+    /// re-chmod, so the daemon's `bind_socket` umask flip left it
+    /// world-traversable — 474 of 521 leftovers were `drwxrwxr-x` (issue #358).
+    #[cfg(unix)]
+    #[test]
+    fn init_test_env_lock_dir_is_contained_and_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        init_test_env();
+        let lock = lock_dir_path().expect("init_test_env creates the lock dir");
+        assert!(
+            lock.starts_with(harness_temp_root()),
+            "lock dir {} escaped the harness root",
+            lock.display(),
+        );
+        let mode = std::fs::metadata(&lock)
+            .expect("stat lock dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "lock dir mode is {mode:o}, want 700");
+    }
+
+    /// A test process that exits normally takes its whole temp root with it.
+    ///
+    /// Re-runs *this* binary against a single test that provably creates the
+    /// root, then asserts the child left nothing behind. This is the regression
+    /// guard for the original defect: the lock dir lived in a
+    /// `static OnceLock<TempDir>`, and because Rust never drops statics, it
+    /// leaked once per test process even when every test passed.
+    #[test]
+    fn harness_temp_root_is_removed_when_the_process_exits_normally() {
+        let exe = std::env::current_exe().expect("current exe");
+        // libtest test names omit the crate segment that `module_path!()`
+        // carries. Getting this wrong makes the filter match nothing, the child
+        // exit 0 having run no tests, and this assertion pass vacuously — so
+        // the missing marker below is treated as a failure, not a skip.
+        let module = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| module_path!());
+        let child_test = format!("{module}::race_safe_tempdir_nests_under_the_harness_root");
+        let out = std::process::Command::new(&exe)
+            .arg(&child_test)
+            .args(["--exact", "--test-threads=1", "--nocapture"])
+            .output()
+            .expect("re-run this test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "child run of {child_test} failed: {}\n{stdout}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+        );
+        // `--nocapture` interleaves the marker onto libtest's own
+        // `test <name> ... ` line, so match it anywhere in the line rather than
+        // at the start.
+        let root = stdout
+            .lines()
+            .find_map(|l| l.split_once(ROOT_MARKER).map(|(_, rest)| rest.trim()))
+            .unwrap_or_else(|| {
+                panic!("child never reported a temp root — did `{child_test}` match no tests?\n{stdout}")
+            });
+        assert!(
+            !Path::new(root).exists(),
+            "child exited cleanly but left its temp root behind: {root}",
+        );
+    }
+
     /// The whole probe arriving in one PTY read (the common case) is answered
     /// with the flags reply first, then DA1 — the order crossterm expects.
     #[test]
@@ -4792,8 +5170,8 @@ mod harness_unit_tests {
     /// and the imported token is registered for recording redaction.
     #[test]
     fn opencode_import_is_auth_only_and_synthesizes_minimal_config() {
-        let source = tempfile::tempdir().expect("source HOME");
-        let target = tempfile::tempdir().expect("target HOME");
+        let source = race_safe_tempdir();
+        let target = race_safe_tempdir();
         let source_auth = source.path().join(".local/share/opencode/auth.json");
         std::fs::create_dir_all(source_auth.parent().unwrap()).expect("source auth dir");
         std::fs::write(
@@ -4849,9 +5227,9 @@ mod harness_unit_tests {
     fn opencode_import_rejects_a_symlinked_source_root() {
         use std::os::unix::fs::symlink;
 
-        let source = tempfile::tempdir().expect("source HOME");
-        let target = tempfile::tempdir().expect("target HOME");
-        let external = tempfile::tempdir().expect("external OpenCode root");
+        let source = race_safe_tempdir();
+        let target = race_safe_tempdir();
+        let external = race_safe_tempdir();
         std::fs::write(
             external.path().join("auth.json"),
             r#"{"openrouter":{"key":"must-not-be-imported"}}"#,

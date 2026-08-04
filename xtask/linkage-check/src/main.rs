@@ -24,6 +24,8 @@
 //!
 //! - `docs` — invokes the `xtask-docs` binary's logic (paired-`.md`
 //!   generator). Forwards remaining args.
+//! - `clean-e2e-tmp` — issue #322: reaps stale e2e harness temp dirs left
+//!   behind by SIGKILLed test processes. Dry-run unless `--apply`.
 //! - `list-tests` — PRD #77 Decision 31: emits a Markdown report of
 //!   every `#[spec]` test created or modified in this branch versus
 //!   `origin/main`, plus per-catalog-entry prose diffs and any
@@ -32,6 +34,7 @@
 //!
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
 
+mod clean_tmp;
 mod list_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +62,9 @@ fn main() -> ExitCode {
     }
     if matches!(args.first().map(String::as_str), Some("list-tests")) {
         return run_list_tests(&args[1..]);
+    }
+    if matches!(args.first().map(String::as_str), Some("clean-e2e-tmp")) {
+        return clean_tmp::run(&args[1..]);
     }
 
     let root = repo_root();
