@@ -4909,6 +4909,12 @@ mod harness_unit_tests {
     /// guard for the original defect: the lock dir lived in a
     /// `static OnceLock<TempDir>`, and because Rust never drops statics, it
     /// leaked once per test process even when every test passed.
+    ///
+    /// Unix-only, matching [`register_temp_root_cleanup`]: there is no `atexit`
+    /// binding in scope on Windows, so a Windows run leaks its root until
+    /// `cargo xtask clean-e2e-tmp` (which is cross-platform) is invoked. The
+    /// containment test above still covers Windows.
+    #[cfg(unix)]
     #[test]
     fn harness_temp_root_is_removed_when_the_process_exits_normally() {
         let exe = std::env::current_exe().expect("current exe");
