@@ -338,10 +338,26 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
     // RESPAWNS the pi worker and stashes the single-line pointer as the fresh
     // pane's NATIVE seed (rather than typing it in) — pi's extension pulls it via
     // `get-seed` → `sendUserMessage`.
+    // The closing clauses are load-bearing, not politeness. An earlier version
+    // ended "That is the entire task — do not do anything else", which
+    // CONTRADICTED the work-done footer the daemon appends below it: the worker
+    // created the sentinel and then stopped, and assertion 3 timed out on a
+    // signal the task text had just told it not to send. The pointer to "When
+    // done" removes that conflict. The no-questions clause removes the other
+    // observed stall — the footer asks the worker to invent a `<summary-slug>`,
+    // and a small model answered by asking the user to supply one, parking the
+    // turn forever ("provide the summary slug ... and I can write the report").
+    // A third run composed the exact completion command but only offered to run it; offering to act is not asking a follow-up question, so the no-questions clause did not cover that conversational stall, and the no-offers clause now requires signalling before any reply while explicitly rejecting the "next step" framing and waiting for confirmation.
+    // None of these clauses dictates HOW to signal, so the real footer stays under test.
     let task = format!(
         "Create a file named {SENTINEL_NAME} in the current working directory whose entire \
          contents are exactly the text {SENTINEL_CONTENT}. Use your shell tool to create it. \
-         That is the entire task — do not do anything else."
+         That is the only work to do — then follow the \"When done\" instructions below to \
+         signal completion. Do not ask any follow-up questions before doing both steps: you \
+         have everything you need, so choose any value the instructions leave up to you. Do \
+         not stop or reply until you have followed the \"When done\" instructions yourself \
+         and signalled completion. Never describe signalling as a next step, offer to do it \
+         later, or wait for confirmation."
     );
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),

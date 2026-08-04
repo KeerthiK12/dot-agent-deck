@@ -42,8 +42,8 @@ expression: buf
    │  g                  generate .dot-agent-deck.toml   /               filter (case-insensitive)       │    
    │  y / n              approve / deny permission       esc             clear filter (twice = close)    │    
    │  s                  scheduled tasks manager         q               cancel                          │    
-   │  ?                  toggle this help                                                                │    
-   │                                                     session                                         │    
+   │  pageup / pagedown  scroll focused pane                                                             │    
+   │  ?                  toggle this help                session                                         │    
    │                                                                                                     │    
    │                                                     panes auto-saved continuously.                  │    
    │                                                     restored automatically on launch.               │    

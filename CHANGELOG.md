@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.35.6] - 2026-08-04
+
+### Added
+
+- **The stacked pane layout no longer wastes a row per non-focused pane**
+  In the default `Stacked` pane layout, every non-focused pane used to render as an empty 1-row title-bar frame — a border drawn around nothing. In a 7-role orchestration tab ([#307](https://github.com/vfarcic/dot-agent-deck/issues/307)), that was six rows spent on frames for `developer`, `tester`, `reviewer`, `releaser`, `researcher` and `documenter`, none of which showed anything: on a laptop screen, roughly 13% of the vertical space. The orchestration sidebar already shows each role's live status, tool counts and click-to-focus, so the collapsed frame was a strictly poorer second copy of information already on screen.
+  Non-focused panes are no longer drawn at all. The focused pane now reclaims every row the collapsed frames used to occupy. Nothing about agent lifecycle changes — every pane's PTY stays open, every agent keeps running, hooks keep arriving, and the sidebar (or dashboard cards) keeps showing live status for all of them. A non-focused pane's PTY is now sized as though it were the focused slot, so switching focus is instant with no resize thrash or reflow.
+  Mode tabs, which render their two side panes simultaneously by design, are unaffected — they already use a fixed tiled split regardless of the global pane-layout setting.
+
+### Fixed
+
+  Fixed watch-wrapped mode panes staying permanently blank for commands that do not exit. Persistent panes (`[[modes.panes]]`) default to `watch = true`, which runs the command through the built-in `dot-agent-deck watch`; that wrapper showed the command's output only once the command finished. A pane running `tail -f app.log`, `kubectl logs -f`, or a dev server therefore showed nothing at all — no output, no error, no hint why.
+  Watched commands now show their output as it is produced, so long-running and slow commands paint progressively. stdout and stderr appear interleaved in the order they arrive, rather than all of stdout followed by all of stderr.
+
+### Miscellaneous
+
+  Fixed the e2e test harness leaking temp directories, which could make a healthy branch fail dozens of unrelated-looking tests. Every temp dir the harness creates now nests under one per-process root that is removed when the process exits, and `cargo xtask clean-e2e-tmp` reaps whatever an interrupted run left behind. When the temp filesystem is genuinely too full, the suite now says so explicitly instead of surfacing the exhaustion as agent and daemon failures. This is developer tooling only — no change to the shipped binary.
+  Fixed the local Windows pre-PR type-check (`scripts/windows-cross-check.sh`), which had been failing on every branch — including a clean `main` — since the reqwest 0.13 upgrade moved rustls onto its `aws-lc-rs` provider. It died inside `aws-lc-sys`'s build script, compiling that crate's ~600 C files with Linux gcc and Linux system headers against a Windows target, so it never reached a single line of this repo's own code and the documented gate produced no signal at all. The check now shims the C compiler the same way it already shimmed the archiver — `cargo check` never links, so nothing reads either artefact — which skips the C build entirely and leaves the Rust type-check real. A cold run takes about fifteen seconds and a warm one about five.
+  CI now runs that script too, in a parallel `windows-cross-check` job, so the same silent rot cannot recur — nothing had ever exercised it, which is why a permanently-red documented gate went unnoticed for months. That job is not a second Windows code gate; `build-windows` still owns Windows, compiling natively with clippy and tests on a real Windows runner, and was unaffected by this bug throughout. This is developer tooling only, with no change to the shipped binary.
+
+
+
+## [0.35.5] - 2026-08-03
+
+### Added
+
+- **The mode you are in is now unmistakable**
+  `Ctrl+D` toggles between driving the deck and typing into a pane, and until now you had to infer which side of that toggle you were on. The pane border went some of the way, but the focused pane still showed a cursor in command mode — the loudest "type here" signal a terminal has, firing in the mode where typing does nothing — and the only words on screen read `[Command Mode Ctrl+D]` precisely when you were *not* in command mode. Acting on the wrong belief was easy, and the usual way to find out was a stray keystroke landing somewhere you did not mean it to.
+  Four things changed. The focused pane now shows a cursor **only** while your keystrokes reach it — neither the highlighted block nor your terminal's own blinking cursor renders in command mode. A chip at the left of the bottom bar names the mode you are in right now, ` COMMAND ` or ` TYPING `, in the same place on every tab; the button beside it still names where `Ctrl+D` would take you, so one tells you where you are and the other where you can go. Entering command mode dims the focused pane and overlays a large `COMMAND MODE · Ctrl+D to type` banner, which clears itself after 2.5 seconds or the moment you press a command-mode key — but stays up, or comes back, when you type a key that is bound to nothing, since that is exactly the moment you probably thought you were talking to the agent. And on the dashboard, the selected card's highlight is de-emphasised while you type into a pane (it keeps its `▸ ` marker), so the deck looks inert exactly when the pane looks live.
+  Command mode is also a genuine read-only inspect mode now. The pane dims but is never blanked — you can still see which agent is mid-work and which one you are about to close — and the scroll wheel over the focused agent pane scrolls it in command mode, matching side panes, which have always scrolled in any mode. Reviewing what an agent did no longer means dropping into the mode where a mistyped key goes into it. In command mode the wheel always drives Agent Deck's own scrollback and is never forwarded to the agent's mouse protocol, so a full-screen TUI in the pane cannot move under you while you read.
+  `PageUp` and `PageDown` do the same from the keyboard. They are the new `scroll_pane_up` and `scroll_pane_down` actions in the `[dashboard]` section of `keybindings.toml`, remappable like every other binding, and they apply in command mode only — while you are typing in a pane those keys still go through to whatever is running there, so pagers and editors keep them.
+  Everything here is on by default and none of it is configurable beyond the two new keybindings; the indicators use terminal-relative highlighting rather than fixed colours, so they read correctly on light and dark backgrounds alike.
+  See [Keyboard Shortcuts](https://agent-deck.devopstoolkit.ai/docs/keyboard-shortcuts) for the full mode reference and the new bindings, and [Workspace Modes](https://agent-deck.devopstoolkit.ai/docs/workspace-modes) for how command mode reads as a resting state on a mode tab.
+  Demo reel: https://youtu.be/lwir8zdUM0E
+
+### Fixed
+
+- **Session Cards Keep a Consistent Height as They Narrow**
+  Session cards no longer restructure themselves when you resize the terminal. Previously, narrowing a card past a width threshold moved the `Last`/`Tools` counters onto their own row, making the card one row taller — which could push it down a density tier and show fewer prompts and tool lines exactly when you were trying to reclaim space (the blocker behind [#336](https://github.com/vfarcic/dot-agent-deck/issues/336), the orchestration sidebar ratio toggle).
+  The `Last`/`Tools` counters now live in the card's bottom-right border, the same way the status badge already occupies the top border, so they cost no content rows at any width. Card height now depends only on density (Compact, Normal, Spacious), not on card width. The `Dir:` line also spans the card's full inner width and ellipsizes properly when a directory path is too long to fit, instead of being clipped without an ellipsis.
+  See [Session Management](https://agent-deck.devopstoolkit.ai/session-management) for a look at the updated card layout, or watch the [demo reel](https://youtu.be/W73TozxLd8A) to see a live card keep its height while the terminal narrows around it.
+
+
+
 ## [0.35.4] - 2026-08-02
 
 ### Fixed

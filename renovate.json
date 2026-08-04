@@ -58,6 +58,12 @@
       "automergeType": "pr"
     },
     {
+      "matchManagers": ["devbox"],
+      "matchUpdateTypes": ["lockFileMaintenance"],
+      "enabled": false,
+      "description": "Lock file maintenance is disabled for devbox.lock, because Renovate resolves the lock inside its own throwaway container and devbox writes an ABSOLUTE path for `path:` flake entries. PR #348 therefore added a `path:gcloud#google-cloud-sdk` entry whose `resolved` field pointed at `path:/tmp/renovate/repos/github/vfarcic/dot-agent-deck/gcloud`, a directory that exists on no real machine; 77b5e87 removed it. The entry is not something devbox recreates — `devbox install` leaves the lock at 17 entries and resolves the local flake from devbox.json — so it is purely an artifact of where the bot ran, and every lock file maintenance run would re-add it. Actual devbox package bumps are unaffected: they still flow through the `Devbox packages` rule above, so only the wholesale lock refresh stops. Consequence to accept: the nixpkgs revisions pinned in devbox.lock now only move when a package bump moves them, so refresh them by hand (`devbox update`) if they drift too far."
+    },
+    {
       "matchManagers": ["github-actions"],
       "matchUpdateTypes": ["digest", "pin", "patch", "minor"],
       "groupName": "GitHub Actions",
