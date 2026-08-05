@@ -35,19 +35,24 @@
 //! `dot-agent-deck` substring, so re-installs are idempotent and a user hook that
 //! merely mentions `dot-agent-deck` in an argument is preserved.
 //!
-//! **Known interaction — duplicate events (see `read_config_from`).** Devin also
-//! reads Claude's hook files (`~/.claude/settings.json`, `~/.claude.json`) by
-//! default, which is exactly where [`crate::hooks_manage`] installs the deck's
-//! CLAUDE hooks. A user who has both installed therefore gets two hook
-//! invocations per lifecycle event from one Devin session: one stamped
-//! [`AgentType::Devin`] (this module) and one stamped
-//! [`AgentType::ClaudeCode`] (the Claude file), which makes the card's agent
-//! badge flap between the two. [`claude_hook_import_conflict`] detects that
-//! situation so the installers can warn with the one-line remedy
-//! (`"read_config_from": { "claude": false }`) instead of leaving the user to
-//! discover it. The deck does NOT write that key itself — it also governs the
-//! user's Claude rules/commands/subagent imports, which are none of our
-//! business.
+//! **On Devin's Claude import.** Devin documents that it also reads hooks from
+//! Claude's files (`~/.claude/settings.json`, `~/.claude.json`) when
+//! `read_config_from.claude` is enabled, which it is by default — and that is
+//! exactly where [`crate::hooks_manage`] installs the deck's CLAUDE hooks. On
+//! paper that should mean two hook invocations per lifecycle event from one
+//! Devin session, one stamped [`AgentType::Devin`] and one
+//! [`AgentType::ClaudeCode`].
+//!
+//! Measured against devin 3000.3.27, it does not: with BOTH the deck's Claude
+//! and Devin hooks installed and the import left at its default, a real session
+//! emits exactly one event per lifecycle step, all stamped `devin` — in print
+//! mode and in an interactive pane alike. An earlier revision of this module
+//! detected the "conflict" and warned users to set
+//! `"read_config_from": { "claude": false }`; that advice was dropped because it
+//! fired on the deck's own default configuration and would have had users
+//! disable their Claude rules, skills, commands and MCP imports to fix a symptom
+//! that never occurred. If duplicate events are ever actually observed, add the
+//! detection back then.
 //!
 //! [`IntegrationStrategy::NativeHooks`]: crate::agent_registry::IntegrationStrategy::NativeHooks
 //! [`AgentType::Devin`]: crate::event::AgentType::Devin
@@ -456,78 +461,6 @@ pub fn uninstall_from(config_dir: &Path) -> io::Result<Vec<String>> {
     Ok(removed)
 }
 
-/// Whether this config would ALSO pick up the deck's Claude hooks, producing
-/// duplicate events (and a flapping agent badge) for one Devin session.
-///
-/// True when Devin's Claude import is active — `read_config_from.claude` is
-/// absent (it defaults to `true`) or explicitly `true` — AND the deck's Claude
-/// hooks are actually installed at `claude_settings`. Both halves matter: a user
-/// with the import on but no Claude hooks installed has nothing to duplicate.
-fn claude_hook_import_conflict(root: &Value, claude_settings: &Path) -> bool {
-    // An absent key defaults to TRUE — Devin's documented default is to import
-    // from Claude, so "not configured" is a conflict, not an all-clear.
-    let import_enabled = root
-        .get("read_config_from")
-        .and_then(|r| r.get("claude"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    import_enabled && claude_hooks_installed(claude_settings)
-}
-
-/// Whether the deck's Claude hooks are present in `claude_settings`. Any parse or
-/// read failure answers `false`: this only drives an advisory warning, so a
-/// best-effort probe must never turn into an install failure.
-fn claude_hooks_installed(claude_settings: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(claude_settings) else {
-        return false;
-    };
-    let Ok(root) = serde_json::from_slice::<Value>(&bytes) else {
-        return false;
-    };
-    root.get("hooks")
-        .and_then(Value::as_object)
-        .is_some_and(|hooks| {
-            hooks.values().any(|rules| {
-                rules.as_array().is_some_and(|rules| {
-                    rules.iter().any(|rule| {
-                        rule.get("hooks")
-                            .and_then(Value::as_array)
-                            .is_some_and(|handlers| {
-                                handlers.iter().any(|handler| {
-                                    handler
-                                        .get("command")
-                                        .and_then(Value::as_str)
-                                        .is_some_and(|cmd| cmd.contains("dot-agent-deck"))
-                                })
-                            })
-                    })
-                })
-            })
-        })
-}
-
-/// The human-readable duplicate-events advisory, or `None` when the config at
-/// `config_dir` has no conflict. Shared by the silent startup path (which logs
-/// it) and the explicit CLI (which prints it), so the wording lives once.
-fn duplicate_events_advisory(config_dir: &Path) -> Option<String> {
-    let root = read_config(&config_path(config_dir)).ok()?;
-    let claude_settings = crate::platform::paths::home_dir_with_tmp_fallback()
-        .join(".claude")
-        .join("settings.json");
-    if !claude_hook_import_conflict(&root, &claude_settings) {
-        return None;
-    }
-    Some(format!(
-        "Devin also imports Claude's hooks from {}, where dot-agent-deck's Claude \
-         hooks are installed, so one Devin action will report twice and the card's \
-         agent badge will flap between Devin and ClaudeCode. To stop that, set \
-         \"read_config_from\": {{ \"claude\": false }} in {} (Devin will then read \
-         project rules from AGENTS.md rather than CLAUDE.md).",
-        claude_settings.display(),
-        config_path(config_dir).display()
-    ))
-}
-
 /// The absolute path of the running deck binary, for pinning into hook commands.
 fn current_binary_path() -> String {
     std::env::current_exe()
@@ -561,9 +494,6 @@ pub fn auto_install() {
                 "auto-installed Devin hooks: {}",
                 DEVIN_HOOK_EVENTS.join(", ")
             );
-            if let Some(advisory) = duplicate_events_advisory(&config_dir) {
-                tracing::warn!("{advisory}");
-            }
         }
         Err(e) => tracing::warn!("auto-install: failed to write Devin hooks: {e}"),
     }
@@ -580,9 +510,6 @@ pub fn install() -> Result<(), String> {
 
     println!("Installed hooks: {}", DEVIN_HOOK_EVENTS.join(", "));
     println!("Settings file: {}", config_path(&config_dir).display());
-    if let Some(advisory) = duplicate_events_advisory(&config_dir) {
-        println!("\nWarning: {advisory}");
-    }
     Ok(())
 }
 
@@ -871,52 +798,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("config tempdir");
         assert!(uninstall_from(dir.path()).expect("no-op").is_empty());
         assert!(!config_path(dir.path()).exists());
-    }
-
-    /// The duplicate-events conflict needs BOTH halves: Devin's Claude import
-    /// active (absent key defaults to true) AND the deck's Claude hooks actually
-    /// installed. Anything else is not a conflict.
-    #[test]
-    fn claude_import_conflict_requires_import_on_and_deck_hooks_present() {
-        let dir = tempfile::tempdir().expect("claude tempdir");
-        let claude = dir.path().join("settings.json");
-        let absent = dir.path().join("missing.json");
-
-        std::fs::write(
-            &claude,
-            serde_json::to_vec_pretty(&json!({
-                "hooks": {
-                    "Stop": [ { "hooks": [
-                        { "type": "command", "command": "/abs/dot-agent-deck hook" }
-                    ] } ]
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        // Import defaults to on when the key is absent.
-        assert!(claude_hook_import_conflict(&json!({}), &claude));
-        assert!(claude_hook_import_conflict(
-            &json!({ "read_config_from": { "claude": true } }),
-            &claude
-        ));
-        // The documented remedy clears it.
-        assert!(!claude_hook_import_conflict(
-            &json!({ "read_config_from": { "claude": false } }),
-            &claude
-        ));
-        // Import on, but no deck hooks to duplicate.
-        assert!(!claude_hook_import_conflict(&json!({}), &absent));
-
-        // A Claude settings file with only USER hooks is not a conflict either.
-        let user_only = dir.path().join("user-only.json");
-        std::fs::write(
-            &user_only,
-            br#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./mine.sh"}]}]}}"#,
-        )
-        .unwrap();
-        assert!(!claude_hook_import_conflict(&json!({}), &user_only));
     }
 
     /// Devin resolves its config the standard XDG way, so the deck must too.

@@ -35,18 +35,6 @@ Hooks are **auto-installed on every startup** — most users never need to think
 
 Auto-install is idempotent and best-effort — if an agent directory is missing the step is silently skipped, and errors are logged without blocking startup.
 
-### Devin events showing twice (or the badge flapping between Devin and Claude Code)
-
-Devin reads Claude's hook files (`~/.claude/settings.json`, `~/.claude.json`) by default — and that is exactly where the deck installs its Claude hooks. If you have both the deck's Claude and Devin hooks installed, one Devin action fires two hook invocations: one stamped `Devin` (from this agent's config) and one stamped `ClaudeCode` (from the imported Claude file), which makes the card's agent badge flap between the two.
-
-The deck detects this at install time and warns with the one-line remedy. To stop the duplication, set `read_config_from` to disable the Claude import in `~/.config/devin/config.json`:
-
-```json
-{ "read_config_from": { "claude": false } }
-```
-
-Devin will then read project rules from `AGENTS.md` rather than `CLAUDE.md`. The deck does not write this key for you, because it also governs your Claude rules, commands, and subagent imports.
-
 ### Codex events not showing
 
 Codex only runs hooks it *trusts*, and the deck handles that for you: it records trust for its own hook entries — and only those — in your Codex home's `config.toml`. This is independent of how you start Codex, so a launcher (`devbox run codex-big`, a `run_codex_agent.sh`, an alias, a path whose name isn't `codex`) needs **nothing** added to it. Launch Codex however you already do.
