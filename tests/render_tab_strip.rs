@@ -111,15 +111,16 @@ fn dashboard_only_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// orchestration tab's label renders in the `palette::status_color()` of the
 /// SINGLE highest-priority status among its panes — fixed order Error(Red) >
 /// WaitingForInput(Yellow) > Working(Green) > Thinking/Compacting(Blue) >
-/// Idle/Unknown(DarkGray) (PRD #333). Covers: (a) one `Error` among `Idle`
+/// Idle/Unknown(no tint) (PRD #333). Covers: (a) one `Error` among `Idle`
 /// panes -> Red; (b) one `WaitingForInput` among `Working`/`Idle` (no Error)
-/// -> Yellow; (c) all `Idle` -> DarkGray; (d) `Thinking` + `Working` (no
-/// higher-priority state) -> Green, since Working outranks Thinking. Also
-/// asserts a non-orchestration tab (`None`) never gets colorized by this
-/// feature. RED today: `render_tab_bar_to_buffer` has no parameter through
-/// which a tab's pane statuses can reach the renderer at all, so this fails
-/// to compile until that seam (and the aggregate-priority resolver behind it)
-/// exist.
+/// -> Yellow; (c) all `Idle` -> the SAME base label color as an ordinary
+/// tab, NOT `Color::DarkGray` (PRD #333 defect B: PRD #13 reserves DarkGray
+/// for purely-decorative elements, not label text); (d) `Thinking` +
+/// `Working` (no higher-priority state) -> Green, since Working outranks
+/// Thinking. Also asserts a non-orchestration tab (`None`) never gets
+/// colorized by this feature. RED today on (c): the Idle branch still
+/// applies `.fg(palette::status_color(Idle))` (`DarkGray`) instead of
+/// falling through to the base style.
 #[spec("tabs/orchestration/009")]
 #[test]
 fn orchestration_009_tab_label_colored_by_highest_priority_status() {
@@ -153,7 +154,10 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
         "a tab with a WaitingForInput pane (no Error present) must render its label Yellow"
     );
 
-    // (c) Every pane Idle -> the lowest-priority / no-activity color.
+    // (c) Every pane Idle -> falls through to the base/unstyled label color,
+    // exactly like an ordinary tab. PRD #13 reserves DarkGray for
+    // purely-decorative, non-read elements only; a tab label is text, so an
+    // all-Idle orchestration tab must NOT be DarkGray (PRD #333 defect B).
     let buf = render_tab_bar_to_buffer(
         &["Dashboard", "squad"],
         &[false, true],
@@ -161,10 +165,18 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
         80,
         &[None, Some(&[Idle, Idle, Idle])],
     );
+    let base_buf = render_tab_bar_to_buffer(
+        &["Dashboard", "demo"],
+        &[false, false],
+        0,
+        80,
+        &[None, None],
+    );
     assert_eq!(
         tab_label_fg(&buf, "squad"),
-        Color::DarkGray,
-        "an all-Idle tab must render its label DarkGray"
+        tab_label_fg(&base_buf, "demo"),
+        "an all-Idle orchestration tab must render with the same base label color as an \
+         ordinary tab, not DarkGray"
     );
 
     // (d) Thinking and Working present, nothing higher-priority -> Green,
@@ -204,69 +216,83 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
 
 /// Scenario: Render the tab strip with an orchestration tab made the ACTIVE
 /// tab (unlike `orchestration_009`, which always leaves Dashboard active) and
-/// give it a single `Error` pane. Assert the label's `fg` is
-/// `palette::status_color(Error)` (Red), `Modifier::BOLD` is set, and
-/// `Modifier::REVERSED` is NOT set — main's `Modifier::REVERSED` active-tab
-/// style would otherwise invert fg/bg at display time, turning a red LABEL
-/// into a red BACKGROUND with terminal-default text, which is the PRD #333
-/// P1 defect this pins. Also renders an active Dashboard tab and an inactive
-/// orchestration tab in the same file to prove the fix is scoped: a
-/// non-orchestration active tab keeps `REVERSED` exactly as today, and an
-/// inactive orchestration tab keeps rendering its status color with neither
-/// `REVERSED` nor `BOLD`. RED today: the active branch applies `.fg(...)` on
-/// top of `active_style` (`REVERSED | BOLD`), so `REVERSED` is still set on
-/// an active orchestration tab.
+/// give it a non-idle (`Error`) pane — assert its label carries NO status
+/// `fg` tint and matches an active non-orchestration (Dashboard) tab's `fg`
+/// and modifiers exactly (`REVERSED | BOLD`, no absolute color), since
+/// stacking a status `fg` on top of `Modifier::REVERSED` inverts the color
+/// into a BACKGROUND at display time instead of coloring text (PRD #333
+/// defect A — this withdraws the earlier BOLD-without-REVERSED decision).
+/// Also asserts an INACTIVE orchestration tab whose aggregate status is
+/// `Idle` renders with the same base label color as an ordinary tab, not
+/// `Color::DarkGray` (defect B), and that an INACTIVE orchestration tab with
+/// a non-idle (`Error`) aggregate status still colors its label text as
+/// today (regression guard). RED today: the active branch still applies
+/// `.fg(status_color(Error))` on top of `REVERSED`, and the Idle branch
+/// still applies `.fg(DarkGray)` instead of falling through to the base
+/// style.
 #[spec("tabs/orchestration/010")]
 #[test]
-fn orchestration_010_active_tab_status_color_is_label_text_not_reversed_background() {
+fn orchestration_010_active_no_status_tint_and_idle_no_grey() {
     use SessionStatus::*;
 
-    // Active orchestration tab (index 1) with an Error pane: the status
-    // color must land on the label as plain `fg` with BOLD, and REVERSED
-    // must be absent so a terminal doesn't invert it into a background.
-    let buf = render_tab_bar_to_buffer(
+    // Case 1 (defect A): an ACTIVE orchestration tab with a non-idle (Error)
+    // pane must render IDENTICALLY to an active non-orchestration tab — no
+    // status fg tint at all, same REVERSED | BOLD modifiers.
+    let active_orch_buf = render_tab_bar_to_buffer(
         &["Dashboard", "squad"],
         &[false, true],
         1,
         80,
         &[None, Some(&[Idle, Error, Idle])],
     );
-    assert_eq!(
-        tab_label_fg(&buf, "squad"),
-        Color::Red,
-        "an ACTIVE orchestration tab with an Error pane must still render its label fg Red"
-    );
-    let modifier = tab_label_modifier(&buf, "squad");
-    assert!(
-        modifier.contains(Modifier::BOLD),
-        "an active orchestration tab must render its label BOLD, got {modifier:?}"
-    );
-    assert!(
-        !modifier.contains(Modifier::REVERSED),
-        "an active orchestration tab must NOT render REVERSED — that would invert the Red fg \
-         into a background at display time instead of coloring the label text, got {modifier:?}"
-    );
-
-    // Active non-orchestration (Dashboard) tab: unaffected by this feature,
-    // must keep main's existing REVERSED active-tab styling exactly as
-    // today. Regression guard for the deliberate non-orchestration scoping.
-    let buf = render_tab_bar_to_buffer(
+    let active_plain_buf = render_tab_bar_to_buffer(
         &["Dashboard", "squad"],
         &[false, true],
         0,
         80,
         &[None, None],
     );
-    let dashboard_modifier = tab_label_modifier(&buf, "Dashboard");
-    assert!(
-        dashboard_modifier.contains(Modifier::REVERSED),
-        "an active non-orchestration tab must keep Modifier::REVERSED unchanged, got {dashboard_modifier:?}"
+    assert_eq!(
+        tab_label_fg(&active_orch_buf, "squad"),
+        tab_label_fg(&active_plain_buf, "Dashboard"),
+        "an ACTIVE orchestration tab must carry NO status fg tint — it must render with the \
+         same fg as an active non-orchestration tab"
+    );
+    assert_eq!(
+        tab_label_modifier(&active_orch_buf, "squad"),
+        tab_label_modifier(&active_plain_buf, "Dashboard"),
+        "an ACTIVE orchestration tab must carry the same REVERSED | BOLD modifiers as an \
+         active non-orchestration tab"
     );
 
-    // Inactive orchestration tab (Dashboard active, index 0): the existing
-    // working path — status color on fg, no REVERSED, no BOLD — must not
-    // regress once the active branch is fixed.
-    let buf = render_tab_bar_to_buffer(
+    // Case 2 (defect B): an INACTIVE orchestration tab whose aggregate
+    // status is Idle must render with the base/unstyled label color, not
+    // DarkGray — an idle tab must look like an ordinary tab.
+    let idle_buf = render_tab_bar_to_buffer(
+        &["Dashboard", "squad"],
+        &[false, true],
+        0,
+        80,
+        &[None, Some(&[Idle, Idle, Idle])],
+    );
+    let base_buf = render_tab_bar_to_buffer(
+        &["Dashboard", "demo"],
+        &[false, false],
+        0,
+        80,
+        &[None, None],
+    );
+    assert_eq!(
+        tab_label_fg(&idle_buf, "squad"),
+        tab_label_fg(&base_buf, "demo"),
+        "an INACTIVE orchestration tab whose aggregate status is Idle must render with the \
+         same base label color as an ordinary tab, not DarkGray"
+    );
+
+    // Case 3 (no regression): an INACTIVE orchestration tab with a non-idle
+    // (Error) aggregate status still colors its label text, exactly as
+    // today, with neither REVERSED nor BOLD.
+    let err_buf = render_tab_bar_to_buffer(
         &["Dashboard", "squad"],
         &[false, true],
         0,
@@ -274,11 +300,11 @@ fn orchestration_010_active_tab_status_color_is_label_text_not_reversed_backgrou
         &[None, Some(&[Idle, Error, Idle])],
     );
     assert_eq!(
-        tab_label_fg(&buf, "squad"),
+        tab_label_fg(&err_buf, "squad"),
         Color::Red,
         "an INACTIVE orchestration tab with an Error pane must still render its label fg Red"
     );
-    let inactive_modifier = tab_label_modifier(&buf, "squad");
+    let inactive_modifier = tab_label_modifier(&err_buf, "squad");
     assert!(
         !inactive_modifier.contains(Modifier::REVERSED)
             && !inactive_modifier.contains(Modifier::BOLD),
