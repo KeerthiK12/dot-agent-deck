@@ -174,6 +174,21 @@ pub async fn handle_dispatch(ctx: &DispatchContext, name: &str, task: &str) -> D
             // no user work to protect — and it MUST actually go, or the leftover
             // dir and branch wedge this name for every later dispatch.
             remove_worktree(&paths.worktree_dir, &clone_dir, RemovalPolicy::Force).await;
+            // Also delete the branch: `git worktree remove` never deletes it,
+            // but on this rollback path the agent never ran so there is no
+            // committed work to protect — leaving the branch would wedge this
+            // name for every later dispatch.
+            let _ = run_status(
+                "git",
+                &[
+                    "-C",
+                    &clone_dir.to_string_lossy(),
+                    "branch",
+                    "-D",
+                    &paths.branch,
+                ],
+            )
+            .await;
 
             {
                 let mut wts = ctx.worktrees.lock().unwrap_or_else(|e| e.into_inner());
