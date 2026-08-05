@@ -5,7 +5,7 @@ use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
     RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree, record_worktree,
-    remove_worktree,
+    remove_worktree, run_status,
 };
 use crate::scheduler::StderrNotifier;
 use crate::spawn::{SpawnKind, SpawnRequest, spawn};
@@ -178,7 +178,7 @@ pub async fn handle_dispatch(ctx: &DispatchContext, name: &str, task: &str) -> D
             // but on this rollback path the agent never ran so there is no
             // committed work to protect — leaving the branch would wedge this
             // name for every later dispatch.
-            let _ = run_status(
+            let branch_cleanup_failed = run_status(
                 "git",
                 &[
                     "-C",
@@ -188,17 +188,31 @@ pub async fn handle_dispatch(ctx: &DispatchContext, name: &str, task: &str) -> D
                     &paths.branch,
                 ],
             )
-            .await;
+            .await
+            .is_err();
+
+            if branch_cleanup_failed {
+                tracing::warn!(
+                    branch = %paths.branch,
+                    "spawn rollback: failed to delete branch — name may be wedged for future dispatches"
+                );
+            }
 
             {
                 let mut wts = ctx.worktrees.lock().unwrap_or_else(|e| e.into_inner());
                 wts.remove(&paths.worktree_dir);
             }
 
+            let cleanup_note = if branch_cleanup_failed {
+                " (cleanup failed: branch may still exist — name may be wedged)"
+            } else {
+                ""
+            };
+
             DispatchResult {
                 worktree_dir: paths.worktree_dir,
                 success: false,
-                message: format!("dispatch: spawn failed: {e}"),
+                message: format!("dispatch: spawn failed: {e}{cleanup_note}"),
             }
         }
     }

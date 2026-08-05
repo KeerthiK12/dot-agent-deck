@@ -774,7 +774,7 @@ fn parse_issue_numbers(json: &str) -> Result<Vec<u64>, String> {
 
 /// Run a subprocess that must exit zero; on failure return a message carrying
 /// the program, args, exit status, and any stderr.
-async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
+pub async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
     let output = tokio::process::Command::new(program)
         .args(args)
         .output()
