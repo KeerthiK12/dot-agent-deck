@@ -67,7 +67,7 @@ fn devin_live_001_real_interactive_turn_drives_the_card_live() {
     // before Devin can accept input — keystrokes sent in that window are simply
     // dropped and the turn never starts.
     assert!(
-        deck.wait_for_grid_string_within("Ask Devin", Duration::from_secs(90)),
+        deck.wait_for_grid_string_within("Ask Devin", Duration::from_secs(120)),
         "Devin's interactive UI never became ready in the pane:\n{}",
         deck.snapshot_grid()
     );
@@ -97,7 +97,7 @@ fn devin_live_001_real_interactive_turn_drives_the_card_live() {
 
     // Status is driven entirely by Devin's hooks: UserPromptSubmit -> Thinking.
     assert!(
-        deck.wait_for_grid_string_within("Thinking", Duration::from_secs(120)),
+        deck.wait_for_grid_string_within("Thinking", Duration::from_secs(60)),
         "the card never showed Thinking, so Devin did not run the deck-installed \
          UserPromptSubmit hook:\n{}",
         deck.snapshot_grid()
@@ -107,7 +107,7 @@ fn devin_live_001_real_interactive_turn_drives_the_card_live() {
     // against Devin's actual shape rather than a synthesized one.
     let tool = events.wait_for(
         |event| event.agent_type == AgentType::Devin && event.event_type == EventType::ToolStart,
-        Duration::from_secs(180),
+        Duration::from_secs(45),
     );
     assert_eq!(
         tool.tool_name.as_deref(),
@@ -120,7 +120,7 @@ fn devin_live_001_real_interactive_turn_drives_the_card_live() {
     );
 
     assert!(
-        deck.wait_for_grid_string_within(SENTINEL_NAME, Duration::from_secs(180)),
+        deck.wait_for_grid_string_within(SENTINEL_NAME, Duration::from_secs(60)),
         "the real Devin turn never reported the sentinel file:\n{}",
         deck.snapshot_grid()
     );
@@ -129,7 +129,7 @@ fn devin_live_001_real_interactive_turn_drives_the_card_live() {
     // agent exiting or hanging mid-tool.
     let idle = events.wait_for(
         |event| event.agent_type == AgentType::Devin && event.event_type == EventType::Idle,
-        Duration::from_secs(180),
+        Duration::from_secs(30),
     );
     assert_eq!(idle.agent_type, AgentType::Devin);
 }
