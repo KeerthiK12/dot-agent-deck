@@ -334,6 +334,21 @@ fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
     {
         let mut file = std::fs::File::create(&tmp)?;
+        // Publish with the destination's OWN mode, or owner-only when the file
+        // is new. `File::create` would otherwise apply `0666 & !umask` — 0644
+        // under a typical 022 umask — and the rename below would silently widen
+        // a config the user (or Devin itself) had kept private. Devin ships this
+        // file at 0600 and it holds `devin.org_id`, MCP server entries, and
+        // whatever else the user puts there, so widening it leaks to every local
+        // account.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dest)
+                .map(|meta| meta.permissions().mode() & 0o777)
+                .unwrap_or(0o600);
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         file.write_all(bytes)?;
         file.sync_all()?;
     }
@@ -877,5 +892,57 @@ mod tests {
         )
         .unwrap();
         assert!(!claude_hook_import_conflict(&json!({}), &user_only));
+    }
+
+    /// The atomic publish must never widen the config's permissions. Devin ships
+    /// `config.json` at 0600 and it holds `devin.org_id`, MCP server entries and
+    /// whatever else the user keeps there, so a `File::create` default of 0644
+    /// (under a typical 022 umask) would expose it to every local account the
+    /// first time the deck installed its hooks.
+    #[cfg(unix)]
+    #[test]
+    fn install_never_widens_config_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode_of = |dir: &Path| {
+            std::fs::metadata(config_path(dir))
+                .expect("stat config.json")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        // A config the deck creates itself is owner-only, not umask-dependent.
+        let fresh = tempfile::tempdir().expect("config tempdir");
+        install_to(fresh.path(), "/abs/dot-agent-deck").expect("install");
+        assert_eq!(
+            mode_of(fresh.path()),
+            0o600,
+            "a deck-created Devin config must be owner-only"
+        );
+
+        // An existing owner-only config stays owner-only across install AND
+        // uninstall — both go through the same atomic publish.
+        let existing = tempfile::tempdir().expect("config tempdir");
+        std::fs::write(config_path(existing.path()), br#"{"theme_mode":"dark"}"#).unwrap();
+        std::fs::set_permissions(
+            config_path(existing.path()),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        install_to(existing.path(), "/abs/dot-agent-deck").expect("install");
+        assert_eq!(
+            mode_of(existing.path()),
+            0o600,
+            "install must not widen an owner-only Devin config"
+        );
+
+        uninstall_from(existing.path()).expect("uninstall");
+        assert_eq!(
+            mode_of(existing.path()),
+            0o600,
+            "uninstall must not widen an owner-only Devin config"
+        );
     }
 }
