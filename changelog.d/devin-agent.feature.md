@@ -1,5 +1,0 @@
-## Devin CLI Is Now a First-Class Agent
-
-Devin joins Claude, Codex, OpenCode and the rest as an agent the deck can spawn, track and orchestrate. Devin ships a Claude-Code-compatible hooks engine, so its native command hooks post the same stdin JSON shape Claude does and ride the existing hook socket — no new wire format, and nothing about the TUI↔daemon protocol changes. Devin's badge colour is LightBlue.
-
-The deck installs its hooks into Devin's user config — `$XDG_CONFIG_HOME/devin/config.json` when that variable is set, otherwise `~/.config/devin/config.json` — and auto-installs at daemon startup whenever `devin` is on `PATH`. The install merges into the existing file rather than clobbering it, never widens the file's permissions, and refuses to guess at content it cannot parse: malformed or JSONC config is backed up and the install errors out instead of silently destroying your model, permissions or MCP servers. `dot-agent-deck hooks install --agent devin` and `dot-agent-deck hooks uninstall --agent devin` are the explicit CLI.
