@@ -12,7 +12,7 @@ A user with several orchestration tabs open has no way to tell, without switchin
 
 ## Solution
 
-Color the orchestration tab's label text using the same per-pane status palette already in `src/palette.rs` — no new colors, no new palette module. The color reflects the single highest-priority state among that tab's panes, evaluated in this fixed order (confirmed with the user):
+Color the orchestration tab's label text using the same per-pane status palette already in `src/palette.rs` — no new colors, no new palette module. An **inactive** orchestration tab's label reflects the single highest-priority state among that tab's panes, evaluated in this fixed order (confirmed with the user):
 
 | Priority | State | Color | Notes |
 |---|---|---|---|
@@ -20,11 +20,15 @@ Color the orchestration tab's label text using the same per-pane status palette 
 | 2 | Needs Input | Yellow | `SessionStatus::WaitingForInput` |
 | 3 | Working | Green | `SessionStatus::Working` |
 | 4 | Thinking | Blue | `SessionStatus::Thinking`, and `Compacting` (already aliases to Thinking's color in `palette.rs`) |
-| 5 (lowest) | Idle | DarkGray | `SessionStatus::Idle`, and `Unknown` (already aliases to Idle's color in `palette.rs`) |
+| 5 (lowest) | Idle | *no status color — base tab style* | `SessionStatus::Idle`, and `Unknown` (already aliases to Idle's color in `palette.rs`) |
+
+The resolver still ranks Idle as the lowest priority and still returns it; what changed is that the renderer does not *paint* it. The resulting semantics: **color means "something in here needs attention"**, and a tab with nothing going on looks like an ordinary tab.
 
 Scope decisions, confirmed with the user during PRD creation:
 - **Orchestration tabs only.** Single-pane/mode tabs already show their own status directly and don't need an aggregate signal.
 - **Renders as the tab label's text color** (not a dot/icon prefix, not a border/underline) — consistent with how deck cards already color their status badge text.
+- **The active tab is never tinted** (added during maintainer review — see the Work Log). It renders exactly like an active non-orchestration tab: `REVERSED | BOLD` with no absolute foreground. Reverse video swaps fg/bg, so a status foreground there would become the label's *background* and draw the text in the terminal's background color.
+- **An aggregate that resolves to Idle is not painted grey.** `STATUS_IDLE` is a grey, and PRD #13 removed exactly that pattern from read-critical text in `ui.rs` (it reserves faintness for purely-decorative, non-read elements such as borders). A tab label is text, so the idle case falls through to the base style instead.
 
 ## Decisions
 
@@ -55,3 +59,12 @@ Scope decisions, confirmed with the user during PRD creation:
 ### 2026-08-03 — M1-M4 complete
 
 The aggregate-priority resolver, its wiring into `render_tab_bar_to_buffer`, L1 `insta` snapshot coverage for the priority ordering and aliasing, and the `docs/orchestration.md` note all landed. `tests/render_tab_strip.rs` also gained a real zero-pane orchestration tab case for `layout_004`. Implementation complete.
+
+### 2026-08-06 — maintainer-requested contrast fix (PR #356)
+
+Upstream review on [PR #356](https://github.com/vfarcic/dot-agent-deck/pull/356) found two contrast defects in the M2 wiring, both from stacking an absolute foreground unconditionally. Fixed in `render_tab_strip` by narrowing the status tint to inactive, non-idle tabs; `palette::highest_priority_status` is unchanged.
+
+- **Active tab.** The tint was applied on top of `Modifier::REVERSED`, so the status color became the label's *background* and the text was drawn in the terminal's background color — measured as `fg=DarkGray bg=Reset mod=BOLD|REVERSED` for an active idle tab, against `fg=Reset` for an active plain tab, which has full contrast by construction. The reverse-video cue is deliberate (the comment above the wiring says so), so the fix keeps it and drops the tint.
+- **Idle painted `DarkGray` on read-critical text.** Before this PRD every tab label went through `text_primary()` = `Color::Reset`. Regressing it to a grey is the light-background hazard PRD #13 exists to prevent (near-black on DarkGray is also unreadable for an active tab on a dark theme). Idle now falls through to the base style.
+
+This supersedes an earlier proposal to switch the active tab from `REVERSED` to `BOLD`; that approach was withdrawn.

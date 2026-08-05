@@ -11384,8 +11384,10 @@ struct TabStripRects {
 
 /// PRD #333: `orchestration_statuses[i]` carries tab `i`'s pane statuses
 /// (`Some` for an Orchestration tab, `None` for every tab this feature
-/// doesn't touch) so its label can render in `palette::status_color()` of
-/// the highest-priority status among them.
+/// doesn't touch) so an *inactive* tab's label can render in
+/// `palette::status_color()` of the highest-priority status among them. The
+/// active tab, and any tab whose aggregate resolves to Idle, render in the
+/// ordinary tab style — see the carve-out comment in the loop.
 fn render_tab_strip(
     frame: &mut Frame,
     area: Rect,
@@ -11424,15 +11426,30 @@ fn render_tab_strip(
         } else {
             base_style
         };
-        // PRD #333: an orchestration tab's label takes the color of the
-        // single highest-priority status among its panes instead of the
-        // base label color. Tabs this feature doesn't touch (`None`) are
-        // untouched.
+        // PRD #333: an orchestration tab's label takes the color of the single
+        // highest-priority status among its panes instead of the base label
+        // color, so color means "something here needs attention". Two
+        // carve-outs (maintainer review on PR #356) keep the label readable:
+        //   - the ACTIVE tab is never tinted. Its highlight is `REVERSED`,
+        //     which swaps fg/bg, so an absolute fg would become the label's
+        //     *background* and draw the text in the terminal's background
+        //     color. It renders exactly like an active non-orchestration tab.
+        //   - an aggregate that resolves to Idle (including `Unknown`, which
+        //     `status_color` aliases to it) falls through to the base style
+        //     rather than painting `STATUS_IDLE` (a grey) onto read-critical
+        //     text — the low-contrast-on-light pattern PRD #13 removed from
+        //     `ui.rs`. An idle tab simply looks like an ordinary tab.
+        // Tabs this feature doesn't touch (`None`) are untouched.
         let style = match orchestration_statuses.get(i).copied().flatten() {
-            Some(statuses) => style.fg(palette::status_color(&palette::highest_priority_status(
-                statuses,
-            ))),
-            None => style,
+            Some(statuses) if i != active_index => {
+                let color = palette::status_color(&palette::highest_priority_status(statuses));
+                if color == palette::STATUS_IDLE {
+                    style
+                } else {
+                    style.fg(color)
+                }
+            }
+            _ => style,
         };
 
         // Divider between tabs (not before the first).
