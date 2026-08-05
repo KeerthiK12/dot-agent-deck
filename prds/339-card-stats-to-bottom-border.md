@@ -1,6 +1,6 @@
 # PRD #339: Move card Last/Tools stats into the bottom border
 
-**Status**: Not started
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-08-02
 
@@ -110,12 +110,12 @@ No (CLAUDE.md rule 9 asks the question; the answer here is no). This is a refine
 
 ## Milestones
 
-- [ ] **M1 — Stats move to the bottom border.** `render_session_card` renders `Last`/`Tools` as a bottom-positioned block title; both old branches deleted.
-- [ ] **M2 — Height table collapses.** `card_height` and `choose_density` lose the `wide` parameter; the layout caller stops computing it; `CardDensityKind::rendered_height` and its test callers follow.
-- [ ] **M3 — Narrow-width fallback.** The degradation ladder is implemented as one testable function with unit tests across a width sweep.
-- [ ] **M4 — `Dir` uses full width.** Single un-branched `Dir:` line, ellipsized via `truncate_with_ellipsis`.
-- [ ] **M5 — L1 coverage.** New snapshots pin the bottom-border content at a wide and a narrow card width; `card_height_001_content_derived_values` reduced to three assertions; existing `render_dashboard__pane_00*` snapshots regenerated. Each new `#[spec]` test carries a `/// Scenario:` comment (rule 7) and a `tests/CATALOG.md` entry.
-- [ ] **M6 — Changelog.** Fragment added via `dot-ai-changelog-fragment`. No user-facing docs currently describe the card stats row; confirm before skipping a docs update.
+- [x] **M1 — Stats move to the bottom border.** `render_session_card` renders `Last`/`Tools` as a bottom-positioned block title; both old branches deleted.
+- [x] **M2 — Height table collapses.** `card_height` and `choose_density` lose the `wide` parameter; the layout caller stops computing it; `CardDensityKind::rendered_height` and its test callers follow.
+- [x] **M3 — Narrow-width fallback.** The degradation ladder is implemented as one testable function with unit tests across a width sweep.
+- [x] **M4 — `Dir` uses full width.** Single un-branched `Dir:` line, ellipsized via `truncate_with_ellipsis`.
+- [x] **M5 — L1 coverage.** New snapshots pin the bottom-border content at a wide and a narrow card width; `card_height_001_content_derived_values` reduced to three assertions; existing `render_dashboard__pane_00*` snapshots regenerated. Each new `#[spec]` test carries a `/// Scenario:` comment (rule 7) and a `tests/CATALOG.md` entry.
+- [x] **M6 — Changelog and docs.** Fragment added via `dot-ai-changelog-fragment`. **The original premise here — "no user-facing docs currently describe the card stats row" — turned out to be false**, and review caught it: `docs/session-management.md:25,29` describes the fields and embeds `docs/img/session-management-card.jpg`, which visibly shows `Last: 0s ago  Tools: 14` on the `Dir:` content row. Both the prose and the screenshot need updating, so this is a docs change, not a docs skip.
 
 ## Risks
 
@@ -125,11 +125,44 @@ No (CLAUDE.md rule 9 asks the question; the answer here is no). This is a refine
 
 ## Open Questions
 
-1. Bottom-**right** (mirroring the top-right status badge) or bottom-**left**? Right is the recommendation; either way pin it in a snapshot.
-2. Should the shortened forms keep the `Last:` / `Tools:` labels, or is `2m · 14` self-evident enough at narrow widths given the position is fixed?
-3. Do the counters belong on placeholder ("No agent") cards at all, where `Tools: 0` and an elapsed time carry no information?
+All three are resolved as of 2026-08-02 (see Work Log).
+
+1. ~~Bottom-**right** or bottom-**left**?~~ → **Bottom-right**, confirmed directly by the user against a rendered mockup of both. The rule: volatile live state (the top-right status badge, these counters) hugs the right edge, while identity and content (`Dir:`, `Prmt:`, tool lines) own the left rail. Bottom-right also lands in the whitespace left by ragged-right content lines, whereas bottom-left would crowd the densest part of the card. Pinned in `dashboard/card-stats/001`.
+2. ~~Keep the `Last:` / `Tools:` labels in the shortened forms?~~ → **Labels drop at narrow widths.** The ladder is used verbatim as the PRD drafted it: `Last: 2m  Tools: 14` → `2m · 14 tools` → `2m · 14` → omitted. The position is fixed, so the labels stop earning their columns once space is scarce.
+3. ~~Do the counters belong on placeholder ("No agent") cards?~~ → **Placeholder cards keep exactly the behavior they have today.** Not because `Tools: 0` is informative, but because deciding *whether* a card shows a field is the field-priority ladder question this PRD's Out of Scope section explicitly defers. This PRD changes only *where* the counters render. If placeholder cards show them today they show them in the border now; if they omit them they still omit them.
+
+### Pinned API contract
+
+Fixed up front so the parallel test and implementation work agree:
+
+```rust
+#[doc(hidden)]
+pub fn card_stats_border_label(usable_width: u16, last: &str, tools: usize) -> Option<String>
+```
+
+`usable_width` is `area.width - 2` (the cells between the corner glyphs). The returned string includes one leading and one trailing space, mirroring the ` ● Thinking ` badge, so the title never touches a corner. A form fits when its **display** width (unicode width, not `str::len()` — `·` is multi-byte, one column) is `<= usable_width`; the widest fitting form wins, and `None` means omit the title rather than clip it.
+
+For the reference input (`last = "2m"`, `tools = 14`) the three forms measure **21 / 15 / 9** columns. An earlier draft of this contract stated 22 / 15 / 10 — forms 1 and 3 were each miscounted by one, and the error was caught only when the implementation could not satisfy both the stated widths and the stated predicate. The fix was to keep the predicate and correct the widths.
+
+The predicate is the *sole* fit rule; there are deliberately no per-rung minimum-width floors. Floors were tried and removed, because a floor is stricter than the fit check exactly when `form.width() < min_width` — that is, precisely when a form fits and would be rejected anyway. They add no safety and are wrong for any input other than the one they were calibrated against. Overrun protection comes entirely from the fit check: `last = "1h 5m"` with `tools = 1234` makes form 1 twenty-six columns wide, and the fit check alone degrades it to ` 1h 5m · 1234 tools ` instead of writing over the corner glyphs.
+
+### `format_elapsed` collapses to the compact form
+
+The card was `format_elapsed`'s only caller anywhere in `src/`, `tests/` or `xtask/`. Since the border shows `Last: 2m` rather than `Last: 2m ago` — the PRD's examples were always written that way, and 4 columns are expensive where the narrowest realistic card has 18 usable cells — the ` ago` suffix became dead across the entire codebase, which `cargo clippy -- -D warnings` duly failed on. So `format_elapsed` now returns the compact form directly (`0s`, `1m 30s`, `1h 5m`) and no suffix-stripping or second near-duplicate formatter remains.
+
+`CardDensity::card_height`, `choose_density`, and `CardDensityKind::rendered_height` each simply drop their `wide: bool` parameter.
 
 ## Work Log
+
+### 2026-08-03 — Complete
+
+All six milestones landed. PR [#340](https://github.com/vfarcic/dot-agent-deck/pull/340): CI green (9/9), `cargo test-fast` 1431/1431, `cargo test-e2e` 2791/2791, fmt/clippy clean, `cargo xtask linkage-check` and `cargo xtask docs --tests` both pass. Greptile review settled with 0 inline findings, confidence 5/5. Review raised 11 findings; 9 were fixed here and 2 were declined and filed as follow-ups instead of dropped silently: [#357](https://github.com/vfarcic/dot-agent-deck/issues/357) (`truncate_styled_segments` budgets chars, not display columns), [#358](https://github.com/vfarcic/dot-agent-deck/issues/358) (test-harness credentials left in world-traversable `/tmp` sandbox HOMEs), [#359](https://github.com/vfarcic/dot-agent-deck/issues/359) (repo-wide East-Asian-ambiguous-width policy). Demo reel published: https://youtu.be/W73TozxLd8A.
+
+### 2026-08-02 — Open Questions resolved, implementation started
+
+All three Open Questions answered before any code was written (details inline above). Bottom-right placement was the one put to the user directly, since the current right-alignment is an artifact of sharing the `Dir:` line rather than a deliberate choice — on its own border row the decision was genuinely open. The other two followed from the PRD's own Out of Scope boundary: use the drafted ladder as-is, and do not renegotiate which cards show which fields.
+
+The `card_stats_border_label` contract was pinned up front so the test-writing and implementation passes could proceed against the same signature without coordinating mid-flight.
 
 ### 2026-08-02 — Created
 

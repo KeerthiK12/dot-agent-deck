@@ -72,6 +72,32 @@ enum StreamCmd {
     Detach,
 }
 
+/// PRD #341 M5 — the child-input side of
+/// [`EmbeddedPaneController::for_scroll_seam_with_focused_pane`]: everything the
+/// pane queued for the agent, standing in for the I/O task that would have framed
+/// it as `KIND_STREAM_IN`.
+///
+/// Opaque on purpose — [`StreamCmd`] is a private wire detail, and a test only
+/// needs the flattened bytes.
+#[doc(hidden)]
+pub struct SeamChildInput {
+    rx: tokio::sync::mpsc::UnboundedReceiver<StreamCmd>,
+}
+
+impl SeamChildInput {
+    /// Take every byte queued for the child since the last call, in order.
+    /// `Detach` carries no payload and contributes nothing.
+    pub fn drain_bytes(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = self.rx.try_recv() {
+            if let StreamCmd::Input(bytes) = cmd {
+                out.extend_from_slice(&bytes);
+            }
+        }
+        out
+    }
+}
+
 /// Backing state for a single pane: the PTY lives in the daemon, and this
 /// side owns one [`crate::daemon_client::AttachConnection`]. Bytes flow
 /// daemon → STREAM_OUT → vt100 parser; keystrokes flow vt100 → input
@@ -313,6 +339,36 @@ pub fn parser_init_dims(rows: u16, cols: u16) -> (u16, u16) {
 
 use crate::pane_input::{SUBMIT_DELAY, encode_pane_payload};
 
+/// Placeholder daemon socket path for the render-only constructors below. It
+/// intentionally points at nothing: any spawn/attach against it fails, which is
+/// exactly what a render seam wants.
+fn render_only_socket_path() -> PathBuf {
+    let mut placeholder = std::env::temp_dir();
+    placeholder.push(format!(
+        "dot-agent-deck-render-only-{}.sock",
+        std::process::id()
+    ));
+    placeholder
+}
+
+/// One lazily-built current-thread runtime shared by the render-only
+/// constructors. A [`StreamBackend`] holds a `Handle` even when it owns no task,
+/// and `Handle::current` panics outside a runtime — so a render seam that never
+/// performs I/O still needs one to exist. Built on first use, so a normal run
+/// (which always has a real runtime) never creates it.
+fn render_only_runtime() -> tokio::runtime::Handle {
+    use std::sync::OnceLock;
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("render-only runtime")
+    })
+    .handle()
+    .clone()
+}
+
 /// Embedded terminal pane controller. Spawns agents on the daemon at
 /// [`Self::client`]'s socket path and renders their PTY output through a
 /// local vt100 parser. PRD #93 Phase 2 collapsed the historical
@@ -389,20 +445,202 @@ impl EmbeddedPaneController {
     /// attempt to spawn or attach against it will fail.
     #[cfg(test)]
     pub fn for_render_only_tests() -> Self {
-        use std::sync::OnceLock;
-        static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-        let rt = RT.get_or_init(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime")
-        });
-        let mut placeholder = std::env::temp_dir();
-        placeholder.push(format!(
-            "dot-agent-deck-render-only-{}.sock",
-            std::process::id()
-        ));
-        Self::new(placeholder, rt.handle().clone())
+        Self::new(render_only_socket_path(), render_only_runtime())
+    }
+
+    /// PRD #341 M1 — L1 render-seam constructor: a controller carrying exactly
+    /// ONE focused pane whose vt100 screen has already consumed `bytes`, with no
+    /// daemon behind it.
+    ///
+    /// [`Self::for_render_only_tests`] builds an EMPTY controller, and
+    /// `render_terminal_panes` returns before it touches a cursor when there is
+    /// no pane — so a seam that renders the real pane path needs a pane that
+    /// exists. It is also `#[cfg(test)]`, hence unreachable from the integration
+    /// tests that drive the `pub` L1 seams in `ui.rs`.
+    ///
+    /// The backend is inert by construction: no I/O task, no resize task, and
+    /// the input channel's receiver is dropped, so nothing is spawned, nothing
+    /// reaches a socket, and every input path fails as "detached". Rendering
+    /// only ever reads `screen` / `is_focused` / `name`, which is the whole
+    /// point of the seam. `#[doc(hidden)]`: `pub` because integration tests
+    /// cannot enable a crate feature on demand, not because it is API.
+    #[doc(hidden)]
+    pub fn for_render_seam_with_focused_pane(
+        pane_id: &str,
+        rows: u16,
+        cols: u16,
+        bytes: &[u8],
+    ) -> Self {
+        // The receiver is dropped immediately: an inert backend must not be able
+        // to queue input at an agent that does not exist.
+        let (controller, _child_input) =
+            Self::seam_with_focused_pane(pane_id, rows, cols, bytes, false);
+        controller
+    }
+
+    /// PRD #341 M5 — L1 scroll-seam constructor: the same single-focused-pane
+    /// controller as [`Self::for_render_seam_with_focused_pane`], but with the
+    /// child-input channel KEPT so a test can see exactly which bytes (if any) the
+    /// pane queued for the agent, and with the child's mouse-reporting flag
+    /// settable.
+    ///
+    /// Those two are the whole point: the M5 safety property is "in command mode
+    /// the wheel never reaches the agent's mouse protocol", and the only honest way
+    /// to assert it is to record what the child would have received. Dropping the
+    /// receiver (as the render seam does) would make every write fail as "detached"
+    /// and a forwarding regression would look identical to correct behaviour.
+    #[doc(hidden)]
+    pub fn for_scroll_seam_with_focused_pane(
+        pane_id: &str,
+        rows: u16,
+        cols: u16,
+        bytes: &[u8],
+        mouse_mode_enabled: bool,
+    ) -> (Self, SeamChildInput) {
+        let (controller, rx) =
+            Self::seam_with_focused_pane(pane_id, rows, cols, bytes, mouse_mode_enabled);
+        (controller, SeamChildInput { rx })
+    }
+
+    /// PRD #341 M6 — add ONE more inert seam pane, UNFOCUSED, to a controller
+    /// already built by [`Self::for_scroll_seam_with_focused_pane`].
+    ///
+    /// The M6 scrollback reconcile keys on the `(mode, focused pane id)` PAIR, so
+    /// its most interesting case — focus moving to an already-scrolled OTHER pane
+    /// while `PaneInput` never lifts — cannot be posed against a one-pane
+    /// controller at all. This adds the second pane through the same
+    /// [`Self::seam_pane`] body the constructors use, so there is still exactly one
+    /// place an inert pane is built.
+    ///
+    /// Child mouse reporting is left off: the reconcile never consults
+    /// `mouse_mode`, only `screen`, `is_focused` and `name`. The child-input channel
+    /// comes back for symmetry with
+    /// [`Self::for_scroll_seam_with_focused_pane`] — a caller that wants to prove
+    /// nothing at all reached THIS pane's agent can, and holding it keeps the pane's
+    /// writes from failing as "detached" for the wrong reason.
+    #[doc(hidden)]
+    pub fn add_scroll_seam_pane(
+        &self,
+        pane_id: &str,
+        rows: u16,
+        cols: u16,
+        bytes: &[u8],
+    ) -> SeamChildInput {
+        let (pane, rx) = Self::seam_pane(pane_id, rows, cols, bytes, false, false);
+        self.panes.lock().unwrap().insert(pane_id.to_string(), pane);
+        SeamChildInput { rx }
+    }
+
+    /// PRD #341 (code-review finding 3) — L1 seam constructor: an inert controller
+    /// with **no panes at all**, so [`Self::focused_pane_id`] answers `None`.
+    ///
+    /// That is the state the finding is about — `UiMode::PaneInput` with nothing
+    /// focused, which a vanished reactive pane with no successor really does
+    /// produce — and it cannot be posed against either
+    /// [`Self::for_render_seam_with_focused_pane`] or
+    /// [`Self::for_scroll_seam_with_focused_pane`], both of which focus their pane
+    /// by construction. `for_render_only_tests` builds exactly this controller but
+    /// is `#[cfg(test)]`, hence unreachable from the integration tests that drive
+    /// the `pub` L1 seams in `ui.rs`.
+    #[doc(hidden)]
+    pub fn for_render_seam_without_panes() -> Self {
+        Self::new(render_only_socket_path(), render_only_runtime())
+    }
+
+    /// Shared body of the two L1 seam constructors: one focused pane whose vt100
+    /// screen has already consumed `bytes`, with no daemon behind it.
+    ///
+    /// [`Self::for_render_only_tests`] builds an EMPTY controller, and
+    /// `render_terminal_panes` returns before it touches a cursor when there is
+    /// no pane — so a seam that renders the real pane path needs a pane that
+    /// exists. It is also `#[cfg(test)]`, hence unreachable from the integration
+    /// tests that drive the `pub` L1 seams in `ui.rs`.
+    fn seam_with_focused_pane(
+        pane_id: &str,
+        rows: u16,
+        cols: u16,
+        bytes: &[u8],
+        mouse_mode_enabled: bool,
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<StreamCmd>) {
+        let controller = Self::new(render_only_socket_path(), render_only_runtime());
+        let (pane, input_rx) =
+            Self::seam_pane(pane_id, rows, cols, bytes, mouse_mode_enabled, true);
+        controller
+            .panes
+            .lock()
+            .unwrap()
+            .insert(pane_id.to_string(), pane);
+        (controller, input_rx)
+    }
+
+    /// One inert seam pane: a real vt100 parser that has already consumed `bytes`,
+    /// behind a backend with nothing live in it.
+    ///
+    /// The backend is inert apart from the returned input channel: no I/O task and
+    /// no resize task are spawned, and nothing reaches a socket. Rendering only
+    /// ever reads `screen` / `is_focused` / `name`, and scrolling only ever reads
+    /// `screen` / `mouse_mode`, which is the whole point of the seams.
+    ///
+    /// `rows` / `cols` are caller-controlled on every seam above, and these are
+    /// ordinary `pub` entry points of the release library — so they go through the
+    /// same [`parser_init_dims`] guard the hydration path uses rather than reaching
+    /// `vt100::Parser::new` raw. A zero axis would otherwise build a parser whose
+    /// grid panics on the first byte, and `u16::MAX` square would ask for ~4.3
+    /// billion cells. This is the single construction point for a seam pane, so it
+    /// is the single place the guard has to sit.
+    ///
+    /// Valid dims are not enough on their own: `parser_init_dims` admits a 1-row /
+    /// 1-col parser, and vt100 0.16.2 underflows in `col_wrap` the moment text
+    /// wraps in one that short. The live output path already contains that exact
+    /// bug with [`guarded_parser_feed`], so the seam feeds through the same guard
+    /// and rebuilds the parser at the same geometry on a contained panic — the
+    /// pane then renders blank instead of taking the process down.
+    fn seam_pane(
+        pane_id: &str,
+        rows: u16,
+        cols: u16,
+        bytes: &[u8],
+        mouse_mode_enabled: bool,
+        focused: bool,
+    ) -> (Pane, tokio::sync::mpsc::UnboundedReceiver<StreamCmd>) {
+        let (rows, cols) = parser_init_dims(rows, cols);
+        let mut parser = vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES);
+        if guarded_parser_feed(|| parser.process(bytes)).is_err() {
+            tracing::warn!(
+                rows,
+                cols,
+                "vt100 parser panicked seeding an inert seam pane; rebuilding it empty at the \
+                 same geometry. Known vt100 0.16.2 edge case in a very short pane."
+            );
+            parser = vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES);
+        }
+
+        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
+        // Dropped immediately: an inert backend must not be able to resize an
+        // agent that does not exist.
+        let (resize_tx, _resize_rx) = tokio::sync::watch::channel::<Option<(u16, u16)>>(None);
+
+        let pane = Pane {
+            backend: StreamBackend {
+                agent_id: Arc::new(Mutex::new(String::new())),
+                input_tx,
+                io_task: None,
+                io_state: Arc::new(AtomicU8::new(IO_FINISHED)),
+                runtime: render_only_runtime(),
+                daemon_path: render_only_socket_path(),
+                resize_tx,
+                resize_task: None,
+                lost: Arc::new(Mutex::new(None)),
+            },
+            screen: Arc::new(Mutex::new(parser)),
+            name: pane_id.to_string(),
+            is_focused: focused,
+            command: None,
+            cwd: None,
+            mouse_mode: Arc::new(AtomicBool::new(mouse_mode_enabled)),
+            hyperlinks: Arc::new(Mutex::new(HyperlinkMap::new())),
+        };
+        (pane, input_rx)
     }
 
     /// Access the vt100 screen for a pane (used by the terminal widget for rendering).

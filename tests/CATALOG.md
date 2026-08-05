@@ -52,14 +52,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L1 (ratatui `TestBackend` + `insta`).
 - **Agent:** none.
 - **Asserts:** with three session cards and a `Tab::Dashboard` whose `selected_session_id` points at the second card (`sess-beta`), `ui::sync_and_derive_selection` derives index 1 (not 0); the rendered snapshot shows the `▸` selection marker and highlighted border on the second card while the first and third stay unselected.
-- **Does not assert:** keyboard-driven selection movement (`dashboard/selection/*`); absolute-time clocks (`Last:` is rendered against a fixed test clock).
+- **Does not assert:** keyboard-driven selection movement (`dashboard/selection/*`); elapsed-time rollover behavior (the fixture uses one current instant for all three cards).
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/pane/006 — Card row shows `Dir:` (working directory basename), `Last:` (elapsed since last activity), `Tools:` (tool count), `Prmt:` (latest user prompts).
-- **Layer:** L1.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`).
 - **Agent:** none.
-- **Asserts:** rendered card snapshot has all four labels in order with the supplied fixture data.
-- **Does not assert:** absolute-time clocks (`Last:` is rendered against a fixed test clock).
+- **Asserts:** an over-long working-directory basename renders with all four fields retained; `Dir:` owns the full inner content width and truncates with an ellipsis immediately before the right border, while `Last:` / `Tools:` live in the bottom border. A second 14-column render proves a newline in `abc\ndef` costs no terminal cell, so all six visible prompt cells render as `abcdef` without an ellipsis.
+- **Does not assert:** the card-stats degradation thresholds (covered by `dashboard/card-stats/002` and `/004`); elapsed-time rollovers beyond the fixture's stable one-hour display.
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/pane/007 — A Pi pane's card renders the Pi agent-type identity (PRD #201 M2.2).
@@ -121,6 +121,43 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** a fully-populated session card (3 prompts + 3 tools) rendered at each tier's own `rendered_height` in an 80-column wide viewport has zero blank inner rows between its last content line and the bottom border on Compact, Normal, and Spacious — reserved card height equals rendered content height.
 - **Does not assert:** the exact `card_height` value per tier (covered by `card_height_001_content_derived_values`); the mid-card blank separator line on Normal/Spacious (intentional content, not a trailing row).
 - **Platform coverage:** mac+linux+windows.
+
+#### dashboard/card-stats
+
+##### dashboard/card-stats/001 — A wide card renders its full Last/Tools stats at the bottom-right border.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`).
+- **Agent:** none (synthetic Thinking-session fixture).
+- **Asserts:** a comfortably wide live card right-aligns `Last: 1h  Tools: 14` in its bottom border, and neither counter appears on an inner content row; the complete character buffer is snapshotted. A wide placeholder `No agent` card also retains its full Last/Tools counters in the bottom border.
+- **Does not assert:** narrow-width degradation (covered by `/002` and `/004`); border title colors.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/card-stats/002 — A 20-column card degrades its stats label without damaging border corners.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`).
+- **Agent:** none (synthetic Thinking-session fixture).
+- **Asserts:** with 18 usable bottom-border cells, the card selects `1h · 14 tools`, preserves both bottom corner glyphs, and renders no dedicated stats content row; the complete character buffer is snapshotted.
+- **Does not assert:** widths below the shortest form or the complete transition sweep (covered by `/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/card-stats/003 — Crossing the former 60-column breakpoint is structurally inert.
+- **Layer:** L1 (ratatui `TestBackend`, comparative buffer inspection).
+- **Agent:** none (the same synthetic session rendered on both sides of the old breakpoint).
+- **Asserts:** real Normal-density card renders with 59 and 61 inner columns expose the same `Dir:` / `Prmt:` / `Last:` / `Tools:` labels and keep those labels on the same rows.
+- **Does not assert:** production density selection, because the available L1 render seams require the caller to supply a density; exact horizontal truncation or full-buffer equality, since changing width legitimately changes available text cells.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/card-stats/004 — The stats-label degradation ladder transitions at exact display widths.
+- **Layer:** L1 pure-data unit test over the hidden-public label selector.
+- **Agent:** none.
+- **Asserts:** the reference input selects no label below 9 cells, `2m · 14` from 9, `2m · 14 tools` from 15, and `Last: 2m  Tools: 14` from 21 onward, with both sides of the exact transitions pinned. Property sweeps over `1h 5m`/1234, a six-digit tool count, empty elapsed text, and Unicode/combining text prove every result fits its display-column budget and is the first, widest fitting form.
+- **Does not assert:** ratatui title placement or styling (covered by `/001` and `/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/card-stats/005 — A real interactive Haiku card keeps its height while opening its pane narrows the card and degrades the bottom-border counters. [reel]
+- **Layer:** L2 PTY-attached (the real `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, with recording enabled for a `full-stream.cast`).
+- **Agent:** REAL interactive Claude Code on `claude-haiku-4-5-20251001`, with onboarding/project trust seeded and `--allowedTools Bash`; no `-p`. A second real client on the observer's daemon performs the ordinary Ctrl+N flow and types the prefix-only prompt after Claude's native editor becomes ready; the recorded client observes the live card and later attaches that same daemon pane on demand.
+- **Asserts:** the sentinel response and native Thinking/Working/Idle plus Bash hook prove the genuine spawn → agent → work path; at one fixed 68×16 recording size, the unattached card shows a nonzero, right-aligned full `Last: … Tools: …` label only in its bottom border, then attaching the real pane narrows the dashboard and selects the shorter `… · … tools` rung while preserving `└`/`┘`, the tool count, the `Dir:`/`Prmt:`/`Bash` row offsets, and card height.
+- **Does not assert:** exact Claude prose beyond the discovered sentinel filename; exact elapsed-time text; multiple cards or density changes caused by terminal height.
+- **Platform coverage:** mac+linux.
 
 #### dashboard/selection
 
@@ -1051,6 +1088,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** which gate path fires (SessionStart fast path vs the slow-path fallback) — only that delivery is gated on readiness, not ungated/immediate; the serde round-trip of `seed_prompt` (covered by a coder unit test).
 - **Platform coverage:** mac+linux.
 
+##### tabs/mode/006 — A persistent side pane keeping the default `watch = true` shows its command's output while the command is still running (issue #367).
+- **Layer:** L2.
+- **Agent:** none (fixture whose single mode has one persistent pane running `printf …; sleep 600` under the default watch wrapper).
+- **Asserts:** a sentinel assembled at runtime by the command — so it cannot appear in the command line the pane's shell echoes — is visible in the side pane although the command never exits; the echoed wrapper invocation is gone from the pane, proving the watcher cleared the screen ahead of its first output rather than after process exit.
+- **Does not assert:** the 10s re-run interval; the ordering of interleaved stdout/stderr; the buffer-then-clear internals (covered by `watch::tests` unit tests).
+- **Platform coverage:** mac+linux.
+
 #### tabs/orchestration
 
 ##### tabs/orchestration/001 — Selecting an orchestration on the new-pane form opens one pane per role with the orchestrator's pane in focus.
@@ -1088,21 +1132,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the pane-focus side effect of activating the role; the Dashboard's own restore (covered by `dashboard/selection/008`).
 - **Platform coverage:** mac+linux+windows.
 
-##### tabs/orchestration/006 — `Ctrl+l` toggles an orchestration tab's sidebar/pane-column split between the default 34/66 and a narrower-sidebar 25/75, and back on a second press (PRD #336).
-- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
-- **Agent:** none (`orch-deck` fixture — two stub `cat` roles, no LLM tokens spent).
-- **Asserts:** opening a real orchestration tab renders the pane column's left edge at the default 34%-width boundary; pressing `Ctrl+l` moves that boundary to the narrower-sidebar 25%-width position (sidebar visibly narrows, pane column visibly widens); a second `Ctrl+l` restores the original 34%-width boundary.
-- **Does not assert:** per-tab scoping across multiple open orchestration tabs (out of scope for this entry — PRD #336 scope note); persistence of the toggled state across restart (explicitly out of scope per the PRD); remapping the chord via config.
-- **Platform coverage:** mac+linux.
-
-##### tabs/orchestration/007 — `Ctrl+l` must still forward to a live pane's PTY when the active tab is NOT an orchestration tab.
-- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
-- **Agent:** none (a real interactive `bash --noprofile --norc -i` pane on the Dashboard, no LLM tokens spent).
-- **Asserts:** on a Dashboard (non-orchestration) tab with a live shell pane in PaneInput mode, printing a unique sentinel line then pressing `Ctrl+l` must trigger readline's `clear-screen` binding and remove the sentinel from the rendered grid, proving the raw byte reached the PTY. Pins the PRD #336 scope note that `Action::ToggleOrchestrationSplit` only claims `Ctrl+l` on an orchestration tab — regression coverage for the Greptile P1 finding on PR #342 (the global resolver claimed `Ctrl+l` unconditionally, swallowing it on every other tab).
-- **Does not assert:** the orchestration-tab toggle behavior itself (covered by `tabs/orchestration/006`); Mode-tab or other non-Dashboard tab types (Dashboard is sufficient to prove the missing tab-context check).
-- **Platform coverage:** mac+linux.
-
-##### tabs/orchestration/008 — In a real multi-role orchestration tab under `PaneLayout::Stacked`, non-focused roles render no collapsed title-bar frame, a non-focused role's agent keeps running with its sidebar status transitioning live, and switching focus between roles preserves each role's rendered content with no lost scrollback (PRD #311).
+##### tabs/orchestration/006 — In a real multi-role orchestration tab under `PaneLayout::Stacked`, non-focused roles render no collapsed title-bar frame, a non-focused role's agent keeps running with its sidebar status transitioning live, and switching focus between roles preserves each role's rendered content with no lost scrollback (PRD #311).
 - **Layer:** L2 (PTY-attached, `tests/e2e_orchestration_pane_column.rs`).
 - **Agent:** none (fixture `tests/fixtures/orch-focus-lifecycle`: a 3-role orchestration — `orchestrator` (start), `alpha`, `beta` — each printing a unique sentinel; `beta`'s script additionally self-posts real `SessionStart`/`PreToolUse` hook events via `dot-agent-deck hook --agent claude-code`, resolved to the freshly built test binary, so its sidebar status transitions Idle -> Working while its pane is not the focused/expanded slot).
 - **Asserts:** (a) with `orchestrator` focused/expanded, the settled grid carries no collapsed `Borders::TOP` title-bar frame for either non-focused role (`alpha`, `beta`) — matched by a row that, after trimming only leading blank columns, begins with the bare role name directly followed by border-fill dashes, a pattern only the collapsed-pane block itself can produce; (b) `beta`'s sidebar status card visibly transitions to `Working` purely from its own self-posted hook events while never becoming the focused pane, proving a non-focused role's agent lifecycle (PTY, hook delivery, status) is untouched by the rendering change; (c) driving `j`/`k` (Normal mode) round-trips focus orchestrator -> alpha -> beta -> alpha -> orchestrator, and each role's own sentinel text is visible again once it becomes the expanded pane, proving no lost scrollback or stale fragment across a focus switch.
@@ -2026,21 +2056,7 @@ without depending on the config struct API.
 - **Does not assert:** the full orchestration-tab frame (tab bar, side panes, stats bar); the `ORCHESTRATION_LEFT_PERCENT` width split or `grid_columns` thresholds (out of scope per PRD #147).
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/layout/002 — `Ctrl+l` resolves to a split-toggle `Action` on an orchestration tab, and the toggled geometry is the narrower-sidebar 25/75 split (PRD #336).
-- **Layer:** L1 (pure-data `compute_frame_layout` geometry + `key_action_for_mode`, the `KeyEvent -> Action` seam the live event loop uses; no PTY, no TestBackend render).
-- **Agent:** none.
-- **Asserts:** an orchestration tab's default frame geometry is the fixed 34/66 split (`dashboard_area` / `panes_area` widths); resolving a simulated `Ctrl+l` `KeyEvent` through `key_action_for_mode` with the default keybinding config yields `Some` action; the frame geometry recomputed after the keypress is the narrower-sidebar 25/75 split.
-- **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/orchestration/006`); per-tab scoping across multiple orchestration tabs; the second-press round-trip back to 34/66 (covered by `tabs/orchestration/006`).
-- **Platform coverage:** mac+linux+windows.
-
-##### orchestration/layout/003 — A brand-new orchestration tab spawns its role panes at the default 34/66 split even when another already-open orchestration tab is toggled to the narrow 25/75 split (PRD #336 spawn-order regression).
-- **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
-- **Agent:** none.
-- **Asserts:** dispatch `Action::SpawnPane` to open orchestration tab A at the default split, dispatch `Action::ToggleOrchestrationSplit` to narrow it, then set `ACTIVE_ORCHESTRATION_SPLIT_NARROW` to simulate the render loop syncing it from the now-narrow, still-active tab A (the state a follow-up spawn would observe before the next frame runs); dispatch a second `Action::SpawnPane` to open a brand-new orchestration tab B. B's own `split_narrow` field defaults to `false` (per-tab STATE is correctly isolated); B's role panes' recorded `AgentSpawnOptions::cols` must equal A's initial (default-split) cols, since both tabs were opened untoggled. Catches the case where `orchestration_role_pane_dims` sizes B's role panes using the stale `ACTIVE_ORCHESTRATION_SPLIT_NARROW` thread-local left over from tab A instead of B's own default state.
-- **Does not assert:** the visible rendered grid or a live render-loop resync (the thread-local's post-spawn correction on the next frame is out of scope — this test pins the SPAWN-TIME dims only); mode or dashboard tabs (unaffected by this thread-local).
-- **Platform coverage:** mac+linux+windows.
-
-##### orchestration/layout/004 — In a 7-role orchestration tab with `PaneLayout::Stacked`, the focused pane's rect covers the full pane-column height and no collapsed title-bar frames are drawn for the other 6 roles (PRD #311).
+##### orchestration/layout/002 — In a 7-role orchestration tab with `PaneLayout::Stacked`, the focused pane's rect covers the full pane-column height and no collapsed title-bar frames are drawn for the other 6 roles (PRD #311).
 - **Layer:** L1 (in-process `compute_frame_layout` + `render_frame` driven through a real `ratatui::Terminal<TestBackend>`, via `EmbeddedPaneController::for_render_only_tests()`; no PTY, no subprocess). Lives in `src/ui.rs`'s own `#[cfg(test)]` module (same pattern as `tabs/orchestration/003-005`) because the geometry helpers under test (`pane_stack_rects`, `stacked_expanded_index`, `render_terminal_panes`) are module-private and unreachable from `tests/*.rs`.
 - **Agent:** none (7 synthetic role pane ids, no backing PTYs).
 - **Asserts:** with no pane explicitly focused (so `stacked_expanded_index` falls back to the first role, `orchestrator`), the expanded role's OUTER rect height equals the full pane-column height with no rows ceded to collapsed frames; none of the other 6 roles' pane ids appear anywhere in the rendered grid (i.e. no `Borders::TOP` collapsed title block is drawn for a non-focused pane).
@@ -2492,6 +2508,16 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe plus one short worker turn.
 
+#### devin/live
+
+##### devin/live/001 — A real interactive Devin turn drives the dashboard card live through the deck's own installed hooks. [reel]
+- **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_devin_available` verifies the binary, persisted credentials, and a logged-in account.
+- **Agent:** real interactive `devin` restored into a pane, using the account's default (cheap SWE-family) model with isolated copied credentials, the setup wizard pre-satisfied, workspace trust waived, and `--permission-mode auto`; launch goes through the normal `NativeHooks` seam with no wrapper.
+- **Asserts:** the deck-written `"hooks"` block in Devin's own config is actually read and executed by the third-party binary — a typed prompt produces a Devin-stamped Thinking event and a visible Thinking card, an `exec` ToolStart carrying a non-empty tool detail, the pane showing `devin_live_sentinel_4c81de.txt`, and a Stop-driven Idle.
+- **Does not assert:** exact model phrasing or token usage; hook payload parsing in isolation (covered by the fast-tier `devin_hook_ingestion` tests) or config-merge safety (covered by the `devin_hooks_manage` unit tests).
+- **Platform coverage:** linux+mac (real-agent tier is local-only; `devin_config_dir` is Unix-only by design).
+- **Cost note:** one inference-free `devin auth status` probe plus one short interactive directory-listing turn — measured at roughly 2.7s of agent time. No `--model` is pinned because a free-tier account rejects every explicit model.
+
 #### chain-smoke/claude
 
 ##### chain-smoke/claude/001 — A real Claude Code agent run end-to-end emits hook events that drive the card through Thinking → Working → Idle.
@@ -2744,11 +2770,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### theme/guard
 
-##### theme/guard/001 — No absolute background on any cheaply-seamable surface; selection is cued by the Magenta+BOLD border, not an absolute fill.
+##### theme/guard/001 — No absolute background on any cheaply-seamable surface; command-mode selection is cued by the Magenta+BOLD border, not an absolute fill.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none.
-- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states, (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card is distinguished from the unselected one by a terminal-relative cue (the `▸ ` title prefix and a `Color::Magenta`+BOLD border — the dedicated PRD #155 `selected` accent role, which never reuses a status color or the `focused` cyan) rather than an absolute `selected_bg` fill.
-- **Does not assert:** named-ANSI accents/status colors; the `render_frame` canvas/tab-bar fills (not cheaply reachable through a render seam — guarded by `theme/guard/002`).
+- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states **in command mode** (`UiMode::Normal`), (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card is distinguished from the unselected one by a terminal-relative cue (the `▸ ` title prefix and a `Color::Magenta`+BOLD border — the dedicated PRD #155 `selected` accent role, which never reuses a status color or the `focused` cyan) rather than an absolute `selected_bg` fill.
+- **Does not assert:** named-ANSI accents/status colors; the `render_frame` canvas/tab-bar fills (not cheaply reachable through a render seam — guarded by `theme/guard/002`); the PaneInput de-emphasis of the same accent (PRD #341 M4 — covered by `mode/deck/001`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/guard/002 — `src/ui.rs` carries no forbidden absolute-background patterns (source lint).
@@ -2781,11 +2807,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** pane content/title rendering; the focused/selected pane accents (covered by `theme/palette/004` / `theme/guard/001`).
 - **Platform coverage:** mac+linux+windows.
 
-##### theme/palette/003 — Selected deck-card border is the dedicated `selected` accent (Magenta+BOLD+marker), never a status/focus color.
+##### theme/palette/003 — Selected deck-card border in command mode is the dedicated `selected` accent (Magenta+BOLD+marker), never a status/focus color.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none (one selected live session fixture).
-- **Asserts:** rendering a selected deck card resolves its border to `Color::Magenta` + `Modifier::BOLD` with a `▸ ` title marker, and that this color is neither the working-status green nor the focused-pane cyan — the `selected` role never collides with the status palette or the `focused` accent.
-- **Does not assert:** the status badge (still shows status independent of selection); the absolute-background guard (covered by `theme/guard/001`).
+- **Asserts:** rendering a selected deck card **in command mode** (`UiMode::Normal`) resolves its border to `Color::Magenta` + `Modifier::BOLD` with a `▸ ` title marker, and that this color is neither the working-status green nor the focused-pane cyan — the `selected` role never collides with the status palette or the `focused` accent.
+- **Does not assert:** the status badge (still shows status independent of selection); the absolute-background guard (covered by `theme/guard/001`); the de-emphasised PaneInput strength of the same accent (PRD #341 M4 — covered by `mode/deck/001`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/palette/004 — Focused-pane border is the dedicated `focused` accent (Cyan), distinct from every status and from `selected`.
@@ -2802,6 +2828,139 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** that the inner area / PTY size is unaffected by the border weight (`BorderType` never feeds `Block::inner`, and the PRD #84 invariant-3 contract assert covers a regression there); the bottom-bar and hint-string mode cues (covered by the PRD #241 M4 button-bar specs); the status-less focused pane's dim fallback.
 - **Platform coverage:** mac+linux+windows.
 
+
+### Mode indication (PRD #341)
+
+#### mode/cursor
+
+##### mode/cursor/001 — The painted terminal cursor appears only while pane input is active.
+- **Layer:** L1 (in-process `TerminalWidget` rendered into a `ratatui::buffer::Buffer`; no PTY, no subprocess).
+- **Agent:** none (one focused vt100 fixture rendered twice).
+- **Asserts:** with `input_active=true`, the known cursor cell retains today's exact black-on-`LightGreen` bold block styling; with `input_active=false`, the same cell is styled identically to its neighbouring non-cursor cells and carries no cursor modifier, so command mode renders no painted cursor of any kind.
+- **Does not assert:** the terminal emulator's own cursor (covered by `mode/cursor/002`); pane-border mode styling (covered by `theme/palette/005`).
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/cursor/002 — The terminal emulator cursor is hidden in command mode.
+- **Layer:** L1 (ratatui `TestBackend` frame rendering through the production focused-pane path; no PTY subprocess).
+- **Agent:** none (one in-memory focused pane fixture).
+- **Asserts:** the same focused-pane frame requests a visible terminal cursor in `UiMode::PaneInput` and no terminal cursor in `UiMode::Normal`, proving command mode skips `Frame::set_cursor_position`.
+- **Does not assert:** painted cursor-cell styling (covered by `mode/cursor/001`); cursor shape; unfocused panes; modal input cursors outside the terminal-pane path.
+- **Platform coverage:** mac+linux+windows.
+
+#### mode/chip
+
+##### mode/chip/001 — The bottom bar persistently names the current mode.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, rendered through `render_button_bar_for_mode_to_buffer` and the live `render_bottom_bar` path).
+- **Agent:** none.
+- **Asserts:** command mode begins with ` COMMAND ` and PaneInput begins with ` TYPING `; both chips use `Modifier::REVERSED | Modifier::BOLD`, carry no `Color::Rgb`, and the snapshot pins the complete production bar in both modes.
+- **Does not assert:** behavior after clicking the adjacent destination button; narrow-width wrapping; banner or pane-dimming behavior.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/chip/002 — The current-mode chip is universal and coexists with the destination button.
+- **Layer:** L1 (ratatui `TestBackend` through the production global-only and context-rich bottom-bar paths).
+- **Agent:** none.
+- **Asserts:** Dashboard, Mode, and Orchestration contexts place the chip at the same left-edge position; command mode shows ` COMMAND ` with `[Back to Pane Ctrl+D]`, while PaneInput shows ` TYPING ` with `[Command Mode Ctrl+D]`, so the current-state label never replaces the destination affordance.
+- **Does not assert:** click dispatch for the destination button; exact spacing after the chip; context-specific buttons after the universal prefix.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/chip/003 — Narrow mode chips disappear symmetrically without changing the bar's row budget.
+- **Layer:** L1 (ratatui `TestBackend` through the production bottom-bar renderer; no PTY or subprocess).
+- **Agent:** none.
+- **Asserts:** across every width 0–24, ` COMMAND ` is present if and only if ` TYPING ` is present, both are absent below the shared 10-column threshold and present at or above it, and Normal/PaneInput/Filter/Rename rendering never panics; the command bar's reserved and rendered rows remain 11/5/3/2/1 at widths 19/40/80/120/200.
+- **Does not assert:** click dispatch, exact button placement within each wrapped row, or full-frame card geometry (covered by `render/layout/004`).
+- **Platform coverage:** mac+linux+windows.
+
+#### mode/banner
+
+##### mode/banner/001 — A fresh command-mode entry dims only the focused pane and centres the full block banner without erasing agent output.
+- **Layer:** L1 (in-process production focused-pane renderer through a `TestBackend`-backed buffer seam plus `insta` style-aware capture).
+- **Agent:** none (one synthetic vt100 pane rendered focused in command mode and PaneInput, then unfocused in command mode).
+- **Asserts:** a roomy focused command pane selects the full block-letter tier, centres its REVERSED block region and `Ctrl+D to type` subtitle, retains readable underlying agent output, and applies DIM throughout the inner area except where the banner overlays it; the same focused PaneInput pane and an unfocused command pane have neither banner nor DIM, and no rendered cell uses `Color::Rgb`.
+- **Does not assert:** timed decay or input-driven collapse (covered by `mode/banner/003`); narrow fallback geometry (covered by `mode/banner/002` and `/004`); terminal-specific visual support for DIM or the live binary path (M6 L2 scope).
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/banner/002 — The narrow-pane fallback ladder is pure, monotonic, safe, and always fits.
+- **Layer:** unit/L1 (pure `command_banner_tier(width, height)` width/height sweep; no renderer, PTY, or subprocess).
+- **Agent:** none.
+- **Asserts:** all five tiers own a reachable size band in the documented order; 0×0, 1×1, very-wide/one-row, and very-tall/three-column areas safely omit; every selected tier reports rendered dimensions within the available inner area; increasing either dimension never selects a lower tier.
+- **Does not assert:** glyph shapes, centring, modifiers, or clipping in the actual buffer (covered by `mode/banner/001` and `/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/banner/003 — Banner decay is deterministic, asymmetric for bound versus unbound keys, and re-arms on every entry.
+- **Layer:** L1 state-machine unit using an injected `Instant`; no sleep, PTY, or subprocess.
+- **Agent:** none.
+- **Asserts:** the named TTL is 2.5 seconds; fresh entry is expanded until the TTL and collapsed at expiry; a command-mode Action and a bottom-bar click collapse early; an unbound printable holds the banner before decay and re-asserts it with a fresh clock after collapse; leaving hides/clears it and re-entry expands it again.
+- **Does not assert:** command keybinding resolution itself; rendering or persistent DIM (covered by `mode/banner/001` and `/004`); wall-clock scheduling in the 16ms live loop.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/banner/004 — Every degraded and collapsed banner state stays inside the focused pane.
+- **Layer:** L1 (production pane render seam under `catch_unwind` at tier-boundary sizes plus `insta` text/style capture).
+- **Agent:** none (synthetic vt100 content in small-but-valid focused panes).
+- **Asserts:** nonempty 0×0, 1×1, 2×2, 1×40, and 40×1 pane renders do not panic and return the exact requested buffer size; all three release-exposed controller seam paths resolve a single axis just above `PTY_RESIZE_DIM_MAX` to the safe 24×80 parser fallback; tiers 2–4 render their exact block-COMMAND, full reversed line, and reversed word fallbacks entirely inside the inner area; tier 5 omits safely; all valid bordered sizes retain DIM and avoid `Color::Rgb`; after decay the pane stays dim/readable with no banner while the bottom bar still carries the persistent ` COMMAND ` chip.
+- **Does not assert:** the full tier-1 banner (covered by `mode/banner/001`); the transition rules that produce Collapsed (covered by `mode/banner/003`); M6 PTY/real-agent behavior.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/banner/005 — Same-drain mode edges preserve the command banner's real key semantics.
+- **Layer:** L1 (in-process production `handle_key_event` burst observer with no render between keys; no PTY or subprocess).
+- **Agent:** none (one inert focused pane).
+- **Asserts:** a queued double-`Ctrl+D` burst traverses Normal → PaneInput → Normal and re-expands the banner; `Ctrl+D` then bound `Ctrl+T` from PaneInput lands Normal → Normal and stays Collapsed; single bound `Ctrl+T`, bound-then-unbound-printable, and single PaneInput exit control rows retain their distinct Collapsed/Expanded outcomes, with the before-burst visibility pinned for every case.
+- **Does not assert:** mouse bursts, wall-clock TTL expiry (covered by `mode/banner/003`), or rendered banner geometry.
+- **Platform coverage:** mac+linux+windows.
+
+#### mode/deck
+
+##### mode/deck/001 — The selected deck-card accent is full-strength only in command mode.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, colour-and-modifier-aware card capture through the production renderer).
+- **Agent:** none (one synthetic selected Working session rendered in both modes).
+- **Asserts:** command mode remains byte-identical to the legacy selected-card rendering and carries Magenta+BOLD+`▸ `; PaneInput keeps `▸ ` but has a different, de-emphasised border style where BOLD is absent and/or DIM is present; neither rendering contains `Color::Rgb`; the snapshot pins both styled cards.
+- **Does not assert:** unselected-card styling; focused terminal-pane styling; a single mandated de-emphasis recipe beyond the property that it drops BOLD and/or adds DIM.
+- **Platform coverage:** mac+linux+windows.
+
+#### mode/scroll
+
+##### mode/scroll/001 — Focused agent-pane wheel routing obeys the full mode × child-mouse matrix.
+- **Layer:** L1 (in-process synthetic pane with real vt100 scrollback and a recording child-input channel; no PTY subprocess).
+- **Agent:** none (one in-memory focused pane with synthetic history).
+- **Asserts:** PaneInput forwards a wheel report only when the child has mouse reporting enabled and otherwise moves dot-agent-deck scrollback; command mode moves dot-agent-deck scrollback for both child-mouse states and emits no mouse-protocol bytes, explicitly pinning the Normal+mouse-enabled safety cell.
+- **Does not assert:** wheel-down direction (the same production route receives a direction parameter); side-pane hit-testing, which already works in every mode; real terminal mouse-report decoding.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/scroll/002 — PageUp/PageDown provide a remappable command-mode keyboard equivalent for focused agent-pane scrollback.
+- **Layer:** L1 (in-process production keybinding resolution plus synthetic focused-pane scroll observation).
+- **Agent:** none (one in-memory focused pane with synthetic history).
+- **Asserts:** the default PageUp/PageDown bindings move focused-agent scrollback away from/toward live output in `UiMode::Normal` without writing to the child; `[dashboard] scroll_pane_up` and `scroll_pane_down` remaps parse without warnings, disable the old defaults, and move scrollback on their replacement chords.
+- **Does not assert:** PaneInput key forwarding; help-overlay or bottom-bar discoverability; filesystem loading of `keybindings.toml`.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/scroll/003 — PaneInput snaps newly targeted panes back to live output without disabling deliberate scrolling.
+- **Layer:** L1 (in-process two-frame reconcile through two real synthetic vt100 panes; no PTY subprocess).
+- **Agent:** none (two in-memory panes with synthetic history and production focus changes).
+- **Asserts:** command-mode scrollback is nonzero before entering PaneInput and zero afterward; an unchanged PaneInput target deliberately retains its offset; moving PaneInput focus snaps only the newly targeted second pane while leaving the first at live output; an unchanged command-mode target deliberately retains its offset. Every case pins both pre- and post-reconcile offsets for both panes.
+- **Does not assert:** hardware-cursor rendering after the reset (covered by `mode/live/002`); key dispatch for entering PaneInput; real-agent output.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/scroll/004 — PaneInput without a focused pane settles in command mode exactly once.
+- **Layer:** L1 (in-process two-frame production scrollback reconcile plus command-banner edge observer with injected `Instant`s; no PTY or subprocess).
+- **Agent:** none (a controller with no panes).
+- **Asserts:** a no-focus PaneInput frame lands in Normal with an Expanded banner, remains Normal on the next frame, and reports Collapsed exactly at the TTL so the entry instant was not re-stamped; equal frame instants remain Expanded, and an already-Normal initial mode produces the identical idempotent result.
+- **Does not assert:** how focus vanished, focus replacement policy when another pane exists, rendered banner geometry, or real-agent behavior.
+- **Platform coverage:** mac+linux+windows.
+
+#### mode/live
+
+##### mode/live/001 — A real PTY-attached deck keeps the persistent mode chip after the command banner collapses.
+- **Layer:** L2 PTY (the real `dot-agent-deck` binary in the isolated `TuiDeck` harness, asserted on the rendered vt100 grid and terminal attributes).
+- **Agent:** none (synthetic `printf; sleep` stand-in pane).
+- **Asserts:** Ctrl+D enters command mode with readable DIM pane content, the expanded banner, and the left-anchored ` COMMAND ` chip; the bound `j` action collapses the banner without removing the chip or content; Ctrl+D returns to a banner-free ` TYPING ` chip.
+- **Does not assert:** a genuine agent boot or agent response; real-agent cursor and scroll behavior (covered by `mode/live/002`); exact block-glyph shapes or subtitle position.
+- **Platform coverage:** mac+linux.
+
+##### mode/live/002 — A real interactive Haiku agent visibly traverses typing, command-mode reading and scrollback, then typing again. [reel]
+- **Layer:** L2 PTY (the real `dot-agent-deck` binary in the isolated `TuiDeck` harness, asserted on the rendered vt100 grid and terminal attributes; flaky-tolerant pre-PR real-agent tier).
+- **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`, `--ax-screen-reader`, `--allowedTools Bash Read`, no `-p`), with isolated imported credentials plus onboarding/project trust seeded in the per-test HOME; the supported accessibility renderer keeps genuine interactive output in terminal scrollback instead of repainting it out of the vt100 history.
+- **Asserts:** the live prompt accepts typed keystrokes and exposes both cursor channels with ` TYPING `; the submitted prefix-glob directive makes Haiku inspect and visibly list a uniquely named fixture sentinel; Ctrl+D hides the hardware cursor and removes the painted block while retaining readable DIM output, the expanded banner, and ` COMMAND `; wheel-up reveals older real-agent filename output through deck scrollback rather than the child mouse path; Ctrl+D restores the cursor treatment and ` TYPING `.
+- **Does not assert:** exact model prose, tool-call wording, response timing, pixel-level DIM appearance, light-versus-dark terminal rendering, or command-mode indication on all three tab types (covered at L1 by the mode suites and manually validated across tabs).
+- **Platform coverage:** mac+linux.
 
 ### Scheduled tasks (PRD #127)
 

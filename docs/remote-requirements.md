@@ -53,6 +53,8 @@ The daemon and a single agent are lightweight. Disk is dominated by the project'
 
 If you run in a network-restricted environment, allowlist only the specific destinations your agents and toolchains use rather than allowing wide-open outbound; the destinations vary per project.
 
+If the remote *cannot* be given access to a destination your laptop can reach — an internal git host behind a corporate VPN, say — see [Reaching networks only your laptop can see](remote-recipes.md#reaching-networks-only-your-laptop-can-see) for how to lend the remote your laptop's access over a reverse tunnel.
+
 **Inbound (required):** SSH only (port 22 by default), reachable from the laptop running the deck client. The daemon itself does not listen on any TCP port — it serves a Unix domain socket on the remote, and hooks reach it over localhost.
 
 No other inbound ports are required.
@@ -68,7 +70,7 @@ The host must have:
 
 **AI agent runtime.** The deck launches AI agents but does not bundle them — the agent and its runtime must already be on the host, otherwise the deck has nothing to spawn. You need:
 
-- The agent CLI itself. Claude Code, OpenCode, Pi, and Codex have first-class event/status support in the deck today. Other agents may work if their CLI follows the same PTY pattern, but those four are the ones with first-class event support.
+- The agent CLI itself. Claude Code, OpenCode, Pi, Codex, and Devin have first-class event/status support in the deck today. Other agents may work if their CLI follows the same PTY pattern, but those five are the ones with first-class event support.
 - The runtime that agent depends on (e.g. Node.js for npm-distributed agents like Claude Code).
 - The agent's API credentials available in the user's environment (e.g. `ANTHROPIC_API_KEY` for Claude Code).
 
@@ -78,6 +80,7 @@ Install hints (pick whichever agent you use; install only what you need):
 - OpenCode: `npm install -g opencode-ai` (requires Node.js).
 - Pi: `npm install -g @earendil-works/pi-coding-agent` (requires Node.js).
 - Codex: `npm install -g @openai/codex` (requires Node.js).
+- Devin: follow the [Devin CLI install instructions](https://devin.ai/support) (the `devin` binary must be on `PATH`).
 - Other agents: follow the agent's own install instructions.
 
 The deck does not prescribe a specific agent or pin a specific install method — install whichever supported agent you plan to run, by whichever method that agent's documentation recommends.

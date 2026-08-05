@@ -1,0 +1,10 @@
+---
+source: tests/mode_indication.rs
+expression: "format!(\"COMMAND MODE\\n{}\\n\\nPANE INPUT\\n{}\", buffer_to_text(&command),\nbuffer_to_text(&typing))"
+---
+COMMAND MODE
+ COMMAND  [Back to Pane Ctrl+D] [New Pane Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?] [Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Scheduled Tasks s]
+
+
+PANE INPUT
+ TYPING                                                                                                                                                                            [Command Mode Ctrl+D]

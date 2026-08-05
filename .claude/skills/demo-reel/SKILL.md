@@ -90,44 +90,80 @@ Stitch-only runs (no `--publish`) do **not** require any credentials. The one-ti
 
 For each manifest entry, in order:
 
-1. **Card.** A synthetic asciinema cast paints the **bold title** and the
-   **dim, word-wrapped, block-centered description** as terminal text, declared
-   at the entry's terminal geometry (a `.cast` clip's own `cols`/`rows`; a
-   sensible default for a `gif`/`mp4`). It is rendered through the **same `agg`
-   invocation** (theme, font, size, fps) as the clips, so the card is
-   pixel-identical to a `.cast` clip by construction. The card's **hold**
-   duration is a **flat `CARD_HOLD` seconds** (default **4s**,
-   env-overridable), independent of how much text the card carries: a fixed,
-   deliberately short hold keeps the reel moving, and a viewer who wants to read
-   a long description pauses the video rather than the reel parking on every
-   long card. (The description's rendered line count still drives the card
-   **grid height** so long text doesn't clip — only the hold stopped depending
-   on it.) The hold is enforced at the
-   **ffmpeg** level — a single painted still
-   is frozen from the rendered card and looped to *exactly* the hold duration —
-   so it is decoupled from `agg`'s idle handling (which would otherwise collapse
-   the static tail to a couple of seconds).
+1. **Card.** A synthetic asciinema cast paints the **bold bright-cyan title** and a
+   **bright-white, left-aligned, vertically-centered description** as terminal
+   text, on the engine's own fixed `CARD_COLS`x`CARD_ROWS` grid (84x20 — shaped
+   ~16:9 in character cells so a card **fills** the output canvas rather than
+   letterboxing inside it). `CARD_ROWS` is a *minimum*: a long description grows
+   the grid taller and the font shrinks to match, so text scales instead of
+   clipping. The card's **hold** duration is a **flat `CARD_HOLD` seconds**
+   (default **4s**, env-overridable), independent of how much text the card
+   carries: a fixed, deliberately short hold keeps the reel moving, and a viewer
+   who wants to read a long description pauses the video rather than the reel
+   parking on every long card. The hold is enforced at the **ffmpeg** level — a
+   single painted still is frozen from the rendered card and looped to *exactly*
+   the hold duration — so it is decoupled from `agg`'s idle handling (which would
+   otherwise collapse the static tail to a couple of seconds).
 2. **Clip.** A `.cast` is first **re-timed** (`retime.sh` rewrites its event
-   timestamps for a watchable cadence — see below), then rendered with that same
-   `agg` invocation; a pre-rendered `gif`/`mp4` is used as-is (no re-timing).
+   timestamps for a watchable cadence — see below), then rendered through `agg` at
+   its **recorded terminal grid**; a pre-rendered `gif`/`mp4` is used as-is (no
+   re-timing).
+
+Both are rendered at an `agg` **font size fitted to the output canvas**, not a
+fixed one. A terminal grid carries no pixel size of its own, so choosing the font
+is how the engine gets glyphs rasterized *at* output resolution: a 68x16 cast at
+font 16 is only 674x381, which on a 1080p canvas is a ~2.8x upscale of already-
+rasterized text (mush); at the fitted font (45) it renders 1896x1071 and stays
+sharp. Set `CLIP_FONT_SIZE` / `CARD_FONT_SIZE` to pin a font and skip the fit.
 
 ## Clip re-timing
 
 e2e casts are recorded at machine speed, so their raw timeline is unwatchable: a keypress and the full repaint it triggers land within a millisecond of each other, while short real waits (daemon startup, polling, debounce) sit between them. A single global `agg --speed` cannot fix this — slowing everything stretches the waits into dead air and still cannot spread coincident events apart. So before rendering, every `.cast` clip is passed through `retime.sh`, which rebuilds the timeline from the event payloads (rendering then runs at `CLIP_SPEED` 1.0):
 
-- **Classification is by output-payload size.** A terminal UI like ratatui emits a *minimal diff* per keypress (a typed char is a small payload) but a *full-region repaint* for an operation (opening a deck/form/pane is a large payload). Events at or below `SIZE_THRESHOLD` bytes are typed chars; larger ones are operations. In this repo's real casts char diffs top out at ~48 bytes and the smallest operation repaint is ~106 bytes — a clean, wide gap straddled by the default threshold (80).
-- **Typing** chars are each given their own step `TYPE_GAP` apart, so typing replays at a natural, readable speed.
-- **Operations** are held `OP_HOLD` after the repaint so the new state is actually visible; consecutive large chunks within `COALESCE_GAP` of each other are one logical repaint and are coalesced into a single step.
-- **Idle** waits (an original gap at/above `IDLE_THRESHOLD`) are clamped to `IDLE_CAP`, killing dead air while still reading as a pause.
-- `agg`'s static last-frame hold is left intact, so the final state lingers.
+**The contract:** the re-timer *re-distributes* time, it does not manufacture it. Time reclaimed from dead air is re-spent holding operations, so the output totals about `max(MIN_BUDGET, the input duration)` — and never more than `max(MIN_BUDGET, MAX_STRETCH × input)`, which is a hard ceiling that compresses everything proportionally if the base gaps alone would exceed it. When there is no dead air to reclaim, nothing is held and the clip plays at roughly real time. No cast can come out as a slideshow.
 
-`retime.sh` is repo-agnostic (it operates on any `.cast`) and standalone (`retime.sh [INPUT.cast] [--out OUT.cast]`, reading stdin / writing stdout by default). Its tunables are env-overridable, like the engine's `CLIP_SPEED` (sizes in bytes, everything else in seconds): `SIZE_THRESHOLD` (80), `TYPE_GAP` (0.1), `OP_HOLD` (1.4), `IDLE_CAP` (0.4), `IDLE_THRESHOLD` (0.3), `COALESCE_GAP` (0.05). `CLIP_SPEED` (default 1.0) remains as a global multiplier layered on top of the re-timer for the rare clip that wants a uniform nudge.
+Two measured worked examples. A 28.7s cast of a real agent working, already smoothly paced (no gap over 0.03s), comes out at 32.3s — **1.12×**, essentially unchanged. A synthetic cast of 6 repaints separated by 3s waits — 15s that is almost entirely dead air — comes out at **7s**, with each repaint held the full `OP_HOLD` 1.4s: the waits are gone, every operation is now visible, and the whole thing is *shorter* than the original.
 
-Every segment is then **normalized** (`ffmpeg scale` + `pad`) to one common resolution — the max across all segments — at a constant fps and `yuv420p`, so the segments share resolution/fps/pixfmt. This is the safety net for any clip recorded at a different terminal size. The normalized segments are concatenated into a single uniform video stream (`reel.mp4` by default).
+Each event is classified into one of **three** kinds, by payload **size** *and* **content**:
+
+- **op** — a payload **larger** than `SIZE_THRESHOLD` bytes is a full-region repaint (opening a deck/form/pane). Consecutive large chunks within `COALESCE_GAP` of each other are one logical repaint and are coalesced into a single step. An op is **held** after the repaint (up to `OP_HOLD`) so the new state is actually visible — *budget permitting*.
+- **type** — a small payload that actually **prints** something is a typed character (ratatui emits a minimal diff per keypress). Each gets its own step, at least `TYPE_GAP` apart, so typing replays at a readable speed.
+- **tick** — a small payload that prints **nothing**: pure control sequences (SGR reset, show-cursor, cursor-position). That is the render loop's per-frame tail, not a keystroke, so it keeps its **original** gap (clamped to `IDLE_CAP`) and is never spread.
+
+Any single gap is clamped to `IDLE_CAP`, which is what kills dead air while still reading as a pause. `agg`'s static last-frame hold is left intact, so the final state lingers.
+
+> **Why content and not size alone.** PRD #339's published reel turned a 15.5s cast into a **161s** video (10.4×), and the classifier is why: it called *every* small payload a keystroke. A ratatui render loop emits a per-frame tail of `SGR-reset + show-cursor + cursor-position` that prints nothing at all, and those tails are the overwhelming majority of a cast's events — so each was given its own 100ms "typed char" step, and each coalesced repaint was then *unconditionally* held 1.4s on top. Re-measured on that test's replacement recording (28.7s, 1621 events: **1565 ticks**, 44 real typed chars, 12 repaints), the old re-timer produces **172.4s** — 1609 × 0.1s of fabricated typing cadence, which is ~93% of the total — while the new one produces **32.3s**. Both failure modes are closed: `tick` events are no longer mistaken for typing, and `OP_HOLD` is granted only out of reclaimed slack under the duration budget.
+
+`retime.sh` is repo-agnostic (it operates on any `.cast`) and standalone (`retime.sh [INPUT.cast] [--out OUT.cast]`, reading stdin / writing stdout by default). Its tunables are env-overridable, like the engine's `CLIP_SPEED` — `SIZE_THRESHOLD` (80) is in bytes, `MAX_STRETCH` (1.6) is a ratio, everything else is in seconds: `TYPE_GAP` (0.1), `OP_HOLD` (1.4, a *maximum* now), `IDLE_CAP` (0.4), `MIN_BUDGET` (8), `COALESCE_GAP` (0.05). (`IDLE_THRESHOLD` is gone — every gap is simply clamped to `IDLE_CAP`, so there is no separate "is this a real wait" threshold.) `CLIP_SPEED` (default 1.0) remains as a global multiplier layered on top of the re-timer for the rare clip that wants a uniform nudge; note that it multiplies duration *outside* the re-timer's budget.
+
+## Output canvas
+
+Every segment is then **normalized** (`ffmpeg scale` + `pad`) to one common resolution at a constant fps and `yuv420p`, so all segments share resolution/fps/pixfmt and concat into a single uniform stream (`reel.mp4` by default).
+
+That resolution is a **fixed, landscape 16:9 canvas** — `REEL_W`x`REEL_H`, default **1920x1080**, a normal laptop screen — and is deliberately *not* derived from the segments. It used to be the per-axis max across every native segment, which silently produced a canvas whose aspect ratio belonged to **neither** a card nor a clip: PRD #339's reel took its **width** from the card (1140) and its **height** from a portrait 60x50 clip (1142), came out 1140x1142, and showed the terminal in a ~585px centre strip with black bars either side.
+
+Segments are **fit** into the canvas (scale preserving aspect, then pad) and are **never cropped** — cropping a terminal would cut off content. So the canvas fixes the *frame*, but how much of it a clip *fills* remains a property of the recording:
+
+- A **~16:9 cast fills it nearly edge to edge.** In character cells that is roughly **4x as many columns as rows** (a cell is about 1:2.3), e.g. 68x16 or 200x50.
+- A **portrait cast can only ever occupy a centre strip.** A 60x50 terminal is 0.52:1 against a 1.78:1 canvas and covers ~29% of the frame — no engine setting can fix that; it has to be re-recorded.
+
+The engine **warns** (non-fatally, per segment) when a clip's aspect is more than `ASPECT_TOLERANCE` (1.35) off the canvas, naming the percentage of the frame it will actually cover.
+
+## Checks the engine runs for you
+
+Every run reports these to stderr, so a bad artifact is visible *before* it is published rather than after someone watches it. All are non-fatal — the engine's job is to render what it was given — but each one names a specific thing to fix:
+
+| Check | What it catches |
+| --- | --- |
+| **Cast integrity** — a cursor-position escape (`ESC[row;colH`, `ESC[colG`) addressing a column beyond the cast header's `width` | The terminal was **resized mid-recording**. asciinema v2 stores **one** fixed size in its header and has **no resize event**, so the recorder writes the *final* size and every earlier, wider frame hard-wraps into garbage on replay. This is exactly what made PRD #339's clip unreadable (column 68 in a 60-column header). Re-record at one fixed size. |
+| **Re-timing ratio** — `clip N: re-timed 15.5s -> 24.5s (1.58x)` | A clip being stretched. The ratio is bounded by `MAX_STRETCH`, so anything wildly larger means a tunable (or `CLIP_SPEED`) was overridden into producing a slideshow. |
+| **Aspect** — a segment more than `ASPECT_TOLERANCE` off the canvas | A recording that will letterbox badly, with the percentage of the frame it will actually cover. |
+
+Still worth doing by eye before publishing: **extract a frame and look at it** (`ffmpeg -ss <t> -i reel.mp4 -frames:v 1 -update 1 frame.png`). No automated check substitutes for seeing the thing.
 
 ## Local smoke test
 
-A re-runnable smoke builds a reel from a tiny self-contained fixture (two hand-written `.cast` clips + a manifest under `.claude/skills/demo-reel/tests/fixtures/`) in **stitch-only** mode (no network, no credentials) and asserts the result with `ffprobe`: non-empty file, exactly one video stream at the expected resolution (a single stream proves there is no resolution/fps/pixfmt seam between segments), `yuv420p`, constant `30/1` fps, and a duration at least the sum of the per-card holds. It is **local-only** (never CI):
+A re-runnable smoke builds a reel from a tiny self-contained fixture (two hand-written `.cast` clips + a manifest under `.claude/skills/demo-reel/tests/fixtures/`) in **stitch-only** mode (no network, no credentials) and asserts the result with `ffprobe`: non-empty file, exactly one video stream at the expected resolution (a single stream proves there is no resolution/fps/pixfmt seam between segments), `yuv420p`, constant `30/1` fps, and a duration **between** the sum of the per-card holds and the engine's own upper bound on it (card holds + each clip's re-timing budget + a small per-clip allowance for `agg`'s trailing hold). That upper bound is the regression guard for the 10.4x stretch above. It is **local-only** (never CI):
 
 ```sh
 task reel-smoke

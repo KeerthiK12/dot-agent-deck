@@ -37,14 +37,14 @@ Native Windows is [coming soon](https://github.com/vfarcic/dot-agent-deck/issues
 
 Once the dashboard is running, press `?` inside the app to see all shortcuts. The dashboard is also fully mouse-clickable: a button bar along the bottom exposes the main commands (each labelled with its keyboard shortcut), and cards, tab headers, dialogs, the directory picker, and forms all respond to clicks. See [Keyboard Shortcuts → Mouse](keyboard-shortcuts.md#mouse).
 
-> On launch, dot-agent-deck automatically sets up live status, tool, and prompt tracking for the agents it detects — [Claude Code](https://www.anthropic.com/claude-code), [OpenCode](https://opencode.ai), [Pi](https://github.com/earendil-works/pi), and [Codex](https://github.com/openai/codex). No configuration is needed. See [Troubleshooting](troubleshooting.md#hooks) if you want to manage this manually.
+> On launch, dot-agent-deck automatically sets up live status, tool, and prompt tracking for the agents it detects — [Claude Code](https://www.anthropic.com/claude-code), [OpenCode](https://opencode.ai), [Pi](https://github.com/earendil-works/pi), [Codex](https://github.com/openai/codex), and [Devin](https://devin.ai). No configuration is needed. See [Troubleshooting](troubleshooting.md#hooks) if you want to manage this manually.
 
 ## Launching
 
 Running `dot-agent-deck` opens a two-column layout with native embedded terminal panes:
 
 - **Left (1/3)** — the dashboard, displaying a card grid of agent sessions
-- **Right (2/3)** — agent panes where Claude Code, OpenCode, Pi, or Codex instances run (stacked by default — only the focused pane is shown, at full height; toggle to tiled with `Ctrl+t` to see every pane at once)
+- **Right (2/3)** — agent panes where Claude Code, OpenCode, Pi, Codex, or Devin instances run (stacked by default — only the focused pane is shown, at full height; toggle to tiled with `Ctrl+t` to see every pane at once)
 
 ![Two-column layout showing the dashboard card on the left and a Claude Code agent pane on the right](./img/getting-started-launching.jpg)
 
@@ -59,12 +59,12 @@ About 30 seconds after both the TUI and every managed agent are gone, the daemon
 ## Basic Workflow
 
 1. Launch the dashboard with `dot-agent-deck`
-2. Press `Ctrl+n` to open a new pane — pick a directory, give the pane a name, and enter the command to run (typically `claude`, `opencode`, `pi`, or `codex`)
+2. Press `Ctrl+n` to open a new pane — pick a directory, give the pane a name, and enter the command to run (typically `claude`, `opencode`, `pi`, `codex`, or `devin`)
 3. Watch the agent's status, tool calls, and prompts update on the dashboard in real-time
 4. To type into an agent, move keyboard focus into its pane: press `Ctrl+d` to enter command mode, then either `j`/`k` (or `Down`/`Up`) to cycle through cards or `1`–`9` to jump directly to a card
 5. To close a pane, press `Ctrl+d` to leave it, then `Ctrl+w` on the selected card and choose **Close** in the confirmation. While you're typing inside a pane, `Ctrl+w` is the shell's ordinary delete-previous-word — it never closes anything. The dashboard tab itself can't be closed.
 
-> **Tip:** The command can be any shell command, but real-time status, tool, and prompt tracking on the dashboard work for `claude`, `opencode`, `pi`, and `codex`.
+> **Tip:** The command can be any shell command, but real-time status, tool, and prompt tracking on the dashboard work for `claude`, `opencode`, `pi`, `codex`, and `devin`.
 
 > **Tip:** `Ctrl+d` toggles: press it in a pane to enter command / navigation mode, press it again to go back to the pane.
 
@@ -99,6 +99,6 @@ For the full configuration reference and more examples, see [Workspace Modes](wo
 
 Scheduled tasks let the daemon spawn an agent (or run a command) on a cron schedule — a nightly review, a recurring digest, a periodic health check — without you being at the keyboard. They are defined globally, so they apply across every project.
 
-The fastest way to create one is to let an agent author it: press `Ctrl+n`, cycle the **Mode** field to **schedule**, and the throwaway pane walks you through building the entry. Or press `s` on the dashboard to open the **Scheduled Tasks** manager and choose `[Add a]`. Every schedule needs a command that launches a `claude`, `opencode`, `pi`, or `codex` agent — directly (`claude`, `opencode`, `pi`, `codex`) or via a wrapper like `devbox run agent-new` — which is what gives the run full status tracking.
+The fastest way to create one is to let an agent author it: press `Ctrl+n`, cycle the **Mode** field to **schedule**, and the throwaway pane walks you through building the entry. Or press `s` on the dashboard to open the **Scheduled Tasks** manager and choose `[Add a]`. Every schedule needs a command that launches a `claude`, `opencode`, `pi`, `codex`, or `devin` agent — directly (`claude`, `opencode`, `pi`, `codex`, `devin`) or via a wrapper like `devbox run agent-new` — which is what gives the run full status tracking.
 
 For the full reference — cron syntax, the global config file, tab reuse, and supervisor recipes — see [Scheduled Tasks](scheduled-tasks.md).

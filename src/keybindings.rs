@@ -56,9 +56,6 @@ pub enum Action {
     NewPane,
     ClosePane,
     ToggleLayout,
-    /// PRD #336: toggle an orchestration tab's sidebar/pane-column split
-    /// between the default 34/66 ratio and a narrower-sidebar 25/75.
-    ToggleOrchestrationSplit,
     Jump1,
     Jump2,
     Jump3,
@@ -82,6 +79,8 @@ pub enum Action {
     DenyPermission,
     GenerateConfig,
     OpenScheduledTasks,
+    ScrollPaneUp,
+    ScrollPaneDown,
 }
 
 /// Static description of one action: which section it lives in, its config
@@ -102,10 +101,9 @@ pub struct ActionSpec {
 /// The `default` notations mirror the authoritative hardcoded checks in
 /// `src/ui.rs` as of this branch:
 /// - global Ctrl+ shortcuts: `Ctrl+d` (dashboard/command mode), `Ctrl+n`
-///   (new pane), `Ctrl+w` (close pane), `Ctrl+t` (toggle layout), `Ctrl+l`
-///   (toggle orchestration split); `1`..`9` jump to a card. (Quit is
-///   deliberately absent — `Ctrl+C` is a hardcoded, non-overridable modal
-///   trigger, not a remappable action.)
+///   (new pane), `Ctrl+w` (close pane), `Ctrl+t` (toggle layout); `1`..`9`
+///   jump to a card. (Quit is deliberately absent — `Ctrl+C` is a hardcoded,
+///   non-overridable modal trigger, not a remappable action.)
 /// - dashboard Normal-mode keys: `j`/`k`/`h`/`l`, `/`, `r`, `?`, `Enter`,
 ///   `Esc`, `y`, `n`.
 pub const ACTIONS: &[ActionSpec] = &[
@@ -137,13 +135,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "toggle_layout",
         default: "Ctrl+t",
         description: "Toggle layout",
-    },
-    ActionSpec {
-        action: Action::ToggleOrchestrationSplit,
-        section: Section::Global,
-        name: "toggle_orchestration_split",
-        default: "Ctrl+l",
-        description: "Toggle orchestration split",
     },
     ActionSpec {
         action: Action::Jump1,
@@ -303,6 +294,25 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "open_scheduled_tasks",
         default: "s",
         description: "Scheduled Tasks manager",
+    },
+    // PRD #341 M5: the keyboard equivalent of the mouse wheel over the focused
+    // agent pane. Command mode is the safe resting state, so reading back
+    // through a pane must not require entering the mode where a stray keypress
+    // reaches the agent. Registered actions rather than hardcoded `PageUp` /
+    // `PageDown` matches, so both are remappable like every other key.
+    ActionSpec {
+        action: Action::ScrollPaneUp,
+        section: Section::Dashboard,
+        name: "scroll_pane_up",
+        default: "PageUp",
+        description: "Scroll focused pane back",
+    },
+    ActionSpec {
+        action: Action::ScrollPaneDown,
+        section: Section::Dashboard,
+        name: "scroll_pane_down",
+        default: "PageDown",
+        description: "Scroll focused pane forward",
     },
 ];
 

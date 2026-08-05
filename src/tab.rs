@@ -114,10 +114,6 @@ pub enum Tab {
         config: OrchestrationConfig,
         /// Tracks whether the orchestration is waiting, delegated, or completed.
         status: OrchestrationStatus,
-        /// PRD #336: whether this tab's sidebar/pane-column split is toggled
-        /// to the narrower-sidebar 25/75 ratio. `false` = the 34/66 default.
-        /// Per-tab so toggling one orchestration tab doesn't affect another.
-        split_narrow: bool,
     },
 }
 
@@ -632,7 +628,6 @@ impl TabManager {
             },
             config: config.clone(),
             status: OrchestrationStatus::WaitingForOrchestrator,
-            split_narrow: false,
         });
 
         let index = self.tabs.len() - 1;
@@ -766,7 +761,6 @@ impl TabManager {
             orchestrator_prompt: None,
             config: config.clone(),
             status: OrchestrationStatus::WaitingForOrchestrator,
-            split_narrow: false,
         });
 
         let index = self.tabs.len() - 1;
@@ -1481,7 +1475,6 @@ mod tests {
             orchestrator_prompt: None,
             config: orch_config("orch"),
             status: OrchestrationStatus::WaitingForOrchestrator,
-            split_narrow: false,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -1511,7 +1504,6 @@ mod tests {
             orchestrator_prompt: None,
             config: orch_config("orch"),
             status: OrchestrationStatus::WaitingForOrchestrator,
-            split_narrow: false,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),
