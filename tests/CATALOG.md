@@ -1146,6 +1146,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the aggregate-priority resolver as a standalone pure-function unit test (PRD #333 M1, may land separately); per-pane sidebar status rendering (covered by `focus/orchestration/002`); pane-column geometry (covered by `orchestration/layout/002`/`004`).
 - **Platform coverage:** mac+linux+windows.
 
+##### tabs/orchestration/010 — An orchestration tab's status color renders as the ACTIVE tab's label text, not as a REVERSED background (PRD #333).
+- **Layer:** L1 (in-process `TestBackend` render via `render_tab_bar_to_buffer`, `tests/render_tab_strip.rs`).
+- **Agent:** none (synthetic `SessionStatus` values, no panes/PTYs).
+- **Asserts:** an orchestration tab made the ACTIVE tab with a single `Error` pane renders its label `fg` as `palette::status_color(Error)` (Red) with `Modifier::BOLD` set and `Modifier::REVERSED` NOT set — pinning that the status color reads as label text rather than getting inverted into a background by main's `Modifier::REVERSED` active-tab styling. Also covers the two scoping/regression guards: an active non-orchestration (Dashboard) tab still carries `Modifier::REVERSED` unchanged, and an inactive orchestration tab still carries the status color on `fg` with neither `REVERSED` nor `BOLD`.
+- **Does not assert:** the aggregate-priority resolver (covered by `tabs/orchestration/009`); per-pane sidebar status rendering (covered by `focus/orchestration/002`); pane-column geometry (covered by `orchestration/layout/002`/`004`).
+- **Platform coverage:** mac+linux+windows.
+
 #### tabs/selection
 
 ##### tabs/selection/001 — Each tab remembers its own selection by stable id across switch-away/switch-back (PRD #83 M1).
