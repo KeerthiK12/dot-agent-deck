@@ -13,6 +13,7 @@ pub mod daemon_attach;
 pub mod daemon_client;
 pub mod daemon_protocol;
 pub mod daemon_stop;
+pub mod devin_hooks_manage;
 pub mod embedded_pane;
 pub mod error;
 pub mod event;

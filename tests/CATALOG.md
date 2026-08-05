@@ -2501,6 +2501,16 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe plus one short worker turn.
 
+#### devin/live
+
+##### devin/live/001 — A real interactive Devin turn drives the dashboard card live through the deck's own installed hooks. [reel]
+- **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_devin_available` verifies the binary, persisted credentials, and a logged-in account.
+- **Agent:** real interactive `devin` restored into a pane, using the account's default (cheap SWE-family) model with isolated copied credentials, the setup wizard pre-satisfied, workspace trust waived, and `--permission-mode auto`; launch goes through the normal `NativeHooks` seam with no wrapper.
+- **Asserts:** the deck-written `"hooks"` block in Devin's own config is actually read and executed by the third-party binary — a typed prompt produces a Devin-stamped Thinking event and a visible Thinking card, an `exec` ToolStart carrying a non-empty tool detail, the pane showing `devin_live_sentinel_4c81de.txt`, and a Stop-driven Idle.
+- **Does not assert:** exact model phrasing or token usage; hook payload parsing in isolation (covered by the fast-tier `devin_hook_ingestion` tests) or config-merge safety (covered by the `devin_hooks_manage` unit tests).
+- **Platform coverage:** linux+mac (real-agent tier is local-only; `devin_config_dir` is Unix-only by design).
+- **Cost note:** one inference-free `devin auth status` probe plus one short interactive directory-listing turn — measured at roughly 2.7s of agent time. No `--model` is pinned because a free-tier account rejects every explicit model.
+
 #### chain-smoke/claude
 
 ##### chain-smoke/claude/001 — A real Claude Code agent run end-to-end emits hook events that drive the card through Thinking → Working → Idle.

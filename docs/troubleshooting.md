@@ -31,6 +31,7 @@ Hooks are **auto-installed on every startup** — most users never need to think
 - **Claude Code** (`~/.claude/` detected) — writes entries into `~/.claude/settings.json` for hook types: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, PreCompact, SubagentStart, SubagentStop.
 - **OpenCode** (`~/.opencode/` detected) — creates a JS plugin at `~/.opencode/plugin/dot-agent-deck/index.js` that forwards session, tool, and permission events.
 - **Codex** (`codex` found on `PATH`) — writes a `hooks.json` into your Codex home (`$CODEX_HOME`, or `~/.codex`) whose hooks forward prompt, tool, and turn events to the dashboard, and records trust for **exactly those hooks** in that home's `config.toml` (Codex only runs hooks it trusts). Both happen at startup and again whenever the deck launches a Codex pane, so they work however you launch Codex. Your own hooks are preserved (the deck merges, it never overwrites), and `config.toml` is edited surgically — comments, your model choice, and any trust records you made yourself are left byte-for-byte intact. The deck never trusts a hook it didn't author: a third-party hook sitting in the same file stays untrusted.
+- **Devin** (`devin` found on `PATH`) — merges a `"hooks"` object into Devin's user config, whose commands shell `dot-agent-deck hook --agent devin`. The config is located the way Devin locates it: `$XDG_CONFIG_HOME/devin/config.json` when that variable is set, and `~/.config/devin/config.json` otherwise. Devin ships a Claude-Code-compatible hooks engine, so its native command hooks post the same stdin JSON shape Claude's do and ride the existing hook socket — no wrapper, no trust ceremony. Only the `"hooks"` key is touched; your `agent` (model), `permissions`, `mcpServers`, `theme_mode`, and every other setting survive byte-for-byte. The read-modify-write is serialized by an in-process mutex and published atomically (temp file + `rename`), so a crash mid-write never leaves a truncated config, and the file keeps its existing permissions (a config the deck creates itself is owner-only). Devin documents its config as JSON *with comment support*, which the deck's parser cannot edit in place: a config it cannot parse is backed up to `config.json.bak` and the install errors rather than clobbering it.
 
 Auto-install is idempotent and best-effort — if an agent directory is missing the step is silently skipped, and errors are logged without blocking startup.
 
@@ -69,16 +70,18 @@ The `hooks install` and `hooks uninstall` commands are available when you need t
 dot-agent-deck hooks install                    # Claude Code
 dot-agent-deck hooks install --agent opencode   # OpenCode
 dot-agent-deck hooks install --agent codex      # Codex
+dot-agent-deck hooks install --agent devin      # Devin
 
 # Remove hooks
 dot-agent-deck hooks uninstall                    # Claude Code
 dot-agent-deck hooks uninstall --agent opencode   # OpenCode
 dot-agent-deck hooks uninstall --agent codex      # Codex
+dot-agent-deck hooks uninstall --agent devin      # Devin
 ```
 
 > **Note:** If you uninstall hooks manually, the next dashboard launch will re-install them automatically.
 
-## A bare command like `claude`, `opencode`, `pi`, or `codex` fails to spawn
+## A bare command like `claude`, `opencode`, `pi`, `codex`, or `devin` fails to spawn
 
 If a pane comes up with an error such as *"Unable to spawn `claude` because it doesn't exist on the filesystem and was not found in PATH"*, the daemon couldn't resolve that bare command against its `PATH`.
 

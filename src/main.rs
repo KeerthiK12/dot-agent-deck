@@ -33,6 +33,10 @@ enum CliAgent {
     /// native command hooks shell `dot-agent-deck hook --agent codex`. Ingested
     /// by the [`dot_agent_deck::hook`] `"codex"` arm.
     Codex,
+    /// Devin CLI, likewise Claude-Code-hook-compatible: its native command hooks
+    /// shell `dot-agent-deck hook --agent devin` and are ingested by the
+    /// [`dot_agent_deck::hook`] `"devin"` arm.
+    Devin,
 }
 
 impl CliAgent {
@@ -45,6 +49,7 @@ impl CliAgent {
             CliAgent::ClaudeCode => dot_agent_deck::event::AgentType::ClaudeCode,
             CliAgent::Opencode => dot_agent_deck::event::AgentType::OpenCode,
             CliAgent::Codex => dot_agent_deck::event::AgentType::Codex,
+            CliAgent::Devin => dot_agent_deck::event::AgentType::Devin,
         }
     }
 }
@@ -517,6 +522,7 @@ fn main() -> ExitCode {
                 CliAgent::ClaudeCode => "claude-code",
                 CliAgent::Opencode => "opencode",
                 CliAgent::Codex => "codex",
+                CliAgent::Devin => "devin",
             };
             handle_hook(agent_str)
         }
@@ -891,6 +897,14 @@ fn main() -> ExitCode {
                 // detected against the daemon's real PATH. Self-guards on codex
                 // being installed and a resolvable home; a no-op otherwise.
                 dot_agent_deck::codex_hooks_manage::auto_install_and_trust_at_startup();
+                // Same precedent for Devin, which is also a native-hooks agent:
+                // merge the deck's hooks into Devin's user config ONCE at daemon
+                // startup, command-agnostically, so a headless daemon and a
+                // launcher whose basename isn't `devin` are covered too. Runs
+                // AFTER the login-shell PATH is applied so devin-presence is
+                // detected against the daemon's real PATH. Self-guards on devin
+                // being on PATH and a resolvable config dir; a no-op otherwise.
+                dot_agent_deck::devin_hooks_manage::auto_install();
                 run_daemon_serve_cli()
             }
             DaemonCmd::Hello => run_daemon_hello_cli(),

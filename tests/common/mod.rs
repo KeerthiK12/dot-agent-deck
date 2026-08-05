@@ -90,6 +90,7 @@ enum CredentialImport {
     ClaudeCode,
     OpenCode,
     Codex,
+    Devin,
 }
 
 /// Builder for [`TuiDeck`]. Use the test surface
@@ -193,6 +194,15 @@ impl TuiDeckBuilder {
     /// skip a real-Codex test instead of failing during TUI launch.
     pub fn with_imported_codex_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::Codex);
+        self
+    }
+
+    /// Import the host user's Devin credentials into the isolated per-test HOME
+    /// and seed a config that runs unattended (setup wizard skipped, workspace
+    /// trust waived). Pair with [`check_devin_available`] so a host without
+    /// Devin skips cleanly instead of failing during TUI launch.
+    pub fn with_imported_devin_credentials(mut self) -> Self {
+        self.credential_imports.push(CredentialImport::Devin);
         self
     }
 
@@ -486,6 +496,10 @@ impl TuiDeck {
                 CredentialImport::Codex => {
                     import_codex_credentials(&home).map_err(|e| e.to_string())?;
                 }
+                CredentialImport::Devin => {
+                    recording_redactions
+                        .extend(import_devin_credentials(&home).map_err(|e| e.to_string())?);
+                }
             }
         }
         recording_redactions.sort_by_key(|value| std::cmp::Reverse(value.len()));
@@ -567,9 +581,20 @@ impl TuiDeck {
         // 20's pins, and finally layer the test's `with_env` overrides
         // (so a test asking for `NO_COLOR=1` still wins).
         let state_dir = work.join("state");
+        // Pin the XDG config root inside the isolated HOME. `env_clear` above
+        // already drops the host's value, but an agent adapter that resolves its
+        // config the XDG way (Devin does — see `devin_hooks_manage`) would then
+        // fall back to `$HOME/.config` only by luck of the variable being unset.
+        // Setting it explicitly makes the isolation intentional, so no test can
+        // ever write hooks into the developer's real config.
+        let xdg_config_home = home.join(".config");
         let pinned: &[(&str, &str)] = &[
             ("TERM", "xterm-256color"),
             ("LC_ALL", "C.UTF-8"),
+            (
+                "XDG_CONFIG_HOME",
+                xdg_config_home.to_str().expect("XDG config path is UTF-8"),
+            ),
             ("COLORTERM", "truecolor"),
             // M2.1 auditor S3: pin SHELL so portable-pty cannot leak
             // the parent password DB entry on Unix. /bin/sh is
@@ -2217,6 +2242,113 @@ pub fn check_codex_available() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Whether a real Devin CLI can run in this environment. Pair with
+/// `skip_unless!` so a host without Devin skips the real-agent test cleanly.
+///
+/// Deliberately does NOT run a model probe the way [`check_codex_available`]
+/// does. Devin bills every inference call to the user's Cognition account, so a
+/// probe would spend real money on every `cargo test-e2e` run just to decide
+/// whether to spend more. `devin auth status` reaches the account without
+/// inference and distinguishes a logged-out host from a logged-in one.
+pub fn check_devin_available() -> Result<(), String> {
+    if !cli_invocable("devin") {
+        return Err("Devin CLI not installed (could not invoke `devin --version`)".into());
+    }
+
+    let creds = host_home()
+        .join(".local")
+        .join("share")
+        .join("devin")
+        .join("credentials.toml");
+    let creds_is_regular = std::fs::symlink_metadata(&creds)
+        .map(|meta| meta.file_type().is_file())
+        .unwrap_or(false);
+    if !creds_is_regular {
+        return Err("Devin credentials not found at \
+                    ~/.local/share/devin/credentials.toml — log in with `devin auth login`"
+            .into());
+    }
+
+    let status = std::process::Command::new("devin")
+        .args(["auth", "status"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not check Devin auth status: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    if !status.status.success() || !text.to_ascii_lowercase().contains("logged in") {
+        return Err("Devin is not authenticated — log in with `devin auth login`".into());
+    }
+    Ok(())
+}
+
+/// Import the host user's Devin credentials into the isolated per-test HOME and
+/// seed a config that can run unattended. Returns the strings a successful-run
+/// recording must redact.
+///
+/// Two pieces are non-obvious, and both were measured against devin 3000.3.27
+/// rather than inferred:
+///
+/// - The host `config.json` is copied for its `version` / `devin.org_id` /
+///   `shell.setup_complete` keys. Without them Devin runs its first-run setup
+///   wizard instead of the prompt, and the run ends without doing any work.
+/// - `respect_workspace_trust` is written `false`. Devin refuses to run in an
+///   untrusted directory and the per-test fixture dir is always untrusted. This
+///   is belt-and-braces alongside the CLI flag the test passes — only the flag
+///   is documented to take effect in print mode.
+///
+/// `devin.org_id` identifies the user's Cognition org, so it is returned as a
+/// redaction rather than being allowed into a recorded cast.
+pub fn import_devin_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
+    let share = host_home().join(".local").join("share").join("devin");
+    let bytes = read_credential_file_no_symlink(
+        &share.join("credentials.toml"),
+        "Devin credentials not found at ~/.local/share/devin/credentials.toml — log in with \
+         `devin auth login`",
+        "~/.local/share/devin/credentials.toml",
+    )?;
+    let dst_share = test_home.join(".local").join("share").join("devin");
+    std::fs::create_dir_all(&dst_share)?;
+    write_credential_file_atomic_0o600(&dst_share.join("credentials.toml"), &bytes)?;
+
+    // Seed the config from the host's so the setup wizard stays out of the way.
+    // A missing or unparsable host config is fine: those keys are simply absent
+    // on a machine that has never run setup, and `check_devin_available` has
+    // already established the account itself is usable.
+    let host_config = host_home()
+        .join(".config")
+        .join("devin")
+        .join("config.json");
+    let mut root: serde_json::Value = std::fs::read(&host_config)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let mut redactions = Vec::new();
+    if let Some(org) = root
+        .get("devin")
+        .and_then(|d| d.get("org_id"))
+        .and_then(|v| v.as_str())
+        && !org.is_empty()
+    {
+        redactions.push(org.to_string());
+    }
+    root["respect_workspace_trust"] = serde_json::Value::Bool(false);
+
+    let dst_config_dir = test_home.join(".config").join("devin");
+    std::fs::create_dir_all(&dst_config_dir)?;
+    write_credential_file_atomic_0o600(
+        &dst_config_dir.join("config.json"),
+        serde_json::to_string_pretty(&root)?.as_bytes(),
+    )?;
+    Ok(redactions)
 }
 
 /// Helper: returns true when `bin --version` exits 0, false otherwise
