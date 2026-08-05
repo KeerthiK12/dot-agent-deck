@@ -94,14 +94,20 @@ const DEVIN_HOOK_EVENTS: &[&str] = &[
     "PostCompaction",
 ];
 
-/// Devin CLI's user config directory: the literal `~/.config/devin` Devin
-/// documents.
+/// Devin CLI's user config directory, resolved the way Devin itself resolves it:
+/// `$XDG_CONFIG_HOME/devin` when that variable is set to an absolute path, and
+/// `~/.config/devin` otherwise.
 ///
-/// `$XDG_CONFIG_HOME` is deliberately NOT consulted. Devin documents the literal
-/// `~/.config/devin/config.json`, and honouring XDG here would write hooks to a
-/// path Devin may not read — which is worse than not installing them, because it
-/// looks like success and silently delivers nothing (the same reasoning
-/// [`crate::codex_hooks_manage`] applies to guessing a Windows Codex home).
+/// **`$XDG_CONFIG_HOME` must be honoured** — measured against devin 3000.3.27,
+/// not inferred. With `XDG_CONFIG_HOME` set, Devin reads
+/// `$XDG_CONFIG_HOME/devin/config.json` and never touches `~/.config/devin` at
+/// all. Writing to the literal `~/.config/devin` in that case would install
+/// hooks into a file Devin never reads — which is worse than not installing
+/// them, because it looks like success and silently delivers nothing.
+///
+/// A relative `XDG_CONFIG_HOME` is ignored per the XDG base-directory spec,
+/// which requires an absolute path and says to fall back to the default
+/// otherwise.
 ///
 /// **Windows: deliberately a no-op, not an oversight.** This returns `None` off
 /// Unix, so every caller degrades to a documented skip — exactly what
@@ -119,13 +125,32 @@ const DEVIN_HOOK_EVENTS: &[&str] = &[
 pub fn devin_config_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
-        Some(PathBuf::from(home).join(".config").join("devin"))
+        config_dir_from(
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        )
     }
     #[cfg(not(unix))]
     {
         None
     }
+}
+
+/// The pure resolution behind [`devin_config_dir`], taking the two environment
+/// values explicitly so it is testable without mutating process-global state.
+#[cfg(unix)]
+fn config_dir_from(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home {
+        let xdg = Path::new(xdg);
+        if xdg.is_absolute() {
+            return Some(xdg.join("devin"));
+        }
+    }
+    let home = home.filter(|h| !h.is_empty())?;
+    Some(Path::new(home).join(".config").join("devin"))
 }
 
 /// Devin CLI's user config file inside [`devin_config_dir`].
@@ -892,6 +917,43 @@ mod tests {
         )
         .unwrap();
         assert!(!claude_hook_import_conflict(&json!({}), &user_only));
+    }
+
+    /// Devin resolves its config the standard XDG way, so the deck must too.
+    /// Measured against devin 3000.3.27: with `XDG_CONFIG_HOME` set it reads
+    /// `$XDG_CONFIG_HOME/devin/config.json` and never touches `~/.config/devin`,
+    /// so writing to the literal `~/.config` there would install hooks into a
+    /// file Devin never reads — a silent no-op that still reports success.
+    #[cfg(unix)]
+    #[test]
+    fn config_dir_follows_xdg_config_home_like_devin_does() {
+        use std::ffi::OsStr;
+
+        // XDG set to an absolute path wins over HOME.
+        assert_eq!(
+            config_dir_from(Some(OsStr::new("/xdg/cfg")), Some("/home/u")),
+            Some(PathBuf::from("/xdg/cfg/devin"))
+        );
+        // Unset XDG falls back to ~/.config/devin.
+        assert_eq!(
+            config_dir_from(None, Some("/home/u")),
+            Some(PathBuf::from("/home/u/.config/devin"))
+        );
+        // A relative XDG_CONFIG_HOME is invalid per the XDG spec — ignore it
+        // rather than resolving a path against the process cwd.
+        assert_eq!(
+            config_dir_from(Some(OsStr::new("relative/cfg")), Some("/home/u")),
+            Some(PathBuf::from("/home/u/.config/devin"))
+        );
+        // An empty XDG_CONFIG_HOME is likewise not absolute, so it falls back.
+        assert_eq!(
+            config_dir_from(Some(OsStr::new("")), Some("/home/u")),
+            Some(PathBuf::from("/home/u/.config/devin"))
+        );
+        // No usable HOME and no XDG resolves to nothing, so a guarded caller
+        // never writes into a throwaway location.
+        assert_eq!(config_dir_from(None, None), None);
+        assert_eq!(config_dir_from(None, Some("")), None);
     }
 
     /// The atomic publish must never widen the config's permissions. Devin ships
