@@ -2081,7 +2081,7 @@ without depending on the config struct API.
 - **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
 - **Agent:** none (two `cat`-role orchestration tabs opened through `TabManager::open_orchestration_tab`).
 - **Asserts:** dispatching `Action::ToggleOrchestrationSplit` on the Dashboard tab is a no-op (it cannot mutate unrelated tab state); opening tab A alone starts at the default (`split_narrow == false`) and toggling it flips the flag to `true`; opening tab B AFTER that toggle shows B starting already narrow, not reset to the default; toggling from B (now active) flips BOTH tabs back to `false`; switching back to A and toggling again flips both to `true`. This is PRD #336's revised "toggling one tab changes all of them, and a new tab adopts the live global value" criterion, asserted on the real field.
-- **Does not assert:** the resulting rendered geometry (covered by `orchestration/layout/003`); spawn-time PTY dims.
+- **Does not assert:** the resulting rendered geometry (covered by `orchestration/layout/003`); spawn-time PTY dims (covered by `orchestration/layout/006`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/layout/005 — `scope_orchestration_split` claims the split toggle only on an orchestration tab in command mode, un-resolving it everywhere else so `Ctrl+l` reaches the pane's PTY, and passes every other action through untouched (PRD #336).
@@ -2089,6 +2089,13 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** `Some(ToggleOrchestrationSplit)` survives only for (orchestration tab, `UiMode::Normal`); it becomes `None` off an orchestration tab in any mode, and on an orchestration tab in `PaneInput`/`Filter`/`Help`/`NewPaneForm` (so the key falls through to the `PaneInput` forwarding path). The mode half mirrors `close_pane` (PRD #241 M1), which is command-mode only so `Ctrl+w` still reaches the PTY as word-delete. `ToggleLayout`, `DetachToNormal` and `None` pass through unchanged for every tab/mode pair, proving the guard is surgical rather than a general-purpose filter.
 - **Does not assert:** that the event loop actually calls it (covered end-to-end by `tabs/orchestration/008`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/006 — A role pane spawned while the GLOBAL orchestration split is already narrow gets its PTY sized at the 75%-width column, not the 66%-width default (PRD #336, PR #342).
+- **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController` extended to record each spawn's `(rows, cols)`; no PTY, no TestBackend render).
+- **Agent:** none (two 2-role `cat` orchestration tabs opened through the real `Action::SpawnPane` dispatch path).
+- **Asserts:** open tab A through `Action::SpawnPane` at the default split; toggle the GLOBAL split narrow via `Action::ToggleOrchestrationSplit` dispatched from tab A (the only way a real user reaches the narrow state, since the toggle only resolves on an active orchestration tab); then open tab B, also through `Action::SpawnPane`, while the global is already narrow. Every role pane spawned for tab B must be recorded with `cols == 73` (the 75%-width inner column on a 100-wide frame), not `64` (the 66%-width default) — the `dispatch_action` new-tab-open branch must read `tab_manager.orchestration_split_narrow()` rather than a hardcoded `false` when computing `spawn_dims`. This is the spawn-time-dims gap `orchestration/layout/004` explicitly left uncovered. Verified with teeth: reverting the seed to a hardcoded `false` at the call site reproduces the pre-fix bug and fails this test with `left: 64, right: 73`.
+- **Does not assert:** the restore/hydrate call site in `run_tui`'s `apply_snapshot` branch, which reads the same `tab_manager.orchestration_split_narrow()` at its own spawn-dims call — not reachable at L1 (embedded in `run_tui`, which needs a real `Terminal` and a disk-loaded `SavedSession`, with no factored-out testable seam) and, per the current call graph, not distinguishable at ANY layer today: that branch runs exactly once, before the event loop starts, when `TabManager`'s global is still at its just-constructed default (`false`) — so `tab_manager.orchestration_split_narrow()` and the old hardcoded `false` currently always agree there, and no test could show them diverging without also changing when restore can run.
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/route

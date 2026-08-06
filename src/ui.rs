@@ -18407,6 +18407,129 @@ mod tests {
         );
     }
 
+    /// Scenario: PRD #336 gap-fill — `orchestration/layout/004` pins that the
+    /// GLOBAL split flag propagates to a newly opened tab's `split_narrow`
+    /// mirror field, but its own "Does not assert" line explicitly leaves
+    /// spawn-time PTY dims uncovered. This test dispatches the REAL
+    /// `Action::SpawnPane` (the production new-tab-open path inside
+    /// `dispatch_action`, not `TabManager::open_orchestration_tab` called
+    /// directly) so the exact branch that computes `spawn_dims` from
+    /// `tab_manager.orchestration_split_narrow()` runs. Open tab A at the
+    /// default split, toggle the global narrow FROM tab A (the only way a
+    /// real user reaches the narrow state — `Ctrl+l` only resolves on an
+    /// active orchestration tab, `orchestration/layout/005`), then open tab B
+    /// while the global is ALREADY narrow: tab B's role panes must be spawned
+    /// at the 75%-width narrow column (73 inner cols on this 100-wide frame),
+    /// not the 66%-width default (64 cols) that a hardcoded `false` at the
+    /// spawn call site would still produce. Before PR #342's fix, a role PTY
+    /// opened while the deck was already narrow opened at 64 cols and only
+    /// reflowed to 73 on the first frame.
+    #[spec("orchestration/layout/006")]
+    #[test]
+    fn orchestration_layout_006_spawn_dims_honor_the_global_split_when_already_narrow() {
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        // 100-wide frame: default 66% split -> 64 inner cols; narrow 75%
+        // split -> 73 inner cols (`right_column_pane_dims`:
+        // width * percent / 100 - 2 for the pane border).
+        let frame_area = Rect::new(0, 0, 100, 40);
+
+        let cfg = |name: &str| OrchestrationConfig {
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        };
+
+        let open = |tm: &mut TabManager, ui: &mut UiState, name: &str| {
+            let req = NewPaneRequest {
+                dir: tmp.path().to_path_buf(),
+                name: name.to_string(),
+                command: String::new(),
+                mode_config: None,
+                orchestration_config: Some(cfg(name)),
+                seed_prompt: None,
+            };
+            let _ = dispatch_action(
+                Action::SpawnPane(Box::new(req)),
+                ui,
+                pc.as_ref(),
+                &state,
+                tm,
+                &snapshot,
+                &[],
+                None,
+                frame_area,
+            );
+        };
+
+        // Open tab A at the default (unnarrowed) split.
+        open(&mut tm, &mut ui, "tab-a");
+        assert!(
+            matches!(tm.active_tab(), Tab::Orchestration { .. }),
+            "opening tab A must land on an orchestration tab"
+        );
+
+        // Toggle the global narrow FROM tab A.
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationSplit,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            tm.orchestration_split_narrow(),
+            "the global split must be narrow after one toggle from an orchestration tab"
+        );
+
+        // Open tab B while the global is ALREADY narrow — this is the gap:
+        // pre-fix, the new-tab-open branch hardcoded `false` here regardless
+        // of the live global.
+        let spawned_before_b = pc.recorded_spawn_dims().len();
+        open(&mut tm, &mut ui, "tab-b");
+        let dims_after = pc.recorded_spawn_dims();
+        let b_dims = &dims_after[spawned_before_b..];
+        assert_eq!(
+            b_dims.len(),
+            2,
+            "tab B has 2 roles, so exactly 2 new spawns must be recorded"
+        );
+        for (role_index, (_rows, cols)) in b_dims.iter().enumerate() {
+            assert_eq!(
+                *cols, 73,
+                "role {role_index} of a tab opened while the global split is \
+                 narrow must spawn its PTY at the 75%-width column (73 cols \
+                 on this 100-wide frame), not the 66%-width default (64 \
+                 cols) — a role pane opened while narrow must not start too \
+                 wide and only reflow on the first frame"
+            );
+        }
+    }
+
     /// Scenario: PRD #336 — `scope_orchestration_split` is the guard that keeps
     /// `Ctrl+l` from being swallowed anywhere it cannot act. It must claim
     /// `ToggleOrchestrationSplit` ONLY on an orchestration tab in command mode,
@@ -26564,6 +26687,11 @@ mod tests {
         next: std::sync::Mutex<u32>,
         memberships: std::sync::Mutex<Vec<Option<TabMembership>>>,
         agent_generation: std::sync::Mutex<String>,
+        // PRD #336: (rows, cols) passed to `AgentSpawnOptions` for every
+        // `create_pane_with_options` call, in call order — lets a test assert
+        // the PTY dims a role pane was actually spawned/restored at, not just
+        // that a pane was created.
+        spawn_dims: std::sync::Mutex<Vec<(u16, u16)>>,
     }
 
     impl CapturingPaneController {
@@ -26572,6 +26700,7 @@ mod tests {
                 next: std::sync::Mutex::new(0),
                 memberships: std::sync::Mutex::new(Vec::new()),
                 agent_generation: std::sync::Mutex::new("original".to_string()),
+                spawn_dims: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -26592,6 +26721,11 @@ mod tests {
         fn rebind_agents(&self) {
             *self.agent_generation.lock().unwrap() = "replacement".to_string();
         }
+
+        /// The `(rows, cols)` recorded for every spawned pane, in call order.
+        fn recorded_spawn_dims(&self) -> Vec<(u16, u16)> {
+            self.spawn_dims.lock().unwrap().clone()
+        }
     }
 
     impl PaneController for CapturingPaneController {
@@ -26605,6 +26739,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(opts.tab_membership.clone());
+            self.spawn_dims.lock().unwrap().push((opts.rows, opts.cols));
             let mut n = self.next.lock().unwrap();
             let id = format!("pane-{n}");
             *n += 1;
