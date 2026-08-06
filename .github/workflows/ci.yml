@@ -106,11 +106,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: 1.97.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2 # v2
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo build --release
@@ -172,17 +175,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: 1.97.1
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - name: Type-check the workspace for Windows from Linux
         run: |
           set -euo pipefail
           # Resolve the toolchain directory instead of trusting the script's
-          # local-machine default: the name here is whatever
-          # dtolnay/rust-toolchain resolved `stable` to, which need not be
-          # literally `stable-*`.
+          # local-machine default: the directory is named for the pinned
+          # toolchain (`1.97.1-x86_64-unknown-linux-gnu`), not `stable-*`, and it
+          # changes on every version bump — so read it from rustup rather than
+          # hardcoding either spelling.
           WINDOWS_CROSS_CHECK_TOOLCHAIN="$(rustup show home)/toolchains/$(rustup show active-toolchain | cut -d' ' -f1)"
           export WINDOWS_CROSS_CHECK_TOOLCHAIN
           echo "toolchain: $WINDOWS_CROSS_CHECK_TOOLCHAIN"
@@ -214,12 +219,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: 1.97.1
           targets: x86_64-pc-windows-msvc
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
       - run: cargo build
       # Match the Linux `build` job's clippy invocation (no --all-targets) so a
       # test-only lint can't fail Windows-only and be unreproducible on the
@@ -248,11 +256,14 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: 1.97.1
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
       - run: cargo build
       # Match the Linux `build` job's clippy invocation (no --all-targets) so a
       # test-only lint can't fail macOS-only and be unreproducible on the Linux
@@ -267,7 +278,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
       - uses: Swatinem/rust-cache@v2 # v2
       - run: cargo install cargo-audit --locked
       - run: cargo audit
@@ -283,13 +296,30 @@ jobs:
   # executed `vals` at all — and `vals` is what resolves every secret in
   # .env.vals.yaml for the devbox shell.
   #
-  # DELIBERATELY NOT the version source for the build jobs. Those use
-  # dtolnay/rust-toolchain@stable on purpose: they answer "does this still
-  # compile on CURRENT stable", which is also what release.yml ships with,
-  # whereas devbox pins rustc 1.97.0 for a reproducible contributor shell.
-  # Routing CI through devbox would trade the upstream-breakage signal for a pin,
-  # and build-windows could not follow anyway — Nix has no native Windows
-  # support, and that job exists to exercise the MSVC toolchain.
+  # STILL NOT the version source for the build jobs, but no longer because those
+  # jobs float. Until 2026-08-06 every Rust job used dtolnay/rust-toolchain@stable
+  # and taiki-e/install-action@nextest, deliberately, to answer "does this still
+  # compile on CURRENT stable". That traded a reproducible gate for an
+  # upstream-breakage signal: `cargo test-fast` in the devbox shell and the same
+  # command in CI compiled with different toolchains, so "green locally" and
+  # "green in CI" were not the same claim, and a lint introduced by a new stable
+  # would fail here unreproducibly.
+  #
+  # Every toolchain is now pinned explicitly — `toolchain: 1.97.1` and
+  # `tool: cargo-nextest@0.9.140`, matching devbox.json — under the standing rule
+  # that versions are specific, never `@stable` / `@latest` / `@nextest`. The
+  # values are DUPLICATED here rather than read from devbox.json: build-windows
+  # could not consume devbox anyway (Nix has no native Windows support, and that
+  # job exists to exercise the MSVC toolchain), and routing the others through it
+  # would split the mechanism across platforms for no gain.
+  #
+  # Duplication is kept honest by Renovate rather than by discipline: the
+  # `customManagers` entries in renovate.json track both pinned values (Rust from
+  # rust-lang/rust releases, nextest from the crates.io datasource) and open the
+  # same upgrade PRs the devbox pins get, so the two sides move together instead
+  # of drifting silently. The upstream-breakage signal that the old floating refs
+  # provided now arrives as those PRs — visible and gated on CI, rather than
+  # landing unannounced in the middle of an unrelated change.
   #
   # SCOPE: x86_64-linux only. The aarch64-darwin entries in devbox.lock stay
   # unvalidated; add a macos-latest leg if that gap starts to bite.

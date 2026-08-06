@@ -19,6 +19,25 @@
     "enabled": true,
     "schedule": ["at any time"]
   },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The Rust toolchain pinned in every workflow (`toolchain: 1.97.1`, matching devbox.json). The github-actions manager cannot see this: it reads the `uses:` ref, and dtolnay/rust-toolchain publishes toolchain versions as BRANCHES with only a `v1` tag, so pinning the ref instead (`@1.97.1`) would be a version Renovate could never bump. Pinning the action at `@v1` and passing the toolchain as an input splits the two concerns — the github-actions rule bumps the action, this manager bumps the toolchain. Without it the pin would silently rot, which is the failure mode that made floating `@stable` attractive in the first place.",
+      "fileMatch": ["^\\.github/workflows/[^/]+\\.ya?ml$"],
+      "matchStrings": ["toolchain:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "rust-lang/rust",
+      "extractVersionTemplate": "^(?<version>\\d+\\.\\d+\\.\\d+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "The cargo-nextest version pinned in every workflow (`tool: cargo-nextest@0.9.140`, matching devbox.json). Same reasoning as the toolchain manager above: taiki-e/install-action is pinned at `@v2` and the tool version rides an input, so only a custom manager can see it.",
+      "fileMatch": ["^\\.github/workflows/[^/]+\\.ya?ml$"],
+      "matchStrings": ["tool:\\s*cargo-nextest@(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "crate",
+      "depNameTemplate": "cargo-nextest"
+    }
+  ],
   "packageRules": [
     {
       "matchManagers": ["cargo"],
@@ -69,6 +88,13 @@
       "groupName": "GitHub Actions",
       "automerge": true,
       "automergeType": "pr"
+    },
+    {
+      "matchManagers": ["custom.regex"],
+      "matchDepNames": ["rust-lang/rust", "cargo-nextest"],
+      "automerge": false,
+      "labels": ["dependencies", "manual-review"],
+      "description": "The workflow toolchain pins are held for a human even on a patch. They must stay in lockstep with devbox.json's rustc/cargo/clippy/rustfmt and cargo-nextest pins — that lockstep is the whole point of pinning them, and nothing enforces it automatically — so each PR needs the matching devbox bump alongside it. A Rust patch release is also exactly where a new clippy lint appears, which is a `-D warnings` failure to read rather than automerge."
     },
     {
       "matchManagers": ["npm"],
