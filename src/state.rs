@@ -1831,56 +1831,6 @@ pub(crate) async fn wait_for_session_start(
     }
 }
 
-/// Per-target body of [`AppState::handle_delegate`], factored out so
-/// each target runs in its own `tokio::spawn`. Owns all the inputs it
-/// needs (no `&self` / `&AppState` borrows) so the spawn future is
-/// `'static`.
-///
-/// Holds the per-pane dispatch mutex across the entire respawn +
-/// post-respawn prompt write, writes the worker task file to the
-/// worker's cwd, optionally respawns the worker agent (per the role's
-/// `clear` flag) and then writes the prompt one-liner.
-///
-/// On `clear = true`, this function subscribes to the daemon-wide
-/// hook-event broadcast BEFORE calling
-/// [`AgentPtyRegistry::respawn_agent_for_pane`] — the receiver
-/// attaches to `event_tx` before the new process is forked, so a
-/// fast-booting agent's `SessionStart` lands in the receiver's queue.
-/// Then it waits up to [`SESSION_START_WAIT_TIMEOUT`] for that event;
-/// on timeout, the prompt is written anyway (mirroring the pre-daemon
-/// TUI baseline `2fc39c3:src/ui.rs::process_pending_dispatches`,
-/// which fell back at 10 s for agents that don't emit
-/// `SessionStart`).
-///
-/// The per-pane dispatch mutex (acquired unconditionally — see
-/// [`AgentPtyRegistry::pane_dispatch_lock`]) closes the
-/// `registry.remove` + `spawn_agent` race window inside
-/// [`AgentPtyRegistry::respawn_agent_for_pane`]: two concurrent
-/// connections submitting `Delegate` signals to the same worker pane
-/// no longer race the respawn — they serialize behind the mutex. We
-/// acquire unconditionally even when `clear = false` because it's
-/// cheap and removes the subtler "concurrent clear=true vs
-/// clear=false" interleave.
-///
-/// PRD #249: on the `clear = true` path the prompt write is additionally held
-/// for [`DELEGATE_READINESS_BUFFER`] after the readiness signal (M1), and a
-/// successful write arms the silent-worker watch (M3) when `silence_watch` is
-/// `Some` — resolved by the caller ([`SilenceWatch`], from
-/// [`delegate_no_event_window`]) so a disabled report costs no subscription and
-/// no task, and so the report's delivery target is captured before the dispatch
-/// task's first poll. That resolution is independent of PRD #126's idle
-/// detector: either can be on while the other is off.
-///
-/// PRD #249 review (finding B1): the prompt write itself is identity-guarded
-/// against the worker agent the pointer was composed for, because this function
-/// holds a pane-id string across a wait long enough for the pane to change
-/// hands. See the guarded send at the end of the body.
-///
-/// Errors are logged and dropped; the caller spawns each target
-/// independently so a single pane's failure (a missing role config,
-/// a respawn that couldn't exec the command, a write that hit a
-/// closed PTY) doesn't poison the other panes' dispatches.
-#[allow(clippy::too_many_arguments)]
 /// Resolve what a delegated worker is actually told to act on: the one-line
 /// pointer to its `.dot-agent-deck/worker-task-<role>.md`, or the task body
 /// INLINED when no such file could be written.
@@ -1953,6 +1903,56 @@ fn resolve_delegate_task_body(
     }
 }
 
+/// Per-target body of [`AppState::handle_delegate`], factored out so
+/// each target runs in its own `tokio::spawn`. Owns all the inputs it
+/// needs (no `&self` / `&AppState` borrows) so the spawn future is
+/// `'static`.
+///
+/// Holds the per-pane dispatch mutex across the entire respawn +
+/// post-respawn prompt write, writes the worker task file to the
+/// worker's cwd, optionally respawns the worker agent (per the role's
+/// `clear` flag) and then writes the prompt one-liner.
+///
+/// On `clear = true`, this function subscribes to the daemon-wide
+/// hook-event broadcast BEFORE calling
+/// [`AgentPtyRegistry::respawn_agent_for_pane`] — the receiver
+/// attaches to `event_tx` before the new process is forked, so a
+/// fast-booting agent's `SessionStart` lands in the receiver's queue.
+/// Then it waits up to [`SESSION_START_WAIT_TIMEOUT`] for that event;
+/// on timeout, the prompt is written anyway (mirroring the pre-daemon
+/// TUI baseline `2fc39c3:src/ui.rs::process_pending_dispatches`,
+/// which fell back at 10 s for agents that don't emit
+/// `SessionStart`).
+///
+/// The per-pane dispatch mutex (acquired unconditionally — see
+/// [`AgentPtyRegistry::pane_dispatch_lock`]) closes the
+/// `registry.remove` + `spawn_agent` race window inside
+/// [`AgentPtyRegistry::respawn_agent_for_pane`]: two concurrent
+/// connections submitting `Delegate` signals to the same worker pane
+/// no longer race the respawn — they serialize behind the mutex. We
+/// acquire unconditionally even when `clear = false` because it's
+/// cheap and removes the subtler "concurrent clear=true vs
+/// clear=false" interleave.
+///
+/// PRD #249: on the `clear = true` path the prompt write is additionally held
+/// for [`DELEGATE_READINESS_BUFFER`] after the readiness signal (M1), and a
+/// successful write arms the silent-worker watch (M3) when `silence_watch` is
+/// `Some` — resolved by the caller ([`SilenceWatch`], from
+/// [`delegate_no_event_window`]) so a disabled report costs no subscription and
+/// no task, and so the report's delivery target is captured before the dispatch
+/// task's first poll. That resolution is independent of PRD #126's idle
+/// detector: either can be on while the other is off.
+///
+/// PRD #249 review (finding B1): the prompt write itself is identity-guarded
+/// against the worker agent the pointer was composed for, because this function
+/// holds a pane-id string across a wait long enough for the pane to change
+/// hands. See the guarded send at the end of the body.
+///
+/// Errors are logged and dropped; the caller spawns each target
+/// independently so a single pane's failure (a missing role config,
+/// a respawn that couldn't exec the command, a write that hit a
+/// closed PTY) doesn't poison the other panes' dispatches.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_one_owned(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
