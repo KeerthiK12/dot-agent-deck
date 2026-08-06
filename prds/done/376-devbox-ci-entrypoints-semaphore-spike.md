@@ -1,8 +1,9 @@
 # PRD #376: Devbox-native CI entrypoints and a Semaphore pipeline spike
 
-**Status**: Not started
+**Status**: Closed — not doing (closed 2026-08-06, never implemented)
 **Priority**: Medium
 **Created**: 2026-08-04
+**GitHub Issue**: [#376](https://github.com/vfarcic/dot-agent-deck/issues/376)
 
 ## Problem Statement
 
@@ -126,3 +127,15 @@ Came out of a Semaphore evaluation discussion. Three decisions worth preserving,
 1. **The order is inverted on purpose.** The obvious plan is "make GHA provider-agnostic, then porting is trivial." Rejected: marketplace actions do not exist on Semaphore, so the toolchain has to be hand-provisioned there regardless. Writing the devbox layer on the Semaphore side first means no extra work, keeps GHA as an unmodified control, and produces the numbers that justify (or kill) the retrofit before touching a working gate.
 2. **The version-skew fix is the real motivation**, not portability. Portability of the invocation layer is cheap and mostly cosmetic; caching stays provider-specific either way. `devbox.json` pinning vs `rust-toolchain@stable` floating is an actual latent bug.
 3. **No publish conditionals anywhere.** `ci.yml` has no side effects and `release.yml` is out of scope, so the double-publish problem does not arise at this scope. If a full release pipeline is ever demoed on Semaphore, do it by pointing at **separate destinations** — the existing `NAME=dot-agent-deck-beta` channel in `Taskfile.yml`, a throwaway tap, a `:semaphore-test` image tag — rather than by flagging the real one. A flag can be misconfigured; a different destination structurally cannot collide. Note also that `release.yml`'s `concurrency: group: release` gives zero protection against a second CI provider, since concurrency domains do not span systems.
+
+### 2026-08-06 — Closed, not doing
+
+Semaphore was removed from the repo entirely, which removes the forcing function this PRD was built around.
+
+The spike never landed: PR #378 was closed unmerged, so no `.semaphore/semaphore.yml` ever reached `main`. But the Semaphore GitHub webhook stayed connected and kept firing on every push, and with no pipeline file to run it reported `ci/semaphoreci/push` as a **failure on every PR**. `main` carries no required status checks (see `CLAUDE.md` rule 8), so it never blocked a merge — it was pure noise on every PR for two days. The webhook (`hooks.semaphoreci.com/github`, id `661298142`) was deleted on 2026-08-06.
+
+Closing the whole PRD was a deliberate call, not an oversight — but note what goes with it:
+
+**The version-skew bug in the Problem Statement is real and remains unfixed.** `devbox.json` pins `rustc`/`cargo`/`clippy`/`rustfmt` at 1.97.0 and `cargo-nextest` at 0.9.140, while `.github/workflows/ci.yml:33` uses `dtolnay/rust-toolchain@stable` and `:37` installs nextest via `taiki-e/install-action@nextest`. Both float to whatever is current the day the job runs, so the local gate and CI compile with different toolchains and the gap widens silently. The predicted first symptom is a clippy failure that cannot be reproduced locally. That is worth its own issue whenever it bites; it does not need this PRD's devbox-entrypoint framing to be fixed, and `dtolnay/rust-toolchain` accepts a pinned version directly.
+
+The three decisions recorded in the 2026-08-04 entry are kept because they are about CI-provider strategy generally, not about Semaphore specifically — particularly #3 (demo a release pipeline by pointing at separate destinations, never by flagging the real one).
