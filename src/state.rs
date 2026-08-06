@@ -1881,6 +1881,78 @@ pub(crate) async fn wait_for_session_start(
 /// a respawn that couldn't exec the command, a write that hit a
 /// closed PTY) doesn't poison the other panes' dispatches.
 #[allow(clippy::too_many_arguments)]
+/// Resolve what a delegated worker is actually told to act on: the one-line
+/// pointer to its `.dot-agent-deck/worker-task-<role>.md`, or the task body
+/// INLINED when no such file could be written.
+///
+/// The pointer is only safe to send once the file it names exists. Emitting it
+/// unconditionally — which this did until the `orchestration/route/001`
+/// investigation — delegates a DANGLING REFERENCE on any write failure: the
+/// worker is told to read a file that is missing or empty, has no task to act
+/// on, and stalls. The observed stall is the worker exploring its directory and
+/// asking the user what to do, which reads as agent flakiness but originates
+/// here. `route_001` failed exactly that way on a full-parallel e2e gate and
+/// never in isolation; tmpfs pressure (#322) is the plausible trigger, and a
+/// transient ENOSPC/EROFS is enough.
+///
+/// Both failure paths therefore converge on the same remedy: inline the body. A
+/// worker handed its task inline can do the work; a worker pointed at a file
+/// that is not there cannot. The task file lands in the WORKER's cwd, not the
+/// orchestrator's — earlier rounds reused one cwd capture across every worker
+/// and broke the moment two role panes started in different directories.
+///
+/// Extracted from [`dispatch_one_owned`] so the fallback policy is unit-testable
+/// without standing up a registry, a broadcast channel and a live pane.
+fn resolve_delegate_task_body(
+    cwd: Option<&str>,
+    prompt_template: Option<&str>,
+    task: &str,
+    target_role: &str,
+    pane_id: &str,
+) -> String {
+    let file_content = compose_worker_task_file(prompt_template, task, target_role);
+    let Some(cwd) = cwd else {
+        // Defensive: the daemon's StartAgent handler always records
+        // `pane_cwd_map` for orchestration panes (see `daemon_protocol.rs`), so
+        // this branch should be unreachable in production.
+        warn!(
+            role = %target_role,
+            pane_id = %pane_id,
+            "delegate: no cwd recorded for worker pane — inlining task body"
+        );
+        return file_content;
+    };
+
+    let safe_name = sanitize_role_name(target_role);
+    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
+    // Not fatal on its own: the directory may already exist, and if it genuinely
+    // cannot be created the `write` below fails too and takes the inline path.
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(
+            dir = %dir.display(),
+            role = %target_role,
+            pane_id = %pane_id,
+            error = %e,
+            "delegate: failed to create task directory"
+        );
+    }
+    let file_path = dir.join(format!("worker-task-{safe_name}.md"));
+    match std::fs::write(&file_path, &file_content) {
+        Ok(()) => format!("Read .dot-agent-deck/worker-task-{safe_name}.md for your task."),
+        Err(e) => {
+            warn!(
+                path = %file_path.display(),
+                role = %target_role,
+                pane_id = %pane_id,
+                error = %e,
+                "delegate: failed to write worker task file — inlining task body instead of \
+                 pointing the worker at a file that does not exist"
+            );
+            file_content
+        }
+    }
+}
+
 async fn dispatch_one_owned(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
@@ -1928,48 +2000,13 @@ async fn dispatch_one_owned(
     let prompt_template = role_config
         .as_ref()
         .and_then(|r| r.prompt_template.as_deref());
-    let safe_name = sanitize_role_name(&target_role);
-    // The task file lands in the *worker's* cwd, not the
-    // orchestrator's — earlier rounds reused a single cwd capture
-    // across every worker and broke the moment two role panes
-    // were started in different cwds.
-    let task_body = if let Some(cwd) = cwd.as_deref() {
-        let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            warn!(
-                dir = %dir.display(),
-                role = %target_role,
-                pane_id = %pane_id,
-                error = %e,
-                "delegate: failed to create task directory"
-            );
-        }
-        let file_path = dir.join(format!("worker-task-{safe_name}.md"));
-        let file_content = compose_worker_task_file(prompt_template, &task, &target_role);
-        if let Err(e) = std::fs::write(&file_path, &file_content) {
-            warn!(
-                path = %file_path.display(),
-                role = %target_role,
-                pane_id = %pane_id,
-                error = %e,
-                "delegate: failed to write worker task file"
-            );
-        }
-        format!("Read .dot-agent-deck/worker-task-{safe_name}.md for your task.")
-    } else {
-        // Defensive: the daemon's StartAgent handler always
-        // records `pane_cwd_map` for orchestration panes (see
-        // `daemon_protocol.rs`), so this branch should be
-        // unreachable in production. Log and fall back to
-        // inlining the task body so the worker still gets
-        // *something* useful rather than a dangling reference.
-        warn!(
-            role = %target_role,
-            pane_id = %pane_id,
-            "delegate: no cwd recorded for worker pane — inlining task body"
-        );
-        compose_worker_task_file(prompt_template, &task, &target_role)
-    };
+    let task_body = resolve_delegate_task_body(
+        cwd.as_deref(),
+        prompt_template,
+        &task,
+        &target_role,
+        &pane_id,
+    );
     // The single-line pointer the worker receives ("Read
     // .dot-agent-deck/worker-task-<role>.md for your task."). Computed here so
     // the PRD #201 pi-native path below can stash it as the pane's seed before
@@ -3613,6 +3650,99 @@ mod tests {
         assert!(
             !prompt.contains('\n'),
             "pane-injected delegate prompt must normalize newlines"
+        );
+    }
+
+    /// The happy path: the task file is written, and the worker gets the short
+    /// pointer to it rather than the whole body.
+    #[test]
+    fn resolve_delegate_task_body_points_at_the_file_it_wrote() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let body = resolve_delegate_task_body(
+            Some(cwd.path().to_str().expect("utf8 cwd")),
+            Some("You are coder."),
+            "Implement the thing.",
+            "coder",
+            "pane-1",
+        );
+
+        assert_eq!(
+            body, "Read .dot-agent-deck/worker-task-coder.md for your task.",
+            "a successful write must delegate the one-line pointer, not the body"
+        );
+        let written = std::fs::read_to_string(
+            cwd.path()
+                .join(".dot-agent-deck")
+                .join("worker-task-coder.md"),
+        )
+        .expect("the pointer names a file that must exist");
+        assert!(
+            written.contains("Implement the thing."),
+            "the file the pointer names must carry the task: {written}"
+        );
+    }
+
+    /// A failed write must NOT emit the pointer. Until the
+    /// `orchestration/route/001` investigation it warned and pointed anyway, so
+    /// the worker was told to read a file that did not exist, had nothing to act
+    /// on, and stalled asking the user what to do — a failure that looked like
+    /// agent flakiness and reproduced only under a loaded e2e gate.
+    ///
+    /// The write is made to fail portably by putting a regular FILE where
+    /// `.dot-agent-deck` must be a directory: `create_dir_all` and `write` both
+    /// fail, on every platform, with no dependence on permissions or on not
+    /// running as root (a 0o500 dir would not stop root).
+    ///
+    /// Confirmed to catch the defect: against the pre-fix code, which warned and
+    /// emitted the pointer regardless, this test fails.
+    #[test]
+    fn resolve_delegate_task_body_inlines_when_the_file_cannot_be_written() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        std::fs::write(cwd.path().join(".dot-agent-deck"), b"not a directory")
+            .expect("plant a regular file where the task dir must go");
+
+        let body = resolve_delegate_task_body(
+            Some(cwd.path().to_str().expect("utf8 cwd")),
+            Some("You are coder."),
+            "Implement the thing.",
+            "coder",
+            "pane-1",
+        );
+
+        assert!(
+            !body.contains("Read .dot-agent-deck/worker-task-coder.md"),
+            "a failed write must never delegate a pointer to a file that is not there: {body}"
+        );
+        assert!(
+            body.contains("Implement the thing."),
+            "the task body must be inlined so the worker can still act: {body}"
+        );
+        assert!(
+            body.contains("dot-agent-deck work-done"),
+            "the inlined body must keep the completion footer, or the worker \
+             cannot signal done: {body}"
+        );
+    }
+
+    /// The pre-existing no-cwd fallback keeps inlining — same remedy, and the
+    /// branch the write-failure path was aligned with.
+    #[test]
+    fn resolve_delegate_task_body_inlines_when_no_cwd_is_recorded() {
+        let body = resolve_delegate_task_body(
+            None,
+            Some("You are coder."),
+            "Implement the thing.",
+            "coder",
+            "pane-1",
+        );
+
+        assert!(
+            !body.contains("Read .dot-agent-deck/"),
+            "with no cwd there is nowhere to write, so no pointer may be sent: {body}"
+        );
+        assert!(
+            body.contains("Implement the thing."),
+            "the task body must be inlined: {body}"
         );
     }
 
