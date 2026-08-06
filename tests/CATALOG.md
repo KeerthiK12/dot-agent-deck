@@ -1143,7 +1143,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness, `tests/e2e_orchestration_pane_column.rs`).
 - **Agent:** none (`orch-deck` fixture — two stub `cat` roles, no LLM tokens spent).
 - **Asserts:** opening a real orchestration tab on a 120-column PTY renders the role-pane column's left edge at the default 34%-width boundary (col 40/41); `Ctrl+l` pressed while still in PaneInput does NOT move it (the chord belongs to the role pane's agent there); after `Ctrl+d` to command mode, `Ctrl+l` moves the boundary to the narrower-sidebar 25%-width position (col 29/30) and a second press restores 34%. The boundary is read from the `orchestrator` role-pane box's top-left corner (exactly `panes_area.x`), matching any corner glyph — PRD #341 renders the focused pane's border heavier in command mode, so pinning one glyph would break on the mode switch.
-- **Does not assert:** per-tab scoping across multiple open orchestration tabs (covered by `orchestration/layout/004`); persistence of the toggled state across restart (out of scope per PRD #336); remapping the chord via config.
+- **Does not assert:** the global scope of the toggle across multiple open orchestration tabs (covered by `orchestration/layout/004`); persistence of the toggled state across restart (out of scope per PRD #336); remapping the chord via config.
 - **Platform coverage:** mac+linux.
 
 ##### tabs/orchestration/008 — `Ctrl+l` still forwards to a live pane's PTY when the active tab is NOT an orchestration tab (PRD #336 scope guard).
@@ -2074,13 +2074,13 @@ without depending on the config struct API.
 - **Layer:** L1 (pure-data `compute_frame_layout` geometry + `key_action_for_mode`, the public L1 seam over the same mode-aware resolver chain the event loop runs; no PTY, no TestBackend render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `compute_frame_layout` and `ActiveTabView` are module-private. Note the resolver is deliberately tab-agnostic — the orchestration-tab scoping is a separate step, covered by `orchestration/layout/005`.
 - **Agent:** none.
 - **Asserts:** resolving a simulated `Ctrl+l` `KeyEvent` through `key_action_for_mode` with the default keybinding config yields `Action::ToggleOrchestrationSplit` specifically (not merely "some action"); an untoggled orchestration tab's `dashboard_area`/`panes_area` widths are 34/66; a toggled one's are 25/75. The split travels on `ActiveTabView::Orchestration::split_narrow`, so the test sets it directly on the render snapshot with no shared state to seed or reset.
-- **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/orchestration/007`); the per-tab dispatch itself (covered by `orchestration/layout/004`).
+- **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/orchestration/007`); the real dispatch and its global scope across tabs (covered by `orchestration/layout/004`).
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/layout/004 — The orchestration split is per-tab: toggling one orchestration tab does not change another's, and a second press round-trips (PRD #336).
+##### orchestration/layout/004 — The orchestration split is GLOBAL: toggling one orchestration tab changes every other one too, including a tab opened later, which adopts the current global split instead of the 34/66 default (PRD #336).
 - **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
 - **Agent:** none (two `cat`-role orchestration tabs opened through `TabManager::open_orchestration_tab`).
-- **Asserts:** dispatching `Action::ToggleOrchestrationSplit` on the Dashboard tab is a no-op (it cannot mutate unrelated tab state); with two orchestration tabs open, both start at the default (`split_narrow == false`); toggling the active one flips only its own flag and leaves the other at the default; a second press restores the default. This is PRD #336's "toggling one tab does not affect another" criterion, asserted on the real per-tab field.
+- **Asserts:** dispatching `Action::ToggleOrchestrationSplit` on the Dashboard tab is a no-op (it cannot mutate unrelated tab state); opening tab A alone starts at the default (`split_narrow == false`) and toggling it flips the flag to `true`; opening tab B AFTER that toggle shows B starting already narrow, not reset to the default; toggling from B (now active) flips BOTH tabs back to `false`; switching back to A and toggling again flips both to `true`. This is PRD #336's revised "toggling one tab changes all of them, and a new tab adopts the live global value" criterion, asserted on the real field.
 - **Does not assert:** the resulting rendered geometry (covered by `orchestration/layout/003`); spawn-time PTY dims.
 - **Platform coverage:** mac+linux+windows.
 

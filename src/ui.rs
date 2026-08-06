@@ -18262,15 +18262,19 @@ mod tests {
         );
     }
 
-    /// Scenario: PRD #336 — the split is per-tab. Dispatch the real
-    /// `Action::ToggleOrchestrationSplit` against an orchestration tab and
-    /// confirm it flips that tab's own `split_narrow` field and flips back on a
-    /// second press, while a second orchestration tab opened alongside it keeps
-    /// the `false` default. Also asserts the dispatch is a no-op on a
-    /// non-orchestration tab, so the action cannot mutate unrelated tab state.
+    /// Scenario: PRD #336 (post-review inversion) — the split is GLOBAL, not
+    /// per-tab. Open a single orchestration tab A, dispatch the real
+    /// `Action::ToggleOrchestrationSplit` against it, then open a second
+    /// orchestration tab B afterward: B must come up already narrow, adopting
+    /// the current global split rather than resetting to the 34/66 default.
+    /// Toggling again from B (now active) must flip A's flag too — the split
+    /// is one shared value observable from either tab, in either direction —
+    /// and a further toggle from A confirms the same holds switching back.
+    /// Also asserts the dispatch is a no-op on a non-orchestration tab, so the
+    /// action cannot mutate unrelated tab state.
     #[spec("orchestration/layout/004")]
     #[test]
-    fn orchestration_layout_004_orchestration_split_is_per_tab_and_round_trips() {
+    fn orchestration_layout_004_orchestration_split_is_global_and_round_trips() {
         let tmp = tempdir().expect("tempdir");
         let pc = Arc::new(CapturingPaneController::new());
         let mut tm = TabManager::new(pc.clone());
@@ -18300,7 +18304,6 @@ mod tests {
             "dispatch must not disturb the Dashboard tab"
         );
 
-        // Open two orchestration tabs, A then B.
         let cfg = |name: &str| OrchestrationConfig {
             name: name.to_string(),
             roles: vec![
@@ -18322,41 +18325,64 @@ mod tests {
                 },
             ],
         };
-        for name in ["tab-a", "tab-b"] {
-            tm.open_orchestration_tab(
-                &cfg(name),
-                tmp.path().to_str().expect("utf-8 tmp path"),
-                None,
-                None,
-                (24, 80),
-            )
-            .expect("open orchestration tab");
-        }
 
         let split_of = |tm: &TabManager, idx: usize| match &tm.tabs()[idx] {
             Tab::Orchestration { split_narrow, .. } => *split_narrow,
             _ => panic!("tab {idx} should be an orchestration tab"),
         };
 
-        // Both start at the default.
+        // Open tab A alone, at the default split, and toggle it narrow.
+        tm.open_orchestration_tab(
+            &cfg("tab-a"),
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab");
         assert!(!split_of(&tm, 1), "tab A must start at the default split");
-        assert!(!split_of(&tm, 2), "tab B must start at the default split");
 
-        // B is active (most recently opened). Toggling it must not touch A.
         toggle(&mut tm, &mut ui);
-        assert!(split_of(&tm, 2), "tab B must be narrow after one toggle");
+        assert!(split_of(&tm, 1), "tab A must be narrow after one toggle");
+
+        // Open tab B AFTER the toggle: it must adopt the current GLOBAL split
+        // (narrow), not reset to the old per-tab 34/66 default.
+        tm.open_orchestration_tab(
+            &cfg("tab-b"),
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab");
+        assert!(
+            split_of(&tm, 2),
+            "a newly opened orchestration tab must adopt the current GLOBAL \
+             split, not reset to the 34/66 default"
+        );
+
+        // B is now active (most recently opened). Toggling from B must flip
+        // BOTH tabs back to the default — the split is a single global value,
+        // not per-tab.
+        toggle(&mut tm, &mut ui);
+        assert!(!split_of(&tm, 2), "tab B must round-trip to the default");
         assert!(
             !split_of(&tm, 1),
-            "toggling tab B must NOT change tab A's split — the state is per-tab"
+            "toggling from tab B must ALSO flip tab A — the split is global"
         );
 
-        // A second press round-trips B back to the default.
+        // Switch back to A and toggle again: the effect must be observable on
+        // B too, proving the global scope holds in either direction.
+        tm.switch_to(1);
         toggle(&mut tm, &mut ui);
         assert!(
-            !split_of(&tm, 2),
-            "a second toggle must restore tab B's default split"
+            split_of(&tm, 1),
+            "tab A must be narrow after toggling from A"
         );
-        assert!(!split_of(&tm, 1), "tab A must still be at the default");
+        assert!(
+            split_of(&tm, 2),
+            "toggling from tab A must ALSO flip tab B — the split is global"
+        );
     }
 
     /// Scenario: PRD #336 — `scope_orchestration_split` is the guard that keeps
