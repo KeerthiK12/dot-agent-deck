@@ -56,8 +56,9 @@ pub enum Action {
     NewPane,
     ClosePane,
     ToggleLayout,
-    /// PRD #336: toggle an orchestration tab's sidebar/pane-column split
-    /// between the default 34/66 ratio and a narrower-sidebar 25/75.
+    /// PRD #336: toggle the orchestration sidebar/pane-column split between
+    /// the default 34/66 ratio and a narrower-sidebar 25/75. Global across
+    /// orchestration tabs, though only pressable from one.
     ToggleOrchestrationSplit,
     Jump1,
     Jump2,

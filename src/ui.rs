@@ -228,11 +228,13 @@ enum ActiveTabView {
     /// Orchestration tab: same card layout as dashboard, scoped to role panes.
     Orchestration {
         role_pane_ids: Vec<String>,
-        /// PRD #336: mirrors this tab's `Tab::Orchestration::split_narrow`, so
-        /// `compute_frame_layout` resolves the sidebar/pane-column split from
-        /// the tab actually being rendered. Carried on the view rather than
-        /// read from shared state: this struct is already the per-tab render
-        /// snapshot, so the split travels with the tab it belongs to.
+        /// PRD #336: mirrors `Tab::Orchestration::split_narrow`, so
+        /// `compute_frame_layout` resolves the sidebar/pane-column split
+        /// without reaching into shared state mid-layout. The split is global
+        /// (`TabManager::orchestration_split_narrow`), so every orchestration
+        /// tab carries the same value here — but it still travels *as data* on
+        /// the render snapshot, which is what keeps the layout pass a pure
+        /// function of its inputs.
         split_narrow: bool,
     },
 }
@@ -2000,9 +2002,11 @@ pub(crate) const ORCHESTRATION_PANES_PERCENT_NARROW: u16 = 75;
 /// through here, so the layout pass and the spawn-time PTY sizing cannot
 /// disagree about how wide a role pane is.
 ///
-/// The flag is threaded in as a parameter rather than read from shared state:
-/// the split is per-tab (`Tab::Orchestration::split_narrow`), and the render
-/// path already carries per-tab render data in `ActiveTabView::Orchestration`.
+/// The flag is threaded in as a parameter rather than read from shared state.
+/// The split itself is global (`TabManager::orchestration_split_narrow`), but
+/// this resolver stays a pure function of the flag: the render path already
+/// carries the value it should use on `ActiveTabView::Orchestration`, so no
+/// call site has to reach for the owner mid-layout.
 pub(crate) fn orchestration_split_percents(narrow: bool) -> (u16, u16) {
     if narrow {
         (
@@ -2105,10 +2109,13 @@ pub(crate) fn dashboard_pane_dims(
 ///
 /// PRD #336: `narrow` selects the split via `orchestration_split_percents`.
 /// The sole caller is the spawn path, which opens a brand-new (or restored)
-/// tab, and such a tab always starts at the default split regardless of what
-/// another open orchestration tab is toggled to — so callers pass `false`.
-/// Keeping it an explicit parameter rather than reading shared state is what
-/// makes that guarantee local and testable (`orchestration/layout/004`).
+/// tab; because the split is GLOBAL, such a tab adopts whatever split is
+/// currently in effect, so callers pass `tab_manager.orchestration_split_narrow()`
+/// — not a hardcoded default, which would open every role PTY at 66% and let
+/// the first frame reflow it. Keeping it an explicit parameter rather than
+/// reading the owner from inside here is what keeps this helper a pure
+/// function of its inputs and testable without a `TabManager`
+/// (`orchestration/layout/003`).
 pub(crate) fn orchestration_role_pane_dims(
     frame_area: Rect,
     role_count: usize,
@@ -3642,10 +3649,11 @@ pub enum Action {
     /// PRD #80: toggle the embedded-pane layout between stacked and tiled
     /// (Ctrl+T).
     ToggleLayout,
-    /// PRD #336: toggle the active orchestration tab's sidebar/pane-column
-    /// split between the default 34/66 ratio and the narrower-sidebar 25/75
-    /// (Ctrl+L). Scoped to orchestration tabs: on any other tab the chord is
-    /// never claimed, so it reaches the PTY as ordinary input.
+    /// PRD #336: toggle the orchestration sidebar/pane-column split between
+    /// the default 34/66 ratio and the narrower-sidebar 25/75 (Ctrl+L). The
+    /// split is global — one press applies to every orchestration tab, open or
+    /// opened later — but the chord is only claimed on an orchestration tab:
+    /// on any other tab it reaches the PTY as ordinary input.
     ToggleOrchestrationSplit,
     /// PRD #80: leave `PaneInput` and return to Normal (command) mode on the
     /// current tab (Ctrl+D).
@@ -7015,17 +7023,24 @@ fn dispatch_action(
             // split on the next frame (it reads `pane_layout`).
             ui.status_message = Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
         }
-        // Ctrl+l: toggle the active orchestration tab's sidebar/pane-column
-        // split (PRD #336). Unreachable off an orchestration tab —
+        // Ctrl+l: toggle the orchestration sidebar/pane-column split (PRD
+        // #336). The split is GLOBAL — one press changes every orchestration
+        // tab, open or opened later — but the chord is still only *actionable*
+        // from an orchestration tab, so the guard below stays: pressing it on
+        // the Dashboard must not silently change orchestration geometry.
+        // Unreachable off an orchestration tab anyway —
         // `scope_orchestration_split` un-resolves the chord there — but the
-        // `if let` keeps this a no-op rather than a panic if that ever changes.
+        // `matches!` keeps this a no-op rather than a panic if that changes.
         Action::ToggleOrchestrationSplit => {
-            if let Tab::Orchestration { split_narrow, .. } = tab_manager.active_tab_mut() {
-                *split_narrow = !*split_narrow;
-                let split_name = if *split_narrow { "25/75" } else { "34/66" };
-                // Mirroring `ToggleLayout`: flip the per-tab flag and let the
-                // next frame pick it up. `compute_frame_layout` reads the flag
-                // off `ActiveTabView::Orchestration`, and the pre-draw
+            if matches!(tab_manager.active_tab(), Tab::Orchestration { .. }) {
+                // `TabManager` owns the split and rewrites every orchestration
+                // tab in the same call, so there is no window in which one tab
+                // disagrees with another.
+                let narrow = tab_manager.toggle_orchestration_split();
+                let split_name = if narrow { "25/75" } else { "34/66" };
+                // Mirroring `ToggleLayout`: flip the flag and let the next
+                // frame pick it up. `compute_frame_layout` reads it off
+                // `ActiveTabView::Orchestration`, and the pre-draw
                 // `resize_panes_to_layout` pass reflows the role panes' PTYs
                 // from the same rects — no resize is pushed from here.
                 ui.status_message =
@@ -7686,8 +7701,10 @@ fn dispatch_action(
                         0,
                         PaneLayout::Tiled,
                         true,
-                        // PRD #336: a newly opened tab starts at the default split.
-                        false,
+                        // PRD #336: the split is global, so a newly opened tab
+                        // adopts whatever is currently in effect — spawn the
+                        // role PTYs at that width rather than at the default.
+                        tab_manager.orchestration_split_narrow(),
                     );
                     match tab_manager.open_orchestration_tab(
                         &orch_config,
@@ -9600,8 +9617,11 @@ pub fn run_tui(
                             0,
                             PaneLayout::Tiled,
                             true,
-                            // PRD #336: a restored tab starts at the default split.
-                            false,
+                            // PRD #336: a restored tab adopts the current
+                            // global split, like any other tab. The global is
+                            // not persisted across launches, so a restore at
+                            // startup lands on the 34/66 default.
+                            tab_manager.orchestration_split_narrow(),
                         );
                         // Empty saved prompt → `None` so the delivery gate
                         // writes nothing (matching the live path's "no prompt"
@@ -10307,8 +10327,10 @@ pub fn run_tui(
                 ..
             } => ActiveTabView::Orchestration {
                 role_pane_ids: role_pane_ids.clone(),
-                // PRD #336: carry the active tab's split state into the render
-                // snapshot so `compute_frame_layout` resolves this tab's ratio.
+                // PRD #336: carry the split into the render snapshot so
+                // `compute_frame_layout` resolves the ratio from data. Every
+                // orchestration tab holds the same (global) value — see
+                // `TabManager::toggle_orchestration_split`.
                 split_narrow: *split_narrow,
             },
         };
