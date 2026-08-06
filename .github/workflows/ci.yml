@@ -305,10 +305,15 @@ jobs:
   # "green in CI" were not the same claim, and a lint introduced by a new stable
   # would fail here unreproducibly.
   #
-  # Every toolchain is now pinned explicitly — `toolchain: 1.97.1` and
-  # `tool: cargo-nextest@0.9.140`, matching devbox.json — under the standing rule
-  # that versions are specific, never `@stable` / `@latest` / `@nextest`. The
-  # values are DUPLICATED here rather than read from devbox.json: build-windows
+  # Every job now pins its Rust toolchain and cargo-nextest explicitly, to the
+  # same versions devbox.json pins, under the standing rule that versions are
+  # specific — never `@stable` / `@latest` / `@nextest`. The literal versions are
+  # deliberately NOT repeated in this comment: renovate.json's customManagers
+  # match on `toolchain:` and `tool: cargo-nextest@` anywhere under
+  # .github/workflows, so a version quoted in prose would be extracted as a
+  # dependency of its own and drift into its own upgrade PR. Read the values off
+  # the steps. The values are DUPLICATED across jobs rather than read from
+  # devbox.json: build-windows
   # could not consume devbox anyway (Nix has no native Windows support, and that
   # job exists to exercise the MSVC toolchain), and routing the others through it
   # would split the mechanism across platforms for no gain.
