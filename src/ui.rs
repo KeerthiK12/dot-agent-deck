@@ -10433,24 +10433,31 @@ pub fn run_tui(
             // The observation runs FIRST and outside the chain, because it must
             // happen on every locked frame no matter which branch below wins.
             tab_manager.observe_waiting_panes(&pane_status_for_focus);
-            if let Some(new_id) = tab_manager.auto_focus_waiting_pane(&pane_status_for_focus) {
-                let _ = pane.focus_pane(&new_id);
-            } else if !crossterm::event::poll(std::time::Duration::from_millis(0))?
-                && let Some(new_id) = tab_manager.auto_focus_all_clear()
+            // The `poll(0ms)` peek is a pending-input guard, computed ONCE per
+            // frame and threaded into the decision as a plain `bool`. A focus
+            // move applied on this frame lands before the event loop below
+            // drains what is already queued, and a key read after focus moved
+            // is forwarded to whatever pane is focused THEN — not the one it
+            // was typed at. So both branches of the decision defer while input
+            // is pending:
+            //
+            // - all-clear: fires exactly when the user has just answered the
+            //   last prompt and is likely still typing, and the resulting key
+            //   would reach the ORCHESTRATOR's PTY, which the command-entry
+            //   lock deliberately does not gate.
+            // - waiting-focus: a lower-role-order pane going `WaitingForInput`
+            //   steals focus from the waiting pane the user is mid-answer to,
+            //   and because the new pane is itself `WaitingForInput` the lock's
+            //   carve-out forwards the queued keystrokes straight to it.
+            //
+            // Deferring costs nothing in either case: the all-clear edge is
+            // latched in `all_clear_pending` and survives until consumed, and
+            // the waiting target is recomputed from the status snapshot every
+            // frame. See `TabManager::auto_focus_locked`.
+            let input_pending = crossterm::event::poll(std::time::Duration::from_millis(0))?;
+            if let Some(new_id) =
+                tab_manager.auto_focus_locked(&pane_status_for_focus, input_pending)
             {
-                // Only reached when the branch above found nothing left to
-                // steer toward this frame — see `auto_focus_all_clear`'s doc
-                // comment for why that gate matters.
-                //
-                // The `poll(0ms)` peek is a pending-input guard: this move
-                // fires exactly when the user has just answered the last prompt
-                // and is likely still typing, and a key read after focus moved
-                // is forwarded to the ORCHESTRATOR's PTY — which the lock
-                // deliberately does not gate. The skip costs nothing: the edge
-                // is latched in `all_clear_pending` and survives until
-                // consumed, so the move simply happens on a later frame, after
-                // the queued input has been dispatched to the pane it was aimed
-                // at.
                 let _ = pane.focus_pane(&new_id);
             }
         }

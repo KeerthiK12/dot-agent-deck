@@ -2195,6 +2195,13 @@ without depending on the config struct API.
 - **Does not assert:** the `TabManager`-level contract in isolation (`orchestration/focus/001`-`006`); the keystroke gate (`orchestration/lock/*`).
 - **Platform coverage:** mac+linux (unix-only: the injector writes to a Unix-domain hook socket).
 
+##### orchestration/focus/008 — The waiting-focus branch defers a focus steal, rather than applying it immediately, while a keystroke is still queued for the currently-focused waiting pane.
+- **Layer:** L1 (in-process unit test; `src/tab.rs`, alongside `orchestration/focus/001`-`006`).
+- **Agent:** none (mock `PaneController`; synthetic `SessionStatus` map, no panes/PTYs).
+- **Asserts:** with a real `TabManager`-opened 3-role Orchestration tab (`orchestrator` < `alpha` < `beta`), `beta` (higher role order) goes `WaitingForInput` and steals focus with no input pending, as `orchestration/focus/001` pins; `alpha` (LOWER role order than `beta`) then ALSO goes `WaitingForInput` on a frame where `input_pending` is true (modeling a keystroke still queued for `beta`) — the steal to `alpha` must be deferred, returning `None` and leaving focus on `beta`, not yanked away from the pane the queued keystroke is aimed at; once `input_pending` clears on a later frame, the deferred steer to `alpha` must still fire, proving the guard DEFERS the move rather than dropping it, mirroring `TabManager::auto_focus_all_clear`'s existing "no one-shot latch" contract. Drives `TabManager::auto_focus_locked(pane_status, input_pending)`, the seam that folds both `auto_focus_waiting_pane` and `auto_focus_all_clear` behind ONE shared `input_pending` guard mirroring the real per-frame call site's shape.
+- **Does not assert:** the real `src/ui.rs` per-frame call site actually computing `input_pending` from `crossterm::event::poll` or applying the result via `pane.focus_pane` (out of L1 `TabManager` reach — it would need a PTY-attached L2 test, and an L2 test was evaluated and rejected: the underlying terminal race is not economically reproducible there, since it requires a keystroke to be sitting in the terminal's input queue on the exact frame a lower-order pane transitions to `WaitingForInput`); the deck-global lock gate itself (`ui.command_entry_locked`, covered by `orchestration/focus/005`/`006`); the multi-waiter ordering contract, covered exhaustively by `orchestration/focus/001`/`004`.
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/layout
 
 ##### orchestration/layout/001 — Seven decks fit the single-column orchestration card area without scrolling (PRD #147).
