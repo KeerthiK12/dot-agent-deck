@@ -1557,6 +1557,24 @@ struct UiState {
     update_available: Option<String>,
     /// Layout mode for embedded terminal panes (stacked or tiled).
     pane_layout: PaneLayout,
+    /// The command-entry lock: while engaged, a keystroke aimed at a focused
+    /// NON-orchestrator role pane of an Orchestration tab is dropped instead of
+    /// reaching that pane's PTY (see [`gate_pane_input_key`]), and the deck
+    /// steers focus itself (see the auto-focus chain in the render loop).
+    /// Toggled by `Ctrl+E` from command mode. **Locked by default** — a lock
+    /// you must remember to engage protects nothing.
+    ///
+    /// Deck-global, deliberately, and stored next to [`Self::pane_layout`] for
+    /// the same reason: it describes how someone is working right now, not
+    /// which tab they happened to open. A per-tab lock means unlocking has to
+    /// be repeated in every Orchestration tab, with nothing on screen saying
+    /// why the state set moments ago does not apply here.
+    ///
+    /// What is deck-global is WHERE the value lives, not how far it reaches:
+    /// the gate still matches only [`Tab::Orchestration`], so Dashboard and
+    /// Mode tabs are never gated whatever this says. Not persisted — every
+    /// deck starts locked.
+    command_entry_locked: bool,
     /// Warnings collected during session save/restore, flushed after terminal restore.
     session_warnings: Vec<String>,
     /// PRD #89 review-fix G1: tracks whether the most recent periodic snapshot
@@ -1849,6 +1867,7 @@ impl UiState {
             last_bell_status: HashMap::new(),
             update_available: None,
             pane_layout: PaneLayout::Stacked,
+            command_entry_locked: true,
             session_warnings: Vec::new(),
             session_snapshot_write_failed: false,
             selection: None,
@@ -3600,6 +3619,11 @@ pub enum Action {
     /// PRD #80: toggle the embedded-pane layout between stacked and tiled
     /// (Ctrl+T).
     ToggleLayout,
+    /// Toggle the deck-global command-entry lock (Ctrl+E), which decides
+    /// whether keystrokes reach a focused non-orchestrator role pane's PTY.
+    /// Only ever reaches the handler from an Orchestration tab in command mode
+    /// — [`scope_command_entry_lock`] un-resolves it everywhere else.
+    ToggleOrchestrationLock,
     /// PRD #80: leave `PaneInput` and return to Normal (command) mode on the
     /// current tab (Ctrl+D).
     DetachToNormal,
@@ -4181,6 +4205,97 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
     } else {
         Action::Continue
     }
+}
+
+/// Status message shown when a keystroke is dropped because the command-entry
+/// lock is engaged. Follows this codebase's existing no-op-with-feedback
+/// convention (e.g. `RequestConfigGen`'s "No active agent session to send
+/// prompt to.").
+///
+/// It names `Ctrl+D` **first**, and that is load-bearing rather than
+/// stylistic: this message is only ever shown from `UiMode::PaneInput`, which
+/// — since [`scope_command_entry_lock`] claims the chord in `UiMode::Normal`
+/// only — is precisely the mode where `Ctrl+E` alone does nothing. Naming just
+/// the unlock chord would instruct the user to press a chord that provably
+/// cannot work from where they are standing.
+const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d then Ctrl+e to unlock";
+
+/// Gate the PTY-forward fallback [`handle_pane_input_key`] produces against the
+/// command-entry lock. When the active tab is [`Tab::Orchestration`], the lock
+/// is engaged, and the focused pane is neither the orchestrator
+/// (`role_pane_ids[start_role_index]`) nor waiting for input, a would-be
+/// [`Action::ForwardToPane`] is dropped (returned as [`Action::Continue`])
+/// before it ever reaches that pane's PTY.
+///
+/// The orchestrator pane's own input is never gated, and non-orchestration tabs
+/// are unaffected — the `Tab::Orchestration` match below is what bounds the
+/// lock's reach, and it is the only thing that does. This is also the sole gate
+/// site, so global chords resolved earlier by [`global_action_for_mode`] never
+/// pass through it.
+///
+/// **Nothing becomes read-only.** The lock does not remove worker input, it
+/// gates it behind one deliberate `Ctrl+D`, `Ctrl+E`. Every reach-into-a-worker
+/// fail-safe stays reachable at that cost.
+///
+/// **The `WaitingForInput` carve-out.** While the focused non-orchestrator role
+/// pane reports [`SessionStatus::WaitingForInput`], the lock stops gating that
+/// pane and the keystroke passes through untouched. The lock's subject is the
+/// *unsolicited* interruption of a working agent; an agent that has stopped and
+/// asked is already blocked on a human, so answering it is a response to a
+/// request rather than an intrusion into state the orchestrator believes it
+/// owns. The exemption is a pure read of live status with nothing latched
+/// anywhere, so the gate re-engages on the very next keystroke once the status
+/// clears. Chosen over an always-allowed navigation-key allowlist because it
+/// reuses a signal the deck already computes every frame, needs no per-agent key
+/// knowledge, and can answer a free-text prompt — which an allowlist cannot.
+/// **Accepted limitation:** an agent that never reports `WaitingForInput` gets
+/// no carve-out and still needs a deliberate unlock.
+///
+/// `pane_status` is the `pane_id -> SessionStatus` join
+/// [`build_pane_status_for_gate`] returns, handed straight over by the call
+/// site. That producer — not this consumer — is where ambiguity is resolved: it
+/// omits any `pane_id` claimed by more than one session, and the `Some(...)`
+/// match below then denies the exemption for a missing key without needing to
+/// know why it is missing. See its docs for why the guard cannot live here.
+fn gate_pane_input_key(
+    action: Action,
+    ui: &UiState,
+    tab_manager: &TabManager,
+    pane: &dyn PaneController,
+    pane_status: &HashMap<&str, SessionStatus>,
+) -> Action {
+    if !matches!(action, Action::ForwardToPane(_)) {
+        return action;
+    }
+    if !ui.command_entry_locked {
+        return action;
+    }
+    let Tab::Orchestration {
+        role_pane_ids,
+        start_role_index,
+        ..
+    } = tab_manager.active_tab()
+    else {
+        return action;
+    };
+    let orchestrator_pane_id = role_pane_ids.get(*start_role_index).map(String::as_str);
+    let focused_pane_id = pane.focused_pane_id();
+    if focused_pane_id.as_deref() == orchestrator_pane_id {
+        return action;
+    }
+    // The carve-out is checked LAST so it can only ever widen what gets
+    // through — the orchestrator's never-gated rule above and the
+    // tab-kind/lock guards before it keep their existing meaning whatever
+    // status happens to be attached to a pane.
+    if let Some(pane_id) = focused_pane_id.as_deref()
+        && matches!(
+            pane_status.get(pane_id),
+            Some(SessionStatus::WaitingForInput)
+        )
+    {
+        return action;
+    }
+    Action::Continue
 }
 
 /// PRD #241 M3: the close-confirmation dialog's whole state — which option is
@@ -6376,6 +6491,9 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     if kb.matches(KbAction::ClosePane, key) {
         return Some(Action::CloseSelected);
     }
+    if kb.matches(KbAction::ToggleOrchestrationLock, key) {
+        return Some(Action::ToggleOrchestrationLock);
+    }
     // Ctrl+PageDown / Ctrl+PageUp: non-configurable tab navigation.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
@@ -6423,6 +6541,42 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     }
 }
 
+/// Un-resolve `Ctrl+E` (`ToggleOrchestrationLock`) unless the active tab is an
+/// Orchestration tab **and** the deck is in command mode.
+///
+/// Same conflict class, and the same trade, as [`global_action_for_mode`]'s
+/// `CloseSelected` scoping above: `Ctrl+E` is `0x05`, readline's
+/// `end-of-line`. A globally-bound chord that a pane's occupant also wants is
+/// claimed only in command mode, and the user pays one extra `Ctrl+D` rather
+/// than losing the chord entirely. Without this, an Orchestration tab would
+/// swallow the byte unconditionally and a focused role pane's PTY would never
+/// receive it — so the user could not move to the end of a line they were
+/// typing at the agent.
+///
+/// It cannot live inside `global_action_for_mode` the way `CloseSelected`'s
+/// mode term does, because it needs one thing that function has no access to:
+/// which KIND of tab is active. `is_orchestration_tab` is true **only** for
+/// [`Tab::Orchestration`], whose `role_pane_ids[start_role_index]` is what
+/// gives the chord something to mean; on a Dashboard or Mode tab the lock
+/// reaches nothing, so claiming the chord there would cost the byte for no
+/// behaviour. Kept a standalone pure function rather than an inline `if` at the
+/// call site because it is then unit-testable without a PTY — an inline
+/// condition is only reachable through the full event loop.
+fn scope_command_entry_lock(
+    action: Option<Action>,
+    is_orchestration_tab: bool,
+    mode: UiMode,
+) -> Option<Action> {
+    match action {
+        Some(Action::ToggleOrchestrationLock)
+            if !is_orchestration_tab || mode != UiMode::Normal =>
+        {
+            None
+        }
+        other => other,
+    }
+}
+
 /// PRD #241 M1 (L1 `keybindings/safety/003`, `/004`, `keybindings/remap/003`):
 /// resolve a key the way the live loop does for a given mode.
 ///
@@ -6431,8 +6585,17 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
 /// PTY-forwarding fall-through (`handle_pane_input_key`). Returning `None`
 /// means "no global command and nothing to forward", i.e. the key belongs to
 /// that mode's own handler.
+///
+/// The `ToggleOrchestrationLock` pass below applies [`scope_command_entry_lock`]'s
+/// MODE term only, with `is_orchestration_tab: true`. Mode is this helper's
+/// whole subject and is knowable here, so leaving it out would make the helper
+/// over-report `Ctrl+E` as claimed in `PaneInput` — the exact thing the scoping
+/// exists to stop. Tab kind is not knowable here and is applied at the live
+/// call site, so this helper answers for the most permissive tab.
 pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
-    if let Some(action) = global_action_for_mode(kb, mode, key) {
+    if let Some(action) =
+        scope_command_entry_lock(global_action_for_mode(kb, mode, key), true, mode)
+    {
         return Some(action);
     }
     if mode == UiMode::PaneInput {
@@ -6919,6 +7082,22 @@ fn dispatch_action(
             // pre-draw `resize_panes_to_layout` re-sizes every pane to the new
             // split on the next frame (it reads `pane_layout`).
             ui.status_message = Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
+        }
+        // Ctrl+e: toggle the deck-global command-entry lock. The action only
+        // ever reaches here from an Orchestration tab in command mode —
+        // `scope_command_entry_lock` un-resolves it everywhere else — so there
+        // is no per-tab guard left to apply.
+        Action::ToggleOrchestrationLock => {
+            ui.command_entry_locked = !ui.command_entry_locked;
+            let lock_name = if ui.command_entry_locked {
+                "locked"
+            } else {
+                "unlocked"
+            };
+            ui.status_message = Some((
+                format!("Pane entry: {lock_name}"),
+                std::time::Instant::now(),
+            ));
         }
         // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
         // the current tab.
@@ -8761,6 +8940,15 @@ fn handle_key_event(
     // while the user is typing in a pane.
     if action.is_none() && !is_ctrl_c {
         action = global_action_for_mode(&kb, ui.mode, &key);
+        // Same reasoning as `close_pane` above, one step further: `Ctrl+E` is
+        // claimed only on an Orchestration tab, and only in command mode.
+        // `global_action_for_mode` has no tab context, so a `Ctrl+E` typed into
+        // a focused pane would otherwise be claimed here and never reach the
+        // PTY — breaking readline's end-of-line for the agent the user is
+        // typing at. Un-resolving it lets the key fall through to the normal
+        // `PaneInput` forwarding path (`0x05`) instead.
+        let is_orchestration_tab = matches!(tab_manager.active_tab(), Tab::Orchestration { .. });
+        action = scope_command_entry_lock(action, is_orchestration_tab, ui.mode);
     }
 
     // PRD #341 M5: command-mode focused-pane scrolling (`scroll_pane_up` /
@@ -8835,7 +9023,32 @@ fn handle_key_event(
             }
             UiMode::DirPicker => handle_dir_picker_key(key, ui),
             UiMode::NewPaneForm => handle_new_pane_form_key(key, ui),
-            UiMode::PaneInput => handle_pane_input_key(key),
+            UiMode::PaneInput => {
+                let candidate = handle_pane_input_key(key);
+                // The gate needs live per-pane status for the
+                // `WaitingForInput` carve-out, and `UiState` caches none — so
+                // build the join from the `snapshot` already in scope here and
+                // hand it over. Deliberately `build_pane_status_for_gate`, not
+                // the plain `build_pane_status` the pane borders read: it omits
+                // any `pane_id` claimed by more than one session, so an
+                // ambiguous pane can never earn the carve-out.
+                let gated = gate_pane_input_key(
+                    candidate.clone(),
+                    ui,
+                    tab_manager,
+                    pane,
+                    &build_pane_status_for_gate(snapshot),
+                );
+                if matches!(candidate, Action::ForwardToPane(_))
+                    && matches!(gated, Action::Continue)
+                {
+                    ui.status_message = Some((
+                        ORCHESTRATION_LOCK_STATUS_MESSAGE.to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
+                gated
+            }
             UiMode::StarPrompt => handle_star_prompt_key(key, ui),
             UiMode::ConfigGenPrompt => handle_config_gen_prompt_key(key, ui),
             UiMode::QuitConfirm => {
@@ -11817,6 +12030,55 @@ pub(crate) fn build_pane_status(state: &AppState) -> HashMap<&str, SessionStatus
         .sessions
         .values()
         .filter_map(|s| s.pane_id.as_deref().map(|pid| (pid, s.status.clone())))
+        .collect()
+}
+
+/// The same `pane_id -> SessionStatus` join as [`build_pane_status`], but
+/// **fail-closed on ambiguity**: a `pane_id` claimed by more than one session
+/// is OMITTED from the result entirely, whatever those sessions' statuses say.
+///
+/// Only [`gate_pane_input_key`] — the `WaitingForInput` carve-out — reads this.
+/// **Omission means "deny"**: the gate tests
+/// `matches!(pane_status.get(pane_id), Some(SessionStatus::WaitingForInput))`,
+/// which is false for a missing key, so leaving an ambiguous pane out of the
+/// map is exactly what makes the carve-out refuse to widen the lock. A single,
+/// unambiguous session behaves identically to [`build_pane_status`].
+///
+/// **Why this is a separate function, and why it must be the producer** — do
+/// not merge it back into [`build_pane_status`], and do not try to move the
+/// check into the gate instead:
+///
+/// - [`build_pane_status`] is deliberately left as-is. Its consumers (pane
+///   border colouring) want today's behaviour, and a colour being wrong on a
+///   collision is cosmetic. The lock is the security-shaped one, so only the
+///   lock's feed hardens.
+/// - `HashMap<&str, SessionStatus>` is one key, one value by construction, so a
+///   collision cannot be *represented* in the join's output at all — by the time
+///   the gate reads the map the ambiguity has already been discarded and no
+///   consumer-side check, however clever, can recover it. Only the raw
+///   `state.sessions` collection still knows, which is why the guard has to live
+///   here, on the producing side.
+/// - The rule is "any duplicate", not "any *disagreeing* duplicate". Permitting
+///   agreeing duplicates would hand an attacker on the status wire precisely
+///   what they want: a second session that also claims `WaitingForInput` would
+///   sail through. "Closed only when the duplicates happen to disagree" is not
+///   fail-closed.
+pub(crate) fn build_pane_status_for_gate(state: &AppState) -> HashMap<&str, SessionStatus> {
+    // `None` marks a pane_id seen more than once; it is dropped below rather
+    // than resolved, since there is no defensible way to pick a winner.
+    let mut joined: HashMap<&str, Option<SessionStatus>> = HashMap::new();
+    for session in state.sessions.values() {
+        let Some(pane_id) = session.pane_id.as_deref() else {
+            continue;
+        };
+        joined
+            .entry(pane_id)
+            .and_modify(|slot| *slot = None)
+            .or_insert_with(|| Some(session.status.clone()));
+    }
+    joined
+        .into_iter()
+        .filter_map(|(pane_id, status)| status.map(|status| (pane_id, status)))
         .collect()
 }
 
