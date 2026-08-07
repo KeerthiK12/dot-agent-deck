@@ -7089,6 +7089,21 @@ fn dispatch_action(
         // is no per-tab guard left to apply.
         Action::ToggleOrchestrationLock => {
             ui.command_entry_locked = !ui.command_entry_locked;
+            // On the locked→unlocked half ONLY, drop the waiting-episode latch
+            // on EVERY Orchestration tab: the lock is deck-global, so
+            // unlocking stops observation everywhere at once and any tab can
+            // be left holding a frozen latch, not just the one active right
+            // now. From this frame on the render loop stops calling
+            // `observe_waiting_panes`, so a latch left standing here would
+            // freeze at its current value and be misread on re-lock as a fresh
+            // all-clear edge for an episode the human already dealt with by
+            // hand. Clearing on the unlocked→locked half instead would be
+            // wrong: that half is followed by frames that observe, so it has
+            // nothing to compensate for, and it would discard an edge the deck
+            // is about to act on legitimately.
+            if !ui.command_entry_locked {
+                tab_manager.clear_waiting_pane_latch();
+            }
             let lock_name = if ui.command_entry_locked {
                 "locked"
             } else {
@@ -10393,6 +10408,52 @@ pub fn run_tui(
                 role_pane_ids: role_pane_ids.clone(),
             },
         };
+        // Focus follows the lock. While the command-entry lock is engaged the
+        // deck steers the active Orchestration tab's focus itself: onto the
+        // lowest-order `WaitingForInput` role pane while one exists, and back
+        // to the orchestrator on the all-clear edge. While unlocked the WHOLE
+        // chain — observation included — is skipped, so the deck makes no focus
+        // decision at all and nothing fights the human's manual choice. Focus
+        // stays exactly where they put it until the deck is locked again.
+        //
+        // The status join is the same `build_pane_status` the pane borders read,
+        // so no new data flow is introduced. `Some(new_id)` means focus actually
+        // moved, so it is re-focused on the live pane controller.
+        //
+        // The gate lives here, at the call site, rather than inside
+        // `TabManager`: the lock is a `UiState` concern and nothing in
+        // `src/tab.rs` knows it exists — the same seam `gate_pane_input_key`
+        // reads it from. Skipping `observe_waiting_panes` means a latch set
+        // before an unlock could otherwise survive across it; the toggle
+        // handler calls `clear_waiting_pane_latch` on the locked→unlocked half
+        // to compensate (see that method's doc comment for the straddling trace
+        // this protects).
+        if ui.command_entry_locked {
+            let pane_status_for_focus: HashMap<&str, SessionStatus> = build_pane_status(&snapshot);
+            // The observation runs FIRST and outside the chain, because it must
+            // happen on every locked frame no matter which branch below wins.
+            tab_manager.observe_waiting_panes(&pane_status_for_focus);
+            if let Some(new_id) = tab_manager.auto_focus_waiting_pane(&pane_status_for_focus) {
+                let _ = pane.focus_pane(&new_id);
+            } else if !crossterm::event::poll(std::time::Duration::from_millis(0))?
+                && let Some(new_id) = tab_manager.auto_focus_all_clear()
+            {
+                // Only reached when the branch above found nothing left to
+                // steer toward this frame — see `auto_focus_all_clear`'s doc
+                // comment for why that gate matters.
+                //
+                // The `poll(0ms)` peek is a pending-input guard: this move
+                // fires exactly when the user has just answered the last prompt
+                // and is likely still typing, and a key read after focus moved
+                // is forwarded to the ORCHESTRATOR's PTY — which the lock
+                // deliberately does not gate. The skip costs nothing: the edge
+                // is latched in `all_clear_pending` and survives until
+                // consumed, so the move simply happens on a later frame, after
+                // the queued input has been dispatched to the pane it was aimed
+                // at.
+                let _ = pane.focus_pane(&new_id);
+            }
+        }
         let tab_bar_labels: Vec<String> = tab_manager
             .tabs()
             .iter()
