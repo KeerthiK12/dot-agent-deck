@@ -1532,6 +1532,24 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the max-lifetime backstop (`DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, covered by the daemon pure-data unit tests) or production daemons (the watchdog is OFF unless the env var is set).
 - **Platform coverage:** mac+linux.
 
+#### lifecycle/sigterm
+
+##### lifecycle/sigterm/001 — A daemon sent SIGTERM (what `daemon stop` / `daemon restart` deliver) exits through its graceful shutdown path AND logs the signal, instead of dying silently under the default disposition.
+- **Layer:** L2.
+- **Agent:** none (a bare `daemon serve` with idle shutdown disabled, so only the signal handler can end it).
+- **Asserts:** after a plain `kill(pid, SIGTERM)` the daemon process terminates within a few seconds, and its `DOT_AGENT_DECK_LOG` file contains a termination line naming `SIGTERM`.
+- **Does not assert:** agent teardown ordering under signal shutdown, or `SIGINT` (the handler treats both identically and the CLI only ever sends `SIGTERM`); `--force`'s SIGKILL escalation stays with `lifecycle/stop/003`.
+- **Regression origin:** the daemon installed no signal handler at all, so a stopped daemon left no log line — a real session lost seven live agent panes and the daemon's own log said nothing about why.
+- **Platform coverage:** linux+mac (Unix signals; the Windows build watches Ctrl-C instead).
+
+##### lifecycle/sigterm/002 — A second SIGTERM during shutdown forces an immediate exit instead of being swallowed, so a wedged daemon is still killable with `pkill`.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** after the daemon logs the first termination signal, a second SIGTERM leaves the process gone within a few seconds.
+- **Does not assert:** the exact exit status (`143`), since a shutdown fast enough to finish before the second signal exits `0` and both outcomes satisfy "the daemon does not linger".
+- **Regression origin:** installing a handler replaces the default disposition process-wide, so once the first signal is consumed every later SIGTERM would be absorbed by a stream nobody reads — removing the `pkill` escape hatch that the pre-handler behaviour always provided.
+- **Platform coverage:** linux+mac (Unix signals).
+
 #### lifecycle/version
 
 ##### lifecycle/version/001 — A build environment that pre-sets `DAD_VERSION` / `DAD_BUILD_ID` produces a binary that reports those values, and changing either one invalidates the cached build (issue #250).
