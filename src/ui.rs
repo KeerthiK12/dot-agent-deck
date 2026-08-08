@@ -10607,7 +10607,22 @@ pub fn run_tui(
         // deck would move focus on its own for a lock the user cannot see or
         // reach. Flag off therefore means no automatic focus movement at all,
         // which is exactly v0.35.8's behaviour.
-        if crate::features::show_command_entry_lock() && ui.command_entry_locked {
+        //
+        // Greptile PR #446: the flag is LIVE-RELOADED (`features::spawn_watcher`
+        // re-reads `.dot-agent-deck.toml` every ~2s), so unlike a compile-time
+        // gate it can flip mid-session — which makes it a second way to stop
+        // observing, alongside the `Ctrl+E` unlock. The latch this chain reads
+        // (`had_waiting_pane` / `all_clear_pending`) is EDGE-triggered, so
+        // stopping observation while it is set freezes it: a pane that resolves
+        // while the flag is off would be re-read on the next enable as a fresh
+        // all-clear edge and yank focus to the orchestrator for an episode the
+        // human already dealt with. The `Ctrl+E` handler compensates for its own
+        // half by calling `clear_waiting_pane_latch`; the flag needs the same
+        // compensation, done here rather than edge-tracked because holding no
+        // latch at all is the honest state while the surface does not exist.
+        if !crate::features::show_command_entry_lock() {
+            tab_manager.clear_waiting_pane_latch();
+        } else if ui.command_entry_locked {
             let pane_status_for_focus: HashMap<&str, SessionStatus> = build_pane_status(&snapshot);
             // The observation runs FIRST and outside the chain, because it must
             // happen on every locked frame no matter which branch below wins.

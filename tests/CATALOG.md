@@ -2260,6 +2260,13 @@ without depending on the config struct API.
 - **Does not assert:** the real `src/ui.rs` per-frame call site actually computing `input_pending` from `crossterm::event::poll` or applying the result via `pane.focus_pane` (out of L1 `TabManager` reach — it would need a PTY-attached L2 test, and an L2 test was evaluated and rejected: the underlying terminal race is not economically reproducible there, since it requires a keystroke to be sitting in the terminal's input queue on the exact frame a lower-order pane transitions to `WaitingForInput`); the deck-global lock gate itself (`ui.command_entry_locked`, covered by `orchestration/focus/005`/`006`); the multi-waiter ordering contract, covered exhaustively by `orchestration/focus/001`/`004`.
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/focus/009 — Turning the `experimental` flag OFF mid-session clears the waiting-episode latch, so re-enabling it replays no stale all-clear edge.
+- **Layer:** L1 (in-process unit test; `src/tab.rs`, alongside `orchestration/focus/001`-`006`/`008`).
+- **Agent:** none (mock `PaneController`; synthetic `SessionStatus` map, no panes/PTYs).
+- **Asserts:** with the flag on and the deck locked, `alpha` goes `WaitingForInput`, latching the episode and stealing focus; the flag then flips OFF (the watcher re-reads `.dot-agent-deck.toml` roughly every 2s, so this is reachable without a restart) and `alpha` resolves unobserved; on the first frame after the flag returns, no focus move may be produced. A latch left standing while the flag was off would read there as a stale `true` -> `false` all-clear and yank focus to the orchestrator for an episode already dealt with. Mirrors `orchestration/focus/006`, which pins the same contract for the `Ctrl+E` unlock — the flag is simply a second way to stop observing.
+- **Does not assert:** the real `src/ui.rs` per-frame call site (out of L1 `TabManager` reach, as `orchestration/focus/008` records); the gating of the keystroke path or the `Ctrl+E` binding (`orchestration/lock/014`).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/layout
 
 ##### orchestration/layout/001 — Seven decks fit the single-column orchestration card area without scrolling (PRD #147).
