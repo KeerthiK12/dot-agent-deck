@@ -1805,6 +1805,105 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    // --- PRD #220: the dispatch shape selector's parsing ---
+
+    fn parse_dispatch(
+        args: &[&str],
+    ) -> (Option<String>, Option<String>, bool, Option<String>, bool) {
+        let mut argv = vec!["dot-agent-deck", "dispatch"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv)
+            .expect("dispatch args should parse")
+            .command
+            .expect("a subcommand")
+        {
+            Commands::Dispatch {
+                name,
+                task,
+                single,
+                orchestration,
+                list_targets,
+                ..
+            } => (name, task, single, orchestration, list_targets),
+            // `Commands` deliberately derives no `Debug`, so this cannot print the
+            // variant it got — the arm is unreachable anyway, since the argv above
+            // always names `dispatch`.
+            _ => panic!("expected the Dispatch subcommand"),
+        }
+    }
+
+    /// `--orchestration` takes an OPTIONAL value (`num_args = 0..=1`), which is the
+    /// risky shape: a greedy parse would swallow the following FLAG as the
+    /// orchestration name, silently starting a different shape than the user chose.
+    /// clap does not consume a `-`-prefixed token as a value, and this pins it —
+    /// a later `allow_hyphen_values` would otherwise break it invisibly.
+    #[test]
+    fn dispatch_bare_orchestration_does_not_swallow_the_next_flag() {
+        let (name, task, single, orch, _) =
+            parse_dispatch(&["unit", "--orchestration", "--task", "hello"]);
+        assert_eq!(name.as_deref(), Some("unit"));
+        assert_eq!(
+            task.as_deref(),
+            Some("hello"),
+            "--task must survive: a greedy --orchestration would have eaten it"
+        );
+        assert!(!single);
+        assert_eq!(
+            orch.as_deref(),
+            Some(""),
+            "a bare --orchestration is the empty default_missing_value, meaning \
+             'this repo's first'"
+        );
+
+        // Trailing bare flag: same outcome, different position.
+        let (_, task, _, orch, _) = parse_dispatch(&["unit", "--task", "hello", "--orchestration"]);
+        assert_eq!(task.as_deref(), Some("hello"));
+        assert_eq!(orch.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn dispatch_named_orchestration_and_single_parse_as_expected() {
+        let (_, _, single, orch, _) = parse_dispatch(&["unit", "--orchestration", "review"]);
+        assert!(!single);
+        assert_eq!(orch.as_deref(), Some("review"));
+
+        let (_, _, single, orch, _) = parse_dispatch(&["unit", "--single", "--task", "t"]);
+        assert!(single);
+        assert_eq!(orch, None);
+    }
+
+    /// The two shape flags are mutually exclusive, so a caller can never express
+    /// an ambiguous choice.
+    #[test]
+    fn dispatch_rejects_single_and_orchestration_together() {
+        assert!(
+            Cli::try_parse_from([
+                "dot-agent-deck",
+                "dispatch",
+                "unit",
+                "--single",
+                "--orchestration",
+                "review",
+            ])
+            .is_err(),
+            "--single and --orchestration must conflict"
+        );
+    }
+
+    /// `--list-targets` is the one form that needs no name; every other form does,
+    /// so a missing name can never be read as an empty dispatch name.
+    #[test]
+    fn dispatch_name_is_required_except_for_list_targets() {
+        let (name, _, _, _, list) = parse_dispatch(&["--list-targets"]);
+        assert!(name.is_none());
+        assert!(list);
+
+        assert!(
+            Cli::try_parse_from(["dot-agent-deck", "dispatch", "--task", "t"]).is_err(),
+            "a dispatch with no name and no --list-targets must be rejected"
+        );
+    }
+
     // PRD #127 B1 — `schedule add --new-tab-per-fire` must accept an explicit
     // `<true|false>` value (ArgAction::Set), matching `update`, the authoring
     // seed prompt, and the docs. A bare SetTrue flag would reject the value.
