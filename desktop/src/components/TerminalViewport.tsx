@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import type { TerminalBuffer } from "../types";
 
@@ -72,6 +73,22 @@ export function TerminalViewport({
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
     terminal.open(host);
+    // GPU rendering. Without it xterm falls back to the DOM renderer, which
+    // cannot keep up with several agents streaming output at once. Loading it
+    // must happen after open(); a lost WebGL context degrades to the DOM
+    // renderer rather than leaving a dead pane.
+    let webglAddon: WebglAddon | undefined;
+    try {
+      webglAddon = new WebglAddon();
+      webglAddon.onContextLoss(() => {
+        webglAddon?.dispose();
+        webglAddon = undefined;
+      });
+      terminal.loadAddon(webglAddon);
+    } catch {
+      webglAddon?.dispose();
+      webglAddon = undefined;
+    }
     terminalRef.current = terminal;
     terminal.write(transcript);
 
@@ -94,6 +111,7 @@ export function TerminalViewport({
       window.cancelAnimationFrame(frame);
       observer.disconnect();
       inputDisposable.dispose();
+      webglAddon?.dispose();
       terminal.dispose();
       terminalRef.current = undefined;
       lastStreamRef.current = undefined;

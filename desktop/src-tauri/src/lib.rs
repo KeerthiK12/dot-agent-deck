@@ -33,6 +33,21 @@ use crate::terminal::DesktopState;
 const WATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 const COORDINATOR_DELIVERY_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Minimum spacing between full-snapshot refreshes driven by the daemon event
+/// stream.
+///
+/// Every hook event used to trigger its own `get_snapshot()` — a `ListAgents`
+/// round-trip over the daemon socket — plus a full snapshot serialization
+/// across the Tauri IPC bridge and a re-render of the whole deck. A busy agent
+/// emits hook events continuously, so with several agents running the webview
+/// spent its time re-rendering instead of painting terminals.
+///
+/// Refreshes are coalesced instead: events that arrive inside the window are
+/// absorbed by the next refresh, because `get_snapshot()` always reads current
+/// state (latest-wins, never a stale replay). This mirrors the single-slot
+/// resize coalescing the terminal bridge already uses.
+const SNAPSHOT_COALESCE_INTERVAL: Duration = Duration::from_millis(150);
+
 fn order_workflow_roles(
     config: &OrchestrationConfig,
     requested: &[WorkflowRoleInput],
@@ -614,10 +629,18 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
                     continue;
                 }
             };
+            let mut last_refresh: Option<tokio::time::Instant> = None;
             while let Ok(Some(event)) = subscription.next_event().await {
                 let _ = app.emit("desktop://daemon-event", &event);
+                if let Some(previous) = last_refresh {
+                    let elapsed = previous.elapsed();
+                    if elapsed < SNAPSHOT_COALESCE_INTERVAL {
+                        tokio::time::sleep(SNAPSHOT_COALESCE_INTERVAL - elapsed).await;
+                    }
+                }
                 let snapshot = get_snapshot().await;
                 emit_snapshot(&app, &snapshot);
+                last_refresh = Some(tokio::time::Instant::now());
             }
             tokio::time::sleep(WATCH_RETRY_DELAY).await;
         }
