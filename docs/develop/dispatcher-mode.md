@@ -24,9 +24,35 @@ Once the agent is running inside dispatcher mode, it can execute:
 dot-agent-deck dispatch <name> --task "..."
 ```
 
-This spawns an isolated agent — or a full multi-role orchestration, depending on the dispatched worktree's own `.dot-agent-deck.toml` — in a dedicated worktree. The `--task` text becomes that agent's opening prompt, and because it runs as a fresh process with no access to the dispatcher's conversation, the text has to be self-contained.
+This creates a dedicated worktree and starts a line of work inside it. The `--task` text becomes the opening prompt, and because it runs as a fresh process with no access to the dispatcher's conversation, the text has to be self-contained.
 
 Several dispatches from one pane are normal, and are not decomposition: working on three PRDs in parallel is three dispatches of three things the user named.
+
+## Choosing the shape: one agent, or a team
+
+A unit can start as a single agent or as a full multi-role orchestration. **Which one is the user's call, not the agent's** — and that is why it is asked rather than inferred. The two cases look identical from the request:
+
+- *"work on these three features"* → usually a team per feature
+- *"verify these three PRs"* → usually one agent each
+
+So the seed tells the dispatcher to enumerate the shapes this repo offers and ask before the first dispatch:
+
+```
+dot-agent-deck dispatch --list-targets
+```
+
+which prints `single` plus every role-bearing orchestration by name. The answer then rides on each call:
+
+```
+dot-agent-deck dispatch <name> --task "..." --single
+dot-agent-deck dispatch <name> --task "..." --orchestration <orchestration-name>
+```
+
+`--list-targets` is a **local read** of the repo's own `.dot-agent-deck.toml`, not a daemon round-trip — the dispatched worktree is a copy of this repo, so that config is the one the spawn branches on. It therefore adds no hook-socket message and no protocol surface.
+
+Two details worth knowing. Naming an orchestration the repo does not define is an **error**, not a silent fallback — starting something other than what the user picked is exactly the surprise the selector removes, and the message lists what is available. And schedule/authoring modes never appear in the listing: a schedule creates a *future* task, so it is not something a dispatch can start.
+
+With neither flag, the shape still falls back to whatever the repo's config implies (its first `[[orchestrations]]`, else a single agent), which is the pre-selector behaviour.
 
 ## Worktree isolation
 
@@ -42,4 +68,5 @@ The unit's branch (`agent/dispatch-<slug>`) always survives removal, because it 
 
 ## Current limitations
 
+- **A dispatched orchestration starts without the delegation protocol, so only its orchestrator acts.** This is the one limitation to know before choosing `--orchestration`. The daemon spawn path never composes the orchestrator context that the interactive `Ctrl+n` path writes: `prepare_orchestrator_prompt` (which writes `.dot-agent-deck/orchestrator-context.md` listing the roles and the delegation protocol) has exactly one caller, `src/ui.rs`, and `src/spawn.rs` never calls it. The orchestrator therefore receives the `--task` text but is never told that it *is* an orchestrator, which roles exist, or how to `delegate` — so it does not delegate, and its worker panes sit idle waiting for work that never arrives. In a repo whose first orchestration has six roles, that is one working agent and five idle ones. Until this is fixed, `--single` is the reliable choice. Tracked on [#222](https://github.com/vfarcic/dot-agent-deck/issues/222), whose "prompt order" parity item is exactly this; scheduled issue-dispatch (#120) has the identical defect because it shares the same spawn path, so one fix covers both.
 - The return edge (the dispatched unit sending results back to the dispatcher) is not yet implemented. The dispatcher reports where each unit is running; it is **not** notified when a unit finishes. This is Phase 2 of [PRD #220](https://github.com/vfarcic/dot-agent-deck/issues/220) itself, deferred rather than dropped. (It is *not* tracked by #174 — that is the separate *Cross-project orchestration dispatch* PRD, which **depends on** this one.)

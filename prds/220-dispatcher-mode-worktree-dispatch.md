@@ -85,7 +85,47 @@ Asked on PR #232 whether the decomposer framing was deliberate, rather than reso
 Both dependent items are now decided:
 
 - **Seed scope → verb-teacher.** Rewritten to mechanics only, per the keep/cut list above, and pinned by `dispatcher_seed_teaches_mechanics_not_work_methodology` so the planner copy cannot drift back in.
-- **`is_authoring_selected()` → `dispatcher` removed.** The "↳ authoring (one-off)" hint stays correct for the schedule modes, whose own seeds tell the user the pane existed only to write the schedule. A dispatcher pane has continued purpose and is spawned as a real mode tab (`mode_config: Some(...)`) rather than a throwaway authoring card, so the hint was telling the user the opposite of the truth.
+- **`is_authoring_selected()` → `dispatcher` removed.** The "↳ authoring (one-off)" hint stays correct for the schedule modes, whose own seeds tell the user the pane existed only to write the schedule. A dispatcher pane has continued purpose, so the hint was telling the user the opposite of the truth.
+
+## Design record — three findings from actually using it (2026-08-08)
+
+Found by running the shipped feature by hand, *after* CI was green, Greptile returned 0 comments, and `prompt/new-pane/016` passed with a real agent. None of the three was caught by any gate, and the reason is instructive: the e2e test asserts the **worktree appears on disk** and explicitly does not assert the dispatched unit's tab or output, so all three sit underneath a passing test. Recorded here with mechanisms and `file:line` because each one looks like it works.
+
+### 1. The dispatcher pane rendered at half width with an empty column — FIXED
+
+`build_new_pane_request` returned `mode_config: Some(build_dispatcher_mode(...))`, and any `mode_config: Some(...)` routes to `open_mode_tab`. `mode_side_pane_dims` computes `half_width = area.width / 2 - 2` **unconditionally**, while `build_dispatcher_mode` declares `panes: []`, `reactive_panes: 0` — so the tab reserved half the width for side panes that do not exist. There is no way to opt out of the split while remaining a mode tab.
+
+PRD #127 hit this first and left the fix in a comment on the `schedule` option: spawn as a dashboard **card** (`mode_config: None`) carrying the seed via `seed_prompt`, "so it routes to the dashboard like any single-agent card instead of through `render_mode_tab`'s 50/50 split." The dispatcher now does the same, keeping the synthetic `ModeConfig` for the cycler's title/chip only. Both branches already funnelled into the same `pending_seed_prompts` queue (`ui.rs:8185` vs `:8271`), so seed delivery was identical either way — the `ModeConfig` was a redundant seed carrier. Pinned by `dispatcher_submits_as_a_dashboard_card_not_a_mode_tab`.
+
+### 2. A dispatched orchestration starts without the delegation protocol → #222
+
+The reported symptom was three dispatches producing tabs where only the first agent in each did anything. Three mechanisms compose:
+
+- `spawn`'s orchestration branch delivers `req.prompt` to exactly one pane, `orchestrator_role_index(&roles)` (`spawn.rs:318`, `:378`).
+- `RoleSpawn` carries no prompt field at all (`role_index`, `role_name`, `command`, `is_start_role`), so every role's configured `prompt_template` is dropped on this path.
+- `prepare_orchestrator_prompt` — which writes `.dot-agent-deck/orchestrator-context.md` with the roles list and delegation protocol — has exactly **one** non-test caller, `src/ui.rs:7794` (the interactive path). `src/spawn.rs` contains **zero** references to orchestrator context.
+
+So the orchestrator gets the task but is never told it is an orchestrator, what roles exist, or how to `delegate`. Workers idling is *normal* for an orchestration — they wait to be delegated to; the defect is that the orchestrator can never delegate. Net effect in a repo whose first orchestration has six roles: one working agent, five idle.
+
+Two things worth carrying to whoever fixes it. First, `RoleSpawn` does **not** need a prompt field: worker `prompt_template`s are consumed only inside `build_orchestrator_context` (the orchestrator's own template verbatim, plus each worker's `description` in an "Available agents" list), and workers get work at delegation time, not spawn time — so calling the one function covers all of it. Second, both `build_orchestrator_context` and `prepare_orchestrator_prompt` are **pure** (config in, `String`/`fs` out, no UI state), so this is a MOVE to a shared module, never a second implementation — which is what "share the interactive composition" above means concretely.
+
+Deliberately **not fixed in PR #232**: `spawn.rs` is shared by the scheduler (#127), issue-dispatch (#120) and dispatch, so the fix changes already-shipped non-experimental #120 behaviour. It belongs in its own PR with its own bisect point and review, and #120's identical defect makes it one fix for both.
+
+### 3. Nothing chose between a single agent and an orchestration — FIXED
+
+`decide_target` took `cfg.orchestrations.first()` unconditionally, so in any repo defining `[[orchestrations]]` every dispatch produced a team — which is how finding 2 was reached by default here.
+
+The decisive argument for asking rather than inferring: *"work on these three features"* wants a team per feature, *"verify these three PRs"* wants one agent each, and both arrive as the same words. An earlier objection that `dispatch` "cannot ask" conflated the **daemon** asking mid-dispatch (true, one-way hook socket, no interactive channel) with the **dispatcher agent** asking beforehand — which is free, because that pane is already conversational. The answer then crosses the CLI boundary as a flag.
+
+Shipped as `--single` / `--orchestration [<name>]` (an additive `#[serde(default)]` field on `DispatchSignal`, so `PROTOCOL_VERSION` does not move) plus `--list-targets`. Two decisions inside it: an unknown orchestration name is an **error listing what is available**, never a silent fallback to something the user did not pick; and `--list-targets` is a **local** read of the repo's own config rather than a daemon round-trip, since the dispatched worktree is a copy of this repo — so it adds no wire message and no protocol surface. Distinct from the `--to` dropped in M1.0, which selected the *completion-routing* target rather than the spawn shape.
+
+### Also found: three sanitizers for one job
+
+Not a live bug, but a maintenance hazard worth naming. Three functions turn arbitrary text into a safe path segment: `config_validation::sanitize_role_name:9` (strip separators, then `..`), `issue_dispatch::sanitize_clone_segment` (separators → `-`, then `..`, fallback `"issues"`), and `dispatch::sanitize_name` (strip `..`, then map non-alphanumeric → `-`, fallback `"dispatch"`).
+
+The ordering **contradicts**: `sanitize_role_name` documents "path separators are removed first so that inputs like `./.` cannot produce `..` after slash removal", and `sanitize_name` does it in the opposite order. `sanitize_name` is nevertheless safe — it maps every non-alphanumeric including `.` to `-`, so dots cannot survive to be recombined — but it is safe by a *different* mechanism than the documented one, and nothing at that site says so. Anyone later "aligning" it with the documented style could reintroduce the exact bug that comment warns about, and the current tests assert outputs rather than the ordering property. One shared helper with one documented rule would remove the trap.
+
+Related asymmetry: `derive_issue_paths` has a property test (`derive_issue_paths_never_escapes_working_dir`) over `/etc/passwd`, `../../escape`, `a/b/c`, `..\..\windows`; `derive_dispatch_paths` has no equivalent — and it is the one whose name comes from an LLM and which deliberately writes *outside* the repo. The property worth pinning there is "resolves to exactly one new segment in the repo's parent".
 
 ## Scope
 
@@ -145,7 +185,8 @@ A running orchestrator creating a worktree partway through and expecting its alr
 ### Phase 1: The `dispatch` verb over the existing engine
 
 - [x] **M1.0** — Define the `dispatch` CLI subcommand (`src/main.rs:36`): args (unit/branch name, optional orchestration selector, `--task`/`--task-file`), validation, and the hook-socket round-trip to the daemon. → Shipped WITHOUT the orchestration selector: `--to` was parsed, serialized, and never read, so it would have shipped in `--help` doing nothing. Dropped; #174 adds it when cross-project targeting is real.
-- [x] **M1.1** — Worktree creation for a user-driven unit: reuse `create_worktree` (`src/issue_dispatch_run.rs:607`) with a non-issue naming/collision scheme; spawn the isolated unit via `SpawnRequest { working_dir }` → `spawn` (`src/spawn.rs:228`). Single-agent vs orchestration chosen from the target dir's config (mirror #174's table). → Single-agent-vs-orchestration comes free: `spawn` → `decide_target` already branches on the dispatched worktree's `.dot-agent-deck.toml`, so a repo defining `[[orchestrations]]` gets a full multi-role orchestration. The result message reports which, from `SpawnHandle::kind`.
+- [x] **M1.1** — Worktree creation for a user-driven unit: reuse `create_worktree` (`src/issue_dispatch_run.rs:607`) with a non-issue naming/collision scheme; spawn the isolated unit via `SpawnRequest { working_dir }` → `spawn` (`src/spawn.rs:228`). Single-agent vs orchestration chosen from the target dir's config (mirror #174's table). → Single-agent-vs-orchestration comes free: `spawn` → `decide_target` already branches on the dispatched worktree's `.dot-agent-deck.toml`, so a repo defining `[[orchestrations]]` gets a full multi-role orchestration. The result message reports which, from `SpawnHandle::kind`. **Superseded by M1.3:** deriving the shape from config alone turned out to be the wrong default — see finding 3 in the 2026-08-08 Design record. Config remains the fallback when the caller passes no flag.
+- [x] **M1.3** — The shape selector (added 2026-08-08, not in the original plan): `--single` / `--orchestration [<name>]` on the CLI, an additive `shape` field on `DispatchSignal`, and `SpawnShapeOverride` threaded through `SpawnRequest` into `decide_target_with_override`. Plus `--list-targets` as a local config read, and a seed that tells the dispatcher to ask the user before its first dispatch. The scheduler and issue-dispatch producers pass `None` and are behaviourally untouched.
 - [x] **M1.2** — Cleanup lifecycle: worktree removal on tab close via the issue-dispatch bookkeeping (`remove_worktree`, `src/issue_dispatch_run.rs:133`), including the shared-worktree accounting for multi-role units. → **Reusing #120's bookkeeping naively regressed #120.** `remove_worktree` is SHARED, and the two producers need opposite dirty-tree policies: dispatch must keep uncommitted work (a sibling of the user's own checkout, LLM-chosen name), while issue-dispatch must force-remove or the reuse-the-vacated-slot model breaks — `dispatch_decision` reads a surviving worktree as "issue already claimed" and skips that issue on every later fire, permanently. Resolved by making the policy travel with the registry entry (`WorktreeEntry { clone_dir, policy }`), because the tab-close handler in `daemon_protocol.rs` serves both producers and only ever sees a path. See also the branch-leftover note under Decisions.
 
 ### Phase 2: Return-edge routing — DEFERRED
