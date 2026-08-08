@@ -48,9 +48,25 @@ ADMIN_BYPASS_MODE="${ADMIN_BYPASS_MODE:-always}"
 
 usage() { sed -n '4,22p' "$0" >&2; exit 64; }
 
+# Echo the id of the `$RULESET_NAME` ruleset, or nothing if it does not exist.
+#
+# Deliberately no `2>/dev/null || true`: an auth, rate-limit or network failure
+# must not be indistinguishable from "no such ruleset". `cmd_delete` treats an
+# empty id as "nothing to remove" and reports success — if a failed lookup
+# produced that empty string, the emergency override would claim to have lifted
+# protection that is in fact still active. Callers assign on their own line
+# (`local id` then `id="$(…)"`), so a non-zero return here propagates under
+# `set -e` rather than being masked by `local`'s own exit status.
 existing_ruleset_id() {
-  gh api "repos/$REPO/rulesets" \
-    --jq ".[] | select(.name == \"$RULESET_NAME\") | .id" 2>/dev/null || true
+  local out
+  if ! out="$(gh api "repos/$REPO/rulesets" \
+      --jq ".[] | select(.name == \"$RULESET_NAME\") | .id")"; then
+    echo "error: could not list rulesets on $REPO." >&2
+    echo "Refusing to guess whether $RULESET_NAME exists — check auth (gh auth status)," >&2
+    echo "rate limits, and network, then retry." >&2
+    return 1
+  fi
+  printf '%s' "$out"
 }
 
 payload() {
@@ -84,28 +100,53 @@ payload() {
 JSON
 }
 
+# Echo "set" or "unset" for the RELEASE_TOKEN secret. Returns non-zero if the
+# lookup itself failed, so callers can distinguish "the secret is missing" from
+# "we could not find out" — the same distinction existing_ruleset_id preserves.
+release_token_state() {
+  local names
+  if ! names="$(gh secret list --repo "$REPO" --json name --jq '.[].name')"; then
+    return 1
+  fi
+  if printf '%s\n' "$names" | grep -qx 'RELEASE_TOKEN'; then
+    echo set
+  else
+    echo unset
+  fi
+}
+
 cmd_status() {
   echo "== rulesets on $REPO =="
   local listed
-  # `gh api --jq` exits 0 on an empty result set, so `|| echo` never fires;
-  # test the captured output instead.
-  listed="$(gh api "repos/$REPO/rulesets" \
-    --jq '.[] | "\(.id)  \(.name)  [\(.enforcement)]"' 2>/dev/null || true)"
+  # Two distinct outcomes that must not be conflated: `gh api --jq` exits 0 with
+  # empty output when there are genuinely no rulesets, and non-zero when the
+  # call failed. Printing "(none)" for the latter would report the branch as
+  # unprotected when it may well be protected.
+  if ! listed="$(gh api "repos/$REPO/rulesets" \
+      --jq '.[] | "\(.id)  \(.name)  [\(.enforcement)]"')"; then
+    echo "error: could not list rulesets on $REPO — protection state is UNKNOWN." >&2
+    return 1
+  fi
   echo "${listed:-(none)}"
   local id
   id="$(existing_ruleset_id)"
   if [ -n "$id" ]; then
     echo
     echo "== rules in $RULESET_NAME =="
-    gh api "repos/$REPO/rulesets/$id" --jq '.rules[] | .type' 2>/dev/null
+    gh api "repos/$REPO/rulesets/$id" --jq '.rules[] | .type'
     echo
     echo "== bypass actors =="
     gh api "repos/$REPO/rulesets/$id" \
-      --jq '.bypass_actors[]? | "\(.actor_type) id=\(.actor_id) mode=\(.bypass_mode)"' 2>/dev/null
+      --jq '.bypass_actors[]? | "\(.actor_type) id=\(.actor_id) mode=\(.bypass_mode)"'
   fi
   echo
   echo "== RELEASE_TOKEN secret =="
-  if gh secret list --repo "$REPO" 2>/dev/null | grep -q '^RELEASE_TOKEN'; then
+  local token_state
+  if ! token_state="$(release_token_state)"; then
+    echo "UNKNOWN — could not list secrets on $REPO. Do not apply until this resolves." >&2
+    return 1
+  fi
+  if [ "$token_state" = set ]; then
     echo "set — CI can bypass"
   else
     echo "NOT SET — applying this ruleset will break the next release and /publish-docs"
@@ -113,7 +154,14 @@ cmd_status() {
 }
 
 cmd_apply() {
-  if ! gh secret list --repo "$REPO" 2>/dev/null | grep -q '^RELEASE_TOKEN'; then
+  local token_state
+  if ! token_state="$(release_token_state)"; then
+    echo "refusing to apply: could not determine whether RELEASE_TOKEN is set on" >&2
+    echo "$REPO. Check auth and network — applying blind risks locking CI out of" >&2
+    echo "main. See docs/develop/governance.md." >&2
+    exit 1
+  fi
+  if [ "$token_state" != set ]; then
     echo "refusing to apply: RELEASE_TOKEN is not set on $REPO." >&2
     echo "release.yml and docs-publish.yml push directly to main; without an" >&2
     echo "admin PAT they will fail with GH006. See docs/develop/governance.md." >&2
