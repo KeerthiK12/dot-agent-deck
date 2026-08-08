@@ -60,6 +60,13 @@ tasks:
         export DOT_AGENT_DECK_STATE_DIR="$sandbox/state"
         export DOT_AGENT_DECK_SESSION="$sandbox/session.toml"
 
+        # Panes inherit this PATH, so an agent inside the sandbox that types a
+        # bare `dot-agent-deck` must reach the branch build — not whatever is
+        # installed. Without this the release binary on PATH wins and the miss is
+        # SILENT for every verb that exists in both builds, so a pane can "test
+        # the branch" while actually exercising the installed release.
+        export PATH="$(dirname "$bin"):$PATH"
+
         echo "deck:    $bin"
         echo "config:  $dir"
         echo "sandbox: $sandbox   (task run-stop to shut its daemon down)"
