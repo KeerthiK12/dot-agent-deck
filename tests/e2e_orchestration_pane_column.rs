@@ -153,3 +153,167 @@ fn orchestration_006_stacked_pane_column_hides_collapsed_frames_while_agents_sta
     deck.send_bytes(b"k"); // alpha -> orchestrator
     deck.wait_for_string("ORCH_ROLE_SENTINEL");
 }
+
+// ---------------------------------------------------------------------------
+// PRD #336 — `Ctrl+l` toggles the orchestration sidebar/pane-column split.
+// ---------------------------------------------------------------------------
+
+/// Column index of the orchestration tab's role-pane column's LEFT edge: the
+/// role-pane box drawn for the fixture's `start = true` role ("orchestrator")
+/// renders its title fused into the top border as `┌orchestrator───…`, so the
+/// column of that `┌` is exactly `panes_area.x` — the boundary between the
+/// sidebar (role list) and the pane column that `orchestration_split_percents`
+/// controls. Distinct from the sidebar's own truncated `orchestrat…` card
+/// label, so there is no collision risk.
+fn orchestrator_box_edge(grid: &str) -> Option<u16> {
+    // The corner glyph is NOT fixed: PRD #341 ("make UI modes unmistakable")
+    // renders the focused pane's border heavier in command mode, so the same
+    // box reads `┌orchestrator` in PaneInput and `┏orchestrator` in command
+    // mode. Match any corner style — this helper is about the box's COLUMN,
+    // not its styling, and pinning one glyph made the test fail on a mode
+    // switch that was working correctly.
+    for line in grid.lines() {
+        for corner in ["┌orchestrator", "┏orchestrator", "╔orchestrator"] {
+            if let Some(byte_idx) = line.find(corner) {
+                return Some(line[..byte_idx].chars().count() as u16);
+            }
+        }
+    }
+    None
+}
+
+/// Panicking form of [`orchestrator_box_edge`], for use outside a predicate
+/// where the box must exist.
+fn pane_column_left_edge(grid: &str) -> u16 {
+    orchestrator_box_edge(grid).unwrap_or_else(|| {
+        panic!("orchestrator role-pane box top border not found in grid:\n{grid}")
+    })
+}
+
+/// Scenario: Open a real orchestration tab from the `orch-deck` fixture (two
+/// stub `cat` roles) on a 120-column PTY at the default 34/66 split, and
+/// confirm the pane column's left edge sits at the ~34%-width boundary. Opening
+/// the tab leaves the deck in PaneInput, so first press `Ctrl+l` there and
+/// confirm the boundary does NOT move — PRD #336 scopes the toggle to command
+/// mode so the chord stays available to the role pane's agent. Then `Ctrl+d` to
+/// command mode, press `Ctrl+l` and wait for the boundary to move to the
+/// narrower-sidebar 25%-width position (sidebar visibly narrows, pane column
+/// visibly widens), and press `Ctrl+l` again to confirm it returns to 34%.
+#[spec("tabs/orchestration/007")]
+#[test]
+fn orchestration_007_ctrl_l_toggles_pane_column_split() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active sessions");
+
+    // Same keystrokes as the `orch-focus-lifecycle` opener above: with no
+    // `[[modes]]` in the fixture, ONE Right selects `[Orch: demo-orch]`, and
+    // selecting an orchestration hides the Command field so a second Enter
+    // submits the form.
+    open_orchestration(&deck);
+    deck.wait_for_string("worker"); // 2nd role card -> orchestration tab is up
+
+    // Baseline: the default 34/66 split puts the pane column's left edge at
+    // 34% of the 120-col frame (col 40 or 41, depending on Percentage
+    // rounding) — well clear of the 25%-split boundary (col 30) asserted next.
+    let default_edge = pane_column_left_edge(&deck.snapshot_grid());
+    assert!(
+        (40..=41).contains(&default_edge),
+        "expected the default 34/66 split's pane-column edge near col 40/41, \
+         got {default_edge}\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Ctrl+l: toggle to the narrower-sidebar 25/75 split. The sidebar narrows
+    // and the pane column widens, so the boundary column DECREASES (25% of
+    // 120 = col 30) — a range tolerates rounding without pinning the constant.
+    // Opening the tab leaves the deck in PaneInput (the role pane owns the
+    // keyboard). PRD #336 scopes the toggle to COMMAND mode, mirroring
+    // `close_pane` (PRD #241 M1), so Ctrl+l here belongs to whatever runs in
+    // the role pane. It must NOT move the boundary — asserted as a predicate
+    // that is expected to TIME OUT.
+    deck.send_bytes(b"\x0c"); // Ctrl+l == 0x0c
+    let narrowed_in_pane_input = deck
+        .wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
+            orchestrator_box_edge(grid).is_some_and(|e| (29..=30).contains(&e))
+        });
+    assert!(
+        !narrowed_in_pane_input,
+        "Ctrl+l must NOT toggle the split while in PaneInput — there the chord \
+         belongs to the role pane's agent (readline's clear-screen). PRD #336 \
+         scopes the toggle to command mode.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Ctrl+d -> command mode, where the toggle DOES resolve.
+    deck.send_bytes(b"\x04");
+
+    deck.send_bytes(b"\x0c"); // Ctrl+l == 0x0c
+    let narrowed = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+        orchestrator_box_edge(grid).is_some_and(|e| (29..=30).contains(&e))
+    });
+    assert!(
+        narrowed,
+        "Ctrl+l did not narrow the sidebar to the 25/75 split within 5s — \
+         pane-column edge stayed at {}\nGrid:\n{}",
+        pane_column_left_edge(&deck.snapshot_grid()),
+        deck.snapshot_grid()
+    );
+
+    // Second Ctrl+l: back to the 34/66 default.
+    deck.send_bytes(b"\x0c");
+    let restored = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+        orchestrator_box_edge(grid).is_some_and(|e| (40..=41).contains(&e))
+    });
+    assert!(
+        restored,
+        "a second Ctrl+l did not restore the 34/66 default split within 5s — \
+         pane-column edge stayed at {}\nGrid:\n{}",
+        pane_column_left_edge(&deck.snapshot_grid()),
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: On the Dashboard (a NON-orchestration tab) with a live `cat -v`
+/// pane in PaneInput mode, type a unique sentinel, then press `Ctrl+l`, then
+/// Enter. `cat -v` renders the received control byte as the two characters
+/// `^L`, so the pane echoes `<sentinel>^L` only if the raw `0x0c` actually
+/// reached the PTY. `Action::ToggleOrchestrationSplit` must not claim `Ctrl+l`
+/// off an orchestration tab (`scope_orchestration_split`), otherwise the
+/// keystroke is swallowed — the dispatcher no-ops there — and the pane never
+/// sees the byte. Regression guard for the Greptile P1 on PR #342.
+///
+/// Deliberately asserts on `cat -v`'s own rendering rather than on a shell's
+/// readline `clear-screen` side effect: whether readline redraws depends on the
+/// host's terminal setup, which made an earlier version of this test fail on a
+/// machine where the forwarding was in fact working correctly.
+#[spec("tabs/orchestration/008")]
+#[test]
+fn orchestration_008_ctrl_l_forwards_to_pty_on_non_orchestration_tab() {
+    const SENTINEL: &str = "CTRLL_FWD_9f3c";
+
+    let deck = TuiDeck::builder()
+        .with_continue_session("ctrl-l-dashboard-cat", "cat -v")
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode
+
+    // Type the sentinel, then the chord under test, then Enter to flush the
+    // tty's canonical-mode line buffer through to `cat`.
+    deck.send_keys(SENTINEL.as_bytes());
+    deck.send_bytes(b"\x0c"); // Ctrl+l == 0x0c
+    deck.send_bytes(b"\r");
+
+    let needle = format!("{SENTINEL}^L");
+    let forwarded =
+        deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| grid.contains(&needle));
+    assert!(
+        forwarded,
+        "Ctrl+l never reached the `cat -v` pane on a non-orchestration tab: \
+         expected {needle:?} in the grid. The global resolver claimed Ctrl+l as \
+         Action::ToggleOrchestrationSplit even though the active tab is a \
+         Dashboard tab, so the byte was swallowed instead of forwarded \
+         (PRD #336 scope violation).\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
