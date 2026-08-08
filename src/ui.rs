@@ -12303,6 +12303,30 @@ fn resize_panes_to_layout(layout: &FrameLayout, embedded: &EmbeddedPaneControlle
 /// avoid a per-frame clone of every pane id; the status enum clone is cheap
 /// (fieldless). Extracted from `render_frame` so the join can be unit-tested
 /// without a live daemon.
+///
+/// **On two sessions sharing one `pane_id`** (issue #398). `HashMap` is one key,
+/// one value, so if it happened the surviving status was whichever session
+/// iteration reached last — unspecified, and able to differ between runs. Three
+/// features read this join and each would have silently taken an arbitrary one:
+/// PRD #333 tab-label colouring, PRD #373 `auto_focus_waiting_pane`, and the
+/// pane borders above.
+///
+/// The collision is now fixed at its source rather than arbitrated here.
+/// `AppState::apply_event`'s reuse guard makes an untagged (`agent_id: None`)
+/// event adopt the pane's existing session instead of minting a sibling, which
+/// was the one pathway that produced a duplicate. **So this function
+/// deliberately keeps its plain `collect()`** — there is no tie left to break,
+/// and a tie-break rule here would be dead code that reads as if duplicates
+/// were still expected.
+///
+/// If a new duplicate pathway is ever introduced, fix it at that source too.
+/// Resolving it here cannot work in general: by the time a consumer holds the
+/// returned map the ambiguity is already discarded, and — as
+/// [`build_pane_status_for_gate`] documents at length — the safe resolution is
+/// not even the same for every consumer. That sibling function keeps its own
+/// fail-closed guard precisely because the lock's answer (deny) is the opposite
+/// of what a colouring consumer would want, and because it must stay correct
+/// against a hostile status wire regardless of what this seam guarantees.
 pub(crate) fn build_pane_status(state: &AppState) -> HashMap<&str, SessionStatus> {
     state
         .sessions

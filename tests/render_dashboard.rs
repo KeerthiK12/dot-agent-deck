@@ -1610,6 +1610,80 @@ fn pane_005_highlight_follows_selected_session_id() {
     insta::assert_snapshot!(buffer_to_text(&buffer));
 }
 
+/// Scenario: A pane is spawned (tagged placeholder card) and then a legacy hook
+/// reports on it without an `agent_id`. The dashboard must still draw exactly
+/// ONE card for that pane — before issue #398 the untagged event minted a second
+/// session and the deck rendered two cards for the one pane.
+#[spec("dashboard/pane/010")]
+#[test]
+fn pane_010_untagged_event_keeps_one_card_on_the_pane() {
+    // Issue #398. The bug lived in `AppState::apply_event`, but what the user
+    // actually saw was the card grid, so this drives the REAL state transition
+    // and renders whatever it produces — rather than handing the renderer a
+    // card list built by the test, which would assert nothing about the defect.
+    const PANE: &str = "2";
+
+    let mut state = AppState::default();
+    state.register_pane(PANE.to_string());
+    // The pane as it exists right after a daemon spawn: one tagged placeholder.
+    state.insert_placeholder_session(
+        PANE.to_string(),
+        Some("/home/dev/worker".to_string()),
+        Some(AgentType::ClaudeCode),
+        Some("agent-42".to_string()),
+    );
+
+    // A pre-F9 / un-envied hook reports on the same pane, naming no generation.
+    state.apply_event(AgentEvent {
+        session_id: "legacy-hook-session".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::WaitingForInput,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some(PANE.to_string()),
+        agent_id: None,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    });
+
+    // The card list the dashboard would build for this pane.
+    let on_pane: Vec<&SessionState> = state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(PANE))
+        .collect();
+    assert_eq!(
+        on_pane.len(),
+        1,
+        "one pane must yield one card; {} sessions claim pane {PANE}",
+        on_pane.len()
+    );
+
+    // And the surviving card carries the status the hook reported, so the fix
+    // suppressed a duplicate rather than suppressing the update itself.
+    assert_eq!(
+        on_pane[0].status,
+        SessionStatus::WaitingForInput,
+        "the single card must show the status the untagged hook reported"
+    );
+
+    let cards: [(&SessionState, Option<&str>); 1] = [(on_pane[0], Some("worker"))];
+    let buffer = render_dashboard_cards_to_buffer(&cards, Some(0), CardDensityKind::Normal, 0, 80);
+    let rendered = buffer_to_text(&buffer);
+    // The status badge is per-card, so counting it counts cards — and keeps the
+    // assertion readable without committing another snapshot file.
+    assert_eq!(
+        rendered.matches("Needs Input").count(),
+        1,
+        "exactly one card should render for the pane:\n{rendered}"
+    );
+}
+
 /// Build one event-rich session fixture that fills `render_session_card`
 /// to capacity at every density tier: three user prompts (Spacious shows 3,
 /// Normal/Compact show the latest 1) and three `ToolStart` events

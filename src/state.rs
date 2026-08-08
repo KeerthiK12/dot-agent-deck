@@ -3129,17 +3129,72 @@ impl AppState {
         // process was intentionally respawned (clear=true delegate);
         // we let that event create a fresh session card instead of
         // remapping it onto the dead session.
-        if let Some(ref pane_id) = event.pane_id
-            && let Some(existing_id) = self.sessions.iter().find_map(|(id, session)| {
-                (session.pane_id.as_ref().is_some_and(|p| p == pane_id)
-                    && id != &event.session_id
-                    && session.agent_id == event.agent_id)
-                    .then(|| id.clone())
-            })
-        {
-            let old_id = std::mem::replace(&mut event.session_id, existing_id);
-            if old_id != event.session_id {
-                self.sessions.remove(&old_id);
+        //
+        // Issue #398: `Some(existing) != None` fails that equality too, so an
+        // event carrying NO `agent_id` used to match neither this guard nor the
+        // retire block below (which skips `None` by construction), fall all the
+        // way through, and mint a SECOND session on a pane that already had a
+        // tagged one. Nothing downstream dedupes: `build_pane_status` keys a
+        // `HashMap` by `pane_id`, so WHICH of the two statuses survived was
+        // decided by `HashMap` iteration order and could differ between runs,
+        // and the deck rendered two cards for one pane. The three consumers of
+        // that join (PRD #333 tab colour, PRD #373 focus steering, pane
+        // borders) each read an arbitrary one of the two.
+        //
+        // That shape is not malformed input. It is what PRD #110 deliberately
+        // preserves for pre-F9 hook scripts, and what any producer emits when
+        // `DOT_AGENT_DECK_AGENT_ID` did not reach it — a hand-written hook, a
+        // wrapper that scrubbed the env, or `dot-agent-deck agent-event` run
+        // from a subprocess that lost it. (Every agent the daemon spawns does
+        // get the var injected — see `AgentRegistry::spawn_agent` — so this is
+        // the legacy/unenvied path, not the default one.)
+        //
+        // So an untagged event now ADOPTS the pane's existing session rather
+        // than creating a sibling. This keeps exactly what PRD #110 was
+        // protecting: the retire block below still skips `None`, and adoption
+        // only remaps where the event is recorded, so the tagged session's
+        // `recent_events` / `tool_count` / `first_prompts` / `started_at` are
+        // never wiped — it is the DUPLICATE that PRD #110 accepted as the price
+        // of that protection which goes away. The card also keeps its `Some`
+        // `agent_id`: only the `Some` -> differing-`Some` path below refreshes
+        // that field, so an untagged event can never blank the pane's identity.
+        //
+        // Adoption is deliberately conditional on there being exactly ONE
+        // candidate. An untagged event carries nothing that says which
+        // generation it belongs to, so with two or more sessions on the pane
+        // there is no defensible winner and we change nothing rather than
+        // guess — the pane is already ambiguous at that point, and picking one
+        // would be the same coin-flip this fix exists to remove.
+        if let Some(ref pane_id) = event.pane_id {
+            let on_pane =
+                |session: &SessionState| session.pane_id.as_ref().is_some_and(|p| p == pane_id);
+            let existing_id = self
+                .sessions
+                .iter()
+                .find_map(|(id, session)| {
+                    (on_pane(session)
+                        && id != &event.session_id
+                        && session.agent_id == event.agent_id)
+                        .then(|| id.clone())
+                })
+                .or_else(|| {
+                    if event.agent_id.is_some() {
+                        return None;
+                    }
+                    let mut candidates = self
+                        .sessions
+                        .iter()
+                        .filter(|(id, session)| on_pane(session) && *id != &event.session_id);
+                    match (candidates.next(), candidates.next()) {
+                        (Some((id, _)), None) => Some(id.clone()),
+                        _ => None,
+                    }
+                });
+            if let Some(existing_id) = existing_id {
+                let old_id = std::mem::replace(&mut event.session_id, existing_id);
+                if old_id != event.session_id {
+                    self.sessions.remove(&old_id);
+                }
             }
         }
 
@@ -3258,17 +3313,28 @@ impl AppState {
         // deliberately-permissive "both sides absent" branch of the
         // reuse guard above.
         //
-        // Trade-off: keeping this guard means a legacy hook can
-        // create a duplicate (untagged) card alongside the tagged
-        // one. Removing it (CodeRabbit's wildcard suggestion on PR
-        // #118) would silently drop accumulated history every time
-        // an old hook fires. PRD #110 prefers the visible duplicate
-        // over silent data loss; the duplicate is observable and
-        // self-resolves once the legacy hook is upgraded, whereas
-        // lost `recent_events` / `tool_count` / `first_prompts` are
-        // not recoverable. The pinned shape lives in the regression
-        // test `pre_f9_hook_with_no_agent_id_does_not_wipe_tagged_session`
-        // below.
+        // Removing this guard (CodeRabbit's wildcard suggestion on
+        // PR #118) would silently drop accumulated history every
+        // time an old hook fires, and lost `recent_events` /
+        // `tool_count` / `first_prompts` are not recoverable.
+        //
+        // Issue #398 update: PRD #110 originally accepted a DUPLICATE
+        // (untagged) card beside the tagged one as the price of this
+        // protection, reasoning that a visible duplicate beats silent
+        // data loss. That price is no longer paid — the reuse guard
+        // above now adopts the pane's lone existing session for an
+        // untagged event, so no sibling is minted in the first place
+        // and this block keeps protecting the history it always did.
+        // The choice between the two was a false one: the duplicate
+        // was never load-bearing, and it was not merely cosmetic
+        // either (see the collision consumers listed above).
+        //
+        // Both halves are pinned by the regression tests
+        // `pre_f9_hook_with_no_agent_id_does_not_wipe_tagged_session`
+        // and `pre_f9_hook_with_no_agent_id_adopts_the_panes_session`
+        // below. The former was cited here for a long time without
+        // ever existing — the shape it claimed to pin was in fact
+        // untested until #398.
         //
         // PRD #127 finding #2: the `display_name` lives on the session, not
         // the pane, so retiring the superseded session would drop the
@@ -4806,6 +4872,184 @@ mod tests {
             prompt.matches(CLOSE).count(),
             1,
             "the submitted idle prompt must carry exactly one frame terminator: {prompt:?}"
+        );
+    }
+
+    // ---- Issue #398: an untagged (`agent_id: None`) event on a pane that
+    // already carries a tagged session. -------------------------------------
+    //
+    // The shape PRD #110 preserves for pre-F9 hooks, and the one any producer
+    // emits when `DOT_AGENT_DECK_AGENT_ID` did not reach it. It used to mint a
+    // SECOND session on the pane; `build_pane_status` then keyed a `HashMap` by
+    // `pane_id` and let iteration order pick which status survived.
+
+    const UNTAGGED_PANE: &str = "7";
+    const UNTAGGED_AGENT_ID: &str = "agent-42";
+
+    /// A pane already owned by a tagged session, with real accumulated history
+    /// on it — the state PRD #110's `None` carve-out exists to protect.
+    fn pane_with_tagged_session() -> AppState {
+        let mut state = AppState::default();
+        state.register_pane(UNTAGGED_PANE.to_string());
+        state.insert_placeholder_session(
+            UNTAGGED_PANE.to_string(),
+            Some("/work".to_string()),
+            Some(AgentType::ClaudeCode),
+            Some(UNTAGGED_AGENT_ID.to_string()),
+        );
+        let session = state
+            .sessions
+            .get_mut(&format!("pane-{UNTAGGED_PANE}"))
+            .expect("precondition: the placeholder is the pane's only session");
+        session.tool_count = 9;
+        session.first_prompts = vec!["the original prompt".to_string()];
+        state
+    }
+
+    fn untagged_event(session_id: &str, event_type: EventType) -> AgentEvent {
+        AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(UNTAGGED_PANE.to_string()),
+            // The whole point: a legacy producer that cannot name a generation.
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// The half PRD #110 always meant to guarantee, and which was cited at the
+    /// retire block under this exact name for a long time without ever
+    /// existing: an untagged event must never cost the tagged session the
+    /// history it has accumulated.
+    #[test]
+    fn pre_f9_hook_with_no_agent_id_does_not_wipe_tagged_session() {
+        let mut state = pane_with_tagged_session();
+
+        state.apply_event(untagged_event(
+            "legacy-hook-session",
+            EventType::SessionStart,
+        ));
+
+        let session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some(UNTAGGED_PANE))
+            .expect("the pane keeps a session");
+        assert_eq!(
+            session.tool_count, 9,
+            "an untagged event must not reset the tagged session's tool_count"
+        );
+        assert_eq!(
+            session.first_prompts,
+            vec!["the original prompt".to_string()],
+            "an untagged event must not drop the tagged session's first_prompts"
+        );
+        assert_eq!(
+            session.agent_id.as_deref(),
+            Some(UNTAGGED_AGENT_ID),
+            "an untagged event must not blank the pane's agent identity"
+        );
+    }
+
+    /// The half that was NOT true before #398: the untagged event lands on the
+    /// pane's existing session instead of minting a sibling, so the pane owns
+    /// exactly one session and `build_pane_status` has nothing to arbitrate.
+    #[test]
+    fn pre_f9_hook_with_no_agent_id_adopts_the_panes_session() {
+        let mut state = pane_with_tagged_session();
+
+        state.apply_event(untagged_event(
+            "legacy-hook-session",
+            EventType::SessionStart,
+        ));
+
+        let on_pane: Vec<&str> = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(UNTAGGED_PANE))
+            .map(|s| s.session_id.as_str())
+            .collect();
+        assert_eq!(
+            on_pane,
+            vec![format!("pane-{UNTAGGED_PANE}").as_str()],
+            "the untagged event must adopt the pane's session, not add a second one"
+        );
+    }
+
+    /// The status an untagged event reports actually reaches the card it
+    /// adopted — adoption must route the update, not merely suppress a
+    /// duplicate. This is what makes a legacy hook still useful.
+    #[test]
+    fn pre_f9_hook_with_no_agent_id_updates_the_adopted_session_status() {
+        let mut state = pane_with_tagged_session();
+
+        state.apply_event(untagged_event(
+            "legacy-hook-session",
+            EventType::WaitingForInput,
+        ));
+
+        let session = state
+            .sessions
+            .get(&format!("pane-{UNTAGGED_PANE}"))
+            .expect("the adopted session is the pane's own");
+        assert_eq!(
+            session.status,
+            SessionStatus::WaitingForInput,
+            "the adopted session must take the untagged event's status"
+        );
+    }
+
+    /// Adoption is conditional on there being exactly one candidate. A pane
+    /// that is ALREADY ambiguous carries nothing that identifies which session
+    /// an untagged event belongs to, so the guard declines to guess rather than
+    /// re-introducing the coin-flip from the other side.
+    #[test]
+    fn pre_f9_hook_with_no_agent_id_does_not_guess_between_two_sessions() {
+        let mut state = pane_with_tagged_session();
+        // A second session on the same pane, as an older build could leave behind.
+        state.sessions.insert(
+            "stale-sibling".to_string(),
+            SessionState {
+                session_id: "stale-sibling".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                cwd: None,
+                status: SessionStatus::Idle,
+                active_tool: None,
+                started_at: Utc::now(),
+                last_activity: Utc::now(),
+                recent_events: VecDeque::new(),
+                tool_count: 0,
+                last_user_prompt: None,
+                first_prompts: Vec::new(),
+                pane_id: Some(UNTAGGED_PANE.to_string()),
+                agent_id: Some("some-other-agent".to_string()),
+                display_name: None,
+            },
+        );
+
+        state.apply_event(untagged_event(
+            "legacy-hook-session",
+            EventType::SessionStart,
+        ));
+
+        assert!(
+            state
+                .sessions
+                .contains_key(&format!("pane-{UNTAGGED_PANE}")),
+            "the tagged session survives an ambiguous pane untouched"
+        );
+        assert!(
+            state.sessions.contains_key("stale-sibling"),
+            "the sibling survives too — the guard picks no winner"
         );
     }
 }

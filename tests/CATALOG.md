@@ -83,6 +83,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** delivery feedback or daemon send results (covered by `prompt/pane-input/004`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/010 — A pane keeps exactly one card when a hook reports on it without an `agent_id` (issue #398).
+- **Layer:** L1 (in-process `AppState::apply_event` + ratatui `TestBackend` buffer text assertion).
+- **Agent:** none (a tagged spawn placeholder plus one synthetic untagged `WaitingForInput` `AgentEvent`).
+- **Asserts:** after an `agent_id: None` event lands on a pane that already carries a tagged session, exactly one session claims that `pane_id`, that session carries the reported `WaitingForInput` status, and the rendered card grid contains exactly one status badge. Before #398 the untagged event minted a second session, so the deck drew two cards for one pane and `build_pane_status` picked between their statuses by `HashMap` iteration order.
+- **Does not assert:** that the tagged session keeps its accumulated history (the `pre_f9_hook_with_no_agent_id_*` unit tests in `src/state.rs` pin that half); the `WaitingForInput` command-entry carve-out that reads the collision-hardened join (`orchestration/lock/007`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
