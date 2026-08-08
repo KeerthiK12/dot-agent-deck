@@ -345,6 +345,8 @@ pub async fn handle_dispatch(
         command: Some(single_command),
         prompt,
         resolved_target: Some(resolved_target),
+        // PRD #222 parity, dispatch-only for now — see the field's docs.
+        compose_orchestrator_context: true,
     };
 
     let notifier = StderrNotifier;

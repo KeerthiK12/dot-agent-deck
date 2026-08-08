@@ -846,6 +846,9 @@ fn make_schedule_callback(
         // `None`: a scheduled task's shape still comes from its working dir's
         // config. The PRD #220 selector is a `dispatch`-only surface.
         resolved_target: None,
+        // Unchanged behaviour: the prompt is delivered verbatim. Giving this path
+        // the orchestrator context is #222's work, not this PR's.
+        compose_orchestrator_context: false,
     };
     let new_tab_per_fire = task.new_tab_per_fire;
     Arc::new(move || {

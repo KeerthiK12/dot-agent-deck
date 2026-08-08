@@ -100,6 +100,21 @@ pub struct SpawnRequest {
     /// `None` (the scheduler and issue-dispatch producers) keeps the
     /// config-derived behaviour untouched.
     pub resolved_target: Option<SpawnTarget>,
+    /// Compose the ORCHESTRATOR CONTEXT (roles + delegation protocol + this
+    /// request's prompt as a task) instead of delivering `prompt` verbatim.
+    ///
+    /// `true` only for PRD #220 `dispatch`. Without it a dispatched orchestration's
+    /// orchestrator is never told that it IS one, so it works alone while every
+    /// worker waits for a delegation that cannot arrive.
+    ///
+    /// Deliberately NOT enabled for the scheduler (#127) or issue-dispatch (#120),
+    /// even though both have the identical defect and the composition is now shared.
+    /// Turning it on there changes what lands in a SHIPPED feature's pane: the
+    /// orchestrator receives a one-line pointer instead of the prompt text, and
+    /// three #120/#127 e2e tests assert that text arriving verbatim (a `cat`-based
+    /// stub never reads the file). That is #222's job to do deliberately, with those
+    /// tests updated as part of it — not a side effect of the dispatcher PR.
+    pub compose_orchestrator_context: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -532,12 +547,18 @@ pub async fn spawn(
             // not submit reliably through a PTY and task text is arbitrary. If the
             // file cannot be written we fall back to the bare task rather than
             // delivering nothing — a degraded orchestrator still beats a silent one.
-            let prompt = crate::orchestrator_context::prepare_orchestrator_prompt(
-                &orch_config,
-                &req.working_dir,
-                Some(req.prompt.as_str()),
-            )
-            .unwrap_or_else(|| req.prompt.clone());
+            let prompt = if req.compose_orchestrator_context {
+                crate::orchestrator_context::prepare_orchestrator_prompt(
+                    &orch_config,
+                    &req.working_dir,
+                    Some(req.prompt.as_str()),
+                )
+                .unwrap_or_else(|| req.prompt.clone())
+            } else {
+                // #120 / #127: unchanged — the prompt is delivered verbatim. See
+                // `compose_orchestrator_context` for why this is not flipped here.
+                req.prompt.clone()
+            };
             // Deliver the prompt to the orchestrator role pane, gated on that
             // pane's readiness (its registry agent_id is the gate's match key).
             let delivery_pane_id = agents[orch_idx].pane_id.clone();

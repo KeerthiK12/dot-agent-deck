@@ -111,9 +111,11 @@ Two things worth carrying to whoever fixes it. First, `RoleSpawn` does **not** n
 
 **Initially deferred, then FIXED here (2026-08-08).** The deferral was the wrong call: without this, "dispatch an orchestration" does not work at all, so the feature's headline case would have shipped non-functional. Reported from real use — an orchestration dispatch produced one working agent and idle workers — which settled it.
 
-Fixed by MOVING both composers to `src/orchestrator_context.rs` and calling them from `spawn`'s orchestration branch. The caller's task is folded into the context file under `## Your task`, and the pointer line then says *carry out that task* rather than *wait for instructions* — leaving the wait wording would have stranded a dispatched unit idle with its task unread on disk. Because the composition is now shared rather than duplicated, **#120 issue-dispatch gained the same fix**, which was the whole argument for a move over a copy.
+Fixed by MOVING both composers to `src/orchestrator_context.rs` and calling them from `spawn`'s orchestration branch. The caller's task is folded into the context file under `## Your task`, and the pointer line then says *carry out that task* rather than *wait for instructions* — leaving the wait wording would have stranded a dispatched unit idle with its task unread on disk. **Scoped to `dispatch` only, and the reason is worth recording.** The first cut enabled the composition for every producer, on the argument that "one fix covers both". The e2e tier immediately caught three #120/#127 failures — `dispatch_001`, `dispatch_004`, `spawn_002` — all asserting that the per-issue prompt text reaches the orchestrator pane VERBATIM. With a context file it arrives as a pointer, and a `cat`-based stub never reads the file. So enabling it there is not a free improvement: it changes what lands in a shipped, non-experimental feature's pane, and three tests encode the old contract.
 
-Accepted cost: this changes `src/spawn.rs`, shared by the scheduler (#127) and #120, so a regression in either bisects to this PR. That is the price of the feature working, and it was the maintainer's call.
+Gated behind `SpawnRequest::compose_orchestrator_context`, `true` only for dispatch. #120 keeps its existing defect until #222 fixes it deliberately, with those tests updated as part of that work. The *shared module* is the durable win — #222 becomes a one-line flip plus test updates rather than a second implementation.
+
+Cost still accepted: `src/spawn.rs` is shared, so a #120 or #127 regression bisects to this PR even though their behaviour is unchanged.
 
 ### 3. Nothing chose between a single agent and an orchestration — FIXED
 
