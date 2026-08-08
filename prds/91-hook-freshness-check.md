@@ -72,7 +72,7 @@ Cleanly separable from PRD #90 (remote daemon upgrade): this PRD runs **wherever
 - A user who upgrades the binary across a release that adds a new hook type sees a warning that registration is stale until they re-run install.
 - A user whose `~/.claude/settings.json` becomes unreadable sees a specific reason in the warning, not a generic "something's wrong."
 - The check adds negligible startup latency (read one small JSON file, compare to a static list).
-- All three gates pass: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+- All three gates pass: `cargo fmt --check`, `cargo clippy --all-targets --features e2e -- -D warnings`, `cargo test`.
 
 ## Milestones
 
