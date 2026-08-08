@@ -1,10 +1,12 @@
 # PRD #176: Desktop GUI app — alternative front-end to the TUI
 
-**Status**: Not Started
+**Status**: In Progress
 **Priority**: Medium
 **Created**: 2026-06-20
 **GitHub Issue**: [#176](https://github.com/vfarcic/dot-agent-deck/issues/176)
 **Related**: PRD #93 (always-external daemon — the daemon is the single source of truth this whole design depends on), PRD #76 (attach protocol / length-prefixed frames — the wire the GUI consumes), PRD #126 (agent-driven notifications — the daemon-side signal the GUI surfaces as OS-native notifications), PRD #174 (cross-project orchestration dispatch — the relationships the agents-graph must render and the source of the new structured events it needs), PRD #139 (the `experimental` feature flag — explained as N/A here, see Design Decisions)
+
+**Implementation note (2026-08-07)**: The M0/M1 spike directly reuses the root `dot-agent-deck` library before protocol extraction and adds a deterministic fixture plus a thin Tauri daemon/terminal bridge. Protocol extraction, the structured communication graph, and OS-native notifications remain pending.
 
 ## Problem Statement
 

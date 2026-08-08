@@ -1336,6 +1336,10 @@ const SNAPSHOT_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// to make the failure mode disappear.
 pub const SPAWN_TIME_READINESS_BUFFER: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Maximum wait for an agent readiness signal before a spawn-time prompt uses
+/// the hookless-agent fallback and attempts delivery directly.
+pub const SPAWN_TIME_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// PRD #128 Direction B-1 — returns whether the spawn-time orchestrator
 /// role prompt should fire NOW. Returns `false` if `ready_since` is set
 /// but `SPAWN_TIME_READINESS_BUFFER` hasn't elapsed yet; `true` once it
@@ -1432,7 +1436,7 @@ struct PromptDelivery {
 /// PROMPTLY once the target transitions, rather than languishing behind a
 /// minutes-long exponential delay. The cap is the "wait for a matching target
 /// transition" bound from the finding: it keeps the catch-up latency small.
-fn send_retry_delay(attempts: u32) -> std::time::Duration {
+pub fn send_retry_delay(attempts: u32) -> std::time::Duration {
     const BASE_MS: u64 = 500;
     const CAP: std::time::Duration = std::time::Duration::from_secs(2);
     let shift = attempts.saturating_sub(1).min(6);
@@ -1445,7 +1449,7 @@ fn send_retry_delay(attempts: u32) -> std::time::Duration {
 /// is actually reachable — the previous code checked it only after the delivery
 /// branch, which always returned first, so a permanent non-delivery
 /// (`wrong-session`, a never-live role) retried one RPC every ~2s forever.
-const AUTOMATIC_PROMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+pub const AUTOMATIC_PROMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// PRD #20 R20-004 (finding #3): mint a GLOBALLY-UNIQUE delivery id for an
 /// automatic prompt. The old `seed-<pane>-<seq>` restarted its counter at 1 in
@@ -2365,7 +2369,7 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
 
 /// Write the orchestrator context to a file and return a one-liner to inject.
 /// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
-fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
+pub fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
     let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
     std::fs::create_dir_all(&dir).ok()?;
     let file_path = dir.join("orchestrator-context.md");
@@ -2879,8 +2883,7 @@ fn process_pending_dispatches(
         });
         // Slow path: no SessionStart after 10 seconds (e.g., opencode).
         // The agent is likely running but hasn't signaled — inject anyway.
-        let timeout_ready =
-            !agent_ready && pd.created_at.elapsed() > std::time::Duration::from_secs(10);
+        let timeout_ready = !agent_ready && pd.created_at.elapsed() > SPAWN_TIME_READINESS_TIMEOUT;
         if agent_ready || timeout_ready {
             let _ = pane.write_to_pane(&pd.pane_id, &pd.prompt);
             return false;
@@ -2939,8 +2942,7 @@ fn process_pending_seed_prompts(
             s.pane_id.as_deref() == Some(sp.pane_id.as_str()) && s.agent_type != AgentType::None
         });
         // Slow path: no SessionStart after 10s (e.g. opencode) — proceed anyway.
-        let timeout_ready =
-            !agent_ready && sp.created_at.elapsed() > std::time::Duration::from_secs(10);
+        let timeout_ready = !agent_ready && sp.created_at.elapsed() > SPAWN_TIME_READINESS_TIMEOUT;
         if agent_ready {
             sp.ready_since.get_or_insert(now);
         }
@@ -3081,7 +3083,7 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
 ///   partial write — a retry could duplicate the input).
 /// * RETRYABLE: `HistoryOnly` / `Stale` / `NoLiveTarget` (the target may become
 ///   live / re-settle). `Applied` / `Queued` never reach this helper.
-fn is_terminal_send_result(result: SendResult) -> bool {
+pub fn is_terminal_send_result(result: SendResult) -> bool {
     matches!(
         result,
         SendResult::WrongSession | SendResult::Unknown | SendResult::Ambiguous
@@ -3157,7 +3159,7 @@ fn deliver_orchestrator_prompt(
         && ui
             .orchestration_created_at
             .get(&tab_id)
-            .is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(10));
+            .is_some_and(|t| now.duration_since(*t) > SPAWN_TIME_READINESS_TIMEOUT);
     if agent_ready {
         ui.orchestration_ready_since.entry(tab_id).or_insert(now);
     }
@@ -3262,7 +3264,7 @@ fn wrap_agent_command(command: &str) -> String {
 /// PRD #20 blocker-5: a short human-readable reason a [`SendResult`] was not
 /// delivered, for the status-bar feedback shown when a seed / orchestrator
 /// prompt could not reach a live target.
-fn describe_send_result(result: SendResult) -> &'static str {
+pub fn describe_send_result(result: SendResult) -> &'static str {
     match result {
         SendResult::Applied => "applied",
         SendResult::Queued => "queued",
