@@ -2144,11 +2144,11 @@ without depending on the config struct API.
 - **Does not assert:** what a real agent does with the forwarded bytes (`orchestration/lock/012`); the `WaitingForInput` carve-out (`orchestration/lock/011`).
 - **Platform coverage:** mac+linux.
 
-##### orchestration/lock/009 — `Ctrl+e` reaches a focused role pane's PTY as readline's `end-of-line`, and still toggles the lock from command mode.
-- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness; terminal-cursor observation).
-- **Agent:** none (fixture `tests/fixtures/orch-lock-bash-role`: a real interactive `bash --noprofile --norc -i` orchestrator role plus a `cat` stub worker).
-- **Asserts:** with a partial line typed into the focused orchestrator pane, `Ctrl+a` (readline `beginning-of-line`, a chord the deck never binds — a control proving the harness can observe cursor movement at all) moves the cursor left within the same row; `Ctrl+e` then returns it to exactly the end-of-line position, proving `0x05` genuinely reached the PTY rather than being claimed as `Action::ToggleOrchestrationLock`. Then `Ctrl+d` → `Ctrl+e` from command mode, and a sentinel typed into the worker pane now reaches its PTY, proving the chord still toggles the lock from the mode it IS claimed in.
-- **Does not assert:** what a given program does with `0x05` beyond readline's documented `end-of-line` — that is the program's business.
+##### orchestration/lock/009 — `Ctrl+e` reaches a focused role pane's PTY in `PaneInput`, is claimed by the deck in command mode, and toggles the lock there.
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness; rendered-grid observation).
+- **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
+- **Asserts:** with a partial line typed into the focused orchestrator pane, `Ctrl+e` makes a literal `^E` appear immediately after it — the tty line discipline's own caret echo (`ECHOCTL`), proving `0x05` genuinely reached the PTY rather than being claimed as `Action::ToggleOrchestrationLock`. Then `Ctrl+d` into command mode and `Ctrl+e` again: the deck reports `Pane entry: unlocked`, NO second `^E` joins the first (claimed there means not forwarded — the mirror of the first half), and jumping to the worker role with `2` lets a sentinel reach its PTY, proving the chord still toggles the lock from the mode it IS claimed in.
+- **Does not assert:** what a given program does with `0x05` once it arrives — that is the program's business. The oracle is deliberately the terminal's caret echo, not readline: an earlier revision drove a real `bash --noprofile --norc -i` role and asserted readline's `beginning-of-line`/`end-of-line` cursor moves, which fails outright wherever bash is built without readline (this repo's own devbox bash offers no `emacs` option, so `Ctrl+a` echoed `^A` and moved the cursor two columns the wrong way).
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/lock/010 — Global chords still fire while a worker pane is focused and the deck is locked.

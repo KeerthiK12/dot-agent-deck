@@ -8,15 +8,13 @@
 //! `Ctrl+`-chords (resolved before the PTY-forward fallback the lock gates)
 //! keep working regardless of lock state or which pane is focused.
 //!
-//! `orchestration_lock_008`/`010`/`011` use the `orch-deck` fixture (two stub
-//! `cat` roles, no LLM tokens spent). `orchestration_lock_009` uses
-//! `orch-lock-bash-role`, whose orchestrator role is a real interactive
-//! bash/readline shell, so `Ctrl+e` reaching the PTY can be observed as
-//! readline's `end-of-line` genuinely running. `orchestration_lock_012` uses
-//! `orch-lock-live`, whose worker role is a REAL interactive Claude Haiku
-//! agent, so the same gate is proven against a genuine agent's input rather
-//! than a `cat` stub's echo — it self-skips where no credentials are
-//! configured.
+//! `orchestration_lock_008`/`009`/`010`/`011` use the `orch-deck` fixture (two
+//! stub `cat` roles, no LLM tokens spent); `009` observes `Ctrl+e` reaching a
+//! PTY through the tty's own `^E` caret echo, which asks nothing of the program
+//! occupying the pane. `orchestration_lock_012` uses `orch-lock-live`, whose
+//! worker role is a REAL interactive Claude Haiku agent, so the same gate is
+//! proven against a genuine agent's input rather than a `cat` stub's echo — it
+//! self-skips where no credentials are configured.
 //!
 //! Gated behind the `e2e` feature so `cargo test-fast` never compiles it.
 
@@ -110,18 +108,16 @@ fn lock_008_forwarding_gated_by_lock_state() {
 }
 
 /// Scenario: The real-pane proof that `Ctrl+e` is claimed only in command
-/// mode. On a real Orchestration tab (`orch-lock-bash-role` fixture: a real
-/// interactive bash/readline orchestrator role plus a `cat`-stub worker role),
-/// with the orchestrator pane focused in `PaneInput` mode: type a partial
-/// line, home the cursor with `Ctrl+a` (readline's `beginning-of-line`, a
-/// chord the deck never binds, so it is a safe control proving the harness can
-/// observe cursor movement at all), then send `Ctrl+e` (`0x05`) and confirm
-/// the cursor returns to end-of-line — proving readline's `end-of-line`
-/// genuinely ran rather than the byte being claimed as
-/// `Action::ToggleOrchestrationLock`. Then press `Ctrl+d` to reach command
-/// mode and `Ctrl+e` again, focus the non-orchestrator worker role, and
-/// confirm a keystroke now reaches its PTY — proving the chord still toggles
-/// the lock from command mode.
+/// mode. On a real Orchestration tab (`orch-deck` fixture, two `cat` stub
+/// roles) with the orchestrator pane focused and the deck typing into it: type
+/// a partial line, send `Ctrl+e` (`0x05`), and confirm a literal `^E` lands in
+/// that pane — the tty's own caret echo, which proves the byte reached the PTY
+/// rather than being claimed as `Action::ToggleOrchestrationLock`. Then press
+/// `Ctrl+d` to reach command mode and send `0x05` again: no second `^E` may
+/// appear (the chord is claimed there), the deck must report `Pane entry:
+/// unlocked`, and jumping to the non-orchestrator worker role must then let a
+/// keystroke reach its PTY — proving the same chord still toggles the lock
+/// from the one mode it IS claimed in.
 #[spec("orchestration/lock/009")]
 #[test]
 fn lock_009_ctrl_e_scoped_to_command_mode_on_real_panes() {
@@ -130,89 +126,81 @@ fn lock_009_ctrl_e_scoped_to_command_mode_on_real_panes() {
 
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
-        .launch_with_fixture("orch-lock-bash-role");
+        .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
     deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode
-    deck.wait_for_string("CTRLE>");
 
-    // --- Part 1: the chord must reach the PTY, observed in the orchestrator's
-    // own pane (never gated by the lock, so this isolates the assertion from
-    // lock state entirely). ---
+    // --- Part 1: in PaneInput the chord must reach the PTY, observed in the
+    // orchestrator's own pane (never gated by the lock, so this isolates the
+    // assertion from lock state entirely). ---
 
-    // Baseline captured BEFORE typing starts, so the first cursor read below
-    // has something to diverge from (see
-    // `TuiDeck::wait_for_terminal_cursor_change_then_settle`'s doc comment for
-    // why a divergence check, not just a stability check, is required).
-    let pre_type = deck.terminal_cursor_snapshot();
-
+    // The oracle is the tty line discipline's caret echo (`ECHOCTL`), NOT
+    // readline: a control byte delivered to a pane echoes as two literal
+    // characters, `^E`. That is deliberately a property of the terminal rather
+    // than of whatever program occupies the pane — an earlier revision of this
+    // test drove a real `bash --noprofile --norc -i` role and asserted
+    // readline's `beginning-of-line`/`end-of-line` cursor moves, which fails
+    // outright wherever bash is built without readline (this repo's own devbox
+    // bash reports no `emacs` option at all, so `Ctrl+a` echoed `^A` and moved
+    // the cursor two columns the WRONG way). What this test needs to prove is
+    // only that `0x05` was forwarded rather than swallowed; the caret echo
+    // shows exactly that, everywhere, and matches what `orchestration/lock/008`
+    // already relies on for ordinary characters.
     deck.send_keys(PARTIAL_LINE.as_bytes()); // no trailing \r -- never submitted
     assert!(
         deck.wait_for_grid_string_within(PARTIAL_LINE, Duration::from_secs(3)),
         "the partial line never appeared on the rendered grid\nGrid:\n{}",
         deck.snapshot_grid()
     );
-    // Not a plain `terminal_cursor_snapshot()`: the substring landing on the
-    // grid only proves those bytes were applied, not that the deck has
-    // finished echoing (more may be in flight) or repainted its own block
-    // cursor overlay at the final position.
-    let end_of_line =
-        deck.wait_for_terminal_cursor_change_then_settle(pre_type, Duration::from_secs(3));
 
-    // Ctrl+a (0x01) == readline's beginning-of-line. The deck binds no action
-    // to this chord, so it is a safe control: if the cursor does not move
-    // here, the harness's cursor-observation technique itself is broken,
-    // independent of anything Ctrl+e does.
-    deck.send_bytes(b"\x01");
-    let start_of_line =
-        deck.wait_for_terminal_cursor_change_then_settle(end_of_line, Duration::from_secs(3));
-    assert!(
-        (start_of_line.row, start_of_line.col) != (end_of_line.row, end_of_line.col),
-        "control check failed: Ctrl+a (readline beginning-of-line) never moved \
-         the terminal cursor away from {end_of_line:?} — the harness cannot \
-         observe cursor movement in this pane at all, so a Ctrl+e failure below \
-         would not be trustworthy either.\nGrid:\n{}",
-        deck.snapshot_grid()
-    );
-    assert_eq!(
-        start_of_line.row, end_of_line.row,
-        "Ctrl+a must move the cursor within the same row, got \
-         start_of_line={start_of_line:?} vs end_of_line={end_of_line:?}"
-    );
-    assert!(
-        start_of_line.col < end_of_line.col,
-        "Ctrl+a must move the cursor LEFT toward the beginning of the line, got \
-         start_of_line={start_of_line:?} vs end_of_line={end_of_line:?}"
-    );
-
-    // Ctrl+e (0x05) == readline's end-of-line. Without the command-mode
-    // scoping the global resolver claims 0x05 as
-    // Action::ToggleOrchestrationLock on every Orchestration tab regardless of
-    // mode, so the byte never reaches the PTY and the cursor never moves back.
+    // Anchored to the partial line so this cannot match a stray `^E` painted
+    // anywhere else on the grid.
+    let echoed = format!("{PARTIAL_LINE}^E");
     deck.send_bytes(b"\x05");
-    let after_ctrl_e =
-        deck.wait_for_terminal_cursor_change_then_settle(start_of_line, Duration::from_secs(3));
     assert!(
-        (after_ctrl_e.row, after_ctrl_e.col) == (end_of_line.row, end_of_line.col),
-        "Ctrl+e did not reach the focused orchestrator role pane's PTY — \
-         readline's end-of-line never ran, so the cursor never returned to \
-         {end_of_line:?} (settled at {after_ctrl_e:?}). The global keybinding \
+        deck.wait_for_grid_string_within(&echoed, Duration::from_secs(3)),
+        "Ctrl+e did not reach the focused orchestrator role pane's PTY — the \
+         tty never echoed `^E` after {PARTIAL_LINE}. The global keybinding \
          resolver claimed 0x05 as Action::ToggleOrchestrationLock even though a \
          role pane was focused in PaneInput mode.\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
-    // --- Part 2: the chord must still work, from command mode. ---
+    // --- Part 2: from command mode the same chord must be claimed by the deck
+    // instead, and must actually toggle the lock. ---
 
     deck.send_bytes(b"\x04"); // Ctrl+d -> Normal (command) mode
     deck.send_bytes(b"\x05"); // Ctrl+e -> Action::ToggleOrchestrationLock
 
-    // Focus the non-orchestrator "worker" role and confirm a keystroke now
-    // reaches its PTY — the same unlocked-forwarding technique
-    // `orchestration/lock/008` uses to observe the lock's toggle state.
-    focus_worker_role(&deck);
+    // The deck reports the toggle. Waiting on this also sequences the rest of
+    // the test behind the mode switch actually having been applied.
+    assert!(
+        deck.wait_for_grid_string_within("Pane entry: unlocked", Duration::from_secs(3)),
+        "Ctrl+e from command mode did not toggle the command-entry lock — the \
+         deck never reported `Pane entry: unlocked`.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    // The mirror of Part 1: claimed here means NOT forwarded, so no second
+    // caret may have joined the first.
+    assert!(
+        !deck.snapshot_grid().contains(&format!("{echoed}^E")),
+        "Ctrl+e in command mode was ALSO forwarded to the orchestrator pane's \
+         PTY — a second `^E` echoed after {echoed}. The chord must be claimed \
+         by the deck in command mode, not delivered to the pane.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Jump straight to the worker from command mode. Deliberately NOT
+    // `focus_worker_role`, which opens with its own `Ctrl+d`: that helper
+    // assumes it is called from PaneInput, and `Ctrl+d` is a TOGGLE, so using
+    // it here would drop back INTO the pane and type the `2` at the
+    // orchestrator instead of jumping. The sentinel would then land in the
+    // orchestrator's own never-gated pane and this test would pass without the
+    // lock having been consulted at all.
+    deck.send_keys(b"2"); // Jump2 -> focus role index 1 ("worker")
     deck.send_keys(format!("{WORKER_UNLOCKED_SENTINEL}\r").as_bytes());
     assert!(
         deck.wait_for_grid_string_within(WORKER_UNLOCKED_SENTINEL, Duration::from_secs(3)),
