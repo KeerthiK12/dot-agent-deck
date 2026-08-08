@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   ArrowRight,
   Blocks,
+  BookMarked,
   Bot,
   Check,
   CheckCircle2,
@@ -22,6 +23,7 @@ import {
   Play,
   RefreshCw,
   Search,
+  Send,
   Settings2,
   ShieldAlert,
   SlidersHorizontal,
@@ -31,12 +33,13 @@ import {
   Zap,
 } from "lucide-react";
 import { AgentTile } from "./components/AgentTile";
-import { ProfilesPanel, ProjectsPanel, WorkflowPanel } from "./components/ConfigurationPanels";
+import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useProjects } from "./hooks/useProjects";
+import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
-import type { DeckAction, DeckRuntimeState, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
+import type { DeckAction, DeckActionResult, DeckRuntimeState, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 
 const WORKFLOW_STORAGE_KEY = "dot-agent-deck.desktop.workflow-preview.v1";
 const DESKTOP_EVIDENCE_QUERY = "(min-width: 1260px)";
@@ -68,6 +71,9 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const [projectsOpen, setProjectsOpen] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [profilesOpen, setProfilesOpen] = useState(false);
+  const [promptsOpen, setPromptsOpen] = useState(false);
+  const [selectedPromptId, setSelectedPromptId] = useState("");
+  const [composerFocus, setComposerFocus] = useState<{ agentId: string; token: number }>();
   const [workflowOpen, setWorkflowOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -75,6 +81,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const [confirm, setConfirm] = useState<ConfirmState>();
   const { profiles, updateProfile, resetProfiles } = useAgentProfiles(snapshot.profiles);
   const { projects, activeId: activeProjectId, activeProject, setActiveId: setActiveProjectId, addProject, updateProject, removeProject } = useProjects(snapshot.worktree, snapshot.repo);
+  const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
   const [profileOrder, setProfileOrder] = useState<string[]>([]);
 
   useEffect(() => {
@@ -94,6 +101,12 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       setSelectedProjectId(activeProjectId || projects[0]?.id || "");
     }
   }, [activeProjectId, projects, selectedProjectId]);
+
+  useEffect(() => {
+    if (!selectedPromptId || !prompts.some((prompt) => prompt.id === selectedPromptId)) {
+      setSelectedPromptId(prompts[0]?.id ?? "");
+    }
+  }, [prompts, selectedPromptId]);
 
   useEffect(() => {
     if (!profiles.length || profileOrder.length) return;
@@ -119,6 +132,8 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const selectedEvidence = snapshot.evidence.find((item) => item.id === selectedEvidenceId);
   const canControlDaemon = snapshot.connection.status === "connected" || snapshot.connection.daemonDetected === true;
 
+  const coordinator = snapshot.agents.find((agent) => agent.isStartRole);
+
   const perform = async (action: DeckAction, success?: string) => {
     try {
       await runtime.runAction(action);
@@ -126,6 +141,21 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
     } catch (cause) {
       setNotice(cause instanceof Error ? cause.message : String(cause));
     }
+  };
+
+  // Returned to the composer rather than swallowed here: only the composer can
+  // show a per-message delivered/failed state next to the text that produced it.
+  const submitText = async (agentId: string, text: string): Promise<DeckActionResult> =>
+    runtime.runAction({ type: "submit_text", agentId, text });
+
+  const renameAgent = async (agentId: string, displayName: string) => {
+    await perform({ type: "rename_agent", agentId, displayName }, `Agent renamed to ${displayName}.`);
+  };
+
+  const focusComposer = (agentId: string) => {
+    setSelectedAgentId(agentId);
+    setTabs((current) => ({ ...current, [agentId]: "terminal" }));
+    setComposerFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
   };
 
   useEffect(() => {
@@ -138,7 +168,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         return;
       }
       if (event.key === "Escape") {
-        setPaletteOpen(false); setHelpOpen(false); setProjectsOpen(false); setProfilesOpen(false); setWorkflowOpen(false); setConfirm(undefined);
+        setPaletteOpen(false); setHelpOpen(false); setProjectsOpen(false); setProfilesOpen(false); setPromptsOpen(false); setWorkflowOpen(false); setConfirm(undefined);
         return;
       }
       if (editing) return;
@@ -250,7 +280,9 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   };
 
   const commandItems = [
+    ...(coordinator ? [{ label: "Message coordinator…", hint: `Send text to ${coordinator.displayName}`, icon: Send, run: () => focusComposer(coordinator.id) }] : []),
     { label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => setProjectsOpen(true) },
+    { label: "Open prompt library", hint: "Reusable launch and message prompts", icon: BookMarked, run: () => setPromptsOpen(true) },
     { label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => setProfilesOpen(true) },
     { label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => setWorkflowOpen(true) },
     { label: evidenceOpen ? "Hide evidence drawer" : "Show evidence drawer", hint: "Toggle transition evidence", icon: PanelRight, run: () => setEvidenceOpen((open) => !open) },
@@ -264,7 +296,8 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
         <nav>
           <RailButton icon={FolderGit2} label="Projects" active={projectsOpen} onClick={() => setProjectsOpen(true)} testId="open-projects" />
-          <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen} onClick={() => { setProjectsOpen(false); setWorkflowOpen(false); setProfilesOpen(false); }} />
+          <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen && !promptsOpen} onClick={() => { setProjectsOpen(false); setWorkflowOpen(false); setProfilesOpen(false); setPromptsOpen(false); }} />
+          <RailButton icon={BookMarked} label="Prompts" active={promptsOpen} onClick={() => setPromptsOpen(true)} testId="open-prompts" />
           <RailButton icon={Network} label="Workflows" active={workflowOpen} onClick={() => setWorkflowOpen(true)} />
           <RailButton icon={Bot} label="Agent Profiles" active={profilesOpen} onClick={() => setProfilesOpen(true)} testId="open-agent-profiles" />
           <RailButton icon={Settings2} label="Settings" onClick={() => setNotice("Runtime settings will use the same local configuration seam.")} />
@@ -353,11 +386,15 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
                   tab={tabs[agent.id] ?? "terminal"}
                   terminalData={runtime.terminalData[agent.id]}
                   evidence={snapshot.evidence}
+                  prompts={prompts}
+                  composerFocusToken={composerFocus?.agentId === agent.id ? composerFocus.token : 0}
                   onSelect={() => setSelectedAgentId(agent.id)}
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
                   onTerminalInput={runtime.sendTerminalInput}
                   onTerminalResize={runtime.resizeTerminal}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); setEvidenceOpen(true); }}
+                  onSubmitText={submitText}
+                  onRename={mode === "live" ? renameAgent : undefined}
                 />
               ))}
             </div>
@@ -380,8 +417,18 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         onActivate={(id) => { setActiveProjectId(id); setNotice("Active project updated. Open Workflows when you are ready to launch its agents."); }}
         onConfigureWorkflow={() => { setProjectsOpen(false); setWorkflowOpen(true); }}
       />
+      <PromptLibraryPanel
+        open={promptsOpen}
+        prompts={prompts}
+        selectedId={selectedPromptId}
+        onSelect={setSelectedPromptId}
+        onClose={() => setPromptsOpen(false)}
+        onAdd={() => setSelectedPromptId(addPrompt())}
+        onUpdate={updatePrompt}
+        onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
+      />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <WorkflowPanel key={activeProject?.id ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} defaultName={activeProject?.workflowName ?? "dot-agent-deck"} defaultCwd={activeProject?.cwd || snapshot.worktree} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} />
+      <WorkflowPanel key={activeProject?.id ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} defaultName={activeProject?.workflowName ?? "dot-agent-deck"} defaultCwd={activeProject?.cwd || snapshot.worktree} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} prompts={prompts} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
@@ -407,18 +454,18 @@ function EvidenceDrawer({ evidence, selected, onSelect, onClose }: { evidence: E
         {evidence.length ? evidence.map((item) => (
           <button key={item.id} role="option" aria-selected={item.id === selected?.id} className={item.id === selected?.id ? "is-active" : ""} onClick={() => onSelect(item.id)}>
             <span className={`verdict verdict-${item.verdict.toLowerCase()}`}>{item.verdict}</span>
-            <div><strong>{item.title}</strong><small>{item.from} <ArrowRight size={10} /> {item.to}</small></div>
+            <div><strong>{item.title}</strong><small>{item.to ? <>{item.from} <ArrowRight size={10} /> {item.to}</> : item.from}</small></div>
             <time>{item.at}</time>
           </button>
-        )) : <div className="evidence-empty"><History size={20} /><strong>No structured events</strong><span>The current daemon does not expose orchestration handoffs yet.</span></div>}
+        )) : <div className="evidence-empty"><History size={20} /><strong>No events yet</strong><span>Live hook events appear here as agents work. Delegate and work-done handoff edges are still pending daemon support (PRD #176 M3.1).</span></div>}
       </div>
       {selected && (
         <div className="evidence-detail">
           <div className="evidence-detail-head"><span className={`verdict verdict-${selected.verdict.toLowerCase()}`}>{selected.verdict}</span><span>{selected.acknowledged ? <><CheckCircle2 size={13} /> acknowledged</> : "unread"}</span></div>
           <h3>{selected.title}</h3>
           <p>{selected.summary}</p>
-          <dl><div><dt>SENDER</dt><dd>{selected.from}</dd></div><div><dt>RECEIVER</dt><dd>{selected.to}</dd></div>{selected.command && <div className="wide"><dt>COMMAND</dt><dd><code>{selected.command}</code></dd></div>}{selected.exitCode !== undefined && <div><dt>EXIT</dt><dd>{selected.exitCode}</dd></div>}</dl>
-          <div className="why-edge"><Gauge size={14} /><div><strong>Why this edge opened</strong><p>{selected.reason}</p></div></div>
+          <dl><div><dt>SENDER</dt><dd>{selected.from}</dd></div><div><dt>RECEIVER</dt><dd>{selected.to || "—"}</dd></div>{selected.command && <div className="wide"><dt>COMMAND</dt><dd><code>{selected.command}</code></dd></div>}{selected.exitCode !== undefined && <div><dt>EXIT</dt><dd>{selected.exitCode}</dd></div>}</dl>
+          <div className="why-edge"><Gauge size={14} /><div><strong>{selected.to ? "Why this edge opened" : "Where this came from"}</strong><p>{selected.reason}</p></div></div>
         </div>
       )}
       <footer><span><i className="status-running" /> append-only run ledger</span><kbd>J</kbd><kbd>K</kbd></footer>

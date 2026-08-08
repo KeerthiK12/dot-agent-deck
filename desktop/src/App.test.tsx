@@ -15,7 +15,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     mode: "fixture",
     snapshot: createFixtureSnapshot("connected"),
     terminalData: {},
-    runAction: vi.fn(async () => undefined),
+    runAction: vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),
     resizeTerminal: vi.fn(async () => undefined),
     reconnect: vi.fn(async () => undefined),
@@ -185,7 +185,7 @@ describe("ControlDeck", () => {
     const disconnected = createFixtureSnapshot("disconnected");
     disconnected.agents = [];
     let releaseStart!: () => void;
-    const runAction = vi.fn(() => new Promise<void>((resolve) => { releaseStart = resolve; }));
+    const runAction = vi.fn(() => new Promise<import("./types").DeckActionResult>((resolve) => { releaseStart = () => resolve({ ok: true }); }));
     const live = runtime({ mode: "live", snapshot: disconnected, runAction });
     render(<ControlDeck runtime={live} />);
     fireEvent.click(screen.getByTestId("start-daemon"));
@@ -203,7 +203,7 @@ describe("ControlDeck", () => {
     connectedNoAgents.agents = [];
     connectedNoAgents.stages = [];
     connectedNoAgents.evidence = [];
-    const runAction = vi.fn(async () => undefined);
+    const runAction = vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult);
     const live = runtime({ mode: "live", snapshot: connectedNoAgents, runAction });
     render(<ControlDeck runtime={live} />);
 
@@ -227,7 +227,7 @@ describe("ControlDeck", () => {
       daemonDetected: true,
       runningAgentCount: 0,
     };
-    const runAction = vi.fn(async () => undefined);
+    const runAction = vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult);
     const live = runtime({ mode: "live", snapshot: incompatible, runAction });
     render(<ControlDeck runtime={live} />);
 

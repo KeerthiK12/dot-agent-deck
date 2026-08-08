@@ -24,6 +24,13 @@ export interface DeckProject {
   notes: string;
 }
 
+export interface DeckPrompt {
+  id: string;
+  name: string;
+  body: string;
+  note?: string;
+}
+
 export interface WorkflowStage {
   id: string;
   label: string;
@@ -74,6 +81,10 @@ export interface AgentSession {
   checks: CheckResult[];
   handoffIds: string[];
   artifacts: Artifact[];
+  /** True when the daemon reports this pane as an orchestration role pane. */
+  inOrchestration?: boolean;
+  /** True for the orchestration's start role — the coordinator an operator should message. */
+  isStartRole?: boolean;
 }
 
 export interface EvidenceItem {
@@ -88,6 +99,8 @@ export interface EvidenceItem {
   exitCode?: number;
   reason: string;
   acknowledged: boolean;
+  /** Deck-side agent this item is attributed to, when the daemon reported one. */
+  agentId?: string;
 }
 
 export type Provider = "OpenAI" | "Anthropic" | "OpenCode" | "Custom";
@@ -140,7 +153,55 @@ export type DeckAction =
   | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number }
   | { type: "retry_stage"; stageId: string }
   | { type: "stop_agent"; agentId: string }
+  | { type: "rename_agent"; agentId: string; displayName: string }
   | { type: "submit_text"; agentId: string; text: string };
+
+/**
+ * The daemon's honest delivery outcome for submitted input, mirroring the Rust
+ * `SendResult` (kebab-case on the wire). Only `applied` and `queued` mean the
+ * text reached the agent; every other value — including an unrecognised future
+ * one decoded as `unknown` — is a non-delivery the UI must not dress up as
+ * success.
+ */
+export type SendResult =
+  | "applied"
+  | "queued"
+  | "stale"
+  | "wrong-session"
+  | "history-only"
+  | "no-live-target"
+  | "ambiguous"
+  | "unknown";
+
+/**
+ * What `desktop_run_action` reports back. The Rust command returns `ok: false`
+ * with a non-delivered `sendResult` instead of raising, so a caller that only
+ * awaits the promise cannot tell delivery from silent loss — every consumer of
+ * `submit_text` must read this.
+ */
+export interface DeckActionResult {
+  ok: boolean;
+  sendResult?: SendResult;
+  message?: string;
+}
+
+/** True only for the two outcomes that actually reached the agent. */
+export function isDelivered(result: DeckActionResult): boolean {
+  return result.ok && (result.sendResult === undefined || result.sendResult === "applied" || result.sendResult === "queued");
+}
+
+/** Operator-facing explanation of a non-delivered outcome. */
+export function sendResultReason(result: SendResult | undefined): string {
+  switch (result) {
+    case "stale": return "the daemon's view of that pane had already moved on";
+    case "wrong-session": return "the pane handle no longer maps to that agent's session";
+    case "history-only": return "the agent has no live pane — only its history remains";
+    case "no-live-target": return "there is nothing live to write to";
+    case "ambiguous": return "the write started but did not complete; some of it may already have landed, so it was not retried";
+    case "unknown": return "the daemon reported an outcome this build does not recognise";
+    default: return "the daemon did not confirm delivery";
+  }
+}
 
 export interface WorkflowLaunchRole {
   role: string;
@@ -179,7 +240,7 @@ export interface DeckRuntimeState {
   snapshot: DeckSnapshot;
   terminalData: Record<string, TerminalBuffer>;
   error?: string;
-  runAction: (action: DeckAction) => Promise<void>;
+  runAction: (action: DeckAction) => Promise<DeckActionResult>;
   sendTerminalInput: (agentId: string, data: string) => Promise<void>;
   resizeTerminal: (agentId: string, cols: number, rows: number) => Promise<void>;
   reconnect: () => Promise<void>;

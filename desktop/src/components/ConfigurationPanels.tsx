@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   ArrowDown,
   ArrowUp,
+  BookMarked,
   Bot,
   Check,
   FolderCheck,
@@ -16,7 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { defaultCliForProvider, permissionModeLabel, permissionModeOptions, resolveProfileCommand } from "../lib/profileCommands";
-import type { AgentProfile, DeckProject, Provider, RuntimeMode, WorkflowLaunchConfig } from "../types";
+import type { AgentProfile, DeckProject, DeckPrompt, Provider, RuntimeMode, WorkflowLaunchConfig } from "../types";
 
 interface ProjectsPanelProps {
   open: boolean;
@@ -90,6 +91,68 @@ export function ProjectsPanel({ open, projects, activeId, selectedId, onSelect, 
               </footer>
             </form>
           ) : <div className="configuration-empty">Add a project to configure its launch directory.</div>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+interface PromptLibraryPanelProps {
+  open: boolean;
+  prompts: DeckPrompt[];
+  selectedId: string;
+  onSelect: (id: string) => void;
+  onClose: () => void;
+  onAdd: () => void;
+  onUpdate: (id: string, updates: Partial<DeckPrompt>) => void;
+  onRemove: (id: string) => void;
+}
+
+export function PromptLibraryPanel({ open, prompts, selectedId, onSelect, onClose, onAdd, onUpdate, onRemove }: PromptLibraryPanelProps) {
+  const [removeArmed, setRemoveArmed] = useState(false);
+  const prompt = prompts.find((candidate) => candidate.id === selectedId) ?? prompts[0];
+  useEffect(() => setRemoveArmed(false), [selectedId, open]);
+  if (!open) return null;
+
+  return (
+    <div className="sheet-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="config-sheet projects-sheet" role="dialog" aria-modal="true" aria-labelledby="prompts-title" data-testid="prompt-library-panel" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="sheet-header">
+          <div><span className="eyebrow">PROMPT LIBRARY</span><h2 id="prompts-title">Saved prompts</h2><p>Reusable text for the launch task prompt and for messaging a running agent.</p></div>
+          <button className="icon-button" aria-label="Close prompt library" onClick={onClose}><X size={18} /></button>
+        </header>
+        <div className="local-only-notice project-notice"><BookMarked size={15} /><span><strong>Local library</strong> — prompts are stored on this Mac only. Nothing is written to the project's <code>.dot-agent-deck.toml</code>.</span></div>
+
+        <div className="projects-layout">
+          <aside className="project-library">
+            <button className="add-project" onClick={onAdd}><Plus size={14} /> Add prompt</button>
+            <nav aria-label="Saved prompts">
+              {prompts.map((item) => (
+                <button key={item.id} className={item.id === prompt?.id ? "is-selected" : ""} onClick={() => onSelect(item.id)}>
+                  <span className="project-icon"><BookMarked size={15} /></span>
+                  <span><strong>{item.name || "Untitled prompt"}</strong><small>{item.body.trim().split("\n")[0] || "Empty prompt"}</small></span>
+                </button>
+              ))}
+            </nav>
+            {!prompts.length && <div className="project-library-empty"><BookMarked size={22} /><span>No saved prompts yet.</span></div>}
+          </aside>
+
+          {prompt ? (
+            <form className="project-form" onSubmit={(event) => event.preventDefault()}>
+              <div className="form-heading">
+                <div><span>PROMPT</span><h3>{prompt.name || "Untitled prompt"}</h3></div>
+              </div>
+              <div className="project-fields">
+                <label><span>Name</span><input aria-label="Prompt name" value={prompt.name} onChange={(event) => onUpdate(prompt.id, { name: event.target.value })} placeholder="Fix the failing test" /></label>
+                <label><span>Prompt body</span><textarea aria-label="Prompt body" rows={10} value={prompt.body} onChange={(event) => onUpdate(prompt.id, { body: event.target.value })} placeholder="The text to send to the coordinator or insert at launch…" /></label>
+                <label><span>Note</span><input aria-label="Prompt note" value={prompt.note ?? ""} onChange={(event) => onUpdate(prompt.id, { note: event.target.value })} placeholder="When you reach for this one" /></label>
+              </div>
+              <footer className="sheet-footer project-footer">
+                <button type="button" className={removeArmed ? "button danger" : "button secondary"} onClick={() => { if (removeArmed) onRemove(prompt.id); else setRemoveArmed(true); }}><Trash2 size={14} /> {removeArmed ? "Confirm remove" : "Remove prompt"}</button>
+                <div><span>Auto-saved locally</span></div>
+              </footer>
+            </form>
+          ) : <div className="configuration-empty">Add a prompt to reuse it at launch and in the agent composer.</div>}
         </div>
       </section>
     </div>
@@ -265,9 +328,10 @@ interface WorkflowPanelProps {
   onMove: (id: string, direction: -1 | 1) => void;
   onLaunch: (config: WorkflowLaunchConfig) => void;
   platformIssue?: string;
+  prompts?: DeckPrompt[];
 }
 
-export function WorkflowPanel({ open, profiles, order, mode, defaultName, defaultCwd, onClose, onToggle, onMove, onLaunch, platformIssue }: WorkflowPanelProps) {
+export function WorkflowPanel({ open, profiles, order, mode, defaultName, defaultCwd, onClose, onToggle, onMove, onLaunch, platformIssue, prompts = [] }: WorkflowPanelProps) {
   const [name, setName] = useState(defaultName);
   const [cwd, setCwd] = useState(defaultCwd.startsWith("/") ? defaultCwd : "");
   const [taskPrompt, setTaskPrompt] = useState("");
@@ -296,7 +360,25 @@ export function WorkflowPanel({ open, profiles, order, mode, defaultName, defaul
           <div className="workflow-launch-form">
             <label><span>Workflow name</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="coding-loop" /></label>
             <label><span>Absolute project directory</span><input value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="/Users/you/dev/project" spellCheck={false} /></label>
-            <label className="workflow-task-prompt"><span>Task prompt</span><textarea aria-label="Task prompt" value={taskPrompt} onChange={(event) => setTaskPrompt(event.target.value)} placeholder="Tell the orchestrator what to build, fix, or investigate..." rows={5} /></label>
+            <label className="workflow-task-prompt">
+              <span className="task-prompt-label">
+                Task prompt
+                {prompts.length > 0 && (
+                  <select
+                    aria-label="Insert saved prompt"
+                    value=""
+                    onChange={(event) => {
+                      const prompt = prompts.find((candidate) => candidate.id === event.target.value);
+                      if (prompt) setTaskPrompt(prompt.body);
+                    }}
+                  >
+                    <option value="">Insert saved prompt…</option>
+                    {prompts.map((prompt) => <option key={prompt.id} value={prompt.id}>{prompt.name || "Untitled prompt"}</option>)}
+                  </select>
+                )}
+              </span>
+              <textarea aria-label="Task prompt" value={taskPrompt} onChange={(event) => setTaskPrompt(event.target.value)} placeholder="Tell the orchestrator what to build, fix, or investigate..." rows={5} />
+            </label>
             {cwd && !cwd.startsWith("/") && <small><AlertTriangle size={12} /> Use an absolute directory path.</small>}
             {!taskPrompt.trim() && <small><AlertTriangle size={12} /> Add the task you want the coordinator to run.</small>}
             {platformIssue && <small data-testid="workflow-platform-issue"><AlertTriangle size={12} /> {platformIssue}</small>}

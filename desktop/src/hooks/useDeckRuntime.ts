@@ -82,7 +82,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   const runAction = useCallback(async (action: DeckAction) => {
     setError(undefined);
     try {
-      await bridge.runAction(action);
+      return await bridge.runAction(action);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);

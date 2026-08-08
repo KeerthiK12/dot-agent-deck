@@ -1,9 +1,12 @@
 import { createFixtureSnapshot, DEFAULT_PROFILES } from "../data/fixture";
+import { mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import type {
   AgentSession,
   AgentStatus,
   DeckAction,
+  DeckActionResult,
   DeckSnapshot,
+  EvidenceItem,
   RuntimeMode,
   TerminalChunk,
   WorkflowStage,
@@ -53,6 +56,17 @@ export interface TerminalAttachResult {
   reused: boolean;
 }
 
+/**
+ * The subset of the Tauri `desktop_run_action` reply the frontend reads. The
+ * command also returns the refreshed snapshot, which arrives separately on
+ * `desktop://snapshot`.
+ */
+export interface DesktopActionResultDto {
+  ok: boolean;
+  sendResult?: import("../types").SendResult;
+  message?: string;
+}
+
 /** Low-volume lifecycle payload emitted as `desktop://terminal-state`. */
 export interface DesktopTerminalStateDto {
   sessionId: string;
@@ -93,7 +107,7 @@ export interface DeckBridge {
   readonly mode: RuntimeMode;
   connect(): Promise<DeckSnapshot>;
   subscribe(onSnapshot: SnapshotListener, onTerminal: TerminalListener): Promise<Unsubscribe>;
-  runAction(action: DeckAction): Promise<void>;
+  runAction(action: DeckAction): Promise<DeckActionResult>;
   sendTerminalInput(agentId: string, data: string): Promise<void>;
   resizeTerminal(agentId: string, cols: number, rows: number): Promise<void>;
   dispose(): Promise<void>;
@@ -119,6 +133,7 @@ function roleFromAgent(agent: DesktopAgentDto, index: number): string {
 function agentFromDto(agent: DesktopAgentDto, index: number): AgentSession {
   const status = statusFromDaemon(agent.status);
   const role = roleFromAgent(agent, index);
+  const orchestration = agent.tab.kind === "orchestration" ? agent.tab : undefined;
   return {
     id: agent.id,
     paneId: agent.paneId,
@@ -145,10 +160,12 @@ function agentFromDto(agent: DesktopAgentDto, index: number): AgentSession {
     checks: [],
     handoffIds: [],
     artifacts: [],
+    inOrchestration: Boolean(orchestration),
+    isStartRole: orchestration?.isStartRole ?? false,
   };
 }
 
-export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot): DeckSnapshot {
+export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[]): DeckSnapshot {
   const agents = dto.agents.map(agentFromDto);
   const cwd = agents.find((agent) => agent.cwd !== "Unavailable")?.cwd
     ?? dto.projectCwd
@@ -188,7 +205,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       const old = previous?.agents.find((candidate) => candidate.id === agent.id);
       return old ? { ...agent, transcript: old.transcript } : agent;
     }),
-    evidence: previous?.evidence ?? [],
+    evidence: evidence ?? previous?.evidence ?? [],
     profiles: previous?.profiles ?? DEFAULT_PROFILES.map((profile) => ({ ...profile })),
   };
 }
@@ -227,7 +244,7 @@ class FixtureDeckBridge implements DeckBridge {
     this.snapshotListeners.forEach((listener) => listener(value));
   }
 
-  async runAction(action: DeckAction): Promise<void> {
+  async runAction(action: DeckAction): Promise<DeckActionResult> {
     if (action.type === "pause_run" || action.type === "resume_run") {
       this.snapshot.paused = action.type === "pause_run";
     } else if (action.type === "approve_run") {
@@ -237,6 +254,8 @@ class FixtureDeckBridge implements DeckBridge {
       this.snapshot.stages = this.snapshot.stages.map((stage) => stage.id === action.stageId ? { ...stage, status: "active", attempt: stage.attempt + 1 } : stage);
     } else if (action.type === "stop_agent") {
       this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === action.agentId ? { ...agent, status: "stopped" } : agent);
+    } else if (action.type === "rename_agent") {
+      this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === action.agentId ? { ...agent, displayName: action.displayName } : agent);
     } else if (action.type === "submit_text") {
       this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === action.agentId ? { ...agent, transcript: `${agent.transcript}\r\n> ${action.text}\r\n` } : agent);
       this.terminalListeners.forEach((listener) => listener({ agentId: action.agentId, data: new TextEncoder().encode(`\r\n> ${action.text}\r\n`), stream: "output", operation: "append" }));
@@ -255,6 +274,7 @@ class FixtureDeckBridge implements DeckBridge {
       }
     }
     this.emitSnapshot();
+    return { ok: true, sendResult: action.type === "submit_text" ? "applied" : undefined };
   }
 
   async sendTerminalInput(agentId: string, data: string): Promise<void> {
@@ -285,6 +305,28 @@ export class TauriDeckBridge implements DeckBridge {
   private terminalListener?: TerminalListener;
   private invoke?: typeof import("@tauri-apps/api/core")["invoke"];
   private lifecycle = 0;
+  /** Newest-first ring of mapped hook events, capped at MAX_LIVE_EVIDENCE. */
+  private evidence: EvidenceItem[] = [];
+  private evidenceSequence = 0;
+  private agentIndex: AgentSession[] = [];
+
+  /**
+   * Resolves a hook event's agent by registry id first, then by the pane id the
+   * daemon tagged the pane with — hook payloads from external agents carry only
+   * one or the other.
+   */
+  private resolveAgent = (agentId?: string, paneId?: string): { id: string; role: string } | undefined => {
+    const match = this.agentIndex.find((agent) => (agentId && agent.id === agentId) || (paneId && agent.paneId === paneId));
+    return match ? { id: match.id, role: match.role } : undefined;
+  };
+
+  private recordDaemonEvent(payload: unknown): boolean {
+    const item = mapDaemonEvent(payload, this.evidenceSequence, this.resolveAgent);
+    if (!item) return false;
+    this.evidenceSequence += 1;
+    this.evidence = [item, ...this.evidence].slice(0, MAX_LIVE_EVIDENCE);
+    return true;
+  }
 
   private async getInvoke(): Promise<typeof import("@tauri-apps/api/core")["invoke"]> {
     if (!this.invoke) this.invoke = (await import("@tauri-apps/api/core")).invoke;
@@ -413,7 +455,9 @@ export class TauriDeckBridge implements DeckBridge {
     const invoke = await this.getInvoke();
     const dto = await invoke<DesktopSnapshotDto>("desktop_bootstrap", { options: { startIfMissing: false } });
     await this.attachAgents(dto.agents, lifecycle);
-    return mapDesktopSnapshot(dto);
+    const snapshot = mapDesktopSnapshot(dto, undefined, this.evidence);
+    this.agentIndex = snapshot.agents;
+    return snapshot;
   }
 
   async subscribe(onSnapshot: SnapshotListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
@@ -422,9 +466,21 @@ export class TauriDeckBridge implements DeckBridge {
     this.pendingTerminal.forEach((events) => events.forEach((event) => onTerminal(event)));
     this.pendingTerminal.clear();
     let latest: DeckSnapshot | undefined;
+    const emit = (dto: DesktopSnapshotDto) => {
+      latest = mapDesktopSnapshot(dto, latest, this.evidence);
+      this.agentIndex = latest.agents;
+      onSnapshot(latest);
+    };
     const stopSnapshot = await listen<DesktopSnapshotDto>("desktop://snapshot", (event) => {
-      latest = mapDesktopSnapshot(event.payload, latest);
       void this.attachAgents(event.payload.agents);
+      emit(event.payload);
+    });
+    // The daemon emits a coalesced snapshot after each event, but not every hook
+    // event produces one within the coalescing window; republishing the last
+    // mapped snapshot keeps the drawer current without waiting for the next.
+    const stopDaemonEvent = await listen<unknown>("desktop://daemon-event", (event) => {
+      if (!this.recordDaemonEvent(event.payload) || !latest) return;
+      latest = { ...latest, evidence: this.evidence };
       onSnapshot(latest);
     });
     const stopTerminalState = await listen<DesktopTerminalStateDto>("desktop://terminal-state", (event) => {
@@ -443,22 +499,25 @@ export class TauriDeckBridge implements DeckBridge {
     });
     return () => {
       stopSnapshot();
+      stopDaemonEvent();
       stopTerminalState();
       if (this.terminalListener === onTerminal) this.terminalListener = undefined;
     };
   }
 
-  async runAction(action: DeckAction): Promise<void> {
+  async runAction(action: DeckAction): Promise<DeckActionResult> {
     const invoke = await this.getInvoke();
-    if (action.type === "stop_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon" || action.type === "restart_daemon") {
-      await invoke("desktop_run_action", { action: action satisfies DesktopRunActionDto });
+    if (action.type === "stop_agent" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon" || action.type === "restart_daemon") {
+      // `desktop_run_action` resolves with `ok: false` for a non-delivered
+      // send rather than raising, so the result must be returned, not dropped.
+      const result = await invoke<DesktopActionResultDto>("desktop_run_action", { action: action satisfies DesktopRunActionDto });
       if (action.type === "stop_daemon" || action.type === "restart_daemon") {
         this.sessions.clear();
         this.attached.clear();
         this.terminalChannels.clear();
         this.lifecycle += 1;
       }
-      return;
+      return { ok: result?.ok !== false, sendResult: result?.sendResult, message: result?.message };
     }
     if (action.type === "start_daemon") {
       const dto = await invoke<DesktopSnapshotDto>("desktop_bootstrap", { options: { startIfMissing: true } });
@@ -466,7 +525,7 @@ export class TauriDeckBridge implements DeckBridge {
         throw new Error(dto.connection.error ?? "The local daemon did not become connected.");
       }
       await this.attachAgents(dto.agents);
-      return;
+      return { ok: true };
     }
     throw new Error("This orchestration control is available in the fixture preview but is not yet exposed by the live daemon.");
   }

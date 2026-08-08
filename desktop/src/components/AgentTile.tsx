@@ -1,15 +1,19 @@
-import { useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Box,
+  Check,
   CheckCircle2,
   CircleDot,
   FileCode2,
   GitCompareArrows,
   Handshake,
+  Pencil,
   ShieldCheck,
   SquareTerminal,
+  X,
 } from "lucide-react";
-import type { AgentSession, EvidenceItem, PanelTab, RuntimeMode, TerminalBuffer } from "../types";
+import type { AgentSession, DeckActionResult, DeckPrompt, EvidenceItem, PanelTab, RuntimeMode, TerminalBuffer } from "../types";
+import { AgentComposer } from "./AgentComposer";
 import { TerminalViewport } from "./TerminalViewport";
 
 const tabs: { id: PanelTab; label: string; icon: typeof SquareTerminal }[] = [
@@ -27,11 +31,16 @@ interface AgentTileProps {
   tab: PanelTab;
   terminalData?: TerminalBuffer;
   evidence: EvidenceItem[];
+  prompts: DeckPrompt[];
+  /** Increments when the command palette asks this tile's composer to focus. */
+  composerFocusToken?: number;
   onSelect: () => void;
   onTabChange: (tab: PanelTab) => void;
   onTerminalInput: (agentId: string, data: string) => Promise<void>;
   onTerminalResize: (agentId: string, cols: number, rows: number) => Promise<void>;
   onEvidenceSelect: (id: string) => void;
+  onSubmitText: (agentId: string, text: string) => Promise<DeckActionResult>;
+  onRename?: (agentId: string, displayName: string) => Promise<void>;
 }
 
 function formatTokens(tokens: number): string {
@@ -45,11 +54,15 @@ export function AgentTile({
   tab,
   terminalData,
   evidence,
+  prompts,
+  composerFocusToken,
   onSelect,
   onTabChange,
   onTerminalInput,
   onTerminalResize,
   onEvidenceSelect,
+  onSubmitText,
+  onRename,
 }: AgentTileProps) {
   const handleInput = useCallback((data: string) => {
     void onTerminalInput(agent.id, data);
@@ -57,8 +70,17 @@ export function AgentTile({
   const handleResize = useCallback((cols: number, rows: number) => {
     void onTerminalResize(agent.id, cols, rows);
   }, [agent.id, onTerminalResize]);
-  const agentEvidence = evidence.filter((item) => agent.handoffIds.includes(item.id));
+  const agentEvidence = evidence.filter((item) => agent.handoffIds.includes(item.id) || item.agentId === agent.id);
   const fixture = mode === "fixture";
+  const [renameDraft, setRenameDraft] = useState<string>();
+  useEffect(() => setRenameDraft(undefined), [agent.id]);
+
+  const commitRename = () => {
+    const next = renameDraft?.trim();
+    setRenameDraft(undefined);
+    if (!onRename || !next || next === agent.displayName) return;
+    void onRename(agent.id, next);
+  };
 
   return (
     <article
@@ -73,9 +95,38 @@ export function AgentTile({
           <div>
             <div className="agent-title-line">
               <h2>{agent.role}</h2>
+              {agent.isStartRole && <span className="coordinator-badge" title="Orchestration start role">COORDINATOR</span>}
               <span className={`status-label status-${agent.status}`}>{agent.status}</span>
             </div>
-            <p>{agent.cli} <span aria-hidden="true">·</span> {agent.model}</p>
+            {renameDraft !== undefined ? (
+              <div className="agent-rename" onMouseDown={(event) => event.stopPropagation()}>
+                <input
+                  autoFocus
+                  aria-label={`Rename ${agent.role}`}
+                  value={renameDraft}
+                  onChange={(event) => setRenameDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") { event.preventDefault(); commitRename(); }
+                    if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setRenameDraft(undefined); }
+                  }}
+                />
+                <button aria-label={`Save ${agent.role} name`} onClick={commitRename}><Check size={12} /></button>
+                <button aria-label={`Cancel renaming ${agent.role}`} onClick={() => setRenameDraft(undefined)}><X size={12} /></button>
+              </div>
+            ) : (
+              <p>
+                {agent.cli} <span aria-hidden="true">·</span> {agent.model}
+                {onRename && (
+                  <button
+                    className="agent-rename-trigger"
+                    aria-label={`Rename ${agent.role}`}
+                    title={`Rename ${agent.displayName}`}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    onClick={() => setRenameDraft(agent.displayName)}
+                  ><Pencil size={11} /></button>
+                )}
+              </p>
+            )}
           </div>
         </div>
         <div className="agent-attempt" title="Current attempt">
@@ -127,16 +178,19 @@ export function AgentTile({
 
       <div className="agent-panel" role="tabpanel">
         {tab === "terminal" && (
-          <TerminalViewport
-            agentId={agent.id}
-            label={agent.role}
-            transcript={agent.transcript}
-            streamData={terminalData}
-            readOnly={agent.status === "queued" || agent.status === "passed" || agent.status === "stopped"}
-            onInput={handleInput}
-            onResize={handleResize}
-            onFocus={onSelect}
-          />
+          <div className="agent-terminal-stack">
+            <TerminalViewport
+              agentId={agent.id}
+              label={agent.role}
+              transcript={agent.transcript}
+              streamData={terminalData}
+              readOnly={agent.status === "queued" || agent.status === "passed" || agent.status === "stopped"}
+              onInput={handleInput}
+              onResize={handleResize}
+              onFocus={onSelect}
+            />
+            <AgentComposer agent={agent} prompts={prompts} focusToken={composerFocusToken} onSubmit={onSubmitText} />
+          </div>
         )}
         {tab === "diff" && (
           <div className="text-panel diff-panel">
