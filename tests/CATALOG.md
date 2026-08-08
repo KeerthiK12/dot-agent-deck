@@ -83,6 +83,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** delivery feedback or daemon send results (covered by `prompt/pane-input/004`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/010 — A pane keeps exactly one card when a hook reports on it without an `agent_id` (issue #398).
+- **Layer:** L1 (in-process `AppState::apply_event` + ratatui `TestBackend` buffer text assertion).
+- **Agent:** none (a tagged spawn placeholder plus one synthetic untagged `WaitingForInput` `AgentEvent`).
+- **Asserts:** after an `agent_id: None` event lands on a pane that already carries a tagged session, exactly one session claims that `pane_id`, that session carries the reported `WaitingForInput` status, and the rendered card grid contains exactly one status badge. Before #398 the untagged event minted a second session, so the deck drew two cards for one pane and `build_pane_status` picked between their statuses by `HashMap` iteration order.
+- **Does not assert:** that the tagged session keeps its accumulated history (the `pre_f9_hook_with_no_agent_id_*` unit tests in `src/state.rs` pin that half); the `WaitingForInput` command-entry carve-out that reads the collision-hardened join (`orchestration/lock/007`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
@@ -2135,6 +2142,13 @@ without depending on the config struct API.
 - **Agent:** none (two synthetic `AppState`s standing in for the daemon-observed collision).
 - **Asserts:** two sessions colliding on one `pane_id` and DISAGREEING on `WaitingForInput`-ness resolve to no exemption and the keystroke is dropped; a single, unambiguous `WaitingForInput` session still resolves to `WaitingForInput` and still passes the keystroke through — so failing closed cannot be bought by breaking the carve-out outright. The guard has to live in the producer: a `HashMap<&str, SessionStatus>` cannot represent the collision, so by the time the gate reads the map the ambiguity is already gone.
 - **Does not assert:** the collision semantics of `build_pane_status` itself, which is deliberately left as-is — its consumers are cosmetic, and only the lock's feed hardens. The rule here is "any duplicate", not "any disagreeing duplicate".
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/013 — A `WaitingForInput` written by a producer that named no generation does NOT open the lock (issue #398, PR #443 review).
+- **Layer:** L1 (in-process gate resolution against a real orchestration tab).
+- **Agent:** none (a synthetic single `WaitingForInput` session plus the pane's untagged-status mark).
+- **Asserts:** with exactly ONE unambiguous `WaitingForInput` session on the focused locked worker pane, `build_pane_status_for_gate` still omits the pane while its status provenance is untagged, and `gate_pane_input_key` drops the keystroke; clearing the mark — what an identified hook does — restores the carve-out and the keystroke passes through unchanged.
+- **Does not assert:** the duplicate-session denial, which is a separate rule (`orchestration/lock/007`); that untagged status is hidden from cards or borders (it deliberately still renders).
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/lock/008 — On a real locked orchestration tab the orchestrator's own input still reaches its PTY while a worker's does not, and `Ctrl+d`,`Ctrl+e` reverses that.
