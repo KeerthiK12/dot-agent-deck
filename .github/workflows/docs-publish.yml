@@ -35,6 +35,15 @@ jobs:
         with:
           fetch-depth: 0
           ref: main
+          # This job pushes the chart bump straight to `main` (see the "Commit
+          # chart changes" step). Once `main` is protected, the default
+          # GITHUB_TOKEN is rejected with `GH006: Protected branch update
+          # failed`, which breaks both the release flow and a standalone
+          # /publish-docs run — see CLAUDE.md rule 8. RELEASE_TOKEN is an admin
+          # PAT that bypasses the ruleset. The `|| github.token` fallback keeps
+          # this workflow behaving exactly as it does today while the secret is
+          # unset, so this change is safe to merge before `main` is protected.
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
 
       - name: Resolve image tag
         id: tag

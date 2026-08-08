@@ -27,6 +27,15 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # This job pushes the changelog commit straight to `main` (see the
+          # "Commit changelog updates" step). Once `main` is protected, the
+          # default GITHUB_TOKEN is rejected with `GH006: Protected branch
+          # update failed` and the tag dies here — the v0.35.6 failure mode
+          # recorded in CLAUDE.md rule 8. RELEASE_TOKEN is an admin PAT that
+          # bypasses the ruleset. The `|| github.token` fallback keeps this
+          # workflow behaving exactly as it does today while the secret is
+          # unset, so this change is safe to merge before `main` is protected.
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
       - name: Extract version
         id: version
         # Every GitHub-context value a `run:` script in this workflow consumes
