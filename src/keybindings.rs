@@ -56,6 +56,10 @@ pub enum Action {
     NewPane,
     ClosePane,
     ToggleLayout,
+    /// Toggle the deck-global command-entry lock — whether direct keystrokes
+    /// reach a focused non-orchestrator role pane's PTY. Claimed only on an
+    /// Orchestration tab in command mode (see `scope_command_entry_lock`).
+    ToggleOrchestrationLock,
     /// PRD #336: toggle the orchestration sidebar/pane-column split between
     /// the default 34/66 ratio and a narrower-sidebar 25/75. Global across
     /// orchestration tabs, though only pressable from one.
@@ -140,6 +144,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "toggle_layout",
         default: "Ctrl+t",
         description: "Toggle layout",
+    },
+    ActionSpec {
+        action: Action::ToggleOrchestrationLock,
+        section: Section::Global,
+        name: "toggle_orchestration_lock",
+        default: "Ctrl+e",
+        description: "Toggle orchestration command-entry lock",
     },
     ActionSpec {
         action: Action::ToggleOrchestrationSplit,
