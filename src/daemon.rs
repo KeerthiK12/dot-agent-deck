@@ -43,6 +43,143 @@ pub fn idle_shutdown_from_env() -> Option<Duration> {
     }
 }
 
+/// Exit status when a SECOND termination signal cuts a graceful shutdown short.
+/// `128 + SIGTERM(15)`, the shell convention for "died on signal 15", so a
+/// supervisor or script reads it the same way it read the pre-handler behaviour.
+const EXIT_FORCED_BY_SECOND_SIGNAL: i32 = 143;
+
+/// Spawn the production termination-signal watch, routing SIGTERM/SIGINT into
+/// the shared `shutdown` notify so a stop reuses the ONE audited teardown path
+/// (sockets unlinked, `AgentPtyRegistry` dropped, tasks aborted).
+///
+/// Why this exists: `daemon stop` / `daemon restart` terminate the daemon with
+/// SIGTERM (see [`crate::daemon_stop`]), and the build-version handshake
+/// SIGTERMs it silently on the no-agents path. With no handler installed the
+/// default disposition applied — the process died instantly, so its owned
+/// agents died by PTY hangup instead of an orderly registry teardown and,
+/// worst of all, **nothing was logged**. A daemon that vanished mid-session
+/// left no evidence of whether it was stopped, crashed, or was OOM-killed;
+/// reconstructing one real incident took kernel logs and an external watchdog
+/// to establish something the daemon itself should have said in one line.
+///
+/// Logged at `warn!` (not `info!`) for the same reason the give-up warnings in
+/// `embedded_pane` are: losing the daemon terminates every managed agent, so
+/// it is a user-visible outcome that must survive a default log filter.
+fn spawn_termination_signal_watch(
+    shutdown: Arc<Notify>,
+    registry: Arc<AgentPtyRegistry>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // Registering can only fail if the runtime can't install the handler
+        // (no signal driver). That is not fatal — the daemon simply keeps the
+        // pre-existing default disposition — so log and carry on.
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "could not install SIGTERM handler; termination will not be logged");
+                return None;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "could not install SIGINT handler; termination will not be logged");
+                return None;
+            }
+        };
+        Some(tokio::spawn(async move {
+            let sig = tokio::select! {
+                _ = sigterm.recv() => "SIGTERM",
+                _ = sigint.recv() => "SIGINT",
+            };
+            warn!(
+                signal = sig,
+                "daemon received termination signal; initiating graceful shutdown \
+                 (every managed agent will be stopped)"
+            );
+
+            // Drain managed agents with the SAME grace the `KIND_SHUTDOWN`
+            // handler gives them, BEFORE releasing the hook loop. Notifying
+            // `shutdown` alone is not enough: the loop returns, `run_daemon_with`
+            // drops the registry, and `Drop` calls `shutdown_all` — the
+            // SIGKILL-WITHOUT-grace path, which `shutdown_all_graceful`'s own docs
+            // scope to "idle shutdown and test cleanup". Idle shutdown only fires
+            // with no agents left, so force-killing there costs nothing; a signal
+            // is a DELIBERATE stop that routinely lands on live agents, so it
+            // belongs on the graceful path. (Greptile P1 on the first draft, which
+            // notified and returned — agents lost the grace this change promised.)
+            //
+            // `spawn_blocking` mirrors `daemon_protocol`'s KIND_SHUTDOWN arm: the
+            // drain blocks while it polls for each child to exit. Idempotent via
+            // the registry's `shutting_down` latch, whose docs already anticipate
+            // "a SIGTERM landing during shutdown".
+            let draining = registry.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                draining.shutdown_all_graceful(crate::agent_pty::AGENT_TERMINATE_GRACE);
+            })
+            .await;
+            shutdown.notify_one();
+
+            // Escape hatch, and the reason this task keeps waiting instead of
+            // returning here. Installing a handler REPLACES the default
+            // disposition for the life of the process: once the first signal is
+            // consumed, tokio's handler stays installed, so every later SIGTERM
+            // would be quietly swallowed by a stream nobody reads. Before this
+            // change SIGTERM always killed the daemon outright, so a wedged
+            // shutdown could still be ended with `pkill dot-agent-deck` — which
+            // sends SIGTERM by default and is the escape hatch the in-repo audit
+            // notes call the only way to stop a daemon. A second signal
+            // therefore force-exits, preserving that. A second signal arriving
+            // DURING the drain above is buffered by tokio's signal stream and
+            // handled as soon as the drain returns, so the hatch is delayed by at
+            // most `AGENT_TERMINATE_GRACE`, never lost.
+            let again = tokio::select! {
+                _ = sigterm.recv() => "SIGTERM",
+                _ = sigint.recv() => "SIGINT",
+            };
+            warn!(
+                signal = again,
+                "second termination signal while shutting down; exiting immediately \
+                 without finishing teardown"
+            );
+            std::process::exit(EXIT_FORCED_BY_SECOND_SIGNAL);
+        }))
+    }
+    #[cfg(windows)]
+    {
+        Some(tokio::spawn(async move {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                warn!(error = %e, "could not await Ctrl-C; termination will not be logged");
+                return;
+            }
+            warn!(
+                signal = "CTRL_C",
+                "daemon received termination signal; initiating graceful shutdown \
+                 (every managed agent will be stopped)"
+            );
+            // Same graceful drain as the Unix arm above; see its comment.
+            let draining = registry.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                draining.shutdown_all_graceful(crate::agent_pty::AGENT_TERMINATE_GRACE);
+            })
+            .await;
+            shutdown.notify_one();
+
+            // Same second-signal escape hatch as the Unix arm above.
+            if tokio::signal::ctrl_c().await.is_ok() {
+                warn!(
+                    signal = "CTRL_C",
+                    "second termination signal while shutting down; exiting immediately \
+                     without finishing teardown"
+                );
+                std::process::exit(EXIT_FORCED_BY_SECOND_SIGNAL);
+            }
+        }))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test-only self-defense: orphan watchdog + max-lifetime backstop.
 //
@@ -443,6 +580,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // expires, the hook loop's `select!` arm wakes up, and the loop exits.
     let shutdown = Arc::new(Notify::new());
 
+    // Production termination watch: route SIGTERM/SIGINT through the same
+    // `shutdown` notify. Armed unconditionally — unlike the two backstops
+    // below, this is not test-only: `daemon stop` IS a SIGTERM.
+    let signal_handle = spawn_termination_signal_watch(shutdown.clone(), pty_registry.clone());
+
     // Test-only orphan watchdog: when `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED` is
     // truthy, gracefully shut down (via the SAME `shutdown` signal the idle
     // monitor uses — so sockets/agents tear down cleanly) once this daemon is
@@ -596,6 +738,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         h.abort();
     }
     if let Some(h) = max_lifetime_handle {
+        h.abort();
+    }
+    if let Some(h) = signal_handle {
         h.abort();
     }
     drop(pty_registry);
@@ -853,7 +998,12 @@ async fn run_hook_loop(
             // is dropped, which doesn't leak the listener (only the
             // partially-built tokio future).
             _ = shutdown.notified() => {
-                info!("Daemon hook loop exiting on idle shutdown");
+                // Deliberately does NOT name a cause: `shutdown` is notified by
+                // the idle monitor, the termination-signal watch, the orphan
+                // watchdog, and the max-lifetime backstop. Each logs its own
+                // reason before notifying, so naming one here (this used to say
+                // "on idle shutdown") mislabels the other three.
+                info!("Daemon hook loop exiting on shutdown signal");
                 return Ok(());
             }
             accept_res = listener.accept() => match accept_res {

@@ -31,6 +31,15 @@ pub enum AgentType {
     /// Serializes to `"codex"` (snake_case); resolved from the `codex` binary
     /// basename through the registry ([`crate::agent_registry`]).
     Codex,
+    /// Devin CLI — Cognition's local terminal agent. Like Codex, it ships a
+    /// Claude-Code-compatible hooks engine, so its native command hooks post the
+    /// SAME stdin JSON shape Claude does and are ingested by the existing
+    /// [`crate::hook`] `"devin"` arm. Unlike Codex it needs no wrapper and no
+    /// hook-trust ceremony, so it is a pure `NativeHooks` agent
+    /// ([`crate::devin_hooks_manage`]). Serializes to `"devin"` (snake_case);
+    /// resolved from the `devin` binary basename through the registry
+    /// ([`crate::agent_registry`]).
+    Devin,
     /// "No recognized agent type." Produced by [`AgentType::from_command`] for
     /// any unrecognized binary, mapped to `Option::None` by
     /// [`crate::state::SessionState::live_snapshot`], and rendered as the "No

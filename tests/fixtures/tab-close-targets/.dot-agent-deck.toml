@@ -1,6 +1,15 @@
 # Two visibly distinct synthetic modes for close-target identity tests. Each
 # mode keeps a side pane alive with a unique sentinel, so the rendered grid
 # proves which tab remains active without an LLM or production-only test hook.
+#
+# `watch = false` is load-bearing (issue #367): the default `watch = true`
+# wraps the command in `dot-agent-deck watch`, and these commands deliberately
+# never exit, so the sentinel would only ever appear inside the wrapped command
+# line the pane's shell echoes — a match whose survival depends on where that
+# long line wraps in the side pane, i.e. on the length of the checkout's
+# absolute path. Running the command directly makes the sentinel real output,
+# and the `sleep` merely holds the pane open. The watch wrapper's own streaming
+# is covered by `tabs/mode/006`, not from here.
 [[modes]]
 name = "alpha"
 reactive_panes = 0
@@ -8,6 +17,7 @@ reactive_panes = 0
 [[modes.panes]]
 command = "printf 'ALPHA_TAB_SENTINEL\\n'; sleep 600"
 name = "Alpha sentinel"
+watch = false
 
 [[modes]]
 name = "beta"
@@ -16,3 +26,4 @@ reactive_panes = 0
 [[modes.panes]]
 command = "printf 'BETA_TAB_SENTINEL\\n'; sleep 600"
 name = "Beta sentinel"
+watch = false

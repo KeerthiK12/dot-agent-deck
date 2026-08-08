@@ -137,6 +137,12 @@ fn opencode_uninstall() -> Result<(), String> {
 fn pi_materialize(env: &[(String, String)]) {
     crate::orchestrator_ext::auto_materialize(env);
 }
+fn devin_install() -> Result<(), String> {
+    crate::devin_hooks_manage::install()
+}
+fn devin_uninstall() -> Result<(), String> {
+    crate::devin_hooks_manage::uninstall()
+}
 /// PRD #20 §4.2.1: `dot-agent-deck hooks install --agent codex` — write the deck's
 /// `hooks.json` into the active Codex home and record scoped, hash-pinned trust
 /// for exactly those entries. The trust step is best-effort (it needs `codex` on
@@ -238,6 +244,37 @@ pub static CODEX: AgentSpec = AgentSpec {
     startup_auto_install: Some(crate::codex_hooks_manage::auto_install_and_trust_at_startup),
 };
 
+/// Devin CLI — native-hooks strategy. The second agent to reuse
+/// [`IntegrationStrategy::NativeHooks`], and the reason the strategy dispatch had
+/// to move onto the spec (PRD #20 finding #15): its handlers below are its OWN
+/// ([`crate::devin_hooks_manage`]), not Claude's.
+///
+/// Devin ships a Claude-Code-compatible hooks engine, so — like Codex — its
+/// command hooks post the same stdin JSON shape Claude does and ride the existing
+/// hook socket. Unlike Codex it needs neither a wrapper (its own TUI runs
+/// directly on the deck's PTY) nor a hook-trust ceremony, which makes it the
+/// cheapest possible registry addition: pure `NativeHooks` + one `hook.rs` arm.
+///
+/// `hook_install` is `Some`, which the PRD #225 readiness gate reads as the
+/// promise that a real (unmarked) `SessionStart` still arrives — Devin documents
+/// a `SessionStart` hook, and being unwrapped it emits no fork-time marked event
+/// at all, so the gate simply waits for the genuine one.
+pub static DEVIN: AgentSpec = AgentSpec {
+    agent_type: AgentType::Devin,
+    label: "Devin",
+    detect_basenames: &["devin"],
+    default_command: Some("devin"),
+    strategy: Some(IntegrationStrategy::NativeHooks),
+    // A named ANSI colour not used by Claude (LightMagenta), OpenCode
+    // (LightGreen), Pi (LightCyan) or Codex (LightYellow), and never the neutral
+    // DarkGray reserved for the "No agent" placeholder.
+    badge_color: Color::LightBlue,
+    hook_install: Some(devin_install),
+    hook_uninstall: Some(devin_uninstall),
+    materialize: None,
+    startup_auto_install: Some(crate::devin_hooks_manage::auto_install),
+};
+
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
 /// it has no detection basenames, no default command, and no integration
 /// strategy. It exists so registry lookups ([`spec`]) are total — the `Display`
@@ -259,7 +296,7 @@ pub static NONE: AgentSpec = AgentSpec {
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral
 /// [`NONE`] placeholder — it is not a detectable agent and has no strategy to
 /// dispatch. Detection and startup auto-install iterate this slice.
-pub static ALL: &[&AgentSpec] = &[&CLAUDE_CODE, &OPEN_CODE, &PI, &CODEX];
+pub static ALL: &[&AgentSpec] = &[&CLAUDE_CODE, &OPEN_CODE, &PI, &CODEX, &DEVIN];
 
 /// The registry entry for a given agent type. Total: every [`AgentType`]
 /// variant — including the neutral [`AgentType::None`] — maps to an entry, so
@@ -270,6 +307,7 @@ pub fn spec(agent_type: &AgentType) -> &'static AgentSpec {
         AgentType::OpenCode => &OPEN_CODE,
         AgentType::Pi => &PI,
         AgentType::Codex => &CODEX,
+        AgentType::Devin => &DEVIN,
         AgentType::None => &NONE,
     }
 }
@@ -462,7 +500,8 @@ mod tests {
                 &AgentType::ClaudeCode,
                 &AgentType::OpenCode,
                 &AgentType::Pi,
-                &AgentType::Codex
+                &AgentType::Codex,
+                &AgentType::Devin
             ]
         );
         assert!(!ALL.iter().any(|spec| spec.agent_type == AgentType::None));

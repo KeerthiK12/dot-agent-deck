@@ -64,6 +64,18 @@ pub fn handle_hook(agent: &str) -> ExitCode {
             };
             build_event_typed(hook_input, AgentType::Codex)
         }
+        // Devin CLI ships a Claude-Code-compatible hooks engine too, so its
+        // command hooks POST the SAME stdin JSON shape ([`ClaudeCodeHookInput`])
+        // and reuse the whole ingestion path, only stamping
+        // [`AgentType::Devin`]. Its `exec` tool carries a plain-string
+        // `command`, which the `extract_tool_detail` `"exec"` arm sharpens.
+        "devin" => {
+            let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
+                Ok(v) => v,
+                Err(_) => return ExitCode::SUCCESS,
+            };
+            build_event_typed(hook_input, AgentType::Devin)
+        }
         _ => {
             let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
                 Ok(v) => v,
@@ -111,6 +123,10 @@ fn map_event_type(hook_event_name: &str) -> Option<EventType> {
         // [`EventType::Error`] — see [`tool_response_is_failure`].
         "PreCompact" => Some(EventType::Compacting),
         "PostCompact" => Some(EventType::Thinking),
+        // Devin's spelling of the post-compaction event. Devin fires ONLY the
+        // post event (it has no `PreCompact`), so this is the sole compaction
+        // signal a Devin session produces.
+        "PostCompaction" => Some(EventType::Thinking),
         "SubagentStart" => Some(EventType::SubagentStart),
         "SubagentStop" => Some(EventType::SubagentStop),
         _ => None,
@@ -198,6 +214,16 @@ fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> O
             codex_patch_path(patch)
                 .unwrap_or_else(|| truncate(patch.lines().next().unwrap_or(patch), 120))
         }
+        // Devin's shell tool is named `exec` and — like Claude's `Bash` — carries
+        // a plain-string `command`. Unlike the arms above this one FALLS THROUGH
+        // to the generic first-string extraction when `command` is absent: only
+        // the tool NAME is documented, so a shape we guessed wrong must still
+        // yield a useful detail rather than none. Devin's other tools (`read`,
+        // `edit`, `grep`, …) are left to the generic branch for the same reason.
+        "exec" => match input.get("command").and_then(|v| v.as_str()) {
+            Some(cmd) => truncate(cmd.lines().next().unwrap_or(cmd), 120),
+            None => truncate(input.values().find_map(|v| v.as_str())?, 80),
+        },
         _ => {
             // First string-valued key
             let val = input.values().find_map(|v| v.as_str())?;

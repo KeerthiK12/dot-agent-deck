@@ -1,5 +1,58 @@
 # Changelog
 
+## [0.35.8] - 2026-08-08
+
+### Added
+
+- **Toggle the Orchestration Sidebar/Pane-Column Split Ratio**
+  In an orchestration tab, the role sidebar and the agent pane column split at a fixed 34/66 ratio — on a laptop screen that leaves the working pane noticeably narrower than it could be, and the only way to reclaim that width was a config edit and restart.
+  `Ctrl+l` in command mode now toggles that split between the default 34/66 and a narrower-sidebar 25/75. Press it again to return to the default. The setting is a preference, not a per-tab property: one press applies to every orchestration tab, and an orchestration tab you open afterwards comes up at the split you chose instead of resetting to 34/66. Dashboard and mode tabs are untouched, and the state resets to 34/66 on the next launch rather than persisting.
+  Like `Ctrl+w`, it is **command mode only**: while you are typing in a pane, and on every tab that is not an orchestration tab, `Ctrl+l` is left alone as ordinary input for whatever is running there — so an agent or shell still gets its clear-screen. Press `Ctrl+d` first to reach command mode, then `Ctrl+l`.
+  Like every other keybinding, `toggle_orchestration_split` is remappable through `[global]` in `~/.config/dot-agent-deck/keybindings.toml`. See [Keyboard Shortcuts](https://agent-deck.devopstoolkit.ai/docs/keyboard-shortcuts) for the full list.
+
+### Fixed
+
+- **A Stopped Daemon Now Shuts Down Cleanly — and Says So**
+  `dot-agent-deck daemon stop` and `daemon restart` terminate the daemon with `SIGTERM`, but the daemon installed no signal handler, so the signal hit the default disposition: the process died instantly. Your managed agents were killed by their terminals hanging up rather than by an orderly teardown, and — the part that hurt most — **nothing was written to the log**. A daemon that disappeared mid-session left no record of whether it had been stopped, had crashed, or had been killed by the kernel under memory pressure, so the one question worth asking after losing a session's panes was the one question the log could not answer.
+  The daemon now handles `SIGTERM` and `SIGINT` (and Ctrl-C on Windows) by running the same shutdown it performs for an explicit stop request: your agents get the full termination grace period to flush their state, sockets are unlinked, and a warning line naming the signal goes to the log before it exits. Stopping the daemon still stops every agent under it — that is unchanged and by design — but it is now a clean stop you can find in the log afterwards.
+  Sending a second `SIGTERM` while that shutdown is in progress exits immediately without waiting for teardown, so a wedged daemon is still killable with `pkill` — installing a handler means the signal is no longer fatal by default, and that escape hatch would otherwise have been lost.
+  Two smaller diagnosis fixes ride along. When a pane gives up trying to reattach, the log now distinguishes **`daemon-unreachable`** (every lookup failed — the daemon went away and your agents may well be fine) from **`no-live-agent`** (the daemon answered and has no agent for that pane), and reports how many lookups were attempted and how many failed. Previously both reported the same thing, so a single daemon disappearing under several panes looked exactly like several agents dying independently. The pane's own on-screen message is unchanged.
+  Finally, `dot-agent-deck wrap` now honours the same orphan and maximum-lifetime safety nets `daemon serve` has always had. Only the daemon read them before, so a wrapper whose parent test was killed could survive indefinitely; wrappers were found still running three days later, from a checkout that had since been deleted, one of them spinning a shell loop a hundred times a second. A wrapper that outlives its parent now terminates itself and takes its child with it, escalating to `SIGKILL` if the child ignores the polite signal.
+
+
+
+## [0.35.7] - 2026-08-05
+
+### Added
+
+- **Devin CLI Is Now a First-Class Agent**
+  Devin joins Claude, Codex, OpenCode and the rest as an agent the deck can spawn, track and orchestrate. Devin ships a Claude-Code-compatible hooks engine, so its native command hooks post the same stdin JSON shape Claude does and ride the existing hook socket — no new wire format, and nothing about the TUI↔daemon protocol changes. Devin's badge colour is LightBlue.
+  The deck installs its hooks into Devin's user config — `$XDG_CONFIG_HOME/devin/config.json` when that variable is set, otherwise `~/.config/devin/config.json` — and auto-installs at daemon startup whenever `devin` is on `PATH`. The install merges into the existing file rather than clobbering it, never widens the file's permissions, and refuses to guess at content it cannot parse: malformed or JSONC config is backed up and the install errors out instead of silently destroying your model, permissions or MCP servers. `dot-agent-deck hooks install --agent devin` and `dot-agent-deck hooks uninstall --agent devin` are the explicit CLI.
+
+
+
+## [0.35.6] - 2026-08-04
+
+### Added
+
+- **The stacked pane layout no longer wastes a row per non-focused pane**
+  In the default `Stacked` pane layout, every non-focused pane used to render as an empty 1-row title-bar frame — a border drawn around nothing. In a 7-role orchestration tab ([#307](https://github.com/vfarcic/dot-agent-deck/issues/307)), that was six rows spent on frames for `developer`, `tester`, `reviewer`, `releaser`, `researcher` and `documenter`, none of which showed anything: on a laptop screen, roughly 13% of the vertical space. The orchestration sidebar already shows each role's live status, tool counts and click-to-focus, so the collapsed frame was a strictly poorer second copy of information already on screen.
+  Non-focused panes are no longer drawn at all. The focused pane now reclaims every row the collapsed frames used to occupy. Nothing about agent lifecycle changes — every pane's PTY stays open, every agent keeps running, hooks keep arriving, and the sidebar (or dashboard cards) keeps showing live status for all of them. A non-focused pane's PTY is now sized as though it were the focused slot, so switching focus is instant with no resize thrash or reflow.
+  Mode tabs, which render their two side panes simultaneously by design, are unaffected — they already use a fixed tiled split regardless of the global pane-layout setting.
+
+### Fixed
+
+  Fixed watch-wrapped mode panes staying permanently blank for commands that do not exit. Persistent panes (`[[modes.panes]]`) default to `watch = true`, which runs the command through the built-in `dot-agent-deck watch`; that wrapper showed the command's output only once the command finished. A pane running `tail -f app.log`, `kubectl logs -f`, or a dev server therefore showed nothing at all — no output, no error, no hint why.
+  Watched commands now show their output as it is produced, so long-running and slow commands paint progressively. stdout and stderr appear interleaved in the order they arrive, rather than all of stdout followed by all of stderr.
+
+### Miscellaneous
+
+  Fixed the e2e test harness leaking temp directories, which could make a healthy branch fail dozens of unrelated-looking tests. Every temp dir the harness creates now nests under one per-process root that is removed when the process exits, and `cargo xtask clean-e2e-tmp` reaps whatever an interrupted run left behind. When the temp filesystem is genuinely too full, the suite now says so explicitly instead of surfacing the exhaustion as agent and daemon failures. This is developer tooling only — no change to the shipped binary.
+  Fixed the local Windows pre-PR type-check (`scripts/windows-cross-check.sh`), which had been failing on every branch — including a clean `main` — since the reqwest 0.13 upgrade moved rustls onto its `aws-lc-rs` provider. It died inside `aws-lc-sys`'s build script, compiling that crate's ~600 C files with Linux gcc and Linux system headers against a Windows target, so it never reached a single line of this repo's own code and the documented gate produced no signal at all. The check now shims the C compiler the same way it already shimmed the archiver — `cargo check` never links, so nothing reads either artefact — which skips the C build entirely and leaves the Rust type-check real. A cold run takes about fifteen seconds and a warm one about five.
+  CI now runs that script too, in a parallel `windows-cross-check` job, so the same silent rot cannot recur — nothing had ever exercised it, which is why a permanently-red documented gate went unnoticed for months. That job is not a second Windows code gate; `build-windows` still owns Windows, compiling natively with clippy and tests on a real Windows runner, and was unaffected by this bug throughout. This is developer tooling only, with no change to the shipped binary.
+
+
+
 ## [0.35.5] - 2026-08-03
 
 ### Added

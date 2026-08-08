@@ -45,8 +45,29 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 filter = 'test(version_001_injected_build_env_reaches_the_binary)'
 slow-timeout = { period = "120s", terminate-after = 10 }
 
+# `devin/live/001` boots a THIRD-PARTY interactive TUI (the Devin CLI) inside a
+# pane and must wait for it to become ready before it can type anything —
+# keystrokes sent before that are silently dropped. Standalone the whole test is
+# ~11s and highly repeatable (four consecutive runs within 0.1s of each other),
+# but in a full `cargo test-e2e` run it shares the machine with every other
+# real-agent PTY test, and Devin's startup — which authenticates over the
+# network before drawing its UI — is the part that stretches. Measured: ~11s
+# alone, killed at the default 3 x 60s under full-suite contention. Its internal
+# waits are budgeted to ~345s so a genuinely stuck run still fails on its own
+# assertion, naming the stage that hung, instead of being killed with no
+# diagnostics; this window sits just above that budget and is still bounded.
+[[profile.default.overrides]]
+filter = 'test(devin_live_001_real_interactive_turn_drives_the_card_live)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
 [profile.e2e]
 slow-timeout = { period = "120s", terminate-after = 2 }
+
+# Same carve-out under the `e2e` profile (see the note below on why the default
+# profile's override list is not inherited).
+[[profile.e2e.overrides]]
+filter = 'test(devin_live_001_real_interactive_turn_drives_the_card_live)'
+slow-timeout = { period = "60s", terminate-after = 6 }
 
 # Same carve-out under the `e2e` profile, for runs that select it explicitly
 # (`cargo test-e2e` uses the default profile; `-P e2e` does not inherit the

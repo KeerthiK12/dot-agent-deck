@@ -125,6 +125,81 @@ fn snapshot_contains(snapshot: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Poll a condition on REAL wall-clock time after a paused Tokio clock has
+/// been advanced past a virtual deadline (#346).
+///
+/// The write that deadline unblocks still needs a genuine round trip through
+/// a real child process and the detached `pump_reader` OS thread (see
+/// `pump_reader` in `agent_pty.rs`) before it is observable in a snapshot —
+/// neither of which is affected by `tokio::time::pause`/`advance`, since both
+/// live entirely outside the Tokio runtime. A single fixed `std::thread::sleep`
+/// guess for that round trip (the pattern this replaces) is tight enough to
+/// lose the race under nextest's full-parallel load, where dozens of other
+/// test processes are contending for the same CPU. Poll with a generous real
+/// budget instead, yielding to the runtime each iteration so any pending
+/// async steps (like the notice/pointer write itself) keep making progress.
+async fn poll_until_after_time_advance(
+    real_timeout: Duration,
+    mut condition: impl FnMut() -> bool,
+) -> bool {
+    let deadline = Instant::now() + real_timeout;
+    loop {
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return condition();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Extra virtual time an `advance` needs in order to CROSS a timer that was
+/// armed exactly `nominal` ago on a paused clock (#402).
+///
+/// Tokio's timer wheel counts whole milliseconds: a deadline is rounded UP to
+/// the next tick (`deadline_to_tick` adds 999_999 ns before truncating) while
+/// `now` is truncated DOWN to one. A timer armed at real offset `a` therefore
+/// expires at tick `ceil(a) + nominal_ms`, but `advance(nominal)` only moves
+/// `now` to tick `floor(a + delta + nominal)`, where `delta` is the REAL time
+/// that elapsed between the daemon task arming the timer and this test calling
+/// `tokio::time::pause()`. On the delegate path `delta` is "whatever is left of
+/// a 20 ms `wait_for_replacement_agent` poll tick once the respawn finished" —
+/// a load-dependent coin flip. When it lands under a millisecond,
+/// `advance(nominal)` stops one tick SHORT and the timer does not fire.
+///
+/// The resulting failure is silent and total rather than off-by-a-little: the
+/// fallback then fires on the NEXT advance instead, so the readiness buffer is
+/// armed a full advance late, its deadline sits beyond every remaining advance,
+/// nothing is ever written to the worker PTY, and the final assertion reports an
+/// EMPTY snapshot. No amount of real-clock polling recovers it, because the
+/// paused clock never moves again. One whole tick of overshoot makes the
+/// crossing a property of the advance instead of host scheduling; two is
+/// used so the margin does not itself depend on where `a` fell inside its tick.
+#[cfg(unix)]
+const TIMER_TICK_SLACK: Duration = Duration::from_millis(2);
+
+/// `tokio::time::advance`, then drain the runtime so the task woken by the
+/// crossed deadline reaches ITS next await before the caller advances again.
+///
+/// `advance` yields exactly once. Every later advance in the
+/// `orchestration/delegate/011` scenarios is measured from the instant the
+/// delegate task arms the readiness-buffer sleep, so "the woken task actually
+/// ran" is a precondition of those advances, not a nicety — if it slips to the
+/// following advance the buffer deadline moves with it and the pointer is never
+/// delivered inside the test's virtual budget. Yields only: no real sleep, so
+/// the paused clock stays exactly where the caller put it.
+#[cfg(unix)]
+async fn advance_and_run(duration: Duration) {
+    tokio::time::advance(duration).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+}
+
 #[cfg(unix)]
 fn write_executable(path: &std::path::Path, contents: &str) {
     use std::os::unix::fs::PermissionsExt;
@@ -860,8 +935,12 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
     let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
 
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(30)).await;
-    tokio::task::yield_now().await;
+    // Cross the 30 s `SessionStart` fallback, with a tick of overshoot so the
+    // crossing does not depend on how much real time happened to pass between
+    // the daemon task arming that timeout and the `pause()` above — see
+    // `TIMER_TICK_SLACK` (#402). Every advance below is relative to the instant
+    // the readiness-buffer sleep is armed, which is this one.
+    advance_and_run(Duration::from_secs(30) + TIMER_TICK_SLACK).await;
     std::thread::sleep(Duration::from_millis(100));
     let after_timeout = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
@@ -870,8 +949,7 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
         String::from_utf8_lossy(&after_timeout)
     );
 
-    tokio::time::advance(Duration::from_millis(DELEGATE_READINESS_BUFFER_MS - 2)).await;
-    tokio::task::yield_now().await;
+    advance_and_run(Duration::from_millis(DELEGATE_READINESS_BUFFER_MS - 2)).await;
     std::thread::sleep(Duration::from_millis(100));
     let just_before_buffer = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
@@ -881,8 +959,13 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
     );
 
     tokio::time::advance(Duration::from_millis(3)).await;
-    tokio::task::yield_now().await;
-    std::thread::sleep(Duration::from_millis(100));
+    poll_until_after_time_advance(Duration::from_secs(2), || {
+        snapshot_contains(
+            &registry.snapshot(&new_agent_id).unwrap_or_default(),
+            POINTER,
+        )
+    })
+    .await;
     let delivered = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
         snapshot_contains(&delivered, POINTER),
@@ -927,10 +1010,9 @@ async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
         .await;
     let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
 
-    tokio::time::advance(Duration::from_secs(30)).await;
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
+    // `TIMER_TICK_SLACK` (#402): same fallback crossing as the scenario above,
+    // and the 1 ms buffer armed here leaves even less room to absorb a miss.
+    advance_and_run(Duration::from_secs(30) + TIMER_TICK_SLACK).await;
     std::thread::sleep(Duration::from_millis(50));
     let at_fallback = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
@@ -940,10 +1022,13 @@ async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
     );
 
     tokio::time::advance(Duration::from_millis(2)).await;
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
-    std::thread::sleep(Duration::from_millis(50));
+    poll_until_after_time_advance(Duration::from_secs(2), || {
+        snapshot_contains(
+            &registry.snapshot(&new_agent_id).unwrap_or_default(),
+            POINTER,
+        )
+    })
+    .await;
     let delivered = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
         snapshot_contains(&delivered, POINTER),
@@ -988,14 +1073,11 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
         .await;
     let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
 
-    tokio::time::advance(Duration::from_secs(30)).await;
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::advance(Duration::from_millis(1001)).await;
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
+    // `TIMER_TICK_SLACK` (#402): the fallback crossing again. The 1001 ms step
+    // below still straddles the 1000 ms default it must NOT have fallen back
+    // to, because it is measured from the instant this advance arms the buffer.
+    advance_and_run(Duration::from_secs(30) + TIMER_TICK_SLACK).await;
+    advance_and_run(Duration::from_millis(1001)).await;
     std::thread::sleep(Duration::from_millis(50));
     let after_default = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
@@ -1005,10 +1087,13 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
     );
 
     tokio::time::advance(Duration::from_millis(29_001)).await;
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
-    std::thread::sleep(Duration::from_millis(50));
+    poll_until_after_time_advance(Duration::from_secs(2), || {
+        snapshot_contains(
+            &registry.snapshot(&new_agent_id).unwrap_or_default(),
+            POINTER,
+        )
+    })
+    .await;
     let delivered = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
         snapshot_contains(&delivered, POINTER),
@@ -1587,8 +1672,20 @@ fn delegate_lagged_event_bus_suppresses_unprovable_silence_notice() {
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
         (DELEGATE_NO_EVENT_WINDOW_ENV, "400"),
     ]);
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    // #346: this scenario overflows a capacity-4 broadcast channel with a tight,
+    // non-yielding burst of 32 sends so the silence watch's OWN receiver lags
+    // and observes `RecvError::Lagged` (proving the "unprovable, so suppress"
+    // path). On a `multi_thread` runtime the watch task (spawned via
+    // `tokio::spawn`) can run truly concurrently on a second OS thread and
+    // drain the channel as it fills, which — depending on real host
+    // scheduling under nextest's full-parallel load — can race the burst
+    // enough to avoid ever lagging, making the intended overflow non-
+    // deterministic. `current_thread` makes it deterministic: the burst loop
+    // below has no `.await` inside it, so on a single-threaded, cooperative
+    // executor it always runs to completion before the watch task gets a
+    // chance to poll even once, guaranteeing the overflow regardless of
+    // machine load.
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build lagged-channel runtime")
@@ -1808,10 +1905,10 @@ fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
             );
 
             tokio::time::advance(Duration::from_millis(30_001)).await;
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+            poll_until_after_time_advance(Duration::from_secs(2), || {
+                snapshot_has_silence_notice(&harness.orchestrator_snapshot())
+            })
+            .await;
             let capped = harness.orchestrator_snapshot();
             assert!(
                 snapshot_has_silence_notice(&capped),
