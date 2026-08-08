@@ -123,6 +123,7 @@ export type DeckAction =
   | { type: "approve_run" }
   | { type: "advance_fixture" }
   | { type: "start_daemon" }
+  | { type: "stop_daemon"; force?: boolean }
   | { type: "start_workflow"; name: string; cwd: string; roles: WorkflowLaunchRole[]; rows: number; cols: number }
   | { type: "retry_stage"; stageId: string }
   | { type: "stop_agent"; agentId: string }

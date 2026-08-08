@@ -183,7 +183,7 @@ export function WorkflowPanel({ open, profiles, order, mode, defaultCwd, onClose
   const [name, setName] = useState("dot-agent-deck");
   const [cwd, setCwd] = useState(defaultCwd.startsWith("/") ? defaultCwd : "");
   useEffect(() => {
-    if (!cwd && defaultCwd.startsWith("/")) setCwd(defaultCwd);
+    if (defaultCwd.startsWith("/") && (!cwd || cwd === "/dev/active/dot-agent-deck-gui")) setCwd(defaultCwd);
   }, [cwd, defaultCwd]);
   if (!open) return null;
   const ordered = [...order.map((id) => profiles.find((profile) => profile.id === id)).filter((profile): profile is AgentProfile => Boolean(profile)), ...profiles.filter((profile) => !order.includes(profile.id))];

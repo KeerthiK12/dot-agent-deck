@@ -7,10 +7,14 @@ import type { DeckAction, DeckRuntimeState, DeckSnapshot, TerminalBuffer } from 
 export function useDeckRuntime(): DeckRuntimeState {
   const mode = useMemo(selectRuntimeMode, []);
   const bridge = useMemo(() => createDeckBridge(mode), [mode]);
-  const [snapshot, setSnapshot] = useState<DeckSnapshot>(() => ({
-    ...createFixtureSnapshot("empty"),
-    connection: { status: "loading", message: mode === "live" ? "Connecting to local daemon…" : "Loading deterministic fixture…" },
-  }));
+  const [snapshot, setSnapshot] = useState<DeckSnapshot>(() => {
+    const initial = createFixtureSnapshot("empty");
+    return {
+      ...initial,
+      worktree: mode === "live" ? "No active project" : initial.worktree,
+      connection: { status: "loading", message: mode === "live" ? "Connecting to local daemon…" : "Loading deterministic fixture…" },
+    };
+  });
   const [error, setError] = useState<string>();
   const [terminalData, setTerminalData] = useState<Record<string, TerminalBuffer>>({});
 

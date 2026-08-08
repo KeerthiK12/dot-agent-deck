@@ -11,7 +11,7 @@ use dot_agent_deck::platform::ipc::IpcStream;
 
 use crate::dto::{
     BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, disconnected_snapshot,
-    map_agent, safe_message, socket_path_text,
+    desktop_project_cwd, map_agent, safe_message, socket_path_text,
 };
 
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -148,6 +148,7 @@ pub(crate) async fn get_snapshot() -> DesktopSnapshot {
         return DesktopSnapshot {
             connection: daemon.connection,
             agents: Vec::new(),
+            project_cwd: desktop_project_cwd(),
             protocol_version: PROTOCOL_VERSION,
             source: "daemon",
         };
@@ -157,6 +158,7 @@ pub(crate) async fn get_snapshot() -> DesktopSnapshot {
         Ok(records) => DesktopSnapshot {
             connection: daemon.connection,
             agents: records.into_iter().map(map_agent).collect(),
+            project_cwd: desktop_project_cwd(),
             protocol_version: PROTOCOL_VERSION,
             source: "daemon",
         },

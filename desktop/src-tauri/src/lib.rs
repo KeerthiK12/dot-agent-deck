@@ -9,7 +9,9 @@ use std::time::Duration;
 use dot_agent_deck::agent_pty::{
     DOT_AGENT_DECK_PANE_ID, TabMembership, is_valid_display_name, mint_orchestration_id,
 };
+use dot_agent_deck::config::attach_socket_path;
 use dot_agent_deck::daemon_client::{DaemonClient, EventSubscription, StartAgentOptions};
+use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{AgentType, BroadcastMsg, EventType, SendResult};
 use dot_agent_deck::project_config::{OrchestrationConfig, load_project_config};
 use dot_agent_deck::ui::{
@@ -799,6 +801,17 @@ async fn desktop_run_action(
             // guarded against removing a newer attachment.
             terminal::detach_agent(&state, &agent_id).await;
             result_agent_id = Some(agent_id);
+        }
+        DesktopAction::StopDaemon { force } => {
+            let outcome = run_daemon_stop(&attach_socket_path(), force)
+                .await
+                .map_err(|error| safe_message(error.to_string()))?;
+            terminal::detach_all(&state).await;
+            result_message = Some(match outcome {
+                StopOutcome::NoDaemonRunning => "No daemon was running.".into(),
+                StopOutcome::Stopped { pid } => format!("Daemon stopped gracefully (pid {pid})."),
+                StopOutcome::ForceKilled { pid } => format!("Daemon force-killed (pid {pid})."),
+            });
         }
         DesktopAction::RenameAgent {
             agent_id,

@@ -23,6 +23,7 @@ export interface DesktopSnapshotDto {
     runningAgentCount?: number;
   };
   agents: DesktopAgentDto[];
+  projectCwd?: string;
   protocolVersion: number;
   source: "daemon";
 }
@@ -71,7 +72,8 @@ export type DesktopRunActionDto =
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
   | { type: "detach_terminal"; sessionId: string }
   | { type: "submit_text"; agentId: string; text: string }
-  | { type: "start_workflow"; name: string; cwd: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number };
+  | { type: "start_workflow"; name: string; cwd: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number }
+  | { type: "stop_daemon"; force?: boolean };
 
 type SnapshotListener = (snapshot: DeckSnapshot) => void;
 type TerminalListener = (event: TerminalChunk) => void;
@@ -147,7 +149,10 @@ function agentFromDto(agent: DesktopAgentDto, index: number): AgentSession {
 
 export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot): DeckSnapshot {
   const agents = dto.agents.map(agentFromDto);
-  const cwd = agents.find((agent) => agent.cwd !== "Unavailable")?.cwd ?? "No active project";
+  const cwd = agents.find((agent) => agent.cwd !== "Unavailable")?.cwd
+    ?? dto.projectCwd
+    ?? (previous?.worktree?.startsWith("/") ? previous.worktree : undefined)
+    ?? "No active project";
   const repo = cwd.split("/").filter(Boolean).at(-1) ?? cwd;
   const stages: WorkflowStage[] = agents.map((agent, index) => ({
     id: `agent-${agent.id}`,
@@ -442,8 +447,14 @@ export class TauriDeckBridge implements DeckBridge {
 
   async runAction(action: DeckAction): Promise<void> {
     const invoke = await this.getInvoke();
-    if (action.type === "stop_agent" || action.type === "submit_text" || action.type === "start_workflow") {
+    if (action.type === "stop_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon") {
       await invoke("desktop_run_action", { action: action satisfies DesktopRunActionDto });
+      if (action.type === "stop_daemon") {
+        this.sessions.clear();
+        this.attached.clear();
+        this.terminalChannels.clear();
+        this.lifecycle += 1;
+      }
       return;
     }
     if (action.type === "start_daemon") {

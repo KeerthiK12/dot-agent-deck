@@ -228,4 +228,26 @@ describe("TauriDeckBridge", () => {
     await expect(bridge.runAction({ type: "start_daemon" })).rejects.toThrow("daemon start timed out");
     await bridge.dispose();
   });
+
+  it("uses the desktop project cwd when no daemon agents are active", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const empty = structuredClone(snapshot);
+    empty.agents = [];
+    empty.projectCwd = "/Users/prabhusriramulu/dev/active/dot-agent-deck-gui";
+
+    expect(mapDesktopSnapshot(empty)).toMatchObject({
+      repo: "dot-agent-deck-gui",
+      worktree: "/Users/prabhusriramulu/dev/active/dot-agent-deck-gui",
+    });
+  });
+
+  it("sends stop_daemon through the live bridge", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+
+    await bridge.runAction({ type: "stop_daemon" });
+
+    expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "stop_daemon" } });
+    await bridge.dispose();
+  });
 });

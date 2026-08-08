@@ -160,7 +160,17 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   };
 
   const requestStop = () => {
-    if (!selectedAgent) return;
+    if (!selectedAgent) {
+      if (snapshot.connection.status !== "connected") return;
+      setConfirm({
+        title: "Stop the local daemon?",
+        body: "This stops the local Agent Deck daemon. No agent panes are currently active, so this only shuts down the control service.",
+        label: "Stop daemon",
+        busyLabel: "Stopping…",
+        action: async () => { await perform({ type: "stop_daemon" }, "Local daemon stopped."); },
+      });
+      return;
+    }
     setConfirm({
       title: `Stop ${selectedAgent.role}?`,
       body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
@@ -261,7 +271,14 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
               title={mode === "live" ? "Whole-run pause is not yet exposed by the daemon" : snapshot.paused ? "Resume fixture run" : "Pause fixture run"}
               onClick={() => void perform({ type: snapshot.paused ? "resume_run" : "pause_run" }, snapshot.paused ? "Fixture resumed." : "Fixture paused.")}
             >{snapshot.paused ? <Play size={14} /> : <Pause size={14} />}<span>{snapshot.paused ? "Resume" : "Pause"}</span></button>
-            <button className="button danger compact" data-testid="stop-run" aria-label={selectedAgent ? `Stop ${selectedAgent.role}` : "Stop selected agent"} title={selectedAgent ? `Stop ${selectedAgent.role}` : "Select an agent to stop"} disabled={!selectedAgent} onClick={requestStop}><CircleStop size={14} /><span>Stop</span></button>
+            <button
+              className="button danger compact"
+              data-testid="stop-run"
+              aria-label={selectedAgent ? `Stop ${selectedAgent.role}` : "Stop daemon"}
+              title={selectedAgent ? `Stop ${selectedAgent.role}` : snapshot.connection.status === "connected" ? "Stop local daemon" : "Daemon is not connected"}
+              disabled={!selectedAgent && snapshot.connection.status !== "connected"}
+              onClick={requestStop}
+            ><CircleStop size={14} /><span>Stop</span></button>
           </div>
         </header>
 

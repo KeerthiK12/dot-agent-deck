@@ -158,6 +158,23 @@ describe("ControlDeck", () => {
     expect(live.reconnect).not.toHaveBeenCalled();
   });
 
+  it("stops the daemon from the topbar when no agent is selected", async () => {
+    const connectedNoAgents = createFixtureSnapshot("connected");
+    connectedNoAgents.agents = [];
+    connectedNoAgents.stages = [];
+    connectedNoAgents.evidence = [];
+    const runAction = vi.fn(async () => undefined);
+    const live = runtime({ mode: "live", snapshot: connectedNoAgents, runAction });
+    render(<ControlDeck runtime={live} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop daemon" }));
+    expect(live.runAction).not.toHaveBeenCalled();
+    fireEvent.click(screen.getAllByRole("button", { name: "Stop daemon" }).at(-1)!);
+
+    await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "stop_daemon" }));
+    expect(screen.getByText("Local daemon stopped.")).toBeVisible();
+  });
+
   it("never reports daemon-start success when the start action fails", async () => {
     const disconnected = createFixtureSnapshot("disconnected");
     disconnected.agents = [];

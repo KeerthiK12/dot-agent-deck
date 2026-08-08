@@ -22,6 +22,8 @@ const ERROR_MESSAGE_MAX_CHARS: usize = 2048;
 pub struct DesktopSnapshot {
     pub connection: DesktopConnection,
     pub agents: Vec<DesktopAgent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_cwd: Option<String>,
     pub protocol_version: u32,
     pub source: &'static str,
 }
@@ -138,6 +140,10 @@ pub enum DesktopAction {
     },
     StopAgent {
         agent_id: String,
+    },
+    StopDaemon {
+        #[serde(default)]
+        force: bool,
     },
     RenameAgent {
         agent_id: String,
@@ -310,6 +316,23 @@ pub(crate) fn socket_path_text() -> String {
     )
 }
 
+pub(crate) fn desktop_project_cwd() -> Option<String> {
+    let project_dir = option_env!("CARGO_MANIFEST_DIR")
+        .map(std::path::PathBuf::from)
+        .and_then(|path| {
+            path.parent()
+                .and_then(|path| path.parent())
+                .map(std::path::Path::to_path_buf)
+        })
+        .filter(|path| path.join(".dot-agent-deck.toml").is_file())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .filter(|path| path.join(".dot-agent-deck.toml").is_file())
+        })?;
+    Some(safe_message(project_dir.to_string_lossy()))
+}
+
 pub(crate) fn disconnected_snapshot(error: impl AsRef<str>) -> DesktopSnapshot {
     DesktopSnapshot {
         connection: DesktopConnection {
@@ -324,6 +347,7 @@ pub(crate) fn disconnected_snapshot(error: impl AsRef<str>) -> DesktopSnapshot {
             running_agent_count: None,
         },
         agents: Vec::new(),
+        project_cwd: desktop_project_cwd(),
         protocol_version: PROTOCOL_VERSION,
         source: "daemon",
     }
