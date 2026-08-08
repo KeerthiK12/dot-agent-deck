@@ -435,6 +435,9 @@ pub async fn spawn(
                 &pane_id,
                 None,
                 &req.task_name,
+                // A single-agent spawn has no role, so its card keeps the task
+                // name it always had.
+                None,
                 pin_sh,
                 notifier,
             )?;
@@ -512,6 +515,12 @@ pub async fn spawn(
                     &pane_id,
                     Some(membership),
                     &req.task_name,
+                    // The card label is the ROLE NAME, not the task name. Every
+                    // role of one dispatch shares `task_name`, so labelling them
+                    // with it makes N identical cards and the user cannot tell
+                    // which is the orchestrator. Matches what the interactive
+                    // `Ctrl+n` path puts on each role pane (`tab.rs`).
+                    Some(role.role_name.as_str()),
                     false,
                     notifier,
                 )?;
@@ -531,6 +540,34 @@ pub async fn spawn(
             // errs only when no TUI is attached (the standalone-daemon case).
             if let Some(tx) = event_tx {
                 surface_spawned_orchestration(tx, &name, &req.working_dir, &roles, &agents);
+                // …and give every role card its ROLE NAME, the same way the
+                // single-agent branch names its card: a synthetic `SessionStart`
+                // carrying the friendly name as metadata.
+                //
+                // The typed `OrchestrationSurface` above carries `role_name`, but
+                // only as tab STRUCTURE — the card title reads the session's
+                // `display_name`, which nothing was setting on this path. So a
+                // dispatched orchestration rendered `ClaudeCode · 6134822e-f2`
+                // (claude's session UUID) on every card while the daemon knew all
+                // three role names, and the user could not tell the orchestrator
+                // from a worker (`orchestration/dispatch/002`).
+                //
+                // Sent AFTER the surface so the tab exists before the cards it
+                // names, and it cannot disturb the readiness gate below: these
+                // events carry `agent_id: None`, while `wait_for_session_start`
+                // matches only `Some(<registry id>)`. When the role's real
+                // `SessionStart` arrives it supersedes this placeholder and
+                // INHERITS the name (PRD #127 finding #2), so the label survives
+                // the handover instead of reverting to a UUID.
+                for (role, agent) in roles.iter().zip(agents.iter()) {
+                    surface_spawned_pane(
+                        tx,
+                        &agent.pane_id,
+                        &req.working_dir,
+                        Some(&role.command),
+                        &role.role_name,
+                    );
+                }
             }
             // PRD #222 parity: compose the ORCHESTRATOR CONTEXT, exactly as the
             // interactive `Ctrl+n` path does, instead of delivering the caller's
@@ -594,13 +631,18 @@ fn spawn_one(
     pane_id: &str,
     membership: Option<TabMembership>,
     task_name: &str,
+    // The friendly label for this pane's CARD, when it differs from the task
+    // name — the role name for an orchestration role. `None` keeps the task
+    // name. `task_name` stays the notifier's subject either way: a spawn
+    // failure is reported against the dispatch, not against one role.
+    display_name: Option<&str>,
     pin_sh: bool,
     notifier: &dyn Notifier,
 ) -> Result<String, SpawnError> {
     let opts = SpawnOptions {
         command,
         cwd: Some(cwd),
-        display_name: Some(task_name),
+        display_name: Some(display_name.unwrap_or(task_name)),
         rows: 24,
         cols: 80,
         env: pane_env(pane_id, pin_sh),

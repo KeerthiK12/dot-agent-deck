@@ -288,23 +288,35 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
     run_now(&deck, SCHEDULE_NAME);
 
     // Precondition (daemon side): the dispatch flow really enumerated, cloned
-    // from GitHub, created the worktree, and spawned the orchestration's role
-    // agents under the schedule's friendly name (every role pane carries it as
-    // its display name). A generous timeout absorbs the live clone + `gh`
-    // round-trips. This isolates the showcase below to the attached TUI's live
-    // surfacing — the registry holds the agents regardless of whether a tab
-    // paints.
-    assert!(
-        common::wait_for_agent_display_name(
-            deck.attach_socket_path(),
-            SCHEDULE_NAME,
-            true,
-            Duration::from_secs(120),
-        ),
-        "the daemon must clone from GitHub + worktree + spawn the dispatched \
-         orchestration's role agents under the schedule name '{SCHEDULE_NAME}' \
-         (precondition for the showcase)"
-    );
+    // from GitHub, created the worktree, and spawned BOTH of the orchestration's
+    // role agents. A generous timeout absorbs the live clone + `gh` round-trips.
+    // This isolates the showcase below to the attached TUI's live surfacing — the
+    // registry holds the agents regardless of whether a tab paints.
+    //
+    // Checked per ROLE NAME. Until `orchestration/dispatch/002` this looked for
+    // the schedule name on every role pane, because that is what a dispatched
+    // role's `display_name` used to be — which meant N identically-titled cards
+    // and no way for a user to tell the orchestrator from the worker. Role names
+    // are now what a role pane carries (matching the interactive `Ctrl+n` path),
+    // and asserting both of them here is strictly stronger than the old check:
+    // one shared name could be satisfied by a single spawned pane.
+    for role in ["orchestrator", "worker"] {
+        assert!(
+            common::wait_for_agent_display_name(
+                deck.attach_socket_path(),
+                role,
+                true,
+                Duration::from_secs(120),
+            ),
+            "the daemon must clone from GitHub + worktree + spawn the dispatched \
+             orchestration's `{role}` role agent (precondition for the showcase). \
+             Records: {:?}",
+            common::agent_records_on(deck.attach_socket_path())
+                .iter()
+                .map(|r| (r.id.clone(), r.display_name.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
 
     // The load-bearing showcase assertion (RED today): the dispatched
     // ORCHESTRATION must surface LIVE as an orchestration TAB on the
