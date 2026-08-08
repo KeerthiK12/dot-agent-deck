@@ -10,14 +10,14 @@ expression: buffer_to_text(&buffer)
 │                                                                              │
 │                                                                              │
 └────────────────────────────────────────────────────────── Last: 0s  Tools: 3 ┘
-┌ ▸ 2 ClaudeCode · example-beta ──────────────────────────────────── ● Working ┐
-│Dir:  beta                                                                    │
-│Prmt: do the thing                                                            │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-└────────────────────────────────────────────────────────── Last: 0s  Tools: 3 ┘
+┏ ▸ 2 ClaudeCode · example-beta ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● Working ┓
+┃Dir:  beta                                                                    ┃
+┃Prmt: do the thing                                                            ┃
+┃                                                                              ┃
+┃                                                                              ┃
+┃                                                                              ┃
+┃                                                                              ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 0s  Tools: 3 ┛
 ┌ 3 ClaudeCode · example-gamma ───────────────────────────────────── ● Working ┐
 │Dir:  gamma                                                                   │
 │Prmt: do the thing                                                            │

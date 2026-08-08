@@ -3033,11 +3033,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### theme/guard
 
-##### theme/guard/001 — No absolute background on any cheaply-seamable surface; command-mode selection is cued by the Magenta+BOLD border, not an absolute fill.
+##### theme/guard/001 — No absolute background on any cheaply-seamable surface; command-mode selection is cued by the terminal's own foreground plus a thickened border, not an absolute fill.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none.
-- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states **in command mode** (`UiMode::Normal`), (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card is distinguished from the unselected one by a terminal-relative cue (the `▸ ` title prefix and a `Color::Magenta`+BOLD border — the dedicated PRD #155 `selected` accent role, which never reuses a status color or the `focused` cyan) rather than an absolute `selected_bg` fill.
-- **Does not assert:** named-ANSI accents/status colors; the `render_frame` canvas/tab-bar fills (not cheaply reachable through a render seam — guarded by `theme/guard/002`); the PaneInput de-emphasis of the same accent (PRD #341 M4 — covered by `mode/deck/001`).
+- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states **in command mode** (`UiMode::Normal`), (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card is distinguished from the unselected one by terminal-relative cues — the `▸ ` title prefix, a border in the terminal's own foreground (`Color::Reset`), and a thickened `┃` glyph where the unselected card draws `│` — rather than an absolute `selected_bg` fill, and that the selected border is never `DIM` (issue #442).
+- **Does not assert:** named-ANSI accents/status colors; the `render_frame` canvas/tab-bar fills (not cheaply reachable through a render seam — guarded by `theme/guard/002`); the per-mode emphasis of the selection (covered by `mode/deck/001`); the all-statuses sweep proving a selected border never inherits a low-contrast status colour (covered by `theme/palette/006`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/guard/002 — `src/ui.rs` carries no forbidden absolute-background patterns (source lint).
@@ -3059,8 +3059,8 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### theme/palette/001 — Deck-card border encodes status via the centralized palette roles.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none (six live session fixtures, one per status).
-- **Asserts:** rendering a deck card (not selected, not focused) for each agent status resolves its border to the matching centralized status role — working=`Color::Green`, thinking=`Color::Blue`, compacting=`Color::Blue` (shares the thinking role), waiting=`Color::Yellow`, error=`Color::Red`, idle=`Color::DarkGray`; and that no status border reuses an accent role (`Color::Magenta`=selected, `Color::Cyan`=focused), so a status never collides with selection/focus.
-- **Does not assert:** the per-card status badge text/glyph; selection/focus accents (covered by `theme/palette/003-004`); the palette module's internal API (reads the rendered border color).
+- **Asserts:** rendering a deck card (not selected, not focused) for each agent status resolves its border to the matching centralized status role — working=`Color::Green`, thinking=`Color::Blue`, compacting=`Color::Blue` (shares the thinking role), waiting=`Color::Yellow`, error=`Color::Red`, idle=`Color::DarkGray`; and that no status border reuses the `focused` accent (`Color::Cyan`) or the retired `selected` accent (`Color::Magenta`), so a status never collides with focus.
+- **Does not assert:** the per-card status badge text/glyph; the selection glyph and the focus accent (covered by `theme/palette/003-004`, `theme/palette/006`); the palette module's internal API (reads the rendered border color).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/palette/002 — Embedded-pane border uses the SAME status color the deck card uses (deck/pane consistency).
@@ -3070,17 +3070,17 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** pane content/title rendering; the focused/selected pane accents (covered by `theme/palette/004` / `theme/guard/001`).
 - **Platform coverage:** mac+linux+windows.
 
-##### theme/palette/003 — Selected deck-card border in command mode is the dedicated `selected` accent (Magenta+BOLD+marker), never a status/focus color.
+##### theme/palette/003 — Selected deck-card border in command mode is the terminal's own foreground, with a thick glyph + BOLD + marker.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none (one selected live session fixture).
-- **Asserts:** rendering a selected deck card **in command mode** (`UiMode::Normal`) resolves its border to `Color::Magenta` + `Modifier::BOLD` with a `▸ ` title marker, and that this color is neither the working-status green nor the focused-pane cyan — the `selected` role never collides with the status palette or the `focused` accent.
-- **Does not assert:** the status badge (still shows status independent of selection); the absolute-background guard (covered by `theme/guard/001`); the de-emphasised PaneInput strength of the same accent (PRD #341 M4 — covered by `mode/deck/001`).
+- **Asserts:** rendering a selected deck card for a Working agent **in command mode** (`UiMode::Normal`) resolves its border to `palette::SELECTED` (`Color::Reset`, the terminal's own foreground) — explicitly NOT the working-status `Color::Green`, the retired Magenta accent, or the focused-pane Cyan — carried together with a thick `┃` glyph, `Modifier::BOLD` and a `▸ ` title marker, and with no `Modifier::DIM` (issue #442).
+- **Does not assert:** the status badge (still shows status independent of selection); the absolute-background guard (covered by `theme/guard/001`); the PaneInput emphasis of the same selection (covered by `mode/deck/001`); the all-statuses/both-modes sweep (covered by `theme/palette/006`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/palette/004 — Focused-pane border is the dedicated `focused` accent (Cyan), distinct from every status and from `selected`.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none (one focused `TerminalWidget`).
-- **Asserts:** rendering a focused embedded pane resolves its border to `Color::Cyan`, and that this color is distinct from every status role (green/blue/yellow/red/dark-gray) and from the `selected` accent (magenta) — focus stays Cyan while selection moves to Magenta, so status/selection/focus are provably distinct (PRD #155 success criterion #3). Also asserts the PRECEDENCE invariant: a pane that is focused AND carries a present `Working` status still renders the focused accent (Cyan), never the Working/Green status color — focus OVERRIDES a present status in the unified border precedence (Option A).
+- **Asserts:** rendering a focused embedded pane resolves its border to `Color::Cyan`, and that this color is distinct from every status role (green/blue/yellow/red/dark-gray) and from the retired Magenta accent — focus keeps the only accent HUE while deck selection uses the terminal's own foreground plus thickness, so status/selection/focus stay provably distinct (PRD #155 success criterion #3, issue #442). Also asserts the PRECEDENCE invariant: a pane that is focused AND carries a present `Working` status still renders the focused accent (Cyan), never the Working/Green status color — focus OVERRIDES a present status in the unified border precedence (Option A).
 - **Does not assert:** unfocused-pane status coloring (covered by `theme/palette/002`); pane content rendering; the command-mode half of the focus precedence (covered by `theme/palette/005`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -3089,6 +3089,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (one `TerminalWidget` rendered twice, live vs. command mode).
 - **Asserts:** rendering the SAME focused pane with `input_active=true` (`UiMode::PaneInput`) vs. `input_active=false` (command mode) produces visually distinguishable borders — live resolves to `Color::Cyan` on a thin `│` (`BorderType::Plain`) border, command mode falls through to the agent's status role (`Working`=`Color::Green`) on a thick `┃` (`BorderType::Thick`) border — and that the two colors differ, so colour encodes whether keystrokes reach the pane while thickness still encodes which pane is focused. Also asserts an UNFOCUSED pane keeps the thin border in BOTH modes, so thickness stays exclusive to the focused pane.
 - **Does not assert:** that the inner area / PTY size is unaffected by the border weight (`BorderType` never feeds `Block::inner`, and the PRD #84 invariant-3 contract assert covers a regression there); the bottom-bar and hint-string mode cues (covered by the PRD #241 M4 button-bar specs); the status-less focused pane's dim fallback.
+- **Platform coverage:** mac+linux+windows.
+
+##### theme/palette/006 — A selected deck card is visible at every status: terminal-foreground border, thickened glyph, never dimmed.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
+- **Agent:** none (one live session fixture per status, rendered selected and unselected in both modes).
+- **Asserts:** for every agent status and in BOTH `UiMode::Normal` and `UiMode::PaneInput`, a SELECTED card's border resolves to `palette::SELECTED` (`Color::Reset`) and never to that status's role colour, thickens its glyph from `│` to `┃`, and never carries `Modifier::DIM`. The CONTROL in the same loop is that the UNSELECTED card is untouched — still its status role, still `│` — so an idle agent keeps receding. Guards issue #442 in both of its reported forms: selection dimmed into the `palette::STATUS_IDLE` band (the original report), and a selected idle card inheriting DarkGray so that thickening its border changed nothing (the follow-up).
+- **Does not assert:** the `▸ ` title marker (covered by `theme/palette/003` / `theme/guard/001`); the BOLD-vs-plain mode emphasis (covered by `mode/deck/001`); embedded-pane borders (covered by `theme/palette/002`, `004`, `005`).
 - **Platform coverage:** mac+linux+windows.
 
 
@@ -3172,11 +3179,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### mode/deck
 
-##### mode/deck/001 — The selected deck-card accent is full-strength only in command mode.
+##### mode/deck/001 — The selected deck-card emphasis is full-strength only in command mode, and is never dimmed.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, colour-and-modifier-aware card capture through the production renderer).
 - **Agent:** none (one synthetic selected Working session rendered in both modes).
-- **Asserts:** command mode remains byte-identical to the legacy selected-card rendering and carries Magenta+BOLD+`▸ `; PaneInput keeps `▸ ` but has a different, de-emphasised border style where BOLD is absent and/or DIM is present; neither rendering contains `Color::Rgb`; the snapshot pins both styled cards.
-- **Does not assert:** unselected-card styling; focused terminal-pane styling; a single mandated de-emphasis recipe beyond the property that it drops BOLD and/or adds DIM.
+- **Asserts:** command mode remains byte-identical to the legacy selected-card seam and carries `palette::SELECTED` (`Color::Reset`) on a thick `┃` border with BOLD and `▸ `; PaneInput keeps the same colour, the same thick glyph and `▸ ` but drops BOLD; NEITHER mode carries `Modifier::DIM`, since dimming the selection is what made it read as an idle card (issue #442); neither rendering contains `Color::Rgb`; the snapshot pins both styled cards.
+- **Does not assert:** unselected-card styling (covered by `theme/palette/006`); focused terminal-pane styling; statuses other than `Working`.
 - **Platform coverage:** mac+linux+windows.
 
 #### mode/scroll

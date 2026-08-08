@@ -964,7 +964,7 @@ fn mode_banner_005_same_drain_mode_edges_preserve_banner_semantics() {
     }
 }
 
-/// Scenario: Render the same selected Dashboard card in command mode and PaneInput through the production card renderer. Command mode must retain the full Magenta+BOLD accent, while PaneInput keeps the `▸ ` marker but visibly de-emphasises the selection without introducing an absolute RGB colour; a colour-and-modifier-aware snapshot pins both states.
+/// Scenario: Render the same selected Dashboard card in command mode and PaneInput through the production card renderer. Both must keep the `▸ ` marker, a border in the terminal's own foreground, and a thick glyph; only the emphasis differs, command mode adding BOLD where PaneInput adds nothing. Neither may carry `Modifier::DIM`, since fading the selection is what made it read as an idle card; a colour-and-modifier-aware snapshot pins both states.
 #[spec("mode/deck/001")]
 #[test]
 fn mode_deck_001_selected_card_accent_tracks_mode() {
@@ -1013,8 +1013,32 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
     let border_y = height / 2;
     let command_border = &command[(0, border_y)];
     let typing_border = &typing[(0, border_y)];
-    assert_eq!(command_border.fg, Color::Magenta);
-    assert!(command_border.modifier.contains(Modifier::BOLD));
+
+    // Issue #442: a SELECTED card's border is the terminal's own foreground in
+    // BOTH modes — the one colour that contrasts on a light and a dark theme
+    // alike. Resting on the status colour would make a selected idle card
+    // (DarkGray) invisible on a dark background however thick its border was.
+    for (label, cell) in [("command", command_border), ("PaneInput", typing_border)] {
+        assert_eq!(
+            cell.fg,
+            Color::Reset,
+            "{label}-mode selected card must use the terminal's own foreground, got {:?}",
+            cell.fg
+        );
+        assert_eq!(
+            cell.symbol(),
+            "┃",
+            "{label}-mode selected card must draw a THICK border, got {:?}",
+            cell.symbol()
+        );
+        assert!(
+            !cell.modifier.contains(Modifier::DIM),
+            "{label}-mode selection must never be DIM — that is what made the \
+             selected card read as an idle one (issue #442), got {:?}",
+            cell.style()
+        );
+    }
+
     assert!(
         buffer_to_text(&command).contains("▸ "),
         "command mode must retain the selected-card title marker"
@@ -1023,15 +1047,21 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
         buffer_to_text(&typing).contains("▸ "),
         "PaneInput must retain the selected-card title marker"
     );
+
+    // The mode still has to be legible, and it rides on emphasis alone now.
     assert_ne!(
         typing_border.style(),
         command_border.style(),
         "PaneInput selection must be visibly de-emphasised relative to command mode"
     );
     assert!(
-        !typing_border.modifier.contains(Modifier::BOLD)
-            || typing_border.modifier.contains(Modifier::DIM),
-        "PaneInput selection must drop BOLD and/or add DIM, got {:?}",
+        command_border.modifier.contains(Modifier::BOLD),
+        "command mode drives the deck, so its selection carries BOLD, got {:?}",
+        command_border.style()
+    );
+    assert!(
+        !typing_border.modifier.contains(Modifier::BOLD),
+        "PaneInput drives a pane, so its selection drops BOLD, got {:?}",
         typing_border.style()
     );
     assert_no_rgb(&command, "command-mode selected card");
