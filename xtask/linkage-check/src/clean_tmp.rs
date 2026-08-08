@@ -207,7 +207,10 @@ fn collect(temp_root: &Path, opts: &Options) -> std::io::Result<Vec<Candidate>> 
             age,
         });
     }
-    out.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    // Biggest first. `Reverse` rather than a flipped `cmp` so
+    // `unnecessary_sort_by` stays quiet under the workspace-wide clippy
+    // gate (issue #436) — same ordering, same stability.
+    out.sort_by_key(|c| std::cmp::Reverse(c.bytes));
     Ok(out)
 }
 
