@@ -6,14 +6,14 @@ use dot_agent_deck::daemon_attach::{
     DAEMON_START_POLL_TIMEOUT, ensure_daemon_running, spawn_daemon_serve_detached_with_exe,
 };
 use dot_agent_deck::daemon_client::{DaemonClient, issue_command};
-use dot_agent_deck::daemon_protocol::{AttachRequest, AttachResponse, PROTOCOL_VERSION};
 #[cfg(test)]
 use dot_agent_deck::daemon_protocol::RunningAgentsSummary;
+use dot_agent_deck::daemon_protocol::{AttachRequest, AttachResponse, PROTOCOL_VERSION};
 use dot_agent_deck::platform::ipc::IpcStream;
 
 use crate::dto::{
-    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, disconnected_snapshot,
-    desktop_project_cwd, map_agent, safe_message, socket_path_text,
+    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, desktop_project_cwd,
+    disconnected_snapshot, map_agent, safe_message, socket_path_text,
 };
 
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -305,12 +305,11 @@ mod tests {
 
     #[test]
     fn live_agent_build_mismatch_blocks_replacement() {
-        let response = AttachResponse::hello(PROTOCOL_VERSION).with_running_agents(
-            RunningAgentsSummary {
+        let response =
+            AttachResponse::hello(PROTOCOL_VERSION).with_running_agents(RunningAgentsSummary {
                 count: 2,
                 names: vec!["coder".into(), "tester".into()],
-            },
-        );
+            });
         let info = classify_handshake(&response, "desktop-other-build");
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         assert!(
