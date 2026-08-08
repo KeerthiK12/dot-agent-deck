@@ -561,14 +561,13 @@ fn contrast_001_overlays_reference_frame() {
 /// the keyboard drives the deck), then assert two terminal-relative
 /// properties. (a) NO rendered cell across any surface has a `Color::Rgb(..)`
 /// background — backgrounds must be `Color::Reset` so the terminal's own
-/// background shows through. (b) Selection is cued the PRD #155 Option-A way —
-/// a `▸ ` title prefix plus a `Color::Magenta` + `Modifier::BOLD` border — NOT
-/// an absolute background tint, and Magenta is the dedicated `selected` accent
-/// role so it never collides with a status color (green/blue/yellow/red) or the
-/// `focused` cyan: the selected card's border style must differ from the
-/// unselected card's and be magenta-bold. A regression that filled any surface
-/// with an absolute background, or that reverted the selection border to a
-/// status/focus color, would fail one of these assertions.
+/// background shows through. (b) Selection is cued by a `▸ ` title prefix plus a
+/// THICKER border glyph (`┃` where an unselected card draws `│`) — NOT an
+/// absolute background tint, and NOT a colour of its own: the selected card's
+/// border must differ from the unselected card's while keeping exactly the same
+/// colour, since colour belongs to status alone (issue #442). A regression that
+/// filled any surface with an absolute background, or that spent a colour on
+/// selection again, would fail one of these assertions.
 #[spec("theme/guard/001")]
 #[test]
 fn guard_001_no_absolute_backgrounds() {
@@ -589,35 +588,35 @@ fn guard_001_no_absolute_backgrounds() {
         );
     }
 
-    // (b) PRD #155 Option A: selection is signalled by a `▸ ` title prefix and a
-    //     Magenta+BOLD border — a terminal-relative cue, NOT an absolute
-    //     background. Read the left-border cell (`│`, at a mid-height row) of
-    //     each card: the selected one must DIFFER from the unselected one and
-    //     be Color::Magenta + Modifier::BOLD. Magenta is the dedicated
-    //     `selected` accent role; it deliberately does not reuse the working
-    //     status green or the focused-pane cyan. (The unselected placeholder
-    //     border is a dimmed terminal foreground.) PRD #341 M4: BOLD is the
-    //     command-mode strength — `mode/deck/001` owns the PaneInput recipe.
-    let border_style = |buf: &ratatui::buffer::Buffer| {
+    // (b) Selection is signalled by a `▸ ` title prefix and a THICKER border
+    //     glyph — both terminal-relative cues, NOT an absolute background.
+    //     Read the left-border cell (at a mid-height row) of each card: the
+    //     selected one must DIFFER from the unselected one, and it must differ
+    //     in the GLYPH (`┃` vs `│`) while keeping the very same colour. Issue
+    //     #442 moved selection off the colour channel entirely, so colour is
+    //     free to mean status and nothing else; `mode/deck/001` owns the
+    //     command-vs-PaneInput emphasis recipe.
+    let border_cell = |buf: &ratatui::buffer::Buffer| {
         let y = buf.area().height / 2;
         let cell = &buf[(0, y)];
-        (cell.fg, cell.modifier)
+        (cell.fg, cell.modifier, cell.symbol().to_string())
     };
-    let (unsel_fg, unsel_mod) = border_style(&unselected);
-    let (sel_fg, sel_mod) = border_style(&selected);
+    let (unsel_fg, unsel_mod, unsel_sym) = border_cell(&unselected);
+    let (sel_fg, sel_mod, sel_sym) = border_cell(&selected);
     assert_ne!(
-        (sel_fg, sel_mod),
-        (unsel_fg, unsel_mod),
+        (sel_fg, sel_mod, sel_sym.clone()),
+        (unsel_fg, unsel_mod, unsel_sym.clone()),
         "selected card border must differ from the unselected card border"
     );
     assert_eq!(
-        sel_fg,
-        Color::Magenta,
-        "selected card border must use the `selected` role (Color::Magenta), not a status/focus color (Option-A selection cue)"
+        sel_fg, unsel_fg,
+        "selecting a card must NOT change its border colour — colour is the status \
+         channel (issue #442), got selected={sel_fg:?} unselected={unsel_fg:?}"
     );
-    assert!(
-        sel_mod.contains(Modifier::BOLD),
-        "selected card border must be BOLD (Option-A selection cue)"
+    assert_eq!(
+        (unsel_sym.as_str(), sel_sym.as_str()),
+        ("│", "┃"),
+        "selection must be carried by border thickness: unselected `│`, selected `┃`"
     );
 
     // The `▸ ` selection prefix appears only on the selected card's title row.
@@ -1169,15 +1168,14 @@ fn palette_002_pane_border_matches_deck_status_color() {
 }
 
 /// Scenario: Render a SELECTED deck card in **command mode** (`UiMode::Normal`)
-/// and assert its border is the dedicated `selected` accent role —
-/// Color::Magenta + Modifier::BOLD — plus the `▸ ` title marker, and that this
-/// color is NOT a status color (≠ green) and NOT the focused accent (≠ cyan).
-/// This pins the Option-A rule that selection is conveyed by a non-status accent
-/// that never collides with the palette, at the full strength command mode gets
-/// (PRD #341 M4 de-emphasises the same accent in PaneInput — `mode/deck/001`).
+/// for a Working agent and assert its border still reports that STATUS — Green,
+/// never an accent colour — while selection shows up as a thick `┃` glyph,
+/// `Modifier::BOLD` and the `▸ ` title marker. This pins the issue #442 rule
+/// that selection costs no colour, so a selected card keeps saying what its
+/// agent is doing (`mode/deck/001` owns the PaneInput half of the recipe).
 #[spec("theme/palette/003")]
 #[test]
-fn palette_003_selected_card_border_is_magenta_bold_marker() {
+fn palette_003_selected_card_border_is_status_thick_marker() {
     let session = palette_session(SessionStatus::Working);
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1196,22 +1194,31 @@ fn palette_003_selected_card_border_is_magenta_bold_marker() {
     let (fg, modifier) = border_style_at_mid(&buffer);
     assert_eq!(
         fg,
-        Color::Magenta,
-        "selected card border must use the `selected` role (Color::Magenta), got {fg:?}"
+        Color::Green,
+        "a selected Working card must keep the working-status Green, got {fg:?}"
     );
     assert!(
         modifier.contains(Modifier::BOLD),
-        "selected card border must be BOLD, got {modifier:?}"
+        "command-mode selection must be BOLD, got {modifier:?}"
+    );
+    assert!(
+        !modifier.contains(Modifier::DIM),
+        "selection must never DIM a card (issue #442), got {modifier:?}"
+    );
+    assert_eq!(
+        buffer[(0, buffer.area().height / 2)].symbol(),
+        "┃",
+        "selection must be carried by a thick border glyph"
     );
     assert_ne!(
         fg,
-        Color::Green,
-        "the selected accent must not reuse the working-status green"
+        Color::Magenta,
+        "selection must no longer spend the retired Magenta accent"
     );
     assert_ne!(
         fg,
         Color::Cyan,
-        "the selected accent must not reuse the focused-pane cyan"
+        "a card border must not reuse the focused-pane cyan"
     );
     assert!(
         buffer_to_text(&buffer).contains('▸'),
@@ -1346,6 +1353,70 @@ fn palette_005_command_mode_focused_pane_drops_cyan_accent() {
             "an unfocused pane must keep the thin border (input_active={input_active}), \
              got {glyph:?}"
         );
+    }
+}
+
+/// Scenario: For every agent status, and in BOTH command and PaneInput mode,
+/// render the same deck card selected and unselected and compare the two
+/// borders. Selecting a card must only ever ADD emphasis: the colour must be
+/// identical either way, the glyph must thicken from `│` to `┃`, and the
+/// selected border must never gain `Modifier::DIM` that the unselected one
+/// lacks. This is the direct regression guard for issue #442, where selection
+/// was signalled by dimming a Magenta accent in PaneInput — landing the selected
+/// card in the same visual band as `palette::STATUS_IDLE` (DarkGray) and making
+/// it read as just another idle agent.
+#[spec("theme/palette/006")]
+#[test]
+fn palette_006_selection_only_adds_emphasis() {
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+
+    for (status, role) in status_role_colors() {
+        for mode in [UiMode::Normal, UiMode::PaneInput] {
+            let session = palette_session(status.clone());
+            let render = |selected: bool| {
+                render_card_for_mode_to_buffer(
+                    &session,
+                    Some("example-agent"),
+                    Some(1),
+                    density,
+                    0,
+                    selected,
+                    mode,
+                    width,
+                    height,
+                )
+            };
+            let unselected = render(false);
+            let selected = render(true);
+            let y = height / 2;
+            let (unsel, sel) = (&unselected[(0, y)], &selected[(0, y)]);
+            let context = format!("{status:?} in {mode:?}");
+
+            assert_eq!(
+                sel.fg, unsel.fg,
+                "{context}: selecting a card must not change its border colour — \
+                 colour is the status channel"
+            );
+            assert_eq!(
+                sel.fg, role,
+                "{context}: a selected card must still report its status role"
+            );
+            assert_eq!(
+                (unsel.symbol(), sel.symbol()),
+                ("│", "┃"),
+                "{context}: selection must thicken the border glyph"
+            );
+            assert!(
+                !sel.modifier.contains(Modifier::DIM) || unsel.modifier.contains(Modifier::DIM),
+                "{context}: selection added DIM the unselected card does not carry — \
+                 selection may only ever ADD emphasis (issue #442), got \
+                 selected={:?} unselected={:?}",
+                sel.style(),
+                unsel.style()
+            );
+        }
     }
 }
 

@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 
 use crate::agent_pty::TabMembership;
@@ -16236,28 +16236,57 @@ fn grid_columns(width: u16) -> usize {
     }
 }
 
-/// PRD #341 M4 — the selected card's border accent, de-emphasised when the
-/// keyboard is NOT driving the deck.
+/// Issue #442 — how a deck card's border encodes selection and the keyboard
+/// locus. **Colour is not part of the answer.**
 ///
-/// Selection deliberately survives the mode switch (it is where `Ctrl+D` sends
-/// you back to), so before this the deck looked equally live in both modes — on
-/// the Dashboard the pane overlay sits off to the right and the deck is where the
-/// user's eyes already are, which made it the weakest tab for mode signalling.
+/// The border keeps its STATUS colour in every selection state (see
+/// [`render_session_card`]), so a selected working agent still reads green and a
+/// selected waiting one still reads yellow. Selection rides the *glyph* channel
+/// instead — exactly the split the embedded-pane path already uses for focus
+/// (`TerminalWidget`, `BorderType::Thick`), which deck cards never adopted.
+/// The ladder:
 ///
-/// The colour is [`palette::SELECTED`] in both modes and the `▸ ` title marker
-/// stays in both (Decision 5: the user must still be able to tell WHAT is
-/// selected while typing). Only the accent's weight moves: command mode keeps
-/// today's full-strength BOLD, `PaneInput` drops BOLD **and** adds
-/// `Modifier::DIM`. Two channels rather than one because DIM is not honoured by
-/// every terminal — where it is ignored, the missing BOLD still reads as
-/// de-emphasised.
-fn selected_card_border_style(mode: UiMode) -> Style {
-    let base = Style::default().fg(palette::SELECTED);
-    if mode == UiMode::PaneInput {
-        base.add_modifier(Modifier::DIM)
-    } else {
-        base.add_modifier(Modifier::BOLD)
+/// | state                         | border        | emphasis |
+/// |-------------------------------|---------------|----------|
+/// | unselected                    | `Plain` (`│`) | —        |
+/// | selected, `UiMode::PaneInput` | `Thick` (`┃`) | —        |
+/// | selected, command mode        | `Thick` (`┃`) | BOLD     |
+///
+/// The `▸ ` title marker stays in BOTH selected states (PRD #341 Decision 5:
+/// the user must still be able to tell WHAT is selected while typing), so the
+/// mode distinction is carried by weight alone.
+///
+/// ## Why no `Modifier::DIM` anywhere on this path
+///
+/// The previous recipe (PRD #341 M4) painted selection [`palette::SELECTED`]
+/// (Magenta) and de-emphasised `PaneInput` by adding `Modifier::DIM`. On a dark
+/// theme DIM Magenta lands in the same visual band as [`palette::STATUS_IDLE`]
+/// (DarkGray) — so the SELECTED card read as just another idle one, which is
+/// issue #442. It was worse than an outline problem: ratatui draws the block's
+/// borders first and then PATCHES the title spans over those cells, and
+/// `Style::patch` only overrides fields the title actually sets. A border
+/// modifier therefore leaks into every title span that declares no modifier of
+/// its own — the card's title AND its `Last:` / `Tools:` bottom-border stats
+/// faded along with the outline, making the selected card the faintest thing on
+/// screen.
+///
+/// So the invariant is: selection may only ever ADD emphasis, never subtract it.
+/// A selected card must never render dimmer than the same card unselected —
+/// `theme/palette/006` pins that. Do not reintroduce DIM here to signal a mode;
+/// use the glyph ladder above, which no terminal renders as "less visible".
+fn card_border_glyph(is_selected: bool, mode: UiMode) -> (BorderType, Modifier) {
+    if !is_selected {
+        return (BorderType::Plain, Modifier::empty());
     }
+    // `BorderType` never feeds `Block::inner`, so promoting the selected card to
+    // a heavier glyph costs no rows or columns — the card's inner area, and
+    // everything laid out inside it, is byte-identical to the unselected case.
+    let emphasis = if mode == UiMode::PaneInput {
+        Modifier::empty()
+    } else {
+        Modifier::BOLD
+    };
+    (BorderType::Thick, emphasis)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16349,21 +16378,24 @@ fn render_session_card(
     let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
     let title_spans = truncate_styled_segments(title_segments, max_title);
 
-    let border_style = if is_selected {
-        // PRD #155 Option A: selection uses the dedicated `selected` accent role
-        // (Magenta, paired with the `▸ ` title marker above) — distinct from
-        // every status color and from the focused-pane cyan. PRD #341 M4: its
-        // WEIGHT now tracks the mode, so the deck looks live exactly when the
-        // keyboard is driving it.
-        selected_card_border_style(mode)
-    } else if is_placeholder {
+    // Issue #442: COLOUR is status, always — selection no longer overrides it,
+    // so the selected card keeps reporting the state of its agent instead of
+    // going Magenta and leaving only the badge to say what it is doing.
+    let base_border_style = if is_placeholder {
         // Placeholder ("No agent") cards read as secondary: dim the terminal's
         // own foreground (matching the prior DarkGray intent) so the empty slot
-        // doesn't draw a full-strength border like a live agent.
+        // doesn't draw a full-strength border like a live agent. Note this DIM
+        // is a property of the EMPTY SLOT, not of selection — it is applied
+        // identically whether or not the card is selected, so it never makes
+        // selecting a card dim it.
         text_dim()
     } else {
         Style::default().fg(status_color)
     };
+    // …and SELECTION is the glyph, plus a mode-tracking emphasis that is only
+    // ever additive. See `card_border_glyph`.
+    let (border_type, border_emphasis) = card_border_glyph(is_selected, mode);
+    let border_style = base_border_style.add_modifier(border_emphasis);
 
     // PRD #339: `Last` / `Tools` ride the bottom border instead of a content
     // row. Border cells are paid for by `Borders::ALL` either way, so the
@@ -16382,6 +16414,7 @@ fn render_session_card(
 
     let mut block = Block::default()
         .borders(Borders::ALL)
+        .border_type(border_type)
         .border_style(border_style)
         .title(Line::from(title_spans))
         .title_alignment(ratatui::layout::Alignment::Left)
@@ -16398,10 +16431,9 @@ fn render_session_card(
     }
 
     // PRD #13 Option A: selection is cued by the `▸ ` title prefix and the
-    // Magenta+BOLD border above (the `selected` palette accent, PRD #155) — no
-    // whole-card `Modifier::REVERSED`. The full-card inversion was too heavy and
-    // redundant with those two cues, and stays terminal-relative (no absolute
-    // `selected_bg` tint).
+    // thickened border above (issue #442) — no whole-card `Modifier::REVERSED`.
+    // The full-card inversion was too heavy and redundant with those two cues,
+    // and stays terminal-relative (no absolute `selected_bg` tint).
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
