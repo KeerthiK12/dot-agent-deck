@@ -2144,6 +2144,13 @@ without depending on the config struct API.
 - **Does not assert:** the collision semantics of `build_pane_status` itself, which is deliberately left as-is — its consumers are cosmetic, and only the lock's feed hardens. The rule here is "any duplicate", not "any disagreeing duplicate".
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/lock/013 — A `WaitingForInput` written by a producer that named no generation does NOT open the lock (issue #398, PR #443 review).
+- **Layer:** L1 (in-process gate resolution against a real orchestration tab).
+- **Agent:** none (a synthetic single `WaitingForInput` session plus the pane's untagged-status mark).
+- **Asserts:** with exactly ONE unambiguous `WaitingForInput` session on the focused locked worker pane, `build_pane_status_for_gate` still omits the pane while its status provenance is untagged, and `gate_pane_input_key` drops the keystroke; clearing the mark — what an identified hook does — restores the carve-out and the keystroke passes through unchanged.
+- **Does not assert:** the duplicate-session denial, which is a separate rule (`orchestration/lock/007`); that untagged status is hidden from cards or borders (it deliberately still renders).
+- **Platform coverage:** mac+linux+windows.
+
 ##### orchestration/lock/008 — On a real locked orchestration tab the orchestrator's own input still reaches its PTY while a worker's does not, and `Ctrl+d`,`Ctrl+e` reverses that.
 - **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness).
 - **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).

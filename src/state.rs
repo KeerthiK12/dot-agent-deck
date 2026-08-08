@@ -432,6 +432,30 @@ pub struct AppState {
     pub update_available: Option<String>,
     /// Pane IDs created by our app — events from unknown panes are rejected.
     pub managed_pane_ids: HashSet<String>,
+    /// Panes whose CURRENT [`SessionState::status`] was last written by an
+    /// event carrying no `agent_id` — i.e. by a producer that named no
+    /// generation (issue #398, Greptile PR #443 finding #2).
+    ///
+    /// Status is ordinarily just a display signal, but PRD #393 made one value
+    /// AUTHORITY-BEARING: a pane reporting `WaitingForInput` earns the
+    /// command-entry lock's carve-out and receives keystrokes that are
+    /// otherwise dropped. Before #398 an untagged report could not reach a
+    /// tagged session at all — it minted a rival, and
+    /// [`crate::ui::build_pane_status_for_gate`] then denied the pane for being
+    /// ambiguous. Removing the duplicate removed that incidental protection
+    /// too, so the denial is made explicit and intentional here rather than
+    /// being a side effect of a bug.
+    ///
+    /// Only the GATE consults this. Cards, borders and tab colours keep showing
+    /// an untagged report as they always have — being unable to name a
+    /// generation makes a status untrustworthy to ACT on, not wrong to display.
+    /// Fails closed for legacy setups: a deck whose hooks are entirely pre-F9
+    /// gets no carve-out and reaches its panes with `Ctrl+d`, `Ctrl+e`, which is
+    /// the same trade [`crate::ui::build_pane_status_for_gate`] already makes.
+    ///
+    /// See #401 for the underlying reason a status report cannot be trusted on
+    /// identity alone: the hook socket is unauthenticated.
+    pub untagged_status_panes: HashSet<String>,
     /// Maps pane_id → orchestration role name (set when orchestration tab opens).
     pub pane_role_map: HashMap<String, String>,
     /// Maps pane_id → working directory for orchestration panes.
@@ -3123,6 +3147,11 @@ impl AppState {
         } else if !self.managed_pane_ids.is_empty() {
             return;
         }
+        // PRD #284 sub-problem (a): a terminal frame claims no generation, so it
+        // is not evidence of a takeover and may retire nothing. Hoisted above
+        // the reuse guard for issue #398 — the adoption fallback below needs the
+        // same predicate, for a related reason spelled out at its use.
+        let claims_generation = event.event_type != EventType::SessionEnd;
         // PRD #110: reuse the existing session card for the same pane
         // ONLY when the agent_id matches (or both sides are absent for
         // pre-F9 backward-compat). A different agent_id means the agent
@@ -3179,6 +3208,26 @@ impl AppState {
                 })
                 .or_else(|| {
                     if event.agent_id.is_some() {
+                        return None;
+                    }
+                    // Greptile PR #443 finding #1: a TERMINAL frame must never
+                    // adopt. `SessionEnd` is not handled by the status path
+                    // below — it hits the terminal branch, which REMOVES
+                    // `event.session_id` and rebuilds a bare placeholder. So
+                    // adopting one would hand that branch the tagged session
+                    // and destroy exactly what the `None` carve-out exists to
+                    // protect: `recent_events`, `tool_count`, `first_prompts`.
+                    // Before this PR an untagged `SessionEnd` resolved to no
+                    // session at all and was a silent no-op; excluding it here
+                    // keeps precisely that behaviour, so the fix cannot lose
+                    // history on any path.
+                    //
+                    // The narrower reading — "an untagged end can't name a
+                    // generation, so it cannot prove THIS one ended" — is the
+                    // same rule the retire block applies one screen down, where
+                    // `claims_generation` excludes `SessionEnd` for its own
+                    // reasons. An untagged end simply is not evidence.
+                    if !claims_generation {
                         return None;
                     }
                     let mut candidates = self
@@ -3345,9 +3394,6 @@ impl AppState {
         // keyed by the stable pane, so the replacement created below can
         // inherit it when the superseding event carries none.
         let mut inherited_display_name: Option<String> = None;
-        // PRD #284 sub-problem (a): a terminal frame claims no generation, so it
-        // is not evidence of a takeover and may retire nothing.
-        let claims_generation = event.event_type != EventType::SessionEnd;
         if claims_generation
             && event.agent_id.is_some()
             && let Some(ref pane_id) = event.pane_id
@@ -3626,6 +3672,26 @@ impl AppState {
             session.pane_id.clone_from(&event.pane_id);
         }
 
+        // Issue #398 / Greptile PR #443 finding #2: remember whether the status
+        // this frame is about to write came from a producer that named a
+        // generation. Captured here because `session` borrows `self` for the
+        // rest of the block and `event` is moved into the journal at the end;
+        // applied once both are done with, just below.
+        //
+        // `SubagentStart` / `SubagentStop` assert no status (see the match
+        // arms), so they leave the pane's existing provenance alone rather than
+        // laundering an untagged frame into a tagged one, or vice versa.
+        let status_provenance = event
+            .pane_id
+            .clone()
+            .filter(|_| {
+                !matches!(
+                    event.event_type,
+                    EventType::SubagentStart | EventType::SubagentStop
+                )
+            })
+            .map(|pane_id| (pane_id, event.agent_id.is_none()));
+
         match event.event_type {
             EventType::SessionStart => {
                 session.status = SessionStatus::Idle;
@@ -3687,6 +3753,20 @@ impl AppState {
         session.recent_events.push_back(event);
         if session.recent_events.len() > MAX_RECENT_EVENTS {
             session.recent_events.pop_front();
+        }
+
+        // The `session` borrow is done, so the pane-level provenance captured
+        // above can be recorded. A tagged frame CLEARS the mark: an identified
+        // producer asserting the current status is exactly the evidence the
+        // gate wants, so a pane recovers the carve-out on the next real hook
+        // rather than being poisoned for the rest of the session by one
+        // untagged frame.
+        if let Some((pane_id, untagged)) = status_provenance {
+            if untagged {
+                self.untagged_status_panes.insert(pane_id);
+            } else {
+                self.untagged_status_panes.remove(&pane_id);
+            }
         }
     }
 }
@@ -4960,6 +5040,32 @@ mod tests {
         );
     }
 
+    /// Greptile PR #443 finding #1. A TERMINAL untagged frame must not adopt:
+    /// the `SessionEnd` branch removes `event.session_id` and rebuilds a bare
+    /// placeholder, so adopting would have handed it the tagged session and
+    /// destroyed the very history the `None` carve-out protects. Before #398
+    /// such a frame resolved to no session and was a no-op; that is preserved.
+    #[test]
+    fn pre_f9_hook_with_no_agent_id_session_end_does_not_adopt_and_wipe() {
+        let mut state = pane_with_tagged_session();
+
+        state.apply_event(untagged_event("legacy-hook-session", EventType::SessionEnd));
+
+        let session = state
+            .sessions
+            .get(&format!("pane-{UNTAGGED_PANE}"))
+            .expect("an untagged SessionEnd must not remove the tagged session");
+        assert_eq!(
+            session.tool_count, 9,
+            "an untagged SessionEnd must not reset the tagged session's tool_count"
+        );
+        assert_eq!(
+            session.first_prompts,
+            vec!["the original prompt".to_string()],
+            "an untagged SessionEnd must not drop the tagged session's first_prompts"
+        );
+    }
+
     /// The half that was NOT true before #398: the untagged event lands on the
     /// pane's existing session instead of minting a sibling, so the pane owns
     /// exactly one session and `build_pane_status` has nothing to arbitrate.
@@ -5050,6 +5156,55 @@ mod tests {
         assert!(
             state.sessions.contains_key("stale-sibling"),
             "the sibling survives too — the guard picks no winner"
+        );
+    }
+
+    /// Greptile PR #443 finding #2. Adoption gave an untagged producer a route
+    /// to a real session's status, and `WaitingForInput` is authority-bearing
+    /// (PRD #393). The pane is therefore marked, and a later TAGGED frame
+    /// clears the mark so one legacy event cannot poison the pane for good.
+    #[test]
+    fn untagged_status_marks_the_pane_and_a_tagged_frame_clears_it() {
+        let mut state = pane_with_tagged_session();
+
+        state.apply_event(untagged_event(
+            "legacy-hook-session",
+            EventType::WaitingForInput,
+        ));
+        assert!(
+            state.untagged_status_panes.contains(UNTAGGED_PANE),
+            "a status written by an untagged producer must mark the pane"
+        );
+
+        // The pane's real agent reports the same status, naming its generation.
+        let mut tagged =
+            untagged_event(&format!("pane-{UNTAGGED_PANE}"), EventType::WaitingForInput);
+        tagged.agent_id = Some(UNTAGGED_AGENT_ID.to_string());
+        state.apply_event(tagged);
+        assert!(
+            !state.untagged_status_panes.contains(UNTAGGED_PANE),
+            "an identified producer asserting the status must clear the mark"
+        );
+    }
+
+    /// A frame that asserts no status at all leaves the pane's provenance
+    /// alone, rather than laundering an untagged mark away (or inventing one).
+    #[test]
+    fn subagent_frames_do_not_change_status_provenance() {
+        let mut state = pane_with_tagged_session();
+        state.apply_event(untagged_event(
+            "legacy-hook-session",
+            EventType::WaitingForInput,
+        ));
+
+        let mut tagged_subagent =
+            untagged_event(&format!("pane-{UNTAGGED_PANE}"), EventType::SubagentStop);
+        tagged_subagent.agent_id = Some(UNTAGGED_AGENT_ID.to_string());
+        state.apply_event(tagged_subagent);
+
+        assert!(
+            state.untagged_status_panes.contains(UNTAGGED_PANE),
+            "a status-less frame must not clear a mark it did not earn"
         );
     }
 }

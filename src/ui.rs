@@ -12365,6 +12365,19 @@ pub(crate) fn build_pane_status(state: &AppState) -> HashMap<&str, SessionStatus
 ///   what they want: a second session that also claims `WaitingForInput` would
 ///   sail through. "Closed only when the duplicates happen to disagree" is not
 ///   fail-closed.
+///
+/// **It also omits a pane whose status was last written by an untagged
+/// producer** ([`AppState::untagged_status_panes`]). Until issue #398 an
+/// `agent_id: None` report could not reach a pane's real session at all — it
+/// minted a rival, and the duplicate rule above then denied the pane. Removing
+/// that duplicate would otherwise have handed an unidentified producer a
+/// working route to `WaitingForInput`, and with it the carve-out: on the
+/// unauthenticated hook socket (#401) a pane id is a small integer, so this
+/// would have been strictly easier to reach than the tagged path it replaced.
+/// The denial that used to fall out of a bug is therefore made explicit here.
+/// Both rules are the same principle — act only on a status whose origin is
+/// established — and the duplicate rule stays because it also covers two
+/// TAGGED sessions, which provenance says nothing about.
 pub(crate) fn build_pane_status_for_gate(state: &AppState) -> HashMap<&str, SessionStatus> {
     // `None` marks a pane_id seen more than once; it is dropped below rather
     // than resolved, since there is no defensible way to pick a winner.
@@ -12380,6 +12393,7 @@ pub(crate) fn build_pane_status_for_gate(state: &AppState) -> HashMap<&str, Sess
     }
     joined
         .into_iter()
+        .filter(|(pane_id, _)| !state.untagged_status_panes.contains(*pane_id))
         .filter_map(|(pane_id, status)| status.map(|status| (pane_id, status)))
         .collect()
 }
@@ -29200,6 +29214,106 @@ mod tests {
             other => panic!(
                 "expected the unambiguous WaitingForInput carve-out to still \
                  pass ForwardToPane through unchanged, got {other:?}"
+            ),
+        }
+    }
+
+    /// Scenario: A single, unambiguous session on a locked worker pane reports
+    /// `WaitingForInput`, but that status was written by a producer carrying no
+    /// `agent_id`. The gate must still deny the carve-out and drop the
+    /// keystroke, and must allow it once an identified producer asserts the
+    /// same status.
+    #[spec("orchestration/lock/013")]
+    #[test]
+    fn lock_013_untagged_status_provenance_fails_closed() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-untagged",
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        // ONE session, genuinely WaitingForInput — the shape that earns the
+        // carve-out. The only thing wrong with it is where the status came from.
+        let mut waiting = make_session(SessionStatus::WaitingForInput);
+        waiting.session_id = "sess-waiting".into();
+        waiting.pane_id = Some(worker_id.clone());
+        let mut untagged_state = AppState::default();
+        untagged_state
+            .sessions
+            .insert(waiting.session_id.clone(), waiting);
+        untagged_state
+            .untagged_status_panes
+            .insert(worker_id.clone());
+
+        let untagged_status = build_pane_status_for_gate(&untagged_state);
+        assert_ne!(
+            untagged_status.get(worker_id.as_str()),
+            Some(&SessionStatus::WaitingForInput),
+            "a status written by a producer that named no generation must not \
+             resolve to WaitingForInput for the gate"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &untagged_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "an unidentified producer must not be able to open the lock by \
+             reporting WaitingForInput — fail closed, got {gated:?}"
+        );
+
+        // Clearing the mark — what a real, identified hook does — restores it.
+        untagged_state.untagged_status_panes.remove(&worker_id);
+        let tagged_status = build_pane_status_for_gate(&untagged_state);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &tagged_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "an identified WaitingForInput report must still pass through"
+            ),
+            other => panic!(
+                "expected the carve-out to hold for an identified producer, \
+                 got {other:?}"
             ),
         }
     }
