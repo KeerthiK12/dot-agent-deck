@@ -228,7 +228,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       ? `${generatedCount} commands are generated from their current profile fields; ${config.customCommandCount} explicit custom command override${config.customCommandCount === 1 ? " bypasses" : "s bypass"} those fields. Custom commands may carry arbitrary permissions and are not covered by structured permission claims.`
       : `All ${generatedCount} commands are generated from the current provider, CLI, model, effort, and permission fields.`;
     const accessCopy = config.generatedFullAccessCount > 0
-      ? ` Among generated commands, ${config.generatedFullAccessCount} role${config.generatedFullAccessCount === 1 ? " has" : "s have"} full-access permissions.`
+      ? ` Among generated commands, ${config.generatedFullAccessCount} role${config.generatedFullAccessCount === 1 ? " runs" : "s run"} unrestricted — Claude Code with bypassPermissions, or Codex with no sandbox — so ${config.generatedFullAccessCount === 1 ? "it acts" : "they act"} without asking.`
       : "";
     setConfirm({
       title: `Launch ${config.name}?`,

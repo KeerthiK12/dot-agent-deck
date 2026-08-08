@@ -14,6 +14,79 @@ export interface ProfileCommandResolution {
   note?: string;
 }
 
+/**
+ * Canonical permission modes are provider-neutral, but each CLI names them
+ * differently. These maps are the single source of truth for both the
+ * generated command and the labels shown in the profile editor, so the
+ * selector can never drift from the flag it actually produces.
+ */
+const CLAUDE_PERMISSION_ARGUMENT: Record<PermissionMode, string> = {
+  default: "default",
+  "read-only": "plan",
+  "workspace-write": "acceptEdits",
+  "full-access": "bypassPermissions",
+};
+
+const CODEX_SANDBOX_ARGUMENT: Record<PermissionMode, string> = {
+  default: "default",
+  "read-only": "read-only",
+  "workspace-write": "workspace-write",
+  "full-access": "danger-full-access",
+};
+
+export interface PermissionModeOption {
+  value: PermissionMode;
+  /** The name the selected CLI actually uses for this mode. */
+  label: string;
+  /** The flag this mode produces, so "full access" is never ambiguous. */
+  detail: string;
+}
+
+/**
+ * Permission choices labelled in the vocabulary of the selected provider.
+ * Claude Code calls these plan / acceptEdits / bypassPermissions; Codex calls
+ * them sandboxes. Showing one CLI's words for another's behaviour is how
+ * "Workspace write" ends up silently meaning "accept edits".
+ */
+export function permissionModeOptions(provider: Provider): PermissionModeOption[] {
+  if (provider === "Anthropic") {
+    return [
+      { value: "default", label: "Ask each time (default)", detail: `--permission-mode ${CLAUDE_PERMISSION_ARGUMENT.default}` },
+      { value: "read-only", label: "Plan — read-only", detail: `--permission-mode ${CLAUDE_PERMISSION_ARGUMENT["read-only"]}` },
+      { value: "workspace-write", label: "Accept edits", detail: `--permission-mode ${CLAUDE_PERMISSION_ARGUMENT["workspace-write"]}` },
+      { value: "full-access", label: "Bypass permissions", detail: `--permission-mode ${CLAUDE_PERMISSION_ARGUMENT["full-access"]}` },
+    ];
+  }
+  if (provider === "OpenAI") {
+    return [
+      { value: "default", label: "Ask on request (default)", detail: "--ask-for-approval on-request" },
+      { value: "read-only", label: "Read only", detail: `--sandbox ${CODEX_SANDBOX_ARGUMENT["read-only"]}` },
+      { value: "workspace-write", label: "Workspace write", detail: `--sandbox ${CODEX_SANDBOX_ARGUMENT["workspace-write"]}` },
+      { value: "full-access", label: "Full access — no sandbox", detail: `--sandbox ${CODEX_SANDBOX_ARGUMENT["full-access"]}` },
+    ];
+  }
+  if (provider === "OpenCode") {
+    return [
+      { value: "default", label: "CLI default", detail: "no permission override" },
+      { value: "read-only", label: "Read only", detail: "OPENCODE_PERMISSION deny edit/bash" },
+      { value: "workspace-write", label: "Edits allowed, bash asks", detail: "OPENCODE_PERMISSION allow edit" },
+      { value: "full-access", label: "Allow everything", detail: "OPENCODE_PERMISSION allow *" },
+    ];
+  }
+  return [
+    { value: "default", label: "CLI default", detail: "encoded by the custom command" },
+    { value: "read-only", label: "Read only", detail: "encoded by the custom command" },
+    { value: "workspace-write", label: "Workspace write", detail: "encoded by the custom command" },
+    { value: "full-access", label: "Full access", detail: "encoded by the custom command" },
+  ];
+}
+
+/** The provider-specific name for one mode, for prose outside the selector. */
+export function permissionModeLabel(provider: Provider, mode: PermissionMode): string {
+  const match = permissionModeOptions(provider).find((option) => option.value === mode);
+  return match ? match.label : mode;
+}
+
 export function defaultCliForProvider(provider: Provider): string {
   if (provider === "OpenAI") return "codex";
   if (provider === "Anthropic") return "claude";
@@ -65,19 +138,13 @@ function generatedCommand(profile: AgentProfile): ProfileCommandResolution {
   let note: string | undefined;
 
   if (profile.provider === "OpenAI") {
-    const sandbox = permissionMode === "full-access" ? "danger-full-access" : permissionMode;
+    const sandbox = CODEX_SANDBOX_ARGUMENT[permissionMode];
     const permissionArguments = sandbox === "default"
       ? "--ask-for-approval on-request"
       : `--sandbox ${sandbox} --ask-for-approval on-request`;
     command = `${executable} --model ${modelArgument} ${permissionArguments} -c ${quoteShellWord(`model_reasoning_effort=${effort}`)}`;
   } else if (profile.provider === "Anthropic") {
-    const claudePermission: Record<PermissionMode, string> = {
-      default: "default",
-      "read-only": "plan",
-      "workspace-write": "acceptEdits",
-      "full-access": "bypassPermissions",
-    };
-    command = `${executable} --model ${modelArgument} --effort ${effort} --permission-mode ${claudePermission[permissionMode]}`;
+    command = `${executable} --model ${modelArgument} --effort ${effort} --permission-mode ${CLAUDE_PERMISSION_ARGUMENT[permissionMode]}`;
   } else {
     const modelWithoutVariant = model.split("#", 1)[0];
     if (!modelWithoutVariant) {

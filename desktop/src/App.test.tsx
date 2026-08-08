@@ -112,7 +112,7 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByTestId("launch-live-loop"));
     expect(screen.getByRole("alertdialog")).toHaveTextContent("All 6 commands are generated from the current provider, CLI, model, effort, and permission fields.");
     expect(screen.getByRole("alertdialog")).toHaveTextContent("sends your task prompt to the coordinator");
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("Among generated commands, 1 role has full-access permissions.");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Among generated commands, 1 role runs unrestricted");
     fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
 
     await waitFor(() => {
@@ -140,7 +140,7 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByTestId("launch-live-loop"));
     expect(screen.getByRole("alertdialog")).toHaveTextContent("1 explicit custom command override bypasses those fields");
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Custom commands may carry arbitrary permissions and are not covered by structured permission claims.");
-    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("role has full-access permissions");
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("role runs unrestricted");
     fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
 
     await waitFor(() => {

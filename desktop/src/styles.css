@@ -286,6 +286,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .profile-form textarea[readonly] { color: #40524d; background: #ecefe9; cursor: default; }
 .profile-form label > small { color: var(--faint); font-size: 8px; }
 .form-wide { grid-column: 1 / -1; }
+.profile-form .field-hint { color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8px; }
 .command-control { display: flex; flex-direction: column; gap: 7px; }
 .profile-form .command-override-toggle { flex-direction: row; align-items: center; gap: 7px; color: var(--muted); font-size: 8px; cursor: pointer; }
 .profile-form .command-override-toggle input { width: 14px; height: 14px; padding: 0; accent-color: var(--teal); }

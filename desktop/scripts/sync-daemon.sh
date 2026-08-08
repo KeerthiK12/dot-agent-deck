@@ -8,8 +8,10 @@
 # "Replace daemon" button cannot help in dev because that path starts the
 # bundled sidecar, which only exists in a packaged .app.
 #
-# Running this before `tauri dev` keeps the two in lockstep. It is a no-op when
-# the daemon is already current, so it costs nothing on a warm tree.
+# Wired as the `pretauri` hook, so `pnpm tauri dev` (and `tauri build`) rebuild
+# the daemon first and stay in lockstep. It is deliberately NOT on `predev`:
+# `pnpm dev` serves the browser-only fixture, which talks to no daemon and
+# should not pay a Rust compile. No-op on a warm tree, so it costs nothing.
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

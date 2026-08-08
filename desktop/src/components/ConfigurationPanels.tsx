@@ -15,7 +15,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { defaultCliForProvider, resolveProfileCommand } from "../lib/profileCommands";
+import { defaultCliForProvider, permissionModeLabel, permissionModeOptions, resolveProfileCommand } from "../lib/profileCommands";
 import type { AgentProfile, DeckProject, Provider, RuntimeMode, WorkflowLaunchConfig } from "../types";
 
 interface ProjectsPanelProps {
@@ -194,9 +194,14 @@ export function ProfilesPanel({ open, profiles, onClose, onUpdate, onReset, onSa
                 </label>
                 <label>
                   <span>Permission mode</span>
-                  <select value={profile.permissionMode} onChange={(event) => onUpdate(profile.id, { permissionMode: event.target.value as AgentProfile["permissionMode"] })}>
-                    <option value="default">CLI default</option><option value="read-only">Read only</option><option value="workspace-write">Workspace write</option><option value="full-access">Full access</option>
+                  <select aria-label="Permission mode" value={profile.permissionMode} onChange={(event) => onUpdate(profile.id, { permissionMode: event.target.value as AgentProfile["permissionMode"] })}>
+                    {permissionModeOptions(profile.provider).map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
                   </select>
+                  <small className="field-hint">
+                    {permissionModeOptions(profile.provider).find((option) => option.value === profile.permissionMode)?.detail}
+                  </small>
                 </label>
                 <div className="form-wide command-control">
                   <label className="command-override-toggle">
@@ -230,7 +235,7 @@ export function ProfilesPanel({ open, profiles, onClose, onUpdate, onReset, onSa
                 <SlidersHorizontal size={15} />
                 {commandResolution?.source === "custom"
                   ? <span><strong>{profile.role}</strong> will launch the exact custom command. Permissions are unmanaged here and must be encoded and reviewed in that command.</span>
-                  : <span><strong>{profile.role}</strong> will launch the {profile.provider} command generated from these fields with {profile.permissionMode} permissions.</span>}
+                  : <span><strong>{profile.role}</strong> will launch the {profile.provider} command generated from these fields, running in <strong>{permissionModeLabel(profile.provider, profile.permissionMode)}</strong>.</span>}
               </div>
 
               <footer className="sheet-footer">
