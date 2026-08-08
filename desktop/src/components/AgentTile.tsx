@@ -12,7 +12,7 @@ import {
   SquareTerminal,
   X,
 } from "lucide-react";
-import type { AgentSession, DeckActionResult, DeckPrompt, EvidenceItem, PanelTab, RuntimeMode, TerminalBuffer } from "../types";
+import type { AgentSession, DeckActionResult, DeckPrompt, EvidenceItem, PanelTab, RuntimeMode, TerminalFeed } from "../types";
 import { AgentComposer } from "./AgentComposer";
 import { TerminalViewport } from "./TerminalViewport";
 
@@ -29,7 +29,7 @@ interface AgentTileProps {
   mode: RuntimeMode;
   selected: boolean;
   tab: PanelTab;
-  terminalData?: TerminalBuffer;
+  terminalFeed?: TerminalFeed;
   evidence: EvidenceItem[];
   prompts: DeckPrompt[];
   /** Increments when the command palette asks this tile's composer to focus. */
@@ -52,7 +52,7 @@ export function AgentTile({
   mode,
   selected,
   tab,
-  terminalData,
+  terminalFeed,
   evidence,
   prompts,
   composerFocusToken,
@@ -183,7 +183,7 @@ export function AgentTile({
               agentId={agent.id}
               label={agent.role}
               transcript={agent.transcript}
-              streamData={terminalData}
+              terminalFeed={terminalFeed}
               readOnly={agent.status === "queued" || agent.status === "passed" || agent.status === "stopped"}
               onInput={handleInput}
               onResize={handleResize}

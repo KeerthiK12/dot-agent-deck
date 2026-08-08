@@ -2,13 +2,13 @@ import { useEffect, useRef } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
-import type { TerminalBuffer } from "../types";
+import type { TerminalBuffer, TerminalFeed } from "../types";
 
 interface TerminalViewportProps {
   agentId: string;
   label: string;
   transcript: string;
-  streamData?: TerminalBuffer;
+  terminalFeed?: TerminalFeed;
   readOnly?: boolean;
   onInput: (data: string) => void;
   onResize: (cols: number, rows: number) => void;
@@ -19,7 +19,7 @@ export function TerminalViewport({
   agentId,
   label,
   transcript,
-  streamData,
+  terminalFeed,
   readOnly,
   onInput,
   onResize,
@@ -141,25 +141,33 @@ export function TerminalViewport({
     terminal.write(transcript);
   }, [transcript]);
 
+  // Bytes arrive straight from the bridge feed and go straight into xterm —
+  // never through React state, so output volume cannot cause re-renders.
   useEffect(() => {
-    const terminal = terminalRef.current;
-    if (!terminal || !streamData) return;
-    const previous = lastStreamRef.current;
-    if (!previous) {
-      if (streamData.data.byteLength) terminal.write(streamData.data);
-    } else if (
-      streamData.generation === previous.generation
-      && streamData.baseOffset === previous.baseOffset
-      && streamData.data.byteLength > previous.data.byteLength
-    ) {
-      terminal.write(streamData.data.subarray(previous.data.byteLength));
-    } else if (streamData !== previous) {
-      terminal.reset();
-      terminal.write(transcriptRef.current);
-      if (streamData.data.byteLength) terminal.write(streamData.data);
-    }
-    lastStreamRef.current = streamData;
-  }, [streamData]);
+    if (!terminalFeed) return;
+    const apply = (buffer: TerminalBuffer) => {
+      const terminal = terminalRef.current;
+      if (!terminal) return;
+      const previous = lastStreamRef.current;
+      if (!previous) {
+        if (buffer.data.byteLength) terminal.write(buffer.data);
+      } else if (
+        buffer.generation === previous.generation
+        && buffer.baseOffset === previous.baseOffset
+        && buffer.data.byteLength > previous.data.byteLength
+      ) {
+        terminal.write(buffer.data.subarray(previous.data.byteLength));
+      } else if (buffer !== previous) {
+        terminal.reset();
+        terminal.write(transcriptRef.current);
+        if (buffer.data.byteLength) terminal.write(buffer.data);
+      }
+      lastStreamRef.current = buffer;
+    };
+    const backlog = terminalFeed.get(agentId);
+    if (backlog) apply(backlog);
+    return terminalFeed.subscribe(agentId, apply);
+  }, [agentId, terminalFeed]);
 
   return (
     <div

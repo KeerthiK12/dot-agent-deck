@@ -235,10 +235,17 @@ export interface TerminalBuffer {
   generation?: number;
 }
 
+export interface TerminalFeed {
+  get(agentId: string): TerminalBuffer | undefined;
+  subscribe(agentId: string, listener: (buffer: TerminalBuffer) => void): () => void;
+}
+
 export interface DeckRuntimeState {
   mode: RuntimeMode;
   snapshot: DeckSnapshot;
   terminalData: Record<string, TerminalBuffer>;
+  /** Direct PTY-byte path that bypasses React state; absent in tests/fixture. */
+  terminalFeed?: TerminalFeed;
   error?: string;
   runAction: (action: DeckAction) => Promise<DeckActionResult>;
   sendTerminalInput: (agentId: string, data: string) => Promise<void>;

@@ -384,7 +384,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
                   mode={mode}
                   selected={agent.id === selectedAgentId}
                   tab={tabs[agent.id] ?? "terminal"}
-                  terminalData={runtime.terminalData[agent.id]}
+                  terminalFeed={runtime.terminalFeed}
                   evidence={snapshot.evidence}
                   prompts={prompts}
                   composerFocusToken={composerFocus?.agentId === agent.id ? composerFocus.token : 0}
