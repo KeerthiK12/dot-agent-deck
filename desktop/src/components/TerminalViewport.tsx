@@ -58,7 +58,7 @@ export function TerminalViewport({
       fontWeight: "400",
       fontWeightBold: "600",
       lineHeight: 1.3,
-      scrollback: 4_000,
+      scrollback: 8_000,
       theme: {
         background: "#141817",
         foreground: "#d8ddd8",
@@ -155,13 +155,25 @@ export function TerminalViewport({
       const previous = lastStreamRef.current;
       if (!previous) {
         if (buffer.data.byteLength) terminal.write(buffer.data);
-      } else if (
-        buffer.generation === previous.generation
-        && buffer.baseOffset === previous.baseOffset
-        && buffer.data.byteLength > previous.data.byteLength
-      ) {
-        terminal.write(buffer.data.subarray(previous.data.byteLength));
+      } else if (buffer !== previous && buffer.generation === previous.generation) {
+        // Compare absolute stream offsets, not array lengths: when the rolling
+        // buffer trims its head, baseOffset advances while the tail stays
+        // contiguous. Writing just the unseen suffix keeps xterm's scrollback
+        // accumulating; the old equal-baseOffset check reset the terminal on
+        // every trim, wiping history seconds after it scrolled past.
+        const previousEnd = previous.baseOffset + previous.data.byteLength;
+        const nextEnd = buffer.baseOffset + buffer.data.byteLength;
+        if (nextEnd >= previousEnd && buffer.baseOffset <= previousEnd) {
+          const unseen = nextEnd - previousEnd;
+          if (unseen > 0) terminal.write(buffer.data.subarray(buffer.data.byteLength - unseen));
+        } else {
+          // Non-contiguous jump (daemon restart, missed chunks): rebuild.
+          terminal.reset();
+          terminal.write(transcriptRef.current);
+          if (buffer.data.byteLength) terminal.write(buffer.data);
+        }
       } else if (buffer !== previous) {
+        // Generation changed: the PTY was respawned — a rebuild is correct.
         terminal.reset();
         terminal.write(transcriptRef.current);
         if (buffer.data.byteLength) terminal.write(buffer.data);
