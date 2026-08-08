@@ -150,16 +150,39 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     // so the bytes carrying it are interleaved with cursor-positioning escapes and
     // the text never appears contiguously in the stream. The rendered grid is the
     // only surface where "what the user sees" is actually a substring.
-    deck.wait_until_grid("a single dispatcher session on the dashboard", |g| {
-        g.contains("1 session(s)")
-    });
+    //
+    // `common::wait_until` rather than `deck.wait_until_grid`, because the latter is
+    // hard-capped at the harness `WAIT_TIMEOUT` (10s) — far too short for a real
+    // claude cold boot plus SessionStart, the readiness buffer, and the seed
+    // round-trip. Using it here silently cut an intended 60s wait to 10s and made
+    // this test flaky by construction on a slower or busier host. The polling still
+    // lives in `common` (Decision 21).
+    const SURFACE_WAIT: Duration = Duration::from_secs(60);
+    assert!(
+        common::wait_until(SURFACE_WAIT, || deck
+            .snapshot_grid()
+            .contains("1 session(s)")),
+        "the dispatcher never surfaced a LIVE dashboard card within {}s — expected a \
+         single-agent card on the dashboard (NOT a mode tab, which would split the pane \
+         50/50 with an empty side column).\n\
+         Final grid:\n{}",
+        SURFACE_WAIT.as_secs(),
+        deck.snapshot_grid()
+    );
 
     // The seed really reached the pane — the delivery that makes this a
     // *dispatcher* rather than a bare agent. The card's `Prmt:` line echoes the
     // seed's opening words, so an unseeded pane cannot pass this.
-    deck.wait_until_grid("the dispatcher seed on the card's Prmt line", |g| {
-        g.contains("You are an ordinary assistant")
-    });
+    assert!(
+        common::wait_until(SURFACE_WAIT, || deck
+            .snapshot_grid()
+            .contains("You are an ordinary assistant")),
+        "the dispatcher seed never appeared on the card within {}s — without it the agent \
+         has not been taught the `dispatch` verb at all.\n\
+         Final grid:\n{}",
+        SURFACE_WAIT.as_secs(),
+        deck.snapshot_grid()
+    );
 
     // Give the seeded agent an actual goal. Without one it correctly stalls
     // asking for a task, which is why an earlier version of this test observed
@@ -171,8 +194,9 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     // `single` and the seed's own "nothing to ask" branch applies. The explicit
     // "do not ask me anything first" keeps that deterministic either way.
     deck.send_keys(
-        b"Dispatch exactly one unit named probe-unit, with the task \"list the files here\". \
-          Call the dispatch command now. Do not ask me anything first.\r",
+        b"Dispatch exactly one unit named probe-unit as a SINGLE AGENT (pass --single), \
+          with the task \"list the files here\". Call the dispatch command now. \
+          Do not ask me anything first.\r",
     );
 
     // The real-agent proof, end to end: the agent decomposed the goal, invoked
@@ -213,8 +237,8 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
         if round > 0 {
             deck.send_keys(
                 b"You have not called the dispatch command yet. \
-                  Run `dot-agent-deck dispatch probe-unit --task \"list the files here\"` now, \
-                  with no further questions.\r",
+                  Run `dot-agent-deck dispatch probe-unit --task \"list the files here\" --single` \
+                  now, with no further questions.\r",
             );
         }
         if common::wait_for_path(&expected_worktree, NUDGE_EVERY) {
@@ -232,6 +256,30 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
         expected_worktree.display(),
         NUDGES,
         NUDGE_EVERY.as_secs() * NUDGES as u64,
+        deck.snapshot_grid()
+    );
+
+    // The dispatched unit must be a real AGENT, not a shell.
+    //
+    // Asserting the worktree alone is what let a genuine bug ship: `dispatch`
+    // passed `SpawnRequest.command: None`, which the spawn path reads as `$SHELL`,
+    // so the unit came up as a bash prompt with the `--task` text typed into it.
+    // The worktree appeared, a pane appeared, and the test was green.
+    //
+    // A second live session with an agent type on its card is what distinguishes
+    // the two: the dispatcher card plus the dispatched unit's card, each labelled
+    // with the agent that is actually running. A shell has no agent-type label.
+    assert!(
+        common::wait_until(SURFACE_WAIT, || {
+            let g = deck.snapshot_grid();
+            g.contains("2 session(s)") && g.matches("ClaudeCode").count() >= 2
+        }),
+        "the dispatched unit never came up as a real AGENT within {}s — a second live \
+         session with an agent type on its card. `SpawnRequest.command: None` reads as \
+         $SHELL in the spawn path, so this is what distinguishes an agent from a bash \
+         prompt with the task typed into it.\n\
+         Final grid:\n{}",
+        SURFACE_WAIT.as_secs(),
         deck.snapshot_grid()
     );
 }

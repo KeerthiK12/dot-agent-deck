@@ -48,11 +48,27 @@ dot-agent-deck dispatch <name> --task "..." --single
 dot-agent-deck dispatch <name> --task "..." --orchestration <orchestration-name>
 ```
 
-`--list-targets` is a **local read** of the repo's own `.dot-agent-deck.toml`, not a daemon round-trip — the dispatched worktree is a copy of this repo, so that config is the one the spawn branches on. It therefore adds no hook-socket message and no protocol surface.
+`--list-targets` is answered by the **daemon**, not computed in the CLI, and that is deliberate: the daemon resolves the pane's own cwd and reads the same config the dispatch will resolve its shape from. An earlier cut read the CLI process's `current_dir()` locally and let the spawn resolve names against the *worktree* dir instead — and because `load_project_config` normalises an unnamed orchestration to its **directory basename**, the same entry was `myrepo` in the listing and `myrepo-dispatch-<slug>` at spawn time. The listing offered a name the spawn could never match. One basis for both sides is the only way that stays true.
 
-Two details worth knowing. Naming an orchestration the repo does not define is an **error**, not a silent fallback — starting something other than what the user picked is exactly the surprise the selector removes, and the message lists what is available. And schedule/authoring modes never appear in the listing: a schedule creates a *future* task, so it is not something a dispatch can start.
+Four outcomes, kept distinct because collapsing them makes the agent state something false:
 
-With neither flag, the shape still falls back to whatever the repo's config implies (its first `[[orchestrations]]`, else a single agent), which is the pre-selector behaviour.
+| Situation | What you get |
+|---|---|
+| Config with orchestrations | Each role-bearing one, by the name the spawn will use |
+| No config file | `single` only — the truth |
+| Config present but unparseable | The parse error, named, and a non-zero exit |
+| Pane's directory unknown | Said plainly, and explicitly *not* "this repo has none" |
+
+Two more details. Naming an orchestration the repo does not define is an **error** listing what is available, not a silent fallback — starting something other than what the user picked is exactly the surprise the selector removes — and it is rejected *before* the worktree is created, so a typo leaves no directory or branch behind. And schedule/authoring modes never appear: a schedule creates a *future* task, so it is not something a dispatch can start.
+
+With neither flag, the shape still falls back to whatever the repo's config implies (its first role-bearing `[[orchestrations]]`, else a single agent), which is the pre-selector behaviour.
+
+### What the unit actually gets
+
+Whichever shape you pick, the unit is started the way the interactive `Ctrl+n` path starts it, plus your prompt:
+
+- **`--single`** runs a real agent — the deck's configured `default_command`, or the Claude default when that is unset. (It must never be `None`: the spawn path reads an absent command as `$SHELL`, which started a bare shell and typed the task into a bash prompt.)
+- **`--orchestration`** starts every role, and the orchestrator receives `.dot-agent-deck/orchestrator-context.md` carrying its own `prompt_template`, the available-agents list, the delegation protocol, and your `--task` under `## Your task`. The task rides *inside* the file rather than being appended to the pointer line because a multi-line prompt does not submit reliably through a PTY.
 
 ## Worktree isolation
 
@@ -68,5 +84,5 @@ The unit's branch (`agent/dispatch-<slug>`) always survives removal, because it 
 
 ## Current limitations
 
-- **A dispatched orchestration starts without the delegation protocol, so only its orchestrator acts.** This is the one limitation to know before choosing `--orchestration`. The daemon spawn path never composes the orchestrator context that the interactive `Ctrl+n` path writes: `prepare_orchestrator_prompt` (which writes `.dot-agent-deck/orchestrator-context.md` listing the roles and the delegation protocol) has exactly one caller, `src/ui.rs`, and `src/spawn.rs` never calls it. The orchestrator therefore receives the `--task` text but is never told that it *is* an orchestrator, which roles exist, or how to `delegate` — so it does not delegate, and its worker panes sit idle waiting for work that never arrives. In a repo whose first orchestration has six roles, that is one working agent and five idle ones. Until this is fixed, `--single` is the reliable choice. Tracked on [#222](https://github.com/vfarcic/dot-agent-deck/issues/222), whose "prompt order" parity item is exactly this; scheduled issue-dispatch (#120) has the identical defect because it shares the same spawn path, so one fix covers both.
+- ~~A dispatched orchestration starts without the delegation protocol.~~ **Fixed.** A dispatched orchestration now receives the same orchestrator context the interactive `Ctrl+n` path writes — its own `prompt_template`, the available-agents list, and the delegation protocol — with the `--task` text folded in under `## Your task`. Because the composition is shared rather than duplicated, scheduled issue-dispatch (#120) gained the same fix; it had the identical defect for the same reason. See [Starting a line of work](#choosing-the-shape-one-agent-or-a-team) below and #222.
 - The return edge (the dispatched unit sending results back to the dispatcher) is not yet implemented. The dispatcher reports where each unit is running; it is **not** notified when a unit finishes. This is Phase 2 of [PRD #220](https://github.com/vfarcic/dot-agent-deck/issues/220) itself, deferred rather than dropped. (It is *not* tracked by #174 — that is the separate *Cross-project orchestration dispatch* PRD, which **depends on** this one.)

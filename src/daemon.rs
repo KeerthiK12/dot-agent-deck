@@ -845,7 +845,7 @@ fn make_schedule_callback(
         prompt: task.prompt.clone(),
         // `None`: a scheduled task's shape still comes from its working dir's
         // config. The PRD #220 selector is a `dispatch`-only surface.
-        shape_override: None,
+        resolved_target: None,
     };
     let new_tab_per_fire = task.new_tab_per_fire;
     Arc::new(move || {
@@ -1087,11 +1087,24 @@ async fn run_hook_loop(
                                     // Phase 2: do the slow I/O (git worktree + spawn)
                                     // OUTSIDE any AppState lock so concurrent hook
                                     // processing is never stalled.
+                                    // The deck's configured default command, so a
+                                    // single-agent dispatch starts an AGENT rather
+                                    // than `$SHELL`. Same resolution as the
+                                    // issue-dispatch arm above; empty → the Claude
+                                    // default inside `handle_dispatch`.
+                                    let default_command = {
+                                        let dc = crate::config::DashboardConfig::load()
+                                            .default_command
+                                            .trim()
+                                            .to_string();
+                                        if dc.is_empty() { None } else { Some(dc) }
+                                    };
                                     let ctx = DispatchContext {
                                         working_dir: PathBuf::from(&cwd),
                                         registry: pty_registry.clone(),
                                         event_tx: event_tx.clone(),
                                         worktrees: worktree_registry.clone(),
+                                        default_command,
                                     };
                                     let task = signal.task.as_deref().unwrap_or_default();
                                     let result = dispatch::handle_dispatch(
@@ -1140,6 +1153,37 @@ async fn run_hook_loop(
                                     );
                                     let resp =
                                         crate::event::GetSeedResponse { seed };
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ =
+                                            write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::ListTargets(req) => {
+                                    // PRD #220: the shape menu, computed HERE so it
+                                    // comes from the same cwd and the same config
+                                    // the dispatch will use. Resolving the cwd from
+                                    // `AgentRecord.cwd` — not from the CLI's own
+                                    // `current_dir()` — is the whole point: those
+                                    // two diverge whenever the agent has `cd`'d, and
+                                    // a menu that disagrees with the spawn sends the
+                                    // user to a target that cannot start.
+                                    let cwd = {
+                                        let records = pty_registry.agent_records();
+                                        records
+                                            .iter()
+                                            .find(|r| r.pane_id_env.as_deref() == Some(&req.pane_id))
+                                            .and_then(|r| r.cwd.clone())
+                                    };
+                                    info!(
+                                        pane_id = %req.pane_id,
+                                        resolved_cwd = ?cwd,
+                                        "Received list-targets request"
+                                    );
+                                    let resp = crate::dispatch::list_targets_response(
+                                        cwd.as_deref().map(std::path::Path::new),
+                                    );
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
                                         let _ =

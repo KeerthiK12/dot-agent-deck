@@ -109,7 +109,11 @@ So the orchestrator gets the task but is never told it is an orchestrator, what 
 
 Two things worth carrying to whoever fixes it. First, `RoleSpawn` does **not** need a prompt field: worker `prompt_template`s are consumed only inside `build_orchestrator_context` (the orchestrator's own template verbatim, plus each worker's `description` in an "Available agents" list), and workers get work at delegation time, not spawn time — so calling the one function covers all of it. Second, both `build_orchestrator_context` and `prepare_orchestrator_prompt` are **pure** (config in, `String`/`fs` out, no UI state), so this is a MOVE to a shared module, never a second implementation — which is what "share the interactive composition" above means concretely.
 
-Deliberately **not fixed in PR #232**: `spawn.rs` is shared by the scheduler (#127), issue-dispatch (#120) and dispatch, so the fix changes already-shipped non-experimental #120 behaviour. It belongs in its own PR with its own bisect point and review, and #120's identical defect makes it one fix for both.
+**Initially deferred, then FIXED here (2026-08-08).** The deferral was the wrong call: without this, "dispatch an orchestration" does not work at all, so the feature's headline case would have shipped non-functional. Reported from real use — an orchestration dispatch produced one working agent and idle workers — which settled it.
+
+Fixed by MOVING both composers to `src/orchestrator_context.rs` and calling them from `spawn`'s orchestration branch. The caller's task is folded into the context file under `## Your task`, and the pointer line then says *carry out that task* rather than *wait for instructions* — leaving the wait wording would have stranded a dispatched unit idle with its task unread on disk. Because the composition is now shared rather than duplicated, **#120 issue-dispatch gained the same fix**, which was the whole argument for a move over a copy.
+
+Accepted cost: this changes `src/spawn.rs`, shared by the scheduler (#127) and #120, so a regression in either bisects to this PR. That is the price of the feature working, and it was the maintainer's call.
 
 ### 3. Nothing chose between a single agent and an orchestration — FIXED
 
@@ -118,6 +122,16 @@ Deliberately **not fixed in PR #232**: `spawn.rs` is shared by the scheduler (#1
 The decisive argument for asking rather than inferring: *"work on these three features"* wants a team per feature, *"verify these three PRs"* wants one agent each, and both arrive as the same words. An earlier objection that `dispatch` "cannot ask" conflated the **daemon** asking mid-dispatch (true, one-way hook socket, no interactive channel) with the **dispatcher agent** asking beforehand — which is free, because that pane is already conversational. The answer then crosses the CLI boundary as a flag.
 
 Shipped as `--single` / `--orchestration [<name>]` (an additive `#[serde(default)]` field on `DispatchSignal`, so `PROTOCOL_VERSION` does not move) plus `--list-targets`. Two decisions inside it: an unknown orchestration name is an **error listing what is available**, never a silent fallback to something the user did not pick; and `--list-targets` is a **local** read of the repo's own config rather than a daemon round-trip, since the dispatched worktree is a copy of this repo — so it adds no wire message and no protocol surface. Distinct from the `--to` dropped in M1.0, which selected the *completion-routing* target rather than the spawn shape.
+
+### What real use taught, and what the tests did not
+
+Every defect in this record was found by a human running the feature, never by a gate. Worth keeping, because the pattern repeated three times:
+
+1. **A green e2e test that asserted the wrong thing.** `prompt/new-pane/016` asserted the worktree appeared on disk, and its CATALOG entry said outright that it did not assert the dispatched unit's tab or output. So the mode-tab split, the `$SHELL` unit, and the protocol-less orchestration all sat underneath a passing real-agent test. It now asserts the card shape, that the seed reached the pane, and that the unit comes up as an AGENT — the last verified by reintroducing `command: None` and watching it fail.
+2. **Assertions that could not fail.** Two waits were written against the raw PTY stream, where redrawn dashboard chrome is interleaved with cursor-positioning escapes so the text never appears contiguously; and `deck.wait_until_grid` is hard-capped at the harness `WAIT_TIMEOUT` (10s), silently cutting intended 60s waits. Grid assertions with an explicit `common::wait_until` bound fix both.
+3. **A listing that could disagree with the spawn.** `--list-targets` was argued for on the grounds that "the menu is computed by the code that spawns", then implemented as a local CLI read against a different directory, a different git state, and a different name-resolution basis. The property has to be built in, not asserted in a doc comment.
+
+The generalisable rule: **assert the thing the user sees, and prove the assertion can fail.** A test that spins up a real agent is not automatically a test of the feature.
 
 ### Also found: three sanitizers for one job
 

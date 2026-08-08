@@ -2370,173 +2370,12 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
 // ---------------------------------------------------------------------------
 // Orchestrator prompt construction
 // ---------------------------------------------------------------------------
-
-/// Build the orchestrator context file content.
-/// Includes the role's own prompt_template, the available-agents list, and
-/// delegation protocol instructions.
-fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
-    let mut content = String::new();
-
-    // 1. Orchestrator's own prompt_template.
-    if let Some(start_role) = config.roles.iter().find(|r| r.start)
-        && let Some(ref tpl) = start_role.prompt_template
-    {
-        content.push_str(tpl);
-        content.push_str("\n\n");
-    }
-
-    // 2. Available agents list.
-    content.push_str("## Available agents\n\n");
-    for role in &config.roles {
-        if role.start {
-            continue;
-        }
-        let desc = role.description.as_deref().unwrap_or("(no description)");
-        content.push_str(&format!("- **{}**: {}\n", role.name, desc));
-    }
-
-    // 3. Delegation protocol.
-    //
-    // Issue #303: the task text reaches this CLI through YOUR shell, so
-    // `--task "…"` is rewritten before argv is built — backticks and `$(…)` are
-    // executed, `$VAR` substituted, an unescaped `"` ends the argument, a `\`
-    // removes itself — while the delegation still reports success. The file form
-    // is therefore the unconditional default here, with the reason stated inline
-    // (an orchestrator that does not know WHY drifts back to `--task`).
-    //
-    // The audit of the first cut (auditor finding 1) showed that protecting only
-    // the final `--task-file` read is not enough: an `echo "…"` expands the
-    // content BEFORE it reaches disk, and an unquoted path can itself carry
-    // command substitution or `..` traversal. Hence the four creation rules, and
-    // the persistence/secrets note (#329's advice half).
-    //
-    // Round 3 then deleted the shell fallback that round 2 had recommended. A
-    // quoted `<<'EOF'` delimiter disables expansion inside the heredoc, but a
-    // task line that is exactly `EOF` terminates it and Bash parses and executes
-    // every line after it — and task files are exactly where untrusted text
-    // (issue bodies, code, another agent's brief) lands. "Use a fresh
-    // unpredictable delimiter and check the payload for it" is a rule an agent
-    // must get right on every single input, with silent command execution as the
-    // failure mode, so the only recommendation left is a non-shell file writer.
-    //
-    // Round 4 restored the *inline* fallback — not the shell one. Round 3's
-    // premise, "every agent in this system has a file-writing tool", confused
-    // having a tool with being authorized to use it: the e2e gate then caught a
-    // real Haiku worker launched with `--allowedTools Bash Read` calling `Write`
-    // and parking forever on the approval prompt. Guidance that depends on an
-    // unguaranteed permission produces exactly the silent stall #303 is about,
-    // so all three branches (file / short plain inline / say you cannot) are now
-    // stated outright rather than left to inference.
-    content.push_str("\n## Delegation protocol\n\n");
-    content.push_str(
-        "To delegate work to an agent, use `delegate` with one command per agent. \
-         Pass the task as a **file** — `--task-file` is the default, not an escape hatch:\n\n\
-         ```bash\n\
-         dot-agent-deck delegate --to <role-name> --task-file '.dot-agent-deck/<task-slug>.md'\n\
-         ```\n\n\
-         Four rules for producing that file. The last two are about the *path*, not the \
-         contents:\n\n\
-         - Write it with your **file-writing tool**. Do not construct it with shell redirection \
-         or a heredoc: a line of the task text can terminate the heredoc, and everything after \
-         that line is then executed as shell commands.\n\
-         - Invent a **fresh slug** for `<task-slug>` from `[a-z0-9][a-z0-9-]*` only, at most 40 \
-         characters. Never build it out of an issue title, a branch name, or any other text you \
-         did not write yourself.\n\
-         - No `/`, no `\\` and no `..` in the slug — the file goes directly in \
-         `.dot-agent-deck/`.\n\
-         - **Single-quote the whole path** in every command you run.\n\n\
-         Task and summary files persist on disk after the handoff. Keep credentials, customer \
-         data and other secrets out of them, pick a path that does not already exist, and delete \
-         exactly that path once the handoff has succeeded.\n\n\
-         **If you have no file-writing tool, or it is not authorized and invoking it would stop \
-         you at an approval prompt, do not wait there — skip the file and use the inline form \
-         below.** Never substitute shell redirection or a heredoc for the missing tool.\n\n\
-         `--task \"…\"` is the fallback for exactly that case, and is safe only when the whole \
-         task is **a single line of plain text with no backticks, no `$`, no `\"`, no `\\` and no \
-         `!`**:\n\n\
-         ```bash\n\
-         dot-agent-deck delegate --to <role-name> --task \"Short plain task description.\"\n\
-         ```\n\n\
-         Why the allowlist is that narrow: everything after `--task` is processed by **your own \
-         shell** before dot-agent-deck receives it. Backticks and `$(…)` are executed and \
-         replaced by their output — usually empty — `$VAR` becomes its value or nothing, a \
-         balanced inner `\"` is removed and changes how the rest of the argument is quoted, a \
-         `\\` before `$`, a backtick, `\"` or `\\` removes itself, and a `\\` at the end of a \
-         line removes itself *and* the newline. `!` is excluded because a Bash with history \
-         expansion on rewrites it before argv is built. An unmatched `\"` aborts the command \
-         outright; everything else is dropped silently while the delegation still reports \
-         success, so the worker acts on a task with pieces missing and nobody sees an error. \
-         `--task-file` is read from disk verbatim, so none of this applies to it.\n\n\
-         If a task will not fit that one plain line and you cannot write a file, say so plainly \
-         to the user and ask for the file-writing tool to be authorized, rather than improvising \
-         a way around the allowlist.\n\n\
-         To delegate to multiple agents in parallel, make **one call per agent** so each gets its own task:\n\n\
-         ```bash\n\
-         dot-agent-deck delegate --to coder --task-file '.dot-agent-deck/login-endpoint-coder.md'\n\
-         dot-agent-deck delegate --to reviewer --task-file '.dot-agent-deck/login-endpoint-reviewer.md'\n\
-         ```\n\n\
-         If all agents should receive the **exact same task**, you may combine them in one call:\n\n\
-         ```bash\n\
-         dot-agent-deck delegate --to <role1> --to <role2> --task-file '.dot-agent-deck/<task-slug>.md'\n\
-         ```\n\n\
-         When all work is complete and you are satisfied with the results:\n\n\
-         ```bash\n\
-         dot-agent-deck work-done --done --task-file '.dot-agent-deck/final-summary-<summary-slug>.md'\n\
-         ```\n\
-         (or `dot-agent-deck work-done --done --task \"Final summary.\"` when that summary really is \
-         one plain line). The same four rules apply to that file: `<summary-slug>` is a fresh slug \
-         you invent, the path must not already exist before you write it, and you delete exactly \
-         that path once the command has exited successfully.\n\n\
-         **Shell safety and context length are two different problems.** Writing long context to \
-         `.dot-agent-deck/<task-slug>.md` and *referencing that path inside* `--task \"…\"` keeps the \
-         task description short, but the description itself still goes through your shell. Passing \
-         the file with `--task-file` is what keeps the shell out of the text. One file solves both \
-         at once: write the full task to `.dot-agent-deck/<task-slug>.md` and hand it over with \
-         `--task-file`.\n",
-    );
-
-    // 4. Important guidelines.
-    content.push_str(
-        "\n## Important\n\n\
-         Wait for the user to tell you what to work on.\n\n\
-         Once you know the task, delegate immediately via the CLI commands above. \
-         Do NOT ask for confirmation before delegating. \
-         Do NOT offer to design, analyze, or plan — that is the workers' job. \
-         Do NOT ask 'should I proceed?' or 'do you want me to delegate?' — just delegate. \
-         Your only job: understand what needs doing, frame clear task descriptions, and hand off.\n\n\
-         Never send a new task to a worker that is still working on a previous task. \
-         Wait for its work-done signal before delegating again to the same worker. \
-         Delegating to different workers in parallel is fine.\n\n\
-         Delegation is one-way: orchestrator → worker. Workers NEVER delegate to other workers \
-         — a `dot-agent-deck delegate` call from inside a worker does not route back through your \
-         notification stream, so the downstream task is silently dropped and the calling worker \
-         waits forever (or signals work-done in a paused state). When briefing a worker, never \
-         instruct them to \"delegate the fix to coder\" or \"hand off to <other role>\". \
-         Instead, tell them to report the diagnosis back and signal work-done; you (the orchestrator) \
-         will delegate the next hop. The chain you coordinate is: worker A diagnoses → reports → \
-         you delegate to worker B → worker B works → reports → you re-engage worker A.\n\n\
-         When a task related to a PRD is fully completed (all workers done, reviews passed), \
-         run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n",
-    );
-
-    content
-}
-
-// ---------------------------------------------------------------------------
-// M6: Skill file auto-deployment
-// ---------------------------------------------------------------------------
-
-/// Write the orchestrator context to a file and return a one-liner to inject.
-/// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
-fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
-    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-    std::fs::create_dir_all(&dir).ok()?;
-    let file_path = dir.join("orchestrator-context.md");
-    let content = build_orchestrator_context(config);
-    std::fs::write(&file_path, &content).ok()?;
-    Some("Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and delegation protocol. Acknowledge your role and wait for instructions.".to_string())
-}
-
+//
+// MOVED to `src/orchestrator_context.rs` (PRD #222 parity): the daemon spawn
+// path needs the same composition, and two copies is what left a
+// daemon-started orchestration without its delegation protocol. Imported below
+// so this module's call site and tests are unchanged.
+use crate::orchestrator_context::prepare_orchestrator_prompt;
 // ---------------------------------------------------------------------------
 // PRD #76 M2.12: hydration partition
 // ---------------------------------------------------------------------------
@@ -7815,7 +7654,10 @@ fn dispatch_action(
                     // name to the tab TITLE only, via `display_title`; the
                     // identity stays the canonical `orch_config.name`.
                     let display_title = (!req.name.is_empty()).then(|| req.name.clone());
-                    let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
+                    // `None`: the interactive path carries no caller task — the user
+                    // types their instructions after the orchestrator acknowledges.
+                    // Output is byte-for-byte the pre-#222 text.
+                    let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str, None);
                     // PRD #89 M2b.2: keep a copy of the prepared prompt for the
                     // capture snapshot below — `prompt` itself is moved into
                     // `open_orchestration_tab`. Empty when the orchestration
@@ -17791,6 +17633,7 @@ pub fn render_new_pane_form_schedule_to_buffer(
 mod tests {
     use super::*;
     use crate::event::{AgentEvent, AgentType, EventType};
+    use crate::orchestrator_context::build_orchestrator_context;
     use crate::project_config::OrchestrationRoleConfig;
     use chrono::{Duration, Utc};
     use ratatui::Terminal;
@@ -20899,7 +20742,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
-        let prompt = prepare_orchestrator_prompt(&config, cwd);
+        let prompt = prepare_orchestrator_prompt(&config, cwd, None);
         assert!(prompt.is_some());
         let prompt = prompt.unwrap();
         // One-liner referencing the file.

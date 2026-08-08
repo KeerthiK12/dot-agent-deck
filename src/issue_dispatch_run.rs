@@ -440,7 +440,7 @@ async fn dispatch_one_issue(
         prompt: substitute_issue_number(prompt_template, issue),
         // `None`: issue-dispatch keeps deriving the shape from the cloned repo's
         // own config, exactly as before the PRD #220 selector existed.
-        shape_override: None,
+        resolved_target: None,
     };
     if let Err(e) = spawn(req, registry, notifier, event_tx, true).await {
         // The spawn failed after the worktree was created/recorded: no agent

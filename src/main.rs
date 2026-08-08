@@ -142,14 +142,27 @@ enum Commands {
         /// Mutually exclusive with --orchestration.
         #[arg(long, conflicts_with = "orchestration")]
         single: bool,
-        /// Start a full orchestration. Bare `--orchestration` uses this repo's
-        /// first; `--orchestration <name>` picks one by name. Mutually exclusive
-        /// with --single.
-        #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+        /// Start a full orchestration by name (`--orchestration review`), or this
+        /// repo's first role-bearing one (`--orchestration=` with an empty value).
+        /// Mutually exclusive with --single.
+        ///
+        /// The value is REQUIRED rather than optional: with `num_args = 0..=1` clap
+        /// consumes the next bare token, so `dispatch --orchestration my-unit
+        /// --task "…"` silently bound the UNIT NAME as the orchestration name and
+        /// then aborted for a missing positional. Requiring it makes that
+        /// invocation unambiguous.
+        #[arg(long, value_name = "NAME")]
         orchestration: Option<String>,
         /// Print the spawn targets available in this repo, then exit. Ask the
         /// user which one they want before dispatching.
-        #[arg(long)]
+        ///
+        /// Conflicts with every dispatch argument: combined, it used to print the
+        /// listing and exit 0 WITHOUT dispatching, so an agent that merged the two
+        /// usage lines reported a unit as started that never existed.
+        #[arg(
+            long,
+            conflicts_with_all = ["name", "task", "task_file", "single", "orchestration"]
+        )]
         list_targets: bool,
     },
     /// Signal task completion back to the orchestrator
@@ -703,27 +716,6 @@ fn main() -> ExitCode {
             orchestration,
             list_targets,
         }) => {
-            // `--list-targets` is a pure LOCAL read of this repo's config — no
-            // pane id, no daemon round-trip, no wire message. The dispatched
-            // worktree is a copy of this repo, so this config is the one the
-            // spawn will branch on.
-            if list_targets {
-                let dir = match std::env::current_dir() {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("Error: could not resolve the current directory: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let config = dot_agent_deck::spawn::load_config_for_dir(&dir);
-                let orchestrations =
-                    dot_agent_deck::dispatch::available_orchestrations(config.as_ref(), &dir);
-                print!(
-                    "{}",
-                    dot_agent_deck::dispatch::render_available_targets(&orchestrations)
-                );
-                return ExitCode::SUCCESS;
-            }
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
                 Err(_) => {
@@ -734,48 +726,114 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            // `required_unless_present = "list_targets"` guarantees this.
-            let Some(name) = name else {
-                eprintln!("Error: a dispatch name is required.");
-                return ExitCode::FAILURE;
-            };
-            let task_text = match resolve_task(task, task_file, std::io::stdin().lock()) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("Error: {e}");
+            // `--list-targets` is a READ-ONLY daemon round-trip (the `get-seed`
+            // pattern): the daemon answers from the PANE's cwd and config, which is
+            // the same basis the dispatch itself resolves from. Computing it here
+            // from the CLI's own `current_dir()` diverged whenever the agent had
+            // `cd`'d, and offered targets the dispatch could not start.
+            //
+            // Exits after printing. clap's `conflicts_with_all` guarantees no
+            // dispatch arguments were supplied, so this cannot silently swallow a
+            // real dispatch and still exit 0.
+            if list_targets {
+                let req = dot_agent_deck::event::DaemonMessage::ListTargets(
+                    dot_agent_deck::event::ListTargetsRequest { pane_id },
+                );
+                let json = match serde_json::to_string(&req) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!("Failed to serialize list-targets request: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                match dot_agent_deck::hook::request_from_socket(&json) {
+                    Some(line) if !line.trim().is_empty() => {
+                        match serde_json::from_str::<dot_agent_deck::event::ListTargetsResponse>(
+                            &line,
+                        ) {
+                            Ok(resp) => {
+                                print!("{}", resp.rendered);
+                                // A broken config is reported as a FAILURE so the
+                                // agent cannot read "no orchestrations here" out of
+                                // an error it never noticed.
+                                if resp.error.is_some() {
+                                    return ExitCode::FAILURE;
+                                }
+                                ExitCode::SUCCESS
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to parse the daemon's list-targets reply: {e}");
+                                ExitCode::FAILURE
+                            }
+                        }
+                    }
+                    // No reply: no daemon, or one predating this verb. Say so rather
+                    // than printing a confident empty list the caller would act on.
+                    _ => {
+                        eprintln!(
+                            "Error: the daemon did not answer list-targets (not running, or an \
+                             older build). Dispatch `--single` to start one agent, or \
+                             `--orchestration <name>` if you know the name."
+                        );
+                        ExitCode::FAILURE
+                    }
+                }
+            } else {
+                // `required_unless_present = "list_targets"` guarantees this.
+                let Some(name) = name else {
+                    eprintln!("Error: a dispatch name is required.");
+                    return ExitCode::FAILURE;
+                };
+                let task_text = match resolve_task(task, task_file, std::io::stdin().lock()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                // clap's `conflicts_with` already rejects both flags together. A bare
+                // `--orchestration` arrives as `Some("")` via `default_missing_value`
+                // and means "this repo's first (role-bearing) one".
+                //
+                // The retained name is TRIMMED: an LLM-emitted `--orchestration "review "`
+                // otherwise travels to the daemon with its whitespace, fails the exact
+                // name comparison, and is refused with "no orchestration named 'review ';
+                // available: review" — after a full worktree round trip.
+                let shape = match (single, orchestration) {
+                    (true, _) => Some(dot_agent_deck::event::DispatchShape::SingleAgent),
+                    (false, Some(n)) => Some(dot_agent_deck::event::DispatchShape::Orchestration {
+                        name: {
+                            let n = n.trim();
+                            if n.is_empty() {
+                                None
+                            } else {
+                                Some(n.to_string())
+                            }
+                        },
+                    }),
+                    (false, None) => None,
+                };
+                let signal = dot_agent_deck::event::DispatchSignal {
+                    pane_id,
+                    name,
+                    task: Some(task_text),
+                    shape,
+                    timestamp: chrono::Utc::now(),
+                };
+                let msg = dot_agent_deck::event::DaemonMessage::Dispatch(signal);
+                let json = match serde_json::to_string(&msg) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!("Failed to serialize dispatch signal: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if dot_agent_deck::hook::send_to_socket(&json).is_none() {
+                    eprintln!("Failed to send dispatch signal to daemon socket.");
                     return ExitCode::FAILURE;
                 }
-            };
-            // clap's `conflicts_with` already rejects both flags together. A bare
-            // `--orchestration` arrives as `Some("")` via `default_missing_value`
-            // and means "this repo's first".
-            let shape = match (single, orchestration) {
-                (true, _) => Some(dot_agent_deck::event::DispatchShape::SingleAgent),
-                (false, Some(n)) => Some(dot_agent_deck::event::DispatchShape::Orchestration {
-                    name: if n.trim().is_empty() { None } else { Some(n) },
-                }),
-                (false, None) => None,
-            };
-            let signal = dot_agent_deck::event::DispatchSignal {
-                pane_id,
-                name,
-                task: Some(task_text),
-                shape,
-                timestamp: chrono::Utc::now(),
-            };
-            let msg = dot_agent_deck::event::DaemonMessage::Dispatch(signal);
-            let json = match serde_json::to_string(&msg) {
-                Ok(j) => j,
-                Err(e) => {
-                    eprintln!("Failed to serialize dispatch signal: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
-                eprintln!("Failed to send dispatch signal to daemon socket.");
-                return ExitCode::FAILURE;
+                ExitCode::SUCCESS
             }
-            ExitCode::SUCCESS
         }
         Some(Commands::WorkDone {
             task,
@@ -1832,38 +1890,76 @@ mod tests {
         }
     }
 
-    /// `--orchestration` takes an OPTIONAL value (`num_args = 0..=1`), which is the
-    /// risky shape: a greedy parse would swallow the following FLAG as the
-    /// orchestration name, silently starting a different shape than the user chose.
-    /// clap does not consume a `-`-prefixed token as a value, and this pins it —
-    /// a later `allow_hyphen_values` would otherwise break it invisibly.
+    /// `--orchestration` REQUIRES its value, so it can never consume the unit name.
+    ///
+    /// With `num_args = 0..=1` clap consumed the next bare token, so
+    /// `dispatch --orchestration my-unit --task "…"` bound the UNIT NAME as the
+    /// orchestration and aborted for a missing positional. A required value makes
+    /// both orderings unambiguous.
     #[test]
-    fn dispatch_bare_orchestration_does_not_swallow_the_next_flag() {
-        let (name, task, single, orch, _) =
-            parse_dispatch(&["unit", "--orchestration", "--task", "hello"]);
-        assert_eq!(name.as_deref(), Some("unit"));
-        assert_eq!(
-            task.as_deref(),
-            Some("hello"),
-            "--task must survive: a greedy --orchestration would have eaten it"
-        );
-        assert!(!single);
-        assert_eq!(
-            orch.as_deref(),
-            Some(""),
-            "a bare --orchestration is the empty default_missing_value, meaning \
-             'this repo's first'"
+    fn orchestration_value_is_required_so_it_cannot_eat_the_unit_name() {
+        // Flag-first with a name still binds correctly: `probe` is the VALUE, and
+        // the missing positional is a real error rather than a silent mis-bind.
+        assert!(
+            Cli::try_parse_from([
+                "dot-agent-deck",
+                "dispatch",
+                "--orchestration",
+                "probe",
+                "--task",
+                "t",
+            ])
+            .is_err(),
+            "no positional NAME was supplied, so this must be rejected outright"
         );
 
-        // Trailing bare flag: same outcome, different position.
-        let (_, task, _, orch, _) = parse_dispatch(&["unit", "--task", "hello", "--orchestration"]);
-        assert_eq!(task.as_deref(), Some("hello"));
+        // A bare `--orchestration` with nothing after it is now an error, not a
+        // silent \"this repo\'s first\".
+        assert!(
+            Cli::try_parse_from(["dot-agent-deck", "dispatch", "unit", "--orchestration"]).is_err(),
+            "--orchestration now requires a value"
+        );
+
+        // The explicit empty value is how \"this repo\'s first\" is requested.
+        let (name, _, _, orch, _) = parse_dispatch(&["unit", "--orchestration="]);
+        assert_eq!(name.as_deref(), Some("unit"));
         assert_eq!(orch.as_deref(), Some(""));
+
+        // And --task is never swallowed.
+        let (name, task, _, orch, _) =
+            parse_dispatch(&["unit", "--orchestration=review", "--task", "hello"]);
+        assert_eq!(name.as_deref(), Some("unit"));
+        assert_eq!(task.as_deref(), Some("hello"));
+        assert_eq!(orch.as_deref(), Some("review"));
+    }
+
+    /// `--list-targets` cannot be combined with dispatch arguments. Combined, the
+    /// early branch printed the listing and exited 0 WITHOUT dispatching, so an
+    /// agent that merged the seed\'s two usage lines reported a unit as started
+    /// that never existed.
+    #[test]
+    fn list_targets_conflicts_with_every_dispatch_argument() {
+        for extra in [
+            vec!["unit"],
+            vec!["unit", "--task", "t"],
+            vec!["--single"],
+            vec!["--orchestration=review"],
+        ] {
+            let mut argv = vec!["dot-agent-deck", "dispatch", "--list-targets"];
+            argv.extend(extra.iter().copied());
+            assert!(
+                Cli::try_parse_from(argv.clone()).is_err(),
+                "--list-targets must conflict with {extra:?}"
+            );
+        }
+        // Alone, it parses and needs no name.
+        let (name, _, _, _, list) = parse_dispatch(&["--list-targets"]);
+        assert!(name.is_none() && list);
     }
 
     #[test]
     fn dispatch_named_orchestration_and_single_parse_as_expected() {
-        let (_, _, single, orch, _) = parse_dispatch(&["unit", "--orchestration", "review"]);
+        let (_, _, single, orch, _) = parse_dispatch(&["unit", "--orchestration=review"]);
         assert!(!single);
         assert_eq!(orch.as_deref(), Some("review"));
 
@@ -1882,8 +1978,7 @@ mod tests {
                 "dispatch",
                 "unit",
                 "--single",
-                "--orchestration",
-                "review",
+                "--orchestration=review",
             ])
             .is_err(),
             "--single and --orchestration must conflict"
@@ -1894,10 +1989,6 @@ mod tests {
     /// so a missing name can never be read as an empty dispatch name.
     #[test]
     fn dispatch_name_is_required_except_for_list_targets() {
-        let (name, _, _, _, list) = parse_dispatch(&["--list-targets"]);
-        assert!(name.is_none());
-        assert!(list);
-
         assert!(
             Cli::try_parse_from(["dot-agent-deck", "dispatch", "--task", "t"]).is_err(),
             "a dispatch with no name and no --list-targets must be rejected"

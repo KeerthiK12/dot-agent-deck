@@ -635,6 +635,18 @@ pub enum DaemonMessage {
     /// lifecycle (create, spawn, cleanup on tab close).
     #[serde(rename = "dispatch")]
     Dispatch(DispatchSignal),
+    /// PRD #220: read-only request for the spawn targets available to a pane's
+    /// repo. Like [`Self::GetSeed`], the daemon writes a
+    /// [`ListTargetsResponse`] JSON line back on the same connection; every other
+    /// message on this socket is fire-and-forget.
+    ///
+    /// Answered by the DAEMON rather than computed in the CLI so the menu comes
+    /// from the same cwd and the same config the dispatch will use — a listing
+    /// that can disagree with the spawn is worse than no listing. Additive on the
+    /// hook socket, so it does NOT move the attach `PROTOCOL_VERSION`; an older
+    /// daemon simply never replies, which the CLI degrades on.
+    #[serde(rename = "list_targets")]
+    ListTargets(ListTargetsRequest),
 }
 
 /// PRD #201: payload of [`DaemonMessage::GetSeed`] — the pane whose pending
@@ -654,6 +666,44 @@ pub struct GetSeedRequest {
 pub struct GetSeedResponse {
     #[serde(default)]
     pub seed: Option<String>,
+}
+
+/// PRD #220: payload of [`DaemonMessage::ListTargets`] — the pane whose repo's
+/// spawn targets the caller wants listed.
+///
+/// Pane-scoped rather than carrying a directory, deliberately: the daemon
+/// resolves the caller's cwd from the PTY registry's `AgentRecord.cwd`, which is
+/// the SAME source `dispatch` itself uses. An earlier cut read the CLI process's
+/// own `current_dir()` locally, which diverged from the dispatch whenever the
+/// agent had `cd`'d — the listing then advertised targets the dispatch could not
+/// start, or reported none where the repo defined them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListTargetsRequest {
+    pub pane_id: String,
+}
+
+/// PRD #220: the daemon's reply to a [`DaemonMessage::ListTargets`], one JSON
+/// line back on the hook-socket connection (the [`GetSeedResponse`] pattern).
+///
+/// `rendered` is the human-readable listing the dispatcher agent relays to the
+/// user; `orchestrations` carries the same data structurally so a caller can act
+/// on it without parsing prose. `error` is set when the repo's
+/// `.dot-agent-deck.toml` exists but could not be parsed — distinguishing "no
+/// orchestrations" from "your config is broken", which a bare empty list cannot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListTargetsResponse {
+    pub rendered: String,
+    #[serde(default)]
+    pub orchestrations: Vec<ListedOrchestration>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// One spawnable orchestration in a [`ListTargetsResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedOrchestration {
+    pub name: String,
+    pub roles: usize,
 }
 
 /// Signal sent by the orchestrator via `dot-agent-deck delegate`.

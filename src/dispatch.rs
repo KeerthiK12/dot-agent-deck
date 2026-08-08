@@ -13,14 +13,17 @@ use crate::spawn::{SpawnKind, SpawnRequest, SpawnShapeOverride, spawn};
 /// PRD #220: the orchestrations a dispatch out of `dir` could start, by resolved
 /// name. Empty means only a single agent is available.
 ///
-/// Deliberately a LOCAL config read rather than a daemon round-trip: the
-/// dispatched worktree is a copy of this repo, so this repo's
-/// `.dot-agent-deck.toml` is the same config the spawn will branch on. Keeping it
-/// local means `--list-targets` adds no hook-socket message and no protocol
-/// surface at all.
+/// `dir` must be the CALLER's repo dir — the same directory `handle_dispatch`
+/// resolves its target from. An earlier cut computed this in the CLI process from
+/// its own `current_dir()` and let the spawn resolve names against the WORKTREE
+/// dir instead; because `load_project_config` normalises an unnamed orchestration
+/// to its directory basename, the same entry was then `myrepo` in the listing and
+/// `myrepo-dispatch-<slug>` at spawn time — a name the listing offered and the
+/// spawn could never match. The listing is now answered by the daemon
+/// ([`list_targets_response`]) precisely so both sides share one basis.
 ///
-/// Roleless `[[orchestrations]]` are filtered out because [`crate::spawn::decide_target`]
-/// skips them too — listing one would offer a target that cannot be spawned.
+/// Roleless `[[orchestrations]]` are filtered out because the spawn skips them
+/// too — listing one would offer a target that cannot be spawned.
 pub fn available_orchestrations(
     config: Option<&crate::project_config::ProjectConfig>,
     dir: &Path,
@@ -58,14 +61,99 @@ pub fn render_available_targets(orchestrations: &[(String, usize)]) -> String {
         return out;
     }
     for (name, roles) in orchestrations {
+        // The name is SINGLE-QUOTED in the suggested command, not bare: an
+        // orchestration named `code review` produced `--orchestration code review`,
+        // which clap reads as the name `code` plus a stray positional and rejects
+        // outright — leaving no way to pick the target just offered.
         out.push_str(&format!(
-            "  orchestration     '{name}' — {roles} roles (--orchestration {name})\n"
+            "  orchestration     '{name}' — {roles} roles (--orchestration '{name}')\n"
         ));
     }
     out.push_str(
         "\nAsk the user which they want before dispatching, then pass the matching flag.\n",
     );
     out
+}
+
+/// Build the daemon's reply to a `--list-targets` request for `cwd`.
+///
+/// Four states the caller must be able to tell apart, none of which an empty list
+/// alone can express:
+///
+/// * pane cwd UNKNOWN (no matching agent record) → say so. Rendering this as "no
+///   orchestrations are defined here" would be a claim about a repo we never
+///   looked at, and the agent would relay it as fact;
+/// * no config file → only `single` is available, which is the truth;
+/// * config present but UNPARSEABLE → `error` is set and named, because
+///   `load_config_for_dir` swallows the parse error and a silent "no orchestrations
+///   here" would walk the user past a broken config without ever learning it is
+///   broken;
+/// * config parsed → every role-bearing orchestration, under the name the spawn
+///   will resolve it to.
+pub fn list_targets_response(cwd: Option<&Path>) -> crate::event::ListTargetsResponse {
+    use crate::event::{ListTargetsResponse, ListedOrchestration};
+    let Some(dir) = cwd else {
+        let msg = "could not determine this pane's working directory".to_string();
+        return ListTargetsResponse {
+            rendered: "Could not determine this pane's working directory, so the available \
+                       orchestrations are unknown. This is NOT the same as the repo having \
+                       none — do not report it that way. Dispatch `--single` to start one \
+                       agent, or `--orchestration <name>` if you know the name.\n"
+                .to_string(),
+            orchestrations: Vec::new(),
+            error: Some(msg),
+        };
+    };
+    match crate::project_config::load_project_config(dir) {
+        Ok(config) => {
+            let found = available_orchestrations(config.as_ref(), dir);
+            ListTargetsResponse {
+                rendered: render_available_targets(&found),
+                orchestrations: found
+                    .into_iter()
+                    .map(|(name, roles)| ListedOrchestration { name, roles })
+                    .collect(),
+                error: None,
+            }
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            ListTargetsResponse {
+                rendered: format!(
+                    "Could not read this repo's .dot-agent-deck.toml, so the available \
+                     orchestrations are unknown:\n  {msg}\n\nFix the config, or dispatch \
+                     `--single` (which needs no config).\n"
+                ),
+                orchestrations: Vec::new(),
+                error: Some(msg),
+            }
+        }
+    }
+}
+
+/// The command a single-agent dispatch runs.
+///
+/// `SpawnRequest.command: None` means `$SHELL` in the spawn path, so passing None
+/// here starts a **shell**, not an agent: the worktree appears, a pane appears,
+/// and the `--task` prompt is typed into a bash prompt. Before the shape selector
+/// this repo never took the single-agent branch (role commands win for an
+/// orchestration), which is why it went unnoticed — but any repo with no
+/// `[[orchestrations]]` already hit it.
+///
+/// So resolve a real agent command: the deck's configured `default_command` when
+/// set, else the Claude default, mirroring what the interactive new-pane form does
+/// for a blank Command field (`resolve_authoring_command`). "Single agent" has to
+/// mean an agent.
+pub fn resolve_single_agent_command(configured: Option<&str>) -> String {
+    let trimmed = configured.unwrap_or_default().trim();
+    if trimmed.is_empty() {
+        crate::agent_registry::CLAUDE_CODE
+            .default_command
+            .unwrap_or("claude")
+            .to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -135,6 +223,12 @@ pub struct DispatchContext {
     /// [`WorktreeRegistry`] alias rather than spelling the map out, so the entry
     /// type cannot drift away from the registry it has to interoperate with.
     pub worktrees: WorktreeRegistry,
+    /// The deck's configured `default_command`, resolved by the caller (mirroring
+    /// the issue-dispatch precedent in `daemon.rs`). Used ONLY when the dispatch
+    /// starts a single agent — an orchestration's role commands win. Passed in
+    /// rather than read here so [`handle_dispatch`] does not depend on global
+    /// config. See [`resolve_single_agent_command`].
+    pub default_command: Option<String>,
 }
 
 /// Translate the wire choice into the spawn-side override.
@@ -160,6 +254,34 @@ pub async fn handle_dispatch(
 ) -> DispatchResult {
     let paths = derive_dispatch_paths(&ctx.working_dir, name);
     let clone_dir = ctx.working_dir.clone();
+
+    // Resolve the shape from the CALLER's repo config, BEFORE any git work.
+    //
+    // Caller-side because that is the config the user chose from: the worktree is a
+    // HEAD checkout (uncommitted config invisible) and `load_project_config`
+    // normalises an unnamed orchestration to its directory basename, so the same
+    // entry is `myrepo` here and `myrepo-dispatch-<slug>` there.
+    //
+    // Before the worktree because a rejected shape must not leave debris: validating
+    // inside `spawn` meant a typo'd `--orchestration` created a worktree and branch,
+    // rolled them back, and reported "failed to spawn agent" for what is a plain
+    // validation error.
+    let single_command = resolve_single_agent_command(ctx.default_command.as_deref());
+    let resolved_target = match crate::spawn::decide_target_with_override(
+        crate::spawn::load_config_for_dir(&clone_dir).as_ref(),
+        &clone_dir,
+        Some(single_command.as_str()),
+        shape_override_of(shape).as_ref(),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return DispatchResult {
+                worktree_dir: paths.worktree_dir.clone(),
+                success: false,
+                message: format!("dispatch: {e}"),
+            };
+        }
+    };
 
     match create_worktree(&clone_dir, &paths.worktree_dir, &paths.branch, false).await {
         Ok(WorktreeCreation::Created) => {}
@@ -218,9 +340,11 @@ pub async fn handle_dispatch(
     let req = SpawnRequest {
         task_name: format!("dispatch-{name}"),
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
-        command: None,
+        // A real agent command, never `None` — see `resolve_single_agent_command`.
+        // Ignored when the dispatch starts an orchestration (role commands win).
+        command: Some(single_command),
         prompt,
-        shape_override: shape_override_of(shape),
+        resolved_target: Some(resolved_target),
     };
 
     let notifier = StderrNotifier;
@@ -529,8 +653,11 @@ mod tests {
 
         let rendered = render_available_targets(&found);
         assert!(rendered.contains("--single"), "single is always offered");
-        assert!(rendered.contains("--orchestration digest"));
-        assert!(rendered.contains("--orchestration review"));
+        assert!(
+            rendered.contains("--orchestration 'digest'"),
+            "the name must be single-quoted so a name with spaces still parses:\n{rendered}"
+        );
+        assert!(rendered.contains("--orchestration 'review'"));
         assert!(
             !rendered.contains("schedule") && !rendered.contains("dev"),
             "modes and schedule authoring are not dispatch targets:\n{rendered}"
@@ -558,6 +685,242 @@ mod tests {
         assert!(
             rendered.contains("No orchestrations are defined"),
             "the empty case must state the situation:\n{rendered}"
+        );
+    }
+
+    /// A single-agent dispatch must run an AGENT, never `$SHELL`.
+    ///
+    /// `SpawnRequest.command: None` means `$SHELL` in the spawn path, so the
+    /// original `None` started a shell and typed the `--task` prompt into a bash
+    /// prompt. Reported from real use once `--single` made that branch reachable in
+    /// a repo that defines `[[orchestrations]]`; it was already reachable in any
+    /// repo without them.
+    #[test]
+    fn single_agent_dispatch_resolves_an_agent_command_never_a_shell() {
+        // Configured command wins, whitespace-trimmed.
+        assert_eq!(resolve_single_agent_command(Some("opencode")), "opencode");
+        assert_eq!(resolve_single_agent_command(Some("  claude  ")), "claude");
+
+        // Unset / blank falls back to a real agent, NOT an empty string (which the
+        // spawn path would read as `$SHELL`).
+        for blank in [None, Some(""), Some("   ")] {
+            let resolved = resolve_single_agent_command(blank);
+            assert!(
+                !resolved.trim().is_empty(),
+                "a blank default_command must still resolve to an agent, got {resolved:?}"
+            );
+            assert_eq!(
+                resolved,
+                crate::agent_registry::CLAUDE_CODE
+                    .default_command
+                    .unwrap_or("claude"),
+                "the fallback must match what the new-pane form uses for a blank Command"
+            );
+        }
+    }
+
+    /// The listing must distinguish "unknown pane", "broken config" and "genuinely
+    /// none". Collapsing any of them into the empty listing makes the agent report a
+    /// claim about a repo nobody looked at — the same dishonesty as reading a parse
+    /// error as "no orchestrations".
+    #[test]
+    fn list_targets_distinguishes_unknown_pane_broken_config_and_genuinely_none() {
+        // Unknown pane: explicit, and NOT phrased as "no orchestrations".
+        let unknown = list_targets_response(None);
+        assert!(
+            unknown.error.is_some(),
+            "unknown cwd must be an error state"
+        );
+        assert!(unknown.orchestrations.is_empty());
+        assert!(
+            !unknown
+                .rendered
+                .contains("No orchestrations are defined here"),
+            "must not claim the repo has none:\n{}",
+            unknown.rendered
+        );
+
+        // Genuinely none: no config file at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let none = list_targets_response(Some(tmp.path()));
+        assert!(none.error.is_none(), "an absent config is not an error");
+        assert!(none.rendered.contains("No orchestrations are defined here"));
+
+        // Broken config: named, and flagged as an error.
+        let bad = tempfile::tempdir().unwrap();
+        std::fs::write(
+            bad.path().join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"unterminated\n",
+        )
+        .unwrap();
+        let broken = list_targets_response(Some(bad.path()));
+        assert!(
+            broken.error.is_some(),
+            "an unparseable config must not read as 'no orchestrations':\n{}",
+            broken.rendered
+        );
+        assert!(broken.rendered.contains(".dot-agent-deck.toml"));
+
+        // Present and parseable: listed structurally as well as rendered.
+        let good = tempfile::tempdir().unwrap();
+        std::fs::write(
+            good.path().join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"digest\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"sh\"\n",
+        )
+        .unwrap();
+        let ok = list_targets_response(Some(good.path()));
+        assert!(ok.error.is_none());
+        assert_eq!(ok.orchestrations.len(), 1);
+        assert_eq!(ok.orchestrations[0].name, "digest");
+        assert_eq!(ok.orchestrations[0].roles, 2);
+    }
+
+    /// An ORCHESTRATION dispatch must start the team WITH its delegation protocol.
+    ///
+    /// This is the defect reported from real use: the orchestration came up, its
+    /// orchestrator received the task, and every worker sat idle — because the daemon
+    /// spawn path never composed the orchestrator context that the interactive
+    /// `Ctrl+n` path writes, so the orchestrator was never told it was one or how to
+    /// `delegate`. Asserted on the CONTEXT FILE in the dispatched worktree, which is
+    /// the artefact that was missing entirely.
+    ///
+    /// Roles run `cat` (alive on stdin, no LLM tokens), mirroring the `orch-deck`
+    /// fixture.
+    // Gated to the e2e tier: this spawns REAL PTYs and awaits the prompt-delivery
+    // readiness gate, so it costs ~30s — too slow for the per-task fast gate, and
+    // not a unit test by any honest reading.
+    #[cfg(feature = "e2e")]
+    #[tokio::test]
+    async fn an_orchestration_dispatch_writes_the_delegation_protocol_and_the_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(
+            repo.join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"demo-orch\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"cat\"\ndescription = \"Does the work\"\n",
+        )
+        .unwrap();
+        // The config must be COMMITTED: the shape is resolved from the caller's repo,
+        // but the worktree the roles run in is a HEAD checkout.
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git available");
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "add orchestration"]);
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+        };
+
+        let result = handle_dispatch(
+            &ctx,
+            "team-unit",
+            "Verify PR #232 and report back.",
+            Some(&crate::event::DispatchShape::Orchestration { name: None }),
+        )
+        .await;
+
+        let worktree = result.worktree_dir.clone();
+        // Reclaim the sibling worktree regardless of the assertions below.
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(worktree.clone());
+
+        assert!(
+            result.success,
+            "the orchestration dispatch should succeed, got: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("orchestration"),
+            "the reported shape must say orchestration, got: {}",
+            result.message
+        );
+
+        let context = worktree.join(".dot-agent-deck/orchestrator-context.md");
+        let content = std::fs::read_to_string(&context).unwrap_or_else(|e| {
+            panic!(
+                "the dispatched orchestration must get an orchestrator-context.md at {} \
+                 (its absence is exactly why workers sat idle): {e}",
+                context.display()
+            )
+        });
+        assert!(
+            content.contains("Delegation protocol"),
+            "the orchestrator must be told HOW to delegate:\n{content}"
+        );
+        assert!(
+            content.contains("worker") && content.contains("Does the work"),
+            "the orchestrator must be told WHICH agents exist:\n{content}"
+        );
+        assert!(
+            content.contains("## Your task") && content.contains("Verify PR #232"),
+            "the caller's task must ride inside the context file:\n{content}"
+        );
+    }
+
+    /// A shape the repo cannot satisfy must be refused BEFORE any git work, so a
+    /// typo leaves no worktree or branch behind and is not reported as a spawn
+    /// failure.
+    #[tokio::test]
+    async fn an_unknown_orchestration_name_is_refused_without_creating_a_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+        };
+        let result = handle_dispatch(
+            &ctx,
+            "typo-unit",
+            "task",
+            Some(&crate::event::DispatchShape::Orchestration {
+                name: Some("revew".into()),
+            }),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(
+            result.message.contains("revew"),
+            "the message must name the requested target: {}",
+            result.message
+        );
+        assert!(
+            !result.message.contains("spawn failed"),
+            "a validation error must not masquerade as a spawn failure: {}",
+            result.message
+        );
+        assert!(
+            !result.worktree_dir.exists(),
+            "no worktree may be created for a shape that was refused"
+        );
+        assert!(
+            !branch_exists(&repo, "agent/dispatch-typo-unit"),
+            "no branch may be left behind either"
         );
     }
 
