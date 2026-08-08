@@ -1139,6 +1139,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** PTY resizing of the reclaimed area (`resize_panes_to_layout`); the L1 geometry math (covered by `orchestration/layout/002`); a real LLM agent (all three roles are shell stand-ins); dashboard-tab (non-orchestration) collapsed frames.
 - **Platform coverage:** mac+linux.
 
+##### tabs/orchestration/007 — In command mode `Ctrl+l` toggles an orchestration tab's sidebar/pane-column split between the default 34/66 and a narrower-sidebar 25/75 and back, while in PaneInput the same chord does nothing to the split (PRD #336).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness, `tests/e2e_orchestration_pane_column.rs`).
+- **Agent:** none (`orch-deck` fixture — two stub `cat` roles, no LLM tokens spent).
+- **Asserts:** opening a real orchestration tab on a 120-column PTY renders the role-pane column's left edge at the default 34%-width boundary (col 40/41); `Ctrl+l` pressed while still in PaneInput does NOT move it (the chord belongs to the role pane's agent there); after `Ctrl+d` to command mode, `Ctrl+l` moves the boundary to the narrower-sidebar 25%-width position (col 29/30) and a second press restores 34%. The boundary is read from the `orchestrator` role-pane box's top-left corner (exactly `panes_area.x`), matching any corner glyph — PRD #341 renders the focused pane's border heavier in command mode, so pinning one glyph would break on the mode switch.
+- **Does not assert:** the global scope of the toggle across multiple open orchestration tabs (covered by `orchestration/layout/004`); persistence of the toggled state across restart (out of scope per PRD #336); remapping the chord via config.
+- **Platform coverage:** mac+linux.
+
+##### tabs/orchestration/008 — `Ctrl+l` still forwards to a live pane's PTY when the active tab is NOT an orchestration tab (PRD #336 scope guard).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness, `tests/e2e_orchestration_pane_column.rs`).
+- **Agent:** none (a `cat -v` pane on the Dashboard, no LLM tokens spent).
+- **Asserts:** on a Dashboard (non-orchestration) tab with a live `cat -v` pane in PaneInput mode, typing a unique sentinel then pressing `Ctrl+l` then Enter makes the pane echo `<sentinel>^L` — `cat -v` renders the received `0x0c` as the two characters `^L`, so the echo appears only if the raw byte actually reached the PTY. Pins the PRD #336 scope rule that `Action::ToggleOrchestrationSplit` claims `Ctrl+l` only on an orchestration tab; regression coverage for the Greptile P1 on PR #342, where the global resolver claimed it unconditionally and swallowed the key on every other tab.
+- **Does not assert:** the orchestration-tab toggle behavior itself (covered by `tabs/orchestration/007`); Mode-tab or other non-Dashboard tab types (Dashboard is sufficient to prove the missing tab-context check). Deliberately does NOT rely on a shell's readline `clear-screen` side effect, which depends on the host terminal setup and made an earlier version of this test fail where forwarding was in fact correct.
+- **Platform coverage:** mac+linux.
+
 ##### tabs/orchestration/009 — An orchestration tab's tab-bar label renders in the color of the single highest-priority state among its panes (PRD #333).
 - **Layer:** L1 (in-process `TestBackend` render via `render_tab_bar_to_buffer`, `tests/render_tab_strip.rs`).
 - **Agent:** none (synthetic `SessionStatus` values, no panes/PTYs).
@@ -1545,6 +1559,24 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** after SIGKILLing the intermediate parent, the daemon process terminates within a few seconds, even though idle shutdown is disabled so only the orphan watchdog can end it.
 - **Does not assert:** the max-lifetime backstop (`DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, covered by the daemon pure-data unit tests) or production daemons (the watchdog is OFF unless the env var is set).
 - **Platform coverage:** mac+linux.
+
+#### lifecycle/sigterm
+
+##### lifecycle/sigterm/001 — A daemon sent SIGTERM (what `daemon stop` / `daemon restart` deliver) exits through its graceful shutdown path AND logs the signal, instead of dying silently under the default disposition.
+- **Layer:** L2.
+- **Agent:** none (a bare `daemon serve` with idle shutdown disabled, so only the signal handler can end it).
+- **Asserts:** after a plain `kill(pid, SIGTERM)` the daemon process terminates within a few seconds, and its `DOT_AGENT_DECK_LOG` file contains a termination line naming `SIGTERM`.
+- **Does not assert:** agent teardown ordering under signal shutdown, or `SIGINT` (the handler treats both identically and the CLI only ever sends `SIGTERM`); `--force`'s SIGKILL escalation stays with `lifecycle/stop/003`.
+- **Regression origin:** the daemon installed no signal handler at all, so a stopped daemon left no log line — a real session lost seven live agent panes and the daemon's own log said nothing about why.
+- **Platform coverage:** linux+mac (Unix signals; the Windows build watches Ctrl-C instead).
+
+##### lifecycle/sigterm/002 — A second SIGTERM during shutdown forces an immediate exit instead of being swallowed, so a wedged daemon is still killable with `pkill`.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** after the daemon logs the first termination signal, a second SIGTERM leaves the process gone within a few seconds.
+- **Does not assert:** the exact exit status (`143`), since a shutdown fast enough to finish before the second signal exits `0` and both outcomes satisfy "the daemon does not linger".
+- **Regression origin:** installing a handler replaces the default disposition process-wide, so once the first signal is consumed every later SIGTERM would be absorbed by a stream nobody reads — removing the `pkill` escape hatch that the pre-handler behaviour always provided.
+- **Platform coverage:** linux+mac (Unix signals).
 
 #### lifecycle/version
 
@@ -2068,6 +2100,34 @@ without depending on the config struct API.
 - **Agent:** none (7 synthetic role pane ids, no backing PTYs).
 - **Asserts:** with no pane explicitly focused (so `stacked_expanded_index` falls back to the first role, `orchestrator`), the expanded role's OUTER rect height equals the full pane-column height with no rows ceded to collapsed frames; none of the other 6 roles' pane ids appear anywhere in the rendered grid (i.e. no `Borders::TOP` collapsed title block is drawn for a non-focused pane).
 - **Does not assert:** PTY resizing of the reclaimed area (`resize_panes_to_layout`); mode-tab side-pane geometry (covered by `tabs/mode/001`); the sidebar deck-card capacity math (covered by `orchestration/layout/001`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/003 — `Ctrl+l` resolves to `Action::ToggleOrchestrationSplit`, and an orchestration tab's frame geometry is the default 34/66 split untoggled and the narrower-sidebar 25/75 split toggled (PRD #336).
+- **Layer:** L1 (pure-data `compute_frame_layout` geometry + `key_action_for_mode`, the public L1 seam over the same mode-aware resolver chain the event loop runs; no PTY, no TestBackend render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `compute_frame_layout` and `ActiveTabView` are module-private. Note the resolver is deliberately tab-agnostic — the orchestration-tab scoping is a separate step, covered by `orchestration/layout/005`.
+- **Agent:** none.
+- **Asserts:** resolving a simulated `Ctrl+l` `KeyEvent` through `key_action_for_mode` with the default keybinding config yields `Action::ToggleOrchestrationSplit` specifically (not merely "some action"); an untoggled orchestration tab's `dashboard_area`/`panes_area` widths are 34/66; a toggled one's are 25/75. The split travels on `ActiveTabView::Orchestration::split_narrow`, so the test sets it directly on the render snapshot with no shared state to seed or reset.
+- **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/orchestration/007`); the real dispatch and its global scope across tabs (covered by `orchestration/layout/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/004 — The orchestration split is GLOBAL: toggling one orchestration tab changes every other one too, including a tab opened later, which adopts the current global split instead of the 34/66 default (PRD #336).
+- **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
+- **Agent:** none (two `cat`-role orchestration tabs opened through `TabManager::open_orchestration_tab`).
+- **Asserts:** dispatching `Action::ToggleOrchestrationSplit` on the Dashboard tab is a no-op (it cannot mutate unrelated tab state); opening tab A alone starts at the default (`split_narrow == false`) and toggling it flips the flag to `true`; opening tab B AFTER that toggle shows B starting already narrow, not reset to the default; toggling from B (now active) flips BOTH tabs back to `false`; switching back to A and toggling again flips both to `true`. This is PRD #336's revised "toggling one tab changes all of them, and a new tab adopts the live global value" criterion, asserted on the real field.
+- **Does not assert:** the resulting rendered geometry (covered by `orchestration/layout/003`); spawn-time PTY dims (covered by `orchestration/layout/006`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/005 — `scope_orchestration_split` claims the split toggle only on an orchestration tab in command mode, un-resolving it everywhere else so `Ctrl+l` reaches the pane's PTY, and passes every other action through untouched (PRD #336).
+- **Layer:** L1 (pure function, no PTY, no render).
+- **Agent:** none.
+- **Asserts:** `Some(ToggleOrchestrationSplit)` survives only for (orchestration tab, `UiMode::Normal`); it becomes `None` off an orchestration tab in any mode, and on an orchestration tab in `PaneInput`/`Filter`/`Help`/`NewPaneForm` (so the key falls through to the `PaneInput` forwarding path). The mode half mirrors `close_pane` (PRD #241 M1), which is command-mode only so `Ctrl+w` still reaches the PTY as word-delete. `ToggleLayout`, `DetachToNormal` and `None` pass through unchanged for every tab/mode pair, proving the guard is surgical rather than a general-purpose filter.
+- **Does not assert:** that the event loop actually calls it (covered end-to-end by `tabs/orchestration/008`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/006 — A role pane spawned while the GLOBAL orchestration split is already narrow gets its PTY sized at the 75%-width column, not the 66%-width default (PRD #336, PR #342).
+- **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController` extended to record each spawn's `(rows, cols)`; no PTY, no TestBackend render).
+- **Agent:** none (two 2-role `cat` orchestration tabs opened through the real `Action::SpawnPane` dispatch path).
+- **Asserts:** open tab A through `Action::SpawnPane` at the default split; toggle the GLOBAL split narrow via `Action::ToggleOrchestrationSplit` dispatched from tab A (the only way a real user reaches the narrow state, since the toggle only resolves on an active orchestration tab); then open tab B, also through `Action::SpawnPane`, while the global is already narrow. Every role pane spawned for tab B must be recorded with `cols == 73` (the 75%-width inner column on a 100-wide frame), not `64` (the 66%-width default) — the `dispatch_action` new-tab-open branch must read `tab_manager.orchestration_split_narrow()` rather than a hardcoded `false` when computing `spawn_dims`. This is the spawn-time-dims gap `orchestration/layout/004` explicitly left uncovered. Verified with teeth: reverting the seed to a hardcoded `false` at the call site reproduces the pre-fix bug and fails this test with `left: 64, right: 73`.
+- **Does not assert:** the restore/hydrate call site in `run_tui`'s `apply_snapshot` branch, which reads the same `tab_manager.orchestration_split_narrow()` at its own spawn-dims call — not reachable at L1 (embedded in `run_tui`, which needs a real `Terminal` and a disk-loaded `SavedSession`, with no factored-out testable seam) and, per the current call graph, not distinguishable at ANY layer today: that branch runs exactly once, before the event loop starts, when `TabManager`'s global is still at its just-constructed default (`false`) — so `tab_manager.orchestration_split_narrow()` and the old hardcoded `false` currently always agree there, and no test could show them diverging without also changing when restore can run.
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/route

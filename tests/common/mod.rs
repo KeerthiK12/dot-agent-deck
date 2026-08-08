@@ -52,6 +52,23 @@ pub const QUIESCENT_IDLE_MS: u64 = 50;
 /// budget — quiescence and string-signal waits are bounded internally.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Max-lifetime cap for tests that spawn `dot-agent-deck wrap` DIRECTLY (rather
+/// than through [`TuiDeck`] / `DaemonProc`, which inject their own cap), so a
+/// wrapper orphaned by a SIGKILLed / timed-out / panicking test self-exits
+/// instead of leaking to PID 1 forever.
+///
+/// This is not hypothetical: three `wrap --agent codex` stubs from this file's
+/// own probes were found alive for **three days**, from a worktree that had
+/// already been deleted — two of them spinning a shell `sleep 0.01` loop at
+/// ~100 wakeups/second, and one holding `trap '' TERM` so no SIGTERM could
+/// reach it. The wrapper honours the cap as of the same change that added this
+/// constant; before that the env var was read only by `daemon serve`.
+///
+/// Deliberately generous (120 s) relative to these sub-10 s probes: it is a
+/// leak backstop, not a test timeout, so it must never be the thing that ends a
+/// legitimately slow run.
+pub const WRAP_TEST_MAX_LIFETIME_SECS: &str = "120";
+
 /// Decision 20: pinned PTY dimensions for the deck. Resize tests
 /// override via `TuiDeck::resize`.
 const DEFAULT_COLS: u16 = 120;
@@ -4420,6 +4437,48 @@ pub fn wait_for_file_substr_count(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// A `/bin/sh` line that posts one synthetic Claude-Code hook event from inside
+/// a fixture agent script, through the REAL `dot-agent-deck hook` CLI.
+///
+/// Centralised because six fixture shims across five e2e files hand-rolled this
+/// line, and when the CLI moved the agent from a positional argument to
+/// `--agent` (PRD #30), five of them kept emitting the stale `hook claude-code`
+/// form. `clap` rejected it (exit 2), the `>/dev/null 2>&1` swallowed the error,
+/// and no readiness signal was ever emitted — so the agent-ready gate those
+/// tests exist to exercise silently fell through to the 10-second
+/// `process_pending_seed_prompts` timeout fallback instead (issue #343). They
+/// still passed, just ~10s slower and proving nothing about readiness.
+///
+/// The `|| exit` is what stops that recurring: `handle_hook` returns
+/// `ExitCode::SUCCESS` on EVERY path it reaches — bad JSON, unmapped event, even
+/// a failed socket send — so a nonzero exit can only mean `clap` refused the
+/// argument shape. That makes failing hard here deterministic rather than
+/// load-sensitive: a future CLI change kills the fixture agent loudly instead of
+/// quietly degrading its test into a passing-but-vacuous one.
+///
+/// `bin` is the ABSOLUTE path of the binary under test (`CARGO_BIN_EXE_…`),
+/// single-quoted here so a checkout under a path containing spaces — or a quote
+/// — still resolves the build under test rather than whatever `dot-agent-deck`
+/// a dev machine happens to have on `$PATH`.
+#[allow(dead_code)]
+pub fn claude_hook_line(bin: &str, payload_json: &str) -> String {
+    let quoted_bin = format!("'{}'", bin.replace('\'', r"'\''"));
+    format!(
+        "printf '%s' '{payload_json}' | {quoted_bin} hook --agent claude-code >/dev/null 2>&1 \
+         || {{ echo 'dot-agent-deck hook rejected the fixture payload' >&2; exit 97; }}\n"
+    )
+}
+
+/// [`claude_hook_line`] for the common case: the `SessionStart` event that acts
+/// as the agent-ready signal the spawn-time prompt gate waits on.
+#[allow(dead_code)]
+pub fn claude_session_start_line(bin: &str, session_id: &str) -> String {
+    claude_hook_line(
+        bin,
+        &format!(r#"{{"hook_event_name":"SessionStart","session_id":"{session_id}"}}"#),
+    )
 }
 
 /// The recorder line the deck's own Codex metadata probe produces.

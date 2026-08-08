@@ -73,6 +73,30 @@ const ORCH_NAME: &str = "route-iso";
 const SENTINEL_A: &str = "route_alpha_5f3c.txt";
 const SENTINEL_B: &str = "route_beta_9d21.txt";
 
+/// Appended to both delegated tasks to close the conversational half of the
+/// stall this test hit on a full-parallel e2e gate.
+///
+/// Tab B's reviewer explored its directory, read the orchestrator context and
+/// the OTHER role's task file, and replied "What would you like me to do?
+/// Should I 1. Act as the orchestrator and delegate the coder task 2. Wait for
+/// a reviewer task to be defined 3. Something else" instead of doing the work.
+/// The ROOT CAUSE was a product bug — `delegate` pointed the worker at a task
+/// file it had failed to write, so the worker genuinely had nothing to act on
+/// (fixed in `state::resolve_delegate_task_body`, which now inlines the body
+/// instead). This clause is belt-and-braces for the half that is a model
+/// choice, in the spirit of `bf517c4` for the pi worker.
+///
+/// It names the OBSERVED framings rather than forbidding questions in general:
+/// `bf517c4` recorded that a vague clause ("do not offer to perform any action")
+/// passed once and then failed with the same behaviour rephrased, so the wording
+/// has to reject the specific moves. The last sentence covers the empty-file
+/// case directly, so even a worker that somehow still reads an empty pointer
+/// target does the work rather than asking about it.
+const NO_STALL_CLAUSE: &str = " Do not ask what to do, offer numbered choices, \
+     or wait for a task to be defined - this message IS the task and you have \
+     everything you need. If a file you were pointed at looks empty or missing, \
+     create the file described above anyway instead of asking about it.";
+
 /// The single-line pointer `handle_delegate` writes into the TARGET worker's
 /// PTY. Role-qualified, so "did this pane receive tab A's delegate?" and "…tab
 /// B's?" are different needles.
@@ -390,7 +414,7 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
         "coder",
         &format!(
             "Create a file named {SENTINEL_A} in the current directory with the exact \
-             contents ALPHA_OK. That is the entire task - do nothing else."
+             contents ALPHA_OK. That is the entire task - do nothing else.{NO_STALL_CLAUSE}"
         ),
     );
     ask_orchestrator_to_delegate(
@@ -399,7 +423,7 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
         "reviewer",
         &format!(
             "Create a file named {SENTINEL_B} in the current directory with the exact \
-             contents BETA_OK. That is the entire task - do nothing else."
+             contents BETA_OK. That is the entire task - do nothing else.{NO_STALL_CLAUSE}"
         ),
     );
 
