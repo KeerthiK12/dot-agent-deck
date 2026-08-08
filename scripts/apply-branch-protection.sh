@@ -15,20 +15,24 @@ set -euo pipefail
 #      rejected with `GH006` under this ruleset unless the RELEASE_TOKEN secret
 #      is set to an admin PAT. Applying this without that secret breaks the very
 #      next release, exactly as it did for v0.35.6 (CLAUDE.md rule 8).
-#   2. REQUIRE_CODE_OWNER_REVIEW must stay `false` until a second maintainer is
-#      listed in .github/CODEOWNERS. A code owner cannot approve their own PR,
-#      so a single-owner CODEOWNERS blocks every PR that owner opens.
+#   2. REQUIRED_APPROVALS=1 needs a second maintainer to be useful. Nobody can
+#      approve their own pull request, so while there is one collaborator every
+#      pull request that person opens is unmergeable without a bypass. Onboard
+#      the second maintainer (MAINTAINERS.md) before applying with approvals=1,
+#      or apply with REQUIRED_APPROVALS=0 to require a PR but not a review.
 
 REPO="${REPO:-vfarcic/dot-agent-deck}"
 RULESET_NAME="main-protected"
 
 # Require an approving review before merge. Set to 0 to require a PR but no
 # approval (useful as a first step while there is only one maintainer).
+#
+# GitHub counts an approval only from an account with write or admin permission,
+# so "one approving review" already means "a maintainer approved" — the
+# collaborator list is the maintainer list (MAINTAINERS.md). That is also why
+# there is no CODEOWNERS file: code owners route review to different people for
+# different paths, and with one shared maintainer set there is nothing to route.
 REQUIRED_APPROVALS="${REQUIRED_APPROVALS:-1}"
-
-# Require review from a .github/CODEOWNERS owner. Keep `false` until CODEOWNERS
-# names two maintainers — see note 2 above.
-REQUIRE_CODE_OWNER_REVIEW="${REQUIRE_CODE_OWNER_REVIEW:-false}"
 
 # Repository-role bypass. Role id 5 is `admin`.
 #
@@ -42,7 +46,7 @@ REQUIRE_CODE_OWNER_REVIEW="${REQUIRE_CODE_OWNER_REVIEW:-false}"
 # part of the ruleset source or owner organization`).
 ADMIN_BYPASS_MODE="${ADMIN_BYPASS_MODE:-always}"
 
-usage() { sed -n '3,20p' "$0" >&2; exit 64; }
+usage() { sed -n '4,22p' "$0" >&2; exit 64; }
 
 existing_ruleset_id() {
   gh api "repos/$REPO/rulesets" \
@@ -68,7 +72,7 @@ payload() {
       "type": "pull_request",
       "parameters": {
         "required_approving_review_count": $REQUIRED_APPROVALS,
-        "require_code_owner_review": $REQUIRE_CODE_OWNER_REVIEW,
+        "require_code_owner_review": false,
         "dismiss_stale_reviews_on_push": true,
         "require_last_push_approval": false,
         "required_review_thread_resolution": true,

@@ -10,7 +10,15 @@ Two properties of that arrangement are worth stating plainly rather than discove
 
 **The admin bypass is what keeps releases alive, and it also softens the rule for the owner.** CI pushes two commits directly to `main`, so *something* has to be allowed past the gate. Granting the bypass to the `admin` repository role covers CI's PAT and, unavoidably, covers the owner's own hands at the same time. Enforcement against the owner is therefore a matter of habit, not of mechanism. The stricter arrangement — no admin bypass, with a GitHub App token as the sole bypass actor — is available and is described under [Making the gate bind the owner too](#making-the-gate-bind-the-owner-too).
 
-**A gate needs two maintainers before it means anything.** With a single maintainer, "requires one approving review" means every pull request that maintainer opens is blocked with nobody able to approve it, so every merge becomes a bypass and the rule decays into ceremony within a week. The rollout below is sequenced around that fact.
+**A gate needs two maintainers before it means anything.** Nobody can approve their own pull request. With a single collaborator, "requires one approving review" means every pull request that person opens is unmergeable without a bypass, so every merge becomes a bypass and the rule decays into ceremony within a week. The rollout below is sequenced around that fact.
+
+## Who counts as a maintainer
+
+GitHub counts an approving review only from an account with **write** or **admin** permission. The set of people who can satisfy "one approving review" is therefore exactly the collaborator list, which [`MAINTAINERS.md`](../../MAINTAINERS.md) documents so it is visible in the repository and not only in repository settings.
+
+There is deliberately **no `.github/CODEOWNERS`**. Code owners exist to route review to *different* people for *different* paths. With one shared maintainer set there is nothing to route: a path list would restate "a maintainer must approve", which the approval count already says, while adding a hardcoded set of source paths that goes stale silently every time a file is renamed or split. Stale code-owner paths do not error — they just stop gating, which is the worst failure mode a gate can have.
+
+A consequence worth accepting deliberately: the approval requirement is not path-scoped, so a documentation typo needs a review round trip exactly like a protocol change does. Rulesets condition on ref names rather than file paths, so there is no clean way to exempt `docs/` without giving up the gate. One review on a typo is the cheaper half of that trade.
 
 ## Why CI has to change first
 
@@ -35,13 +43,13 @@ Note that `GITHUB_TOKEN` **cannot** be named as a ruleset bypass actor on a user
 
 The order matters. Each step is safe to stop at.
 
-**1. Merge the plumbing.** The `token:` change, `.github/CODEOWNERS`, `scripts/apply-branch-protection.sh`, and this page. Nothing is enforced yet and nothing changes behaviour.
+**1. Merge the plumbing.** The `token:` change, `scripts/apply-branch-protection.sh`, `MAINTAINERS.md`, and this page. Nothing is enforced yet and nothing changes behaviour.
 
 **2. Create the PAT and set the secret.** A fine-grained PAT scoped to this repository with Contents: read and write, stored as `RELEASE_TOKEN`. Verify with `scripts/apply-branch-protection.sh status`, which reports whether the secret is visible.
 
 **3. Cut one release with the secret in place but no ruleset.** This proves the PAT path works while the safety net is still down. If the tag completes and the chart bump lands, the token is correct.
 
-**4. Onboard the second maintainer.** Grant `write` (or `maintain`) access, then add them to every line of `.github/CODEOWNERS`. Do not skip ahead to step 5 with one name in that file.
+**4. Onboard the second maintainer.** Grant `write` (or `maintain`) access and add them to `MAINTAINERS.md` in the same change. Do not skip ahead to step 5 while there is only one collaborator, or apply step 5 with `REQUIRED_APPROVALS=0`.
 
 **5. Apply the ruleset.**
 
@@ -49,15 +57,15 @@ The order matters. Each step is safe to stop at.
 scripts/apply-branch-protection.sh apply
 ```
 
-The script refuses to run if `RELEASE_TOKEN` is unset. It defaults to one approving review and to `require_code_owner_review: false`; flip the latter on with `REQUIRE_CODE_OWNER_REVIEW=true` once CODEOWNERS names two people.
+The script refuses to run if `RELEASE_TOKEN` is unset. It defaults to one approving review; `REQUIRED_APPROVALS=0` requires a pull request without requiring a review, which is the sensible setting if the gate goes up before a second maintainer does.
 
 **6. Reconsider required status checks.** They were removed for the same `GH006` reason and can now come back, since the PAT bypasses them too. Add them to the ruleset's `rules` array as a `required_status_checks` entry once step 3 has proven the token.
 
-## What is gated, and what is not
+## What is gated
 
-`.github/CODEOWNERS` scopes required review to the surfaces where a mistake breaks interoperability between an older and a newer build: the daemon, the TUI↔daemon protocol, orchestration, hooks, plus the release workflows and `scripts/`. That is the same surface CLAUDE.md rule 12 already singles out for the cross-version contract check.
+Everything that lands on `main`, uniformly: one approving review from a maintainer, all review threads resolved, no deletion, no force-push. There is no path scoping — see [Who counts as a maintainer](#who-counts-as-a-maintainer) for why, and for the round-trip-on-a-typo cost that comes with it.
 
-Docs, tests, changelog fragments and chores are deliberately outside it. The gate exists to catch protocol breaks that ship silently behind a stable wire, not to add a round trip to a typo fix.
+The requirement that review threads resolve before merge is doing specific work. Greptile reviews every pull request and re-reviews on each push, and its actual findings live in the inline comments rather than in the check-run or the summary — a green check has accompanied real P1 defects here before (CLAUDE.md rule 8). Thread resolution is what turns "read the inline comments" from a habit into something the merge button enforces.
 
 ## Making the gate bind the owner too
 
