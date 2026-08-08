@@ -115,7 +115,30 @@ jobs:
         with:
           tool: cargo-nextest@0.9.140
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      # Issue #407 — `--all-targets --features e2e`, not the bare `cargo clippy`
+      # this used to be. Both flags are load-bearing: without `--all-targets`
+      # cargo builds only lib and bin targets, and every `tests/e2e_*.rs` opens
+      # with `#![cfg(feature = "e2e")]`, so without the feature they compile to
+      # empty crates. The old invocation therefore type-checked NO test file at
+      # all — verified by injecting an E0308 into tests/e2e_handshake.rs, which
+      # both `cargo clippy` and `cargo clippy --all-targets` reported clean.
+      #
+      # Until this step existed, e2e code was linted by nothing anywhere and
+      # type-checked only by `cargo test-e2e` — which is not in CI (rule 5: it
+      # spawns binaries and hits LLM APIs). This step is a type-check and lint
+      # only; it runs no test and needs no agent or API key, so it does not
+      # smuggle the e2e tier into CI. It just makes the local rule 2 gate
+      # something a contributor cannot forget to run.
+      #
+      # Linux only. build-windows/build-macos below stay on bare `cargo clippy`
+      # for the reason documented there, reinforced here: the L2 tier is
+      # Unix-only in practice, so `--features e2e` against the Windows target
+      # yields dozens of E0425s (scripts/windows-cross-check.sh, issue #164).
+      #
+      # NOT `--workspace`: cargo's default target selection is the root package,
+      # so the xtask members stay unlinted. That is issue #436, kept separate
+      # because it fails on main today.
+      - run: cargo clippy --all-targets --features e2e -- -D warnings
       - run: cargo build --release
       # `cargo nextest run`, NOT `cargo test` — the same runner as the
       # `cargo test-fast` local gate, and as build-macos/build-windows which
