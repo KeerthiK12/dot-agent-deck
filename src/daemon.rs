@@ -1074,11 +1074,27 @@ async fn run_hook_loop(
                                 }
                             }
                         } else if let Ok(event) = serde_json::from_str::<AgentEvent>(&line) {
+                            // `tool_name`/`tool_detail` are logged so a post-mortem can
+                            // name the command an agent was running, not just that it ran
+                            // one. Four "fleet death" investigations (2026-07-28 23:05,
+                            // 07-29 01:54, 07-29 02:09, 08-08 03:05) stalled on exactly
+                            // this gap: the daemon logged `ToolStart` with a session id
+                            // while the command text lived only in the agent's own
+                            // transcript — and a process killed mid-tool never flushes
+                            // that entry. In the 08-08 case the ToolStart landed 0.838s
+                            // before the daemon took a SIGTERM, so the best-correlated
+                            // command was the one piece of evidence permanently lost.
+                            // `tool_detail` is already first-line-only and truncated to
+                            // 120 chars by `hook::extract_tool_detail`, which bounds the
+                            // added log volume; the untruncated command remains in
+                            // `metadata["bash_command"]` for anyone who needs it.
                             info!(
                                 session_id = %event.session_id,
                                 event_type = ?event.event_type,
                                 pane_id = ?event.pane_id,
                                 agent_type = ?event.agent_type,
+                                tool_name = ?event.tool_name,
+                                tool_detail = ?event.tool_detail,
                                 "Received event"
                             );
                             // Fan out to subscribed attach connections
