@@ -3673,69 +3673,84 @@ impl AppState {
         }
 
         // Issue #398 / Greptile PR #443 finding #2: remember whether the status
-        // this frame is about to write came from a producer that named a
-        // generation. Captured here because `session` borrows `self` for the
-        // rest of the block and `event` is moved into the journal at the end;
-        // applied once both are done with, just below.
-        //
-        // `SubagentStart` / `SubagentStop` assert no status (see the match
-        // arms), so they leave the pane's existing provenance alone rather than
-        // laundering an untagged frame into a tagged one, or vice versa.
-        let status_provenance = event
-            .pane_id
-            .clone()
-            .filter(|_| {
-                !matches!(
-                    event.event_type,
-                    EventType::SubagentStart | EventType::SubagentStop
-                )
-            })
-            .map(|pane_id| (pane_id, event.agent_id.is_none()));
+        // this frame writes came from a producer that named a generation.
+        // Captured here because `session` borrows `self` for the rest of the
+        // block and `event` is moved into the journal at the end; applied once
+        // both are done with, just below.
+        let provenance_pane = event.pane_id.clone();
+        let provenance_untagged = event.agent_id.is_none();
 
-        match event.event_type {
+        // Whether this frame ASSERTED a status, as opposed to leaving whatever
+        // the session already had. Only an assertion may move the provenance
+        // mark — Greptile PR #443 finding #3, which is subtler than it looks:
+        // `ToolStart` PRESERVES an existing `WaitingForInput` rather than
+        // overwriting it, so treating it as an assertion let a tagged
+        // `ToolStart` clear the mark while the untrusted `WaitingForInput` it
+        // declined to overwrite stayed on the card — handing the gate exactly
+        // the status an unidentified producer had planted. Provenance must
+        // therefore track the writer of the CURRENT status, not the last frame
+        // that happened to arrive.
+        //
+        // Note the asymmetry with `ToolEnd`, which does overwrite
+        // `WaitingForInput` (with `Thinking`) and so genuinely asserts. Each
+        // arm reports for itself rather than being classified from outside,
+        // because "does this event type write a status" is a property of the
+        // arm's own conditional and drifts the moment one is edited.
+        let asserted_status = match event.event_type {
             EventType::SessionStart => {
                 session.status = SessionStatus::Idle;
                 session.active_tool = None;
+                true
             }
             EventType::Thinking => {
                 session.status = SessionStatus::Thinking;
                 session.active_tool = None;
+                true
             }
             EventType::ToolStart => {
-                if session.status != SessionStatus::WaitingForInput {
+                let asserted = session.status != SessionStatus::WaitingForInput;
+                if asserted {
                     session.status = SessionStatus::Working;
                 }
                 session.active_tool = Some(ActiveTool {
                     name: event.tool_name.clone().unwrap_or_default(),
                     detail: event.tool_detail.clone(),
                 });
+                asserted
             }
             EventType::ToolEnd => {
                 session.active_tool = None;
                 session.tool_count += 1;
-                if session.status == SessionStatus::WaitingForInput {
+                let asserted = session.status == SessionStatus::WaitingForInput;
+                if asserted {
                     session.status = SessionStatus::Thinking;
                 }
+                asserted
             }
             EventType::WaitingForInput | EventType::PermissionRequest => {
                 session.status = SessionStatus::WaitingForInput;
+                true
             }
             EventType::Idle => {
                 session.status = SessionStatus::Idle;
                 session.active_tool = None;
+                true
             }
             EventType::Compacting => {
                 session.status = SessionStatus::Compacting;
                 session.active_tool = None;
+                true
             }
             EventType::SubagentStart | EventType::SubagentStop => {
                 // Informational — recorded in recent_events but no status change
+                false
             }
             EventType::Error => {
                 session.status = SessionStatus::Error;
+                true
             }
             EventType::SessionEnd => unreachable!(),
-        }
+        };
 
         // PRD #20 blocker-2: keep the live-target durable across the bounded
         // journal. An event that omits `live_target` inherits the session's
@@ -3756,13 +3771,16 @@ impl AppState {
         }
 
         // The `session` borrow is done, so the pane-level provenance captured
-        // above can be recorded. A tagged frame CLEARS the mark: an identified
-        // producer asserting the current status is exactly the evidence the
-        // gate wants, so a pane recovers the carve-out on the next real hook
-        // rather than being poisoned for the rest of the session by one
-        // untagged frame.
-        if let Some((pane_id, untagged)) = status_provenance {
-            if untagged {
+        // above can be recorded — but ONLY if this frame actually asserted the
+        // status now on the card. A tagged frame that asserted CLEARS the mark:
+        // an identified producer stating the current status is exactly the
+        // evidence the gate wants, so a pane recovers the carve-out on the next
+        // real hook rather than being poisoned for the session by one untagged
+        // frame. A frame that asserted nothing changes nothing here, so it can
+        // neither launder an untagged status into a trusted one nor cast doubt
+        // on a status it did not write.
+        if asserted_status && let Some(pane_id) = provenance_pane {
+            if provenance_untagged {
                 self.untagged_status_panes.insert(pane_id);
             } else {
                 self.untagged_status_panes.remove(&pane_id);
@@ -5184,6 +5202,78 @@ mod tests {
         assert!(
             !state.untagged_status_panes.contains(UNTAGGED_PANE),
             "an identified producer asserting the status must clear the mark"
+        );
+    }
+
+    /// Greptile PR #443 finding #3. `ToolStart` PRESERVES an existing
+    /// `WaitingForInput` instead of overwriting it, so a tagged `ToolStart`
+    /// must NOT clear the mark — otherwise the untrusted status it declined to
+    /// overwrite stays on the card and the gate starts trusting it. This is the
+    /// laundering path: untagged plants `WaitingForInput`, the real agent's
+    /// next tool call silently vouches for it.
+    #[test]
+    fn a_tagged_frame_that_preserves_an_untagged_status_does_not_clear_the_mark() {
+        let mut state = pane_with_tagged_session();
+
+        state.apply_event(untagged_event(
+            "legacy-hook-session",
+            EventType::WaitingForInput,
+        ));
+        assert!(state.untagged_status_panes.contains(UNTAGGED_PANE));
+
+        // The pane's real agent starts a tool. The arm leaves `WaitingForInput`
+        // in place, so it asserted nothing and vouches for nothing.
+        let mut tagged_tool =
+            untagged_event(&format!("pane-{UNTAGGED_PANE}"), EventType::ToolStart);
+        tagged_tool.agent_id = Some(UNTAGGED_AGENT_ID.to_string());
+        state.apply_event(tagged_tool);
+
+        let session = state
+            .sessions
+            .get(&format!("pane-{UNTAGGED_PANE}"))
+            .expect("the pane's session");
+        assert_eq!(
+            session.status,
+            SessionStatus::WaitingForInput,
+            "precondition: ToolStart preserves WaitingForInput rather than \
+             overwriting it — that is what makes the laundering possible"
+        );
+        assert!(
+            state.untagged_status_panes.contains(UNTAGGED_PANE),
+            "a frame that only PRESERVED an untagged status must not vouch for \
+             it; the gate would then act on a status nobody identified"
+        );
+    }
+
+    /// The counterpart: `ToolEnd` genuinely overwrites `WaitingForInput` (with
+    /// `Thinking`), so it does assert, and a tagged one legitimately clears the
+    /// mark. Pins the asymmetry so neither arm is "simplified" into the other.
+    #[test]
+    fn a_tagged_frame_that_overwrites_an_untagged_status_clears_the_mark() {
+        let mut state = pane_with_tagged_session();
+
+        state.apply_event(untagged_event(
+            "legacy-hook-session",
+            EventType::WaitingForInput,
+        ));
+
+        let mut tagged_tool_end =
+            untagged_event(&format!("pane-{UNTAGGED_PANE}"), EventType::ToolEnd);
+        tagged_tool_end.agent_id = Some(UNTAGGED_AGENT_ID.to_string());
+        state.apply_event(tagged_tool_end);
+
+        let session = state
+            .sessions
+            .get(&format!("pane-{UNTAGGED_PANE}"))
+            .expect("the pane's session");
+        assert_eq!(
+            session.status,
+            SessionStatus::Thinking,
+            "precondition: ToolEnd overwrites WaitingForInput"
+        );
+        assert!(
+            !state.untagged_status_panes.contains(UNTAGGED_PANE),
+            "a tagged frame that WROTE the current status may clear the mark"
         );
     }
 
