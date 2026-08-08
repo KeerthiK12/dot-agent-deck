@@ -3,6 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import type { TerminalBuffer, TerminalFeed } from "../types";
+import { registerTerminal, unregisterTerminal } from "../lib/terminalRegistry";
 
 interface TerminalViewportProps {
   agentId: string;
@@ -102,6 +103,8 @@ export function TerminalViewport({
       webglAddon = undefined;
     }
     terminalRef.current = terminal;
+    // Expose the instance so the Reader overlay can snapshot the resolved buffer.
+    registerTerminal(agentId, terminal);
     terminal.write(transcriptRef.current);
 
     const inputDisposable = terminal.onData((data) => {
@@ -123,6 +126,7 @@ export function TerminalViewport({
       window.cancelAnimationFrame(frame);
       observer.disconnect();
       inputDisposable.dispose();
+      unregisterTerminal(agentId, terminal);
       webglAddon?.dispose();
       terminal.dispose();
       terminalRef.current = undefined;

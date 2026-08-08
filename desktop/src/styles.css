@@ -194,6 +194,24 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .composer-status.is-delivered { color: #6fae86; }
 .composer-status.is-failed { color: var(--danger, #d0685f); }
 .button.compact { padding: 3px 9px; font-size: 10px; gap: 4px; }
+
+/* ---- Output Reader: a large readable rendering of an agent's CLI output ---- */
+.reader-open { margin-left: auto; min-width: 0; padding: 0 9px; display: flex; align-items: center; gap: 5px; border: 0; border-bottom: 2px solid transparent; color: #9fb5ad; background: transparent; cursor: pointer; font-size: 8px; font-weight: 700; letter-spacing: .06em; }
+.reader-open:hover { color: #7fd0c0; }
+.reader-open span { display: inline; }
+.reader-overlay { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; padding: 3vh 3vw; background: rgba(9, 13, 12, .74); backdrop-filter: blur(2px); }
+.reader-panel { position: relative; width: min(1040px, 100%); display: flex; flex-direction: column; overflow: hidden; border: 1px solid #3d4744; border-radius: 12px; background: #14201d; box-shadow: 0 28px 70px rgba(0, 0, 0, .55); }
+.reader-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid #2c3a36; background: #182622; }
+.reader-title { display: flex; align-items: center; gap: 9px; color: #cfe0da; }
+.reader-title strong { margin-right: 8px; font-size: 13px; }
+.reader-controls { display: flex; align-items: center; gap: 8px; }
+.reader-tail { padding: 2px 7px; border-radius: 9px; color: #8a9691; background: #22302c; font-size: 8px; font-weight: 800; letter-spacing: .1em; }
+.reader-tail.is-live { color: #79d6b6; background: #1d3a30; }
+.reader-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 18px 26px 22px; scrollbar-color: #46534e #14201d; scrollbar-width: thin; }
+.reader-text { margin: 0; white-space: pre-wrap; word-break: break-word; color: #dbe4df; font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: 13.5px; line-height: 1.7; user-select: text; }
+.reader-jump { position: absolute; bottom: 148px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid #3a6a5f; border-radius: 16px; color: #bfe6d8; background: #1c2b28; cursor: pointer; font-size: 10.5px; box-shadow: 0 6px 18px rgba(0, 0, 0, .4); }
+.reader-jump:hover { background: #234238; }
+.reader-panel .agent-composer { border-top: 1px solid #2c3a36; }
 .terminal-host .xterm { height: 100%; }
 .terminal-host .xterm-viewport { scrollbar-color: #45504c #141817; scrollbar-width: thin; }
 .text-panel { width: 100%; height: 100%; padding: 10px; overflow: auto; color: #d0d6d2; background: var(--terminal); font-size: 9px; }

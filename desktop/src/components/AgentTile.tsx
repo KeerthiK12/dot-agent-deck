@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  BookOpenText,
   Box,
   Check,
   CheckCircle2,
@@ -14,6 +15,7 @@ import {
 } from "lucide-react";
 import type { AgentSession, DeckActionResult, DeckPrompt, EvidenceItem, PanelTab, RuntimeMode, TerminalFeed } from "../types";
 import { AgentComposer } from "./AgentComposer";
+import { OutputReader } from "./OutputReader";
 import { TerminalViewport } from "./TerminalViewport";
 
 const tabs: { id: PanelTab; label: string; icon: typeof SquareTerminal }[] = [
@@ -73,7 +75,8 @@ export function AgentTile({
   const agentEvidence = evidence.filter((item) => agent.handoffIds.includes(item.id) || item.agentId === agent.id);
   const fixture = mode === "fixture";
   const [renameDraft, setRenameDraft] = useState<string>();
-  useEffect(() => setRenameDraft(undefined), [agent.id]);
+  const [readerOpen, setReaderOpen] = useState(false);
+  useEffect(() => { setRenameDraft(undefined); setReaderOpen(false); }, [agent.id]);
 
   const commitRename = () => {
     const next = renameDraft?.trim();
@@ -174,7 +177,21 @@ export function AgentTile({
             {id === "checks" && agent.checks.length > 0 && <em>{agent.checks.length}</em>}
           </button>
         ))}
+        <button
+          className="reader-open"
+          data-testid={`reader-open-${agent.id}`}
+          title="Open a large readable view of this agent's output"
+          onMouseDown={(event) => event.stopPropagation()}
+          onClick={() => setReaderOpen(true)}
+        >
+          <BookOpenText size={13} aria-hidden="true" />
+          <span>Reader</span>
+        </button>
       </div>
+
+      {readerOpen && (
+        <OutputReader agent={agent} prompts={prompts} onSubmit={onSubmitText} onClose={() => setReaderOpen(false)} />
+      )}
 
       <div className="agent-panel" role="tabpanel">
         {tab === "terminal" && (
