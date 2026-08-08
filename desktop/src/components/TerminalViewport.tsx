@@ -29,6 +29,18 @@ export function TerminalViewport({
   const terminalRef = useRef<Terminal | undefined>(undefined);
   const lastStreamRef = useRef<TerminalBuffer | undefined>(undefined);
 
+  // The terminal is expensive to build (it allocates a GPU context) and owns
+  // scroll position, selection, and cursor state. Anything that changes on
+  // every snapshot — the growing transcript, or a callback identity — must be
+  // reached through a ref instead of an effect dependency, or the pane is torn
+  // down and rebuilt while the operator is typing in it.
+  const transcriptRef = useRef(transcript);
+  const onInputRef = useRef(onInput);
+  const onResizeRef = useRef(onResize);
+  transcriptRef.current = transcript;
+  onInputRef.current = onInput;
+  onResizeRef.current = onResize;
+
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -41,10 +53,10 @@ export function TerminalViewport({
       disableStdin: readOnly,
       drawBoldTextInBrightColors: false,
       fontFamily: '"JetBrains Mono", "SFMono-Regular", Consolas, monospace',
-      fontSize: 11.5,
+      fontSize: 13.5,
       fontWeight: "400",
       fontWeightBold: "600",
-      lineHeight: 1.28,
+      lineHeight: 1.3,
       scrollback: 4_000,
       theme: {
         background: "#141817",
@@ -90,15 +102,15 @@ export function TerminalViewport({
       webglAddon = undefined;
     }
     terminalRef.current = terminal;
-    terminal.write(transcript);
+    terminal.write(transcriptRef.current);
 
     const inputDisposable = terminal.onData((data) => {
-      if (!readOnly) onInput(data);
+      if (!readOnly) onInputRef.current(data);
     });
     const fit = () => {
       try {
         fitAddon.fit();
-        if (terminal.cols > 0 && terminal.rows > 0) onResize(terminal.cols, terminal.rows);
+        if (terminal.cols > 0 && terminal.rows > 0) onResizeRef.current(terminal.cols, terminal.rows);
       } catch {
         // A hidden/resizing pane can briefly have no measurable dimensions.
       }
@@ -116,7 +128,18 @@ export function TerminalViewport({
       terminalRef.current = undefined;
       lastStreamRef.current = undefined;
     };
-  }, [agentId, onInput, onResize, readOnly, transcript]);
+  }, [agentId, readOnly]);
+
+  // A transcript that arrives (or is replaced) before the attach stream has
+  // delivered anything still has to reach the screen — but by rewriting the
+  // buffer, never by rebuilding the terminal. Once streaming owns the content,
+  // the effect below is authoritative and this one stands down.
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal || lastStreamRef.current) return;
+    terminal.reset();
+    terminal.write(transcript);
+  }, [transcript]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -132,11 +155,11 @@ export function TerminalViewport({
       terminal.write(streamData.data.subarray(previous.data.byteLength));
     } else if (streamData !== previous) {
       terminal.reset();
-      terminal.write(transcript);
+      terminal.write(transcriptRef.current);
       if (streamData.data.byteLength) terminal.write(streamData.data);
     }
     lastStreamRef.current = streamData;
-  }, [streamData, transcript]);
+  }, [streamData]);
 
   return (
     <div
