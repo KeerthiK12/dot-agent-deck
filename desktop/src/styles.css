@@ -196,9 +196,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .button.compact { padding: 3px 9px; font-size: 10px; gap: 4px; }
 
 /* ---- Output Reader: a large readable rendering of an agent's CLI output ---- */
-.reader-open { margin-left: auto; min-width: 0; padding: 0 9px; display: flex; align-items: center; gap: 5px; border: 0; border-bottom: 2px solid transparent; color: #9fb5ad; background: transparent; cursor: pointer; font-size: 8px; font-weight: 700; letter-spacing: .06em; }
-.reader-open:hover { color: #7fd0c0; }
-.reader-open span { display: inline; }
+.reader-open { margin-left: auto; align-self: center; min-width: 0; padding: 3px 10px; display: flex; align-items: center; gap: 5px; border: 1px solid #3a6a5f; border-radius: 12px; color: #9fd8c8; background: #1d3a30; cursor: pointer; font-size: 9px; font-weight: 700; letter-spacing: .06em; }
+.reader-open:hover { color: #d5f3ea; background: #234238; }
+/* Outrank the .agent-tabs button span {display:none} tab-label rule. */
+.agent-tabs .reader-open span { display: inline; }
 .reader-overlay { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; padding: 3vh 3vw; background: rgba(9, 13, 12, .74); backdrop-filter: blur(2px); }
 .reader-panel { position: relative; width: min(1040px, 100%); display: flex; flex-direction: column; overflow: hidden; border: 1px solid #3d4744; border-radius: 12px; background: #14201d; box-shadow: 0 28px 70px rgba(0, 0, 0, .55); }
 .reader-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid #2c3a36; background: #182622; }
