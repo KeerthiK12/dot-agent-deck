@@ -99,7 +99,7 @@ pub(crate) const SESSION_START_WAIT_TIMEOUT: std::time::Duration =
 /// lets the e2e harness skip the buffer entirely and what lets the toggle test
 /// flip it. See [`delegate_readiness_buffer`].
 pub(crate) const DELEGATE_READINESS_BUFFER: std::time::Duration =
-    std::time::Duration::from_millis(1000);
+    std::time::Duration::from_millis(8000);
 
 /// PRD #249 M1 test/e2e seam: overrides [`DELEGATE_READINESS_BUFFER`] with an
 /// integer number of **milliseconds**. Mirrors the
