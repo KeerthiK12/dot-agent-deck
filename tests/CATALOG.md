@@ -2157,6 +2157,17 @@ without depending on the config struct API.
 - **Does not assert:** `AgentRecord.live` — deliberately. It is `Some(Idle)` for every role within ~1.5s of the dispatch, before a byte reaches any of those PTYs (measured), so it is a pane-level fact and an assertion on it is vacuous. Also not asserted: a delegation round-trip (`orchestration/route/001` owns that), or the return edge.
 - **Platform coverage:** mac+linux.
 
+#### dispatch/close
+
+##### dispatch/close/001 — A dispatched single-agent card closes on the FIRST confirmed Ctrl+W, instead of surviving until the user closes it a second time (PRD #220 follow-up).
+- **Layer:** L2 PTY-attached (`TuiDeck` on the `minimal` fixture) driving the REAL `dot-agent-deck dispatch --single` CLI, then closing the resulting card through the production Ctrl+W → confirm path.
+- **Agent:** none — `default_command = "cat"` for both the caller and the dispatched unit. The close path is identical for every agent, and this is about the deck, not the agent.
+- **Stand-in, named:** a PATH `git` stub that sleeps on `status --porcelain` (and ONLY on that — the dispatch's own `git worktree add` runs at full speed). It supplies the one property of a real dispatched worktree a fixture cannot cheaply have: an agent has been working in it, so the status walk takes seconds, not milliseconds.
+- **Asserts:** the CALLER card (which owns no worktree) closes on its first confirm — the control, so a later failure is attributable to the dispatched card specifically; then the dispatched card, closed once, disappears within 30s.
+- **Why it exists:** a user reported closing a dispatched agent leaving its card behind, gone only on a second close. It reproduced TWO independent defects, and the failure message distinguishes them by whether the daemon still holds the agent: (a) a daemon-spawned card has no local pane until focused, so `close_pane` returned `Pane <id> not found`, the PRD #92 F4 policy preserved the card, and the agent kept running; (b) with that fixed, the daemon still awaited the worktree cleanup before answering, blowing the TUI's 5s `CTRL_W_STOP_TIMEOUT`. Reverting either fix alone turns this test red (verified).
+- **Does not assert:** the worktree's own removal (`KeepIfDirty` leaves a dirty one in place by design); the orchestration close path, where the last role's close is the cleanup trigger.
+- **Platform coverage:** mac+linux.
+
 #### orchestration/route
 
 ##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1). [reel]

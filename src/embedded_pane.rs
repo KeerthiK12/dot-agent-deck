@@ -1312,6 +1312,74 @@ impl EmbeddedPaneController {
     /// backs `pane_id` (a genuinely stale card the caller may then drop). Errors
     /// from `list_agents` / `attach` are absorbed into `false`, mirroring
     /// `hydrate_from_daemon`'s best-effort posture.
+    /// Stop the daemon agent backing `pane_id` when this TUI has no local pane
+    /// for it — the daemon-spawned-card case `close_pane` falls through to.
+    ///
+    /// Resolves the agent by `pane_id_env` through `list-agents` (the same lookup
+    /// [`Self::hydrate_pane`] uses) and issues the ordinary `stop-agent`, so the
+    /// daemon side of the close is byte-identical to the attached path. There is
+    /// no local pane to tear down or to restore on failure.
+    ///
+    /// An empty match is reported as SUCCESS: the card is backed by nothing, so
+    /// "close it" has already been achieved and the caller should drop the card
+    /// rather than preserve an unclosable one.
+    fn stop_unattached_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+        let list_client = self.client.clone();
+        let records = match self.runtime.block_on(async move {
+            tokio::time::timeout(HYDRATE_LIST_TIMEOUT, list_client.list_agents()).await
+        }) {
+            Ok(Ok(records)) => records,
+            Ok(Err(e)) => {
+                return Err(PaneError::CommandFailed(format!(
+                    "Pane {pane_id} is not attached here and the daemon could not be \
+                     queried for it: {e}"
+                )));
+            }
+            Err(_) => {
+                return Err(PaneError::CommandFailed(format!(
+                    "Pane {pane_id} is not attached here and the daemon did not answer \
+                     within {}s",
+                    HYDRATE_LIST_TIMEOUT.as_secs()
+                )));
+            }
+        };
+        let Some(agent_id) = records
+            .into_iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
+            .map(|r| r.id)
+        else {
+            tracing::debug!(
+                pane_id,
+                "close_pane: no local pane and no daemon agent for this pane id — \
+                 nothing to stop, treating the close as complete"
+            );
+            return Ok(());
+        };
+        let stop_client = self.client.clone();
+        let stop_id = agent_id.clone();
+        match self.runtime.block_on(async move {
+            tokio::time::timeout(CTRL_W_STOP_TIMEOUT, stop_client.stop_agent(&stop_id)).await
+        }) {
+            Ok(Ok(())) => {
+                tracing::info!(
+                    pane_id,
+                    agent_id,
+                    "close_pane: stopped a daemon-spawned agent this TUI had not attached"
+                );
+                Ok(())
+            }
+            // Already gone between the list and the stop — the close is done.
+            Ok(Err(e)) if is_agent_not_found(&e, &agent_id) => Ok(()),
+            Ok(Err(e)) => Err(PaneError::CommandFailed(format!(
+                "Failed to stop agent {agent_id} behind pane {pane_id}: {e}"
+            ))),
+            Err(_) => Err(PaneError::CommandFailed(format!(
+                "stop-agent for {agent_id} (pane {pane_id}) timed out after {}s",
+                CTRL_W_STOP_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
     pub fn hydrate_pane(&self, pane_id: &str) -> bool {
         if self.panes.lock().unwrap().contains_key(pane_id) {
             return true;
@@ -2949,9 +3017,20 @@ impl PaneController for EmbeddedPaneController {
             match panes.remove(pane_id) {
                 Some(p) => p,
                 None => {
-                    return Err(PaneError::CommandFailed(format!(
-                        "Pane {pane_id} not found"
-                    )));
+                    // No LOCAL pane — but the card the user pressed Ctrl+W on is
+                    // real, so the daemon has an agent for this pane id. That is
+                    // the ordinary state for a DAEMON-SPAWNED card (a dispatch, or
+                    // a scheduled fire): it surfaces via a synthetic `SessionStart`,
+                    // which paints a card without attaching a pane — attaching
+                    // happens only when the user focuses it.
+                    //
+                    // Returning "not found" here made such a card unclosable on the
+                    // FIRST Ctrl+W: the F4 policy preserves a card whose close
+                    // failed, so the card stayed and its agent kept running.
+                    // Selecting the card attaches it, which is why a second Ctrl+W
+                    // then worked — the "I have to close it twice" report
+                    // (`dispatch/close/001`).
+                    return self.stop_unattached_pane(pane_id);
                 }
             }
         };

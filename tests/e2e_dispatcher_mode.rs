@@ -97,14 +97,21 @@ fn dispatch_worktree_of(deck: &TuiDeck, unit: &str) -> PathBuf {
 /// lookup a real dispatcher pane goes through. `cat` is deliberate here and only
 /// here: this pane is the *caller*, never the thing under test, it stays alive on
 /// stdin, and it costs no tokens.
-fn open_cat_caller_pane(deck: &TuiDeck) -> String {
+///
+/// `type_command` must be FALSE when the deck config sets a `default_command`:
+/// the form seeds its Command field from that config, so typing into it APPENDS
+/// (`cat` onto a seeded `cat` → `catcat`), the spawn fails, and no pane ever
+/// registers — which reads exactly like a dispatch bug two assertions later.
+fn open_cat_caller_pane_inner(deck: &TuiDeck, type_command: bool) -> String {
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // Space → confirm dir → new-pane form
     deck.wait_for_string("New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(b"caller");
     deck.send_keys(b"\t");
-    deck.send_keys(b"cat");
+    if type_command {
+        deck.send_keys(b"cat");
+    }
     let (col, row) = deck
         .find_in_grid("[Submit]")
         .expect("the new-pane form should render a [Submit] button");
@@ -129,6 +136,12 @@ fn open_cat_caller_pane(deck: &TuiDeck) -> String {
         deck.snapshot_grid()
     );
     find_caller().expect("checked above")
+}
+
+/// [`open_cat_caller_pane_inner`] for a deck whose config sets no `default_command`
+/// — the ordinary case, where the Command field starts empty and must be typed.
+fn open_cat_caller_pane(deck: &TuiDeck) -> String {
+    open_cat_caller_pane_inner(deck, true)
 }
 
 /// What the daemon knows about ONE role pane of a dispatched orchestration.
@@ -740,6 +753,198 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
             .filter(|role| !card_titled(&deck.snapshot_grid(), role))
             .collect::<Vec<_>>(),
         role_diagnostics(&deck, ORCH, &ROLES),
+        deck.snapshot_grid()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Closing a dispatched card (PRD #220 follow-up)
+// ---------------------------------------------------------------------------
+
+/// A `git` that is deliberately SLOW on `status` and ordinary for everything else.
+///
+/// Stands in for the one property of a real dispatched worktree this fixture
+/// cannot cheaply have: `git status --porcelain` taking real time. In the repo
+/// this feature is used in, the dispatched worktree is a full checkout that an
+/// agent has been working in — often with a multi-GB build dir — and the status
+/// walk is seconds, not milliseconds. Everything else about the close path is
+/// genuine: the real binary, the real daemon, the real `git worktree remove`.
+///
+/// Narrowed to `status --porcelain` — EXACTLY the invocation `remove_worktree`'s
+/// dirty check makes. Sleeping on every `status` also hit the deck's own git
+/// calls during pane creation, which has its own 5s budget, so the pane never
+/// came up and the test failed before reaching what it is about. Everything
+/// else, including the dispatch's `git worktree add`, runs at full speed.
+/// The real `git` path and the sleep are BAKED IN rather than read from the
+/// environment: the harness scrubs the spawned deck's env to a pinned set, and a
+/// stub whose `exec` target arrives empty in some descendant breaks every git
+/// call instead of just the slow one.
+const SLOW_GIT_STATUS_STUB: &str = r#"#!/bin/sh
+saw_status=0
+saw_porcelain=0
+for a in "$@"; do
+    [ "$a" = "status" ] && saw_status=1
+    [ "$a" = "--porcelain" ] && saw_porcelain=1
+done
+if [ "$saw_status" = 1 ] && [ "$saw_porcelain" = 1 ]; then
+    sleep __SLEEP__
+fi
+exec __REAL_GIT__ "$@"
+"#;
+
+/// Absolute path of the real `git`, resolved before any stub shadows it.
+fn real_git_path() -> String {
+    let out = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("resolve the real git");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Install [`SLOW_GIT_STATUS_STUB`] as `git` in a fresh dir and return that dir.
+fn install_slow_git(dir: &Path, sleep_secs: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bindir = dir.join("slow-git-bin");
+    std::fs::create_dir_all(&bindir).expect("create the stub bin dir");
+    let git = bindir.join("git");
+    let script = SLOW_GIT_STATUS_STUB
+        .replace("__SLEEP__", &sleep_secs.to_string())
+        .replace("__REAL_GIT__", &real_git_path());
+    std::fs::write(&git, script).expect("write the git stub");
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755))
+        .expect("make the git stub executable");
+    bindir
+}
+
+/// Press Ctrl+W on the currently-selected card and confirm Close.
+///
+/// `Down`/`j` and a single click all fail to move the dashboard selection in this
+/// deck state (verified separately — `?` opens Help from the same keystroke
+/// stream, so keys ARE being delivered), so this test never navigates: it closes
+/// the default-selected card first and then the one that is left. A close aimed
+/// at the wrong card would make the assertion meaningless.
+fn confirm_close_selected(deck: &TuiDeck) {
+    deck.send_keys(b"\x17"); // Ctrl+W → close confirmation
+    deck.wait_for_string("Close selected pane?");
+    deck.send_keys(b"\x1b[B"); // Down → [Close] (arrows DO work inside the modal)
+    deck.send_keys(b"\r"); // confirm
+}
+
+/// Scenario: Dispatch a single agent (so the daemon owns a worktree for it), with a
+/// `git` whose `status` is slow — the state a real dispatched worktree is in once an
+/// agent has worked there. Select the dispatched card, press Ctrl+W and confirm Close
+/// ONCE. The card must disappear on that first confirm, rather than being retained
+/// while the agent is already dead and needing a second close.
+#[spec("dispatch/close/001")]
+#[test]
+fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
+    const UNIT: &str = "close-probe";
+    /// The single-agent dispatch labels its card with the task name.
+    const CARD: &str = "dispatch-close-probe";
+
+    let scratch = common::race_safe_tempdir();
+    // 8s: comfortably past the TUI's 5s `CTRL_W_STOP_TIMEOUT`, so the symptom is
+    // deterministic rather than a race with a fast machine.
+    let stub_bin = install_slow_git(scratch.path(), 8);
+    // `cat` as the dispatched agent: this test is about the daemon's CLOSE path,
+    // which is identical for every agent, and a real one would only add cost and
+    // LLM variance. The load-bearing difference from a stand-in here is the slow
+    // `git status`, which the stub supplies.
+    let cfg = scratch.path().join("config.toml");
+    std::fs::write(&cfg, "default_command = \"cat\"\n").expect("write the deck config");
+
+    let deck = TuiDeck::builder()
+        // Roomy: at the default width a card title is ellipsized
+        // (`dispatch-clo…`), so the selection check below could never match the
+        // full name on the title row.
+        .with_pty_size(200, 50)
+        .with_env(
+            "PATH",
+            format!("{}:{}", stub_bin.display(), path_with_binary_dir()),
+        )
+        .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+    commit_fixture_repo(deck.workdir());
+
+    // FALSE: this deck config sets `default_command`, so the form already seeds it.
+    let caller_pane = open_cat_caller_pane_inner(&deck, false);
+    let expected_worktree = dispatch_worktree_of(&deck, UNIT);
+    let _guard = SiblingWorktreeGuard(expected_worktree.clone());
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["dispatch", UNIT, "--task", "Wait quietly.", "--single"])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
+        .output()
+        .expect("the dispatch CLI should run");
+    assert!(
+        out.status.success(),
+        "`dispatch --single` failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    const SURFACE_WAIT: Duration = Duration::from_secs(60);
+    assert!(
+        common::wait_until(SURFACE_WAIT, || deck.snapshot_grid().contains(CARD)),
+        "the dispatched agent never surfaced a card within {}s.\nGrid:\n{}",
+        SURFACE_WAIT.as_secs(),
+        deck.snapshot_grid()
+    );
+
+    // Command mode. The CALLER card is the selected one, so close it first — it
+    // owns no worktree, so this close is the control: it must succeed on the
+    // first confirm, and it leaves the dispatched card as the only one.
+    deck.send_keys(b"\x04"); // Ctrl+D → command mode
+    deck.wait_for_string("COMMAND");
+    confirm_close_selected(&deck);
+    assert!(
+        common::wait_until(Duration::from_secs(30), || {
+            let g = deck.snapshot_grid();
+            !g.contains("caller") && g.contains(CARD)
+        }),
+        "the CALLER card (no worktree, nothing to clean up) did not close on the first \
+         confirm — so this test cannot attribute a later failure to the worktree \
+         cleanup.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Now the dispatched card is the only one. Close it — ONCE.
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            let g = deck.snapshot_grid();
+            g.lines().any(|l| l.contains('▸') && l.contains(CARD))
+        }),
+        "the dispatched card is not the selected one after the caller closed, so \
+         Ctrl+W would not target it.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    confirm_close_selected(&deck);
+
+    // The assertion. Generous, so a merely slow close still passes — what this
+    // pins is a card that is never removed at all.
+    const CLOSE_WAIT: Duration = Duration::from_secs(30);
+    assert!(
+        common::wait_until(CLOSE_WAIT, || !deck.snapshot_grid().contains(CARD)),
+        "the dispatched card {CARD:?} was still on the deck {}s after ONE confirmed \
+         close, while the SAME close removed the caller card immediately.\n\
+         Two independent causes produce exactly this, and the daemon records below \
+         tell them apart:\n\
+         (a) records NON-EMPTY — the agent was never stopped. A daemon-spawned card \
+         has no local pane in this TUI until it is focused, so `close_pane` answered \
+         `Pane <id> not found` and the F4 policy preserved the card. Focusing it \
+         attaches it, which is why a second Ctrl+W appears to work.\n\
+         (b) records EMPTY — the agent IS stopped and only the card survived. The \
+         daemon held the close response until it finished removing the worktree, past \
+         the TUI's 5s stop-agent budget, so the client timed out and retained the pane.\n\
+         Daemon records after the close: {:?}\n\
+         Grid:\n{}",
+        CLOSE_WAIT.as_secs(),
+        common::agent_records_on(deck.attach_socket_path())
+            .iter()
+            .map(|r| (r.id.clone(), r.display_name.clone()))
+            .collect::<Vec<_>>(),
         deck.snapshot_grid()
     );
 }
