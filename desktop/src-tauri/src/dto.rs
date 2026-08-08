@@ -134,6 +134,7 @@ pub enum DesktopAction {
     StartWorkflow {
         name: String,
         cwd: String,
+        task_prompt: String,
         roles: Vec<WorkflowRoleInput>,
         rows: Option<u16>,
         cols: Option<u16>,
@@ -145,6 +146,7 @@ pub enum DesktopAction {
         #[serde(default)]
         force: bool,
     },
+    RestartDaemon,
     RenameAgent {
         agent_id: String,
         #[serde(alias = "name")]
@@ -594,6 +596,15 @@ mod tests {
                 ..
             } if name == "builder"
         ));
+    }
+
+    #[test]
+    fn restart_daemon_action_has_no_force_field() {
+        let action: DesktopAction = serde_json::from_value(serde_json::json!({
+            "type": "restart_daemon"
+        }))
+        .unwrap();
+        assert!(matches!(action, DesktopAction::RestartDaemon));
     }
 
     #[test]

@@ -31,9 +31,10 @@ import {
   Zap,
 } from "lucide-react";
 import { AgentTile } from "./components/AgentTile";
-import { ProfilesPanel, WorkflowPanel } from "./components/ConfigurationPanels";
+import { ProfilesPanel, ProjectsPanel, WorkflowPanel } from "./components/ConfigurationPanels";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
+import { useProjects } from "./hooks/useProjects";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import type { DeckAction, DeckRuntimeState, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 
@@ -64,6 +65,8 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
   const [selectedEvidenceId, setSelectedEvidenceId] = useState("");
   const [evidenceOpen, setEvidenceOpen] = useState(evidenceOpenOnFirstLoad);
+  const [projectsOpen, setProjectsOpen] = useState(false);
+  const [selectedProjectId, setSelectedProjectId] = useState("");
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [workflowOpen, setWorkflowOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -71,6 +74,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const [notice, setNotice] = useState<string>();
   const [confirm, setConfirm] = useState<ConfirmState>();
   const { profiles, updateProfile, resetProfiles } = useAgentProfiles(snapshot.profiles);
+  const { projects, activeId: activeProjectId, activeProject, setActiveId: setActiveProjectId, addProject, updateProject, removeProject } = useProjects(snapshot.worktree, snapshot.repo);
   const [profileOrder, setProfileOrder] = useState<string[]>([]);
 
   useEffect(() => {
@@ -84,6 +88,12 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       setSelectedEvidenceId(snapshot.evidence[0]?.id ?? "");
     }
   }, [selectedEvidenceId, snapshot.evidence]);
+
+  useEffect(() => {
+    if (!selectedProjectId || !projects.some((project) => project.id === selectedProjectId)) {
+      setSelectedProjectId(activeProjectId || projects[0]?.id || "");
+    }
+  }, [activeProjectId, projects, selectedProjectId]);
 
   useEffect(() => {
     if (!profiles.length || profileOrder.length) return;
@@ -107,6 +117,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const orderedStages = snapshot.stages;
   const selectedAgent = snapshot.agents.find((agent) => agent.id === selectedAgentId);
   const selectedEvidence = snapshot.evidence.find((item) => item.id === selectedEvidenceId);
+  const canControlDaemon = snapshot.connection.status === "connected" || snapshot.connection.daemonDetected === true;
 
   const perform = async (action: DeckAction, success?: string) => {
     try {
@@ -127,7 +138,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         return;
       }
       if (event.key === "Escape") {
-        setPaletteOpen(false); setHelpOpen(false); setProfilesOpen(false); setWorkflowOpen(false); setConfirm(undefined);
+        setPaletteOpen(false); setHelpOpen(false); setProjectsOpen(false); setProfilesOpen(false); setWorkflowOpen(false); setConfirm(undefined);
         return;
       }
       if (editing) return;
@@ -161,10 +172,13 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
 
   const requestStop = () => {
     if (!selectedAgent) {
-      if (snapshot.connection.status !== "connected") return;
+      if (!canControlDaemon) return;
+      const liveAgents = snapshot.connection.runningAgentCount;
       setConfirm({
         title: "Stop the local daemon?",
-        body: "This stops the local Agent Deck daemon. No agent panes are currently active, so this only shuts down the control service.",
+        body: liveAgents && liveAgents > 0
+          ? `The daemon reports ${liveAgents} live agent${liveAgents === 1 ? "" : "s"}. This safe stop will be refused until those agents are stopped individually.`
+          : "This stops the local Agent Deck daemon. No live agents are reported, so this only shuts down the control service.",
         label: "Stop daemon",
         busyLabel: "Stopping…",
         action: async () => { await perform({ type: "stop_daemon" }, "Local daemon stopped."); },
@@ -177,6 +191,17 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       label: "Stop agent",
       busyLabel: "Stopping…",
       action: async () => { await perform({ type: "stop_agent", agentId: selectedAgent.id }, `${selectedAgent.role} stop requested.`); },
+    });
+  };
+
+  const requestRestartDaemon = () => {
+    if (!snapshot.connection.daemonDetected || snapshot.connection.runningAgentCount !== 0) return;
+    setConfirm({
+      title: "Replace the incompatible daemon?",
+      body: "The old daemon reports no live agents. Agent Deck will stop it and start the exact daemon build bundled with this desktop app.",
+      label: "Replace daemon",
+      busyLabel: "Replacing…",
+      action: async () => { await perform({ type: "restart_daemon" }, "Matching daemon started and reconnected."); },
     });
   };
 
@@ -207,7 +232,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       : "";
     setConfirm({
       title: `Launch ${config.name}?`,
-      body: `This starts ${config.roles.length} live CLI agents in ${config.cwd}. ${commandCopy}${accessCopy} This launch does not rewrite project TOML.`,
+      body: `This starts ${config.roles.length} live CLI agents in ${config.cwd} and sends your task prompt to the coordinator. ${commandCopy}${accessCopy} This launch does not rewrite project TOML.`,
       label: "Launch live loop",
       busyLabel: "Launching…",
       action: async () => {
@@ -225,6 +250,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   };
 
   const commandItems = [
+    { label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => setProjectsOpen(true) },
     { label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => setProfilesOpen(true) },
     { label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => setWorkflowOpen(true) },
     { label: evidenceOpen ? "Hide evidence drawer" : "Show evidence drawer", hint: "Toggle transition evidence", icon: PanelRight, run: () => setEvidenceOpen((open) => !open) },
@@ -237,10 +263,10 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       <aside className="rail" aria-label="Primary navigation">
         <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
         <nav>
-          <RailButton icon={FolderGit2} label="Projects" onClick={() => setNotice("Project switcher is queued for the next desktop milestone.")} />
-          <RailButton icon={Activity} label="Runs" active onClick={() => undefined} />
-          <RailButton icon={Network} label="Workflows" onClick={() => setWorkflowOpen(true)} />
-          <RailButton icon={Bot} label="Agent Profiles" onClick={() => setProfilesOpen(true)} testId="open-agent-profiles" />
+          <RailButton icon={FolderGit2} label="Projects" active={projectsOpen} onClick={() => setProjectsOpen(true)} testId="open-projects" />
+          <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen} onClick={() => { setProjectsOpen(false); setWorkflowOpen(false); setProfilesOpen(false); }} />
+          <RailButton icon={Network} label="Workflows" active={workflowOpen} onClick={() => setWorkflowOpen(true)} />
+          <RailButton icon={Bot} label="Agent Profiles" active={profilesOpen} onClick={() => setProfilesOpen(true)} testId="open-agent-profiles" />
           <RailButton icon={Settings2} label="Settings" onClick={() => setNotice("Runtime settings will use the same local configuration seam.")} />
         </nav>
         <div className="rail-bottom">
@@ -252,8 +278,8 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       <main className="deck-main">
         <header className="topbar">
           <div className="repo-context">
-            <div className="repo-line"><FolderGit2 size={15} /><strong>{snapshot.repo}</strong><ChevronRight size={13} /><span>{snapshot.runId}</span></div>
-            <div className="branch-line"><GitBranch size={12} /><span>{snapshot.branch}</span><i /> <span title={snapshot.worktree}>{snapshot.worktree}</span></div>
+            <div className="repo-line"><FolderGit2 size={15} /><strong>{activeProject?.name || snapshot.repo}</strong><ChevronRight size={13} /><span>{snapshot.runId}</span></div>
+            <div className="branch-line"><GitBranch size={12} /><span>{snapshot.branch}</span><i /> <span title={activeProject?.cwd || snapshot.worktree}>{activeProject?.cwd || snapshot.worktree}</span></div>
           </div>
           <div className="run-instruments">
             <Instrument label="HEALTH" testId="run-health"><span className={`health-value health-${snapshot.health}`}><i />{snapshot.health}</span></Instrument>
@@ -275,8 +301,8 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
               className="button danger compact"
               data-testid="stop-run"
               aria-label={selectedAgent ? `Stop ${selectedAgent.role}` : "Stop daemon"}
-              title={selectedAgent ? `Stop ${selectedAgent.role}` : snapshot.connection.status === "connected" ? "Stop local daemon" : "Daemon is not connected"}
-              disabled={!selectedAgent && snapshot.connection.status !== "connected"}
+              title={selectedAgent ? `Stop ${selectedAgent.role}` : canControlDaemon ? "Stop local daemon" : "Daemon is not connected"}
+              disabled={!selectedAgent && !canControlDaemon}
               onClick={requestStop}
             ><CircleStop size={14} /><span>Stop</span></button>
           </div>
@@ -294,7 +320,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
           <div className={`connection-banner connection-${snapshot.connection.status}`} role="alert">
             {snapshot.connection.status === "loading" ? <RefreshCw className="spin" size={16} /> : <ShieldAlert size={16} />}
             <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span>{snapshot.connection.message}</span></div>
-            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
+            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{mode === "live" && snapshot.connection.daemonDetected && snapshot.connection.status === "error" && snapshot.connection.runningAgentCount === 0 && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
           </div>
         )}
 
@@ -341,8 +367,21 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
 
       {evidenceOpen && <EvidenceDrawer evidence={snapshot.evidence} selected={selectedEvidence} onSelect={setSelectedEvidenceId} onClose={() => setEvidenceOpen(false)} />}
 
+      <ProjectsPanel
+        open={projectsOpen}
+        projects={projects}
+        activeId={activeProjectId}
+        selectedId={selectedProjectId}
+        onSelect={setSelectedProjectId}
+        onClose={() => setProjectsOpen(false)}
+        onAdd={() => setSelectedProjectId(addProject())}
+        onUpdate={updateProject}
+        onRemove={(id) => { removeProject(id); setNotice("Project entry removed. The repository folder was not changed."); }}
+        onActivate={(id) => { setActiveProjectId(id); setNotice("Active project updated. Open Workflows when you are ready to launch its agents."); }}
+        onConfigureWorkflow={() => { setProjectsOpen(false); setWorkflowOpen(true); }}
+      />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <WorkflowPanel open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} defaultCwd={snapshot.worktree} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} />
+      <WorkflowPanel key={activeProject?.id ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} defaultName={activeProject?.workflowName ?? "dot-agent-deck"} defaultCwd={activeProject?.cwd || snapshot.worktree} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}

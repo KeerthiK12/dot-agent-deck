@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "sidecar:prepare": "sh ./scripts/prepare-sidecar.sh release",
+    "sidecar:prepare:debug": "sh ./scripts/prepare-sidecar.sh debug",
+    "bundle:app": "tauri build --config src-tauri/tauri.bundle.conf.json --bundles app",
     "test": "vitest run",
     "test:watch": "vitest",
     "tauri": "tauri"

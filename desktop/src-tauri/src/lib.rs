@@ -112,8 +112,18 @@ fn validate_workflow_against_project(
 fn prepare_workflow_launch(
     name: &str,
     cwd: &str,
+    task_prompt: &str,
     requested: &[WorkflowRoleInput],
 ) -> Result<(Vec<WorkflowRoleInput>, String), String> {
+    let task_prompt = task_prompt.trim();
+    if task_prompt.is_empty() {
+        return Err("task prompt must not be empty".into());
+    }
+    if task_prompt.len() > COMMAND_MAX_BYTES || task_prompt.contains('\0') {
+        return Err(format!(
+            "task prompt must be at most {COMMAND_MAX_BYTES} bytes and contain no NUL"
+        ));
+    }
     let (config, roles) = validate_workflow_against_project(name, cwd, requested)?;
     validate_desktop_coordinator(&roles)?;
     let seed = dot_agent_deck::ui::prepare_orchestrator_prompt(&config, cwd).ok_or_else(|| {
@@ -122,7 +132,10 @@ fn prepare_workflow_launch(
             safe_message(cwd)
         )
     })?;
-    Ok((roles, seed))
+    Ok((
+        roles,
+        format!("{seed}\n\n## User task\n\n{task_prompt}\n"),
+    ))
 }
 
 fn validate_desktop_coordinator(roles: &[WorkflowRoleInput]) -> Result<&WorkflowRoleInput, String> {
@@ -746,6 +759,7 @@ async fn desktop_run_action(
         DesktopAction::StartWorkflow {
             name,
             cwd,
+            task_prompt,
             roles,
             rows,
             cols,
@@ -764,7 +778,8 @@ async fn desktop_run_action(
             // identity-bound retry path in `launch_workflow`; Pi is rejected
             // before this point because its native path has no acknowledgement.
             // Preparing the file first keeps a context-write failure atomic.
-            let (roles, orchestrator_seed) = prepare_workflow_launch(&name, &cwd, &roles)?;
+            let (roles, orchestrator_seed) =
+                prepare_workflow_launch(&name, &cwd, &task_prompt, &roles)?;
             let orchestration_id = mint_orchestration_id();
             let daemon = trusted_daemon().await?;
             daemon.require_compatible()?;
@@ -811,6 +826,28 @@ async fn desktop_run_action(
                 StopOutcome::NoDaemonRunning => "No daemon was running.".into(),
                 StopOutcome::Stopped { pid } => format!("Daemon stopped gracefully (pid {pid})."),
                 StopOutcome::ForceKilled { pid } => format!("Daemon force-killed (pid {pid})."),
+            });
+        }
+        DesktopAction::RestartDaemon => {
+            run_daemon_stop(&attach_socket_path(), false)
+                .await
+                .map_err(|error| safe_message(error.to_string()))?;
+            terminal::detach_all(&state).await;
+            let snapshot = bootstrap(&BootstrapOptions {
+                start_if_missing: true,
+            })
+            .await;
+            emit_snapshot(&app, &snapshot);
+            ensure_snapshot_watcher(&app, &state);
+            ensure_explicit_start_connected(true, &snapshot)?;
+            return Ok(DesktopActionResult {
+                ok: true,
+                agent_id: None,
+                agent_ids: Vec::new(),
+                send_result: None,
+                terminal: None,
+                message: Some("Daemon replaced with the desktop's matching bundled build.".into()),
+                snapshot,
             });
         }
         DesktopAction::RenameAgent {
@@ -1189,14 +1226,17 @@ description = "Implements the requested change"
             },
         ];
         let cwd = project_dir.to_str().unwrap();
-        let (roles, seed) = prepare_workflow_launch("loop", cwd, &requested).unwrap();
+        let (roles, seed) =
+            prepare_workflow_launch("loop", cwd, "Build the requested feature.", &requested)
+                .unwrap();
 
         assert_eq!(roles[0].role, "planner");
         assert_eq!(roles[0].command, "claude --model opus");
         assert_eq!(roles[1].role, "builder");
         assert_eq!(roles[1].command, "codex --model gpt-5.6-sol");
         assert!(seed.contains(".dot-agent-deck/orchestrator-context.md"));
-        assert!(!seed.contains('\n'));
+        assert!(seed.contains("## User task"));
+        assert!(seed.contains("Build the requested feature."));
 
         let context =
             std::fs::read_to_string(project_dir.join(".dot-agent-deck/orchestrator-context.md"))

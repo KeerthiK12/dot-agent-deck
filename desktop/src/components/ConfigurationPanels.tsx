@@ -5,14 +5,96 @@ import {
   ArrowUp,
   Bot,
   Check,
+  FolderCheck,
+  FolderGit2,
   GripVertical,
+  Plus,
   RotateCcw,
   Save,
   SlidersHorizontal,
+  Trash2,
   X,
 } from "lucide-react";
 import { defaultCliForProvider, resolveProfileCommand } from "../lib/profileCommands";
-import type { AgentProfile, Provider, RuntimeMode, WorkflowLaunchConfig } from "../types";
+import type { AgentProfile, DeckProject, Provider, RuntimeMode, WorkflowLaunchConfig } from "../types";
+
+interface ProjectsPanelProps {
+  open: boolean;
+  projects: DeckProject[];
+  activeId: string;
+  selectedId: string;
+  onSelect: (id: string) => void;
+  onClose: () => void;
+  onAdd: () => void;
+  onUpdate: (id: string, updates: Partial<DeckProject>) => void;
+  onRemove: (id: string) => void;
+  onActivate: (id: string) => void;
+  onConfigureWorkflow: () => void;
+}
+
+export function ProjectsPanel({ open, projects, activeId, selectedId, onSelect, onClose, onAdd, onUpdate, onRemove, onActivate, onConfigureWorkflow }: ProjectsPanelProps) {
+  const [removeArmed, setRemoveArmed] = useState(false);
+  const project = projects.find((candidate) => candidate.id === selectedId) ?? projects[0];
+  useEffect(() => setRemoveArmed(false), [selectedId, open]);
+  if (!open) return null;
+  const validDirectory = Boolean(project?.cwd.startsWith("/"));
+  const validWorkflow = Boolean(project?.workflowName.trim());
+
+  return (
+    <div className="sheet-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="config-sheet projects-sheet" role="dialog" aria-modal="true" aria-labelledby="projects-title" data-testid="projects-panel" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="sheet-header">
+          <div><span className="eyebrow">PROJECT LIBRARY</span><h2 id="projects-title">Projects</h2><p>Save the repositories and workflow names you launch most often.</p></div>
+          <button className="icon-button" aria-label="Close projects" onClick={onClose}><X size={18} /></button>
+        </header>
+        <div className="local-only-notice project-notice"><FolderCheck size={15} /><span><strong>Local library</strong> — project entries are stored on this Mac. Agent Deck never moves or deletes the repository folder.</span></div>
+
+        <div className="projects-layout">
+          <aside className="project-library">
+            <button className="add-project" onClick={onAdd}><Plus size={14} /> Add project</button>
+            <nav aria-label="Saved projects">
+              {projects.map((item) => (
+                <button key={item.id} className={item.id === project?.id ? "is-selected" : ""} onClick={() => onSelect(item.id)}>
+                  <span className={item.id === activeId ? "project-icon is-active" : "project-icon"}><FolderGit2 size={15} /></span>
+                  <span><strong>{item.name || "Untitled project"}</strong><small>{item.cwd || "Directory not set"}</small></span>
+                  {item.id === activeId && <em>ACTIVE</em>}
+                </button>
+              ))}
+            </nav>
+            {!projects.length && <div className="project-library-empty"><FolderGit2 size={22} /><span>No saved projects yet.</span></div>}
+          </aside>
+
+          {project ? (
+            <form className="project-form" onSubmit={(event) => { event.preventDefault(); if (validDirectory && validWorkflow) onActivate(project.id); }}>
+              <div className="form-heading">
+                <div><span>PROJECT SETTINGS</span><h3>{project.name || "Untitled project"}</h3></div>
+                {project.id === activeId ? <span className="active-project-badge"><Check size={11} /> Active project</span> : null}
+              </div>
+              <div className="project-fields">
+                <label><span>Display name</span><input aria-label="Project display name" value={project.name} onChange={(event) => onUpdate(project.id, { name: event.target.value })} placeholder="My coding project" /></label>
+                <label><span>Absolute project directory</span><input aria-label="Project directory" value={project.cwd} onChange={(event) => onUpdate(project.id, { cwd: event.target.value })} placeholder="/Users/you/dev/project" spellCheck={false} /><small>The folder must contain the workflow's <code>.dot-agent-deck.toml</code>.</small></label>
+                {project.cwd && !validDirectory && <small className="project-field-error"><AlertTriangle size={12} /> Use an absolute directory beginning with <code>/</code>.</small>}
+                <label><span>Workflow name</span><input aria-label="Project workflow name" value={project.workflowName} onChange={(event) => onUpdate(project.id, { workflowName: event.target.value })} placeholder="dot-agent-deck" spellCheck={false} /><small>This must match an orchestration defined in the project's TOML file.</small></label>
+                <label><span>Notes</span><textarea aria-label="Project notes" rows={5} value={project.notes} onChange={(event) => onUpdate(project.id, { notes: event.target.value })} placeholder="Stack, constraints, setup reminders, or the kind of work you use this loop for…" /></label>
+              </div>
+              <div className="project-readiness">
+                <FolderCheck size={16} />
+                <span><strong>{validDirectory && validWorkflow ? "Ready to select" : "Needs configuration"}</strong>{validDirectory && validWorkflow ? "The workflow launch screen will use this directory and workflow name." : "Add an absolute directory and workflow name before selecting this project."}</span>
+              </div>
+              <footer className="sheet-footer project-footer">
+                <button type="button" className={removeArmed ? "button danger" : "button secondary"} onClick={() => { if (removeArmed) onRemove(project.id); else setRemoveArmed(true); }}><Trash2 size={14} /> {removeArmed ? "Confirm remove" : "Remove entry"}</button>
+                <div>
+                  {project.id === activeId ? <button type="button" className="button secondary" onClick={onConfigureWorkflow}>Configure workflow</button> : null}
+                  <button type="submit" className="button primary" disabled={!validDirectory || !validWorkflow}><FolderCheck size={14} /> {project.id === activeId ? "Active project" : "Use this project"}</button>
+                </div>
+              </footer>
+            </form>
+          ) : <div className="configuration-empty">Add a project to configure its launch directory.</div>}
+        </div>
+      </section>
+    </div>
+  );
+}
 
 interface ProfilesPanelProps {
   open: boolean;
@@ -171,6 +253,7 @@ interface WorkflowPanelProps {
   profiles: AgentProfile[];
   order: string[];
   mode: RuntimeMode;
+  defaultName: string;
   defaultCwd: string;
   onClose: () => void;
   onToggle: (id: string) => void;
@@ -179,9 +262,10 @@ interface WorkflowPanelProps {
   platformIssue?: string;
 }
 
-export function WorkflowPanel({ open, profiles, order, mode, defaultCwd, onClose, onToggle, onMove, onLaunch, platformIssue }: WorkflowPanelProps) {
-  const [name, setName] = useState("dot-agent-deck");
+export function WorkflowPanel({ open, profiles, order, mode, defaultName, defaultCwd, onClose, onToggle, onMove, onLaunch, platformIssue }: WorkflowPanelProps) {
+  const [name, setName] = useState(defaultName);
   const [cwd, setCwd] = useState(defaultCwd.startsWith("/") ? defaultCwd : "");
+  const [taskPrompt, setTaskPrompt] = useState("");
   useEffect(() => {
     if (defaultCwd.startsWith("/") && (!cwd || cwd === "/dev/active/dot-agent-deck-gui")) setCwd(defaultCwd);
   }, [cwd, defaultCwd]);
@@ -191,7 +275,7 @@ export function WorkflowPanel({ open, profiles, order, mode, defaultCwd, onClose
   const resolved = enabled.map((profile) => ({ profile, resolution: resolveProfileCommand(profile) }));
   const invalidCommands = resolved.filter(({ resolution }) => resolution.issue);
   const allRequiredRolesEnabled = enabled.length === ordered.length && enabled.some((profile) => profile.roleId === "orchestrator");
-  const canLaunch = mode === "live" && !platformIssue && name.trim().length > 0 && cwd.startsWith("/") && allRequiredRolesEnabled && invalidCommands.length === 0;
+  const canLaunch = mode === "live" && !platformIssue && name.trim().length > 0 && cwd.startsWith("/") && taskPrompt.trim().length > 0 && allRequiredRolesEnabled && invalidCommands.length === 0;
   const roles = resolved.map(({ profile, resolution }) => ({ role: profile.roleId, command: resolution.command, start: profile.roleId === "orchestrator" }));
   const customCommandCount = resolved.filter(({ resolution }) => resolution.source === "custom").length;
   const generatedFullAccessCount = resolved.filter(({ profile, resolution }) => resolution.source === "generated" && profile.permissionMode === "full-access").length;
@@ -207,7 +291,9 @@ export function WorkflowPanel({ open, profiles, order, mode, defaultCwd, onClose
           <div className="workflow-launch-form">
             <label><span>Workflow name</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="coding-loop" /></label>
             <label><span>Absolute project directory</span><input value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="/Users/you/dev/project" spellCheck={false} /></label>
+            <label className="workflow-task-prompt"><span>Task prompt</span><textarea aria-label="Task prompt" value={taskPrompt} onChange={(event) => setTaskPrompt(event.target.value)} placeholder="Tell the orchestrator what to build, fix, or investigate..." rows={5} /></label>
             {cwd && !cwd.startsWith("/") && <small><AlertTriangle size={12} /> Use an absolute directory path.</small>}
+            {!taskPrompt.trim() && <small><AlertTriangle size={12} /> Add the task you want the coordinator to run.</small>}
             {platformIssue && <small data-testid="workflow-platform-issue"><AlertTriangle size={12} /> {platformIssue}</small>}
             {!allRequiredRolesEnabled && <small><AlertTriangle size={12} /> This project config requires orchestrator, coder, reviewer, auditor, tester, and release for a live launch.</small>}
             {invalidCommands.length > 0 && <small><AlertTriangle size={12} /> Fix the launch command for: {invalidCommands.map(({ profile }) => profile.role).join(", ")}.</small>}
@@ -229,7 +315,7 @@ export function WorkflowPanel({ open, profiles, order, mode, defaultCwd, onClose
         </div>
         <footer className="sheet-footer workflow-footer">
           <span>{enabled.length} active roles · {ordered.length - enabled.length} skipped</span>
-          {mode === "live" ? <button className="button primary" data-testid="launch-live-loop" disabled={!canLaunch} onClick={() => onLaunch({ name: name.trim(), cwd, roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount })}><Bot size={14} /> Launch live loop</button> : <button className="button primary" onClick={onClose}><Check size={14} /> Use preview</button>}
+          {mode === "live" ? <button className="button primary" data-testid="launch-live-loop" disabled={!canLaunch} onClick={() => onLaunch({ name: name.trim(), cwd, taskPrompt: taskPrompt.trim(), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount })}><Bot size={14} /> Launch live loop</button> : <button className="button primary" onClick={onClose}><Check size={14} /> Use preview</button>}
         </footer>
       </section>
     </div>

@@ -50,6 +50,37 @@ describe("ControlDeck", () => {
     expect(screen.getByTestId("evidence-drawer")).toBeVisible();
   });
 
+  it("manages projects and sends the active project defaults into the workflow launcher", async () => {
+    const live = runtime({ mode: "live" });
+    render(<ControlDeck runtime={live} />);
+
+    fireEvent.click(screen.getByTestId("open-projects"));
+    expect(screen.getByTestId("projects-panel")).toBeVisible();
+    await waitFor(() => expect(screen.getByLabelText("Saved projects")).toBeVisible());
+    fireEvent.click(screen.getByRole("button", { name: "Add project" }));
+    fireEvent.change(screen.getByLabelText("Project display name"), { target: { value: "Clipmaker" } });
+    fireEvent.change(screen.getByLabelText("Project directory"), { target: { value: "/Users/prabhusriramulu/dev/active/clipmaker" } });
+    fireEvent.change(screen.getByLabelText("Project workflow name"), { target: { value: "clipmaker-loop" } });
+    fireEvent.change(screen.getByLabelText("Project notes"), { target: { value: "Video pipeline work" } });
+    fireEvent.click(screen.getByRole("button", { name: "Use this project" }));
+
+    await waitFor(() => expect(screen.getByText("Active project updated. Open Workflows when you are ready to launch its agents.")).toBeVisible());
+    expect(window.localStorage.getItem("dot-agent-deck.desktop.projects.v1")).toContain("clipmaker-loop");
+    fireEvent.click(screen.getByRole("button", { name: "Configure workflow" }));
+    expect(screen.getByLabelText("Workflow name")).toHaveValue("clipmaker-loop");
+    expect(screen.getByLabelText("Absolute project directory")).toHaveValue("/Users/prabhusriramulu/dev/active/clipmaker");
+  });
+
+  it("requires two clicks to remove only the local project entry", async () => {
+    render(<ControlDeck runtime={runtime()} />);
+    fireEvent.click(screen.getByTestId("open-projects"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Remove entry" })).toBeVisible());
+    fireEvent.click(screen.getByRole("button", { name: "Remove entry" }));
+    expect(screen.getByRole("button", { name: "Confirm remove" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm remove" }));
+    expect(screen.getByText("Project entry removed. The repository folder was not changed.")).toBeVisible();
+  });
+
   it("edits agent profiles locally and clearly marks the draft as not written to TOML", () => {
     render(<ControlDeck runtime={runtime()} />);
     fireEvent.click(screen.getByTestId("open-agent-profiles"));
@@ -77,8 +108,10 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close agent profiles" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build the project switcher polish." } });
     fireEvent.click(screen.getByTestId("launch-live-loop"));
     expect(screen.getByRole("alertdialog")).toHaveTextContent("All 6 commands are generated from the current provider, CLI, model, effort, and permission fields.");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("sends your task prompt to the coordinator");
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Among generated commands, 1 role has full-access permissions.");
     fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
 
@@ -86,6 +119,7 @@ describe("ControlDeck", () => {
       const launch = vi.mocked(live.runAction).mock.calls[0]?.[0];
       expect(launch).toMatchObject({ type: "start_workflow" });
       if (launch?.type !== "start_workflow") throw new Error("expected workflow launch");
+      expect(launch.taskPrompt).toBe("Build the project switcher polish.");
       expect(launch.roles.find((role) => role.role === "coder")?.command).toBe("'/Applications/Codex Nightly/bin/codex' --model gpt-5.6-sol-fast --sandbox danger-full-access --ask-for-approval on-request -c model_reasoning_effort=high");
     });
   });
@@ -102,6 +136,7 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close agent profiles" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Use the custom coder to fix failing tests." } });
     fireEvent.click(screen.getByTestId("launch-live-loop"));
     expect(screen.getByRole("alertdialog")).toHaveTextContent("1 explicit custom command override bypasses those fields");
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Custom commands may carry arbitrary permissions and are not covered by structured permission claims.");
@@ -119,12 +154,16 @@ describe("ControlDeck", () => {
     const live = runtime({ mode: "live" });
     render(<ControlDeck runtime={live} />);
     fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
+    expect(screen.getByText("Add the task you want the coordinator to run.")).toBeVisible();
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Wire the launch prompt into the workflow." } });
     fireEvent.click(screen.getByTestId("launch-live-loop"));
     expect(live.runAction).not.toHaveBeenCalled();
     fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
     await waitFor(() => expect(live.runAction).toHaveBeenCalledWith(expect.objectContaining({
       type: "start_workflow",
       name: "dot-agent-deck",
+      taskPrompt: "Wire the launch prompt into the workflow.",
       roles: expect.arrayContaining([expect.objectContaining({ role: "orchestrator", start: true }), expect.objectContaining({ role: "coder", start: false })]),
     })));
   });
@@ -133,6 +172,7 @@ describe("ControlDeck", () => {
     const live = runtime({ mode: "live" });
     render(<ControlDeck runtime={live} workflowPlatformIssue={WINDOWS_WORKFLOW_BLOCK_REASON} />);
     fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Try to launch on Windows." } });
 
     expect(screen.getByTestId("workflow-platform-issue")).toHaveTextContent("unavailable in this Windows preview");
     expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
@@ -173,6 +213,47 @@ describe("ControlDeck", () => {
 
     await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "stop_daemon" }));
     expect(screen.getByText("Local daemon stopped.")).toBeVisible();
+  });
+
+  it("replaces an incompatible zero-agent daemon through an explicit confirmation", async () => {
+    const incompatible = createFixtureSnapshot("error");
+    incompatible.agents = [];
+    incompatible.stages = [];
+    incompatible.evidence = [];
+    incompatible.connection = {
+      status: "error",
+      socketPath: "/tmp/dot-agent-deck.sock",
+      message: "build mismatch",
+      daemonDetected: true,
+      runningAgentCount: 0,
+    };
+    const runAction = vi.fn(async () => undefined);
+    const live = runtime({ mode: "live", snapshot: incompatible, runAction });
+    render(<ControlDeck runtime={live} />);
+
+    expect(screen.getByRole("button", { name: "Stop daemon" })).toBeEnabled();
+    fireEvent.click(screen.getByTestId("replace-daemon"));
+    expect(live.runAction).not.toHaveBeenCalled();
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("exact daemon build bundled with this desktop app");
+    fireEvent.click(screen.getAllByRole("button", { name: "Replace daemon" }).at(-1)!);
+
+    await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "restart_daemon" }));
+    expect(screen.getByText("Matching daemon started and reconnected.")).toBeVisible();
+  });
+
+  it("does not offer daemon replacement while an incompatible daemon reports live agents", () => {
+    const incompatible = createFixtureSnapshot("error");
+    incompatible.agents = [];
+    incompatible.connection = {
+      status: "error",
+      message: "build mismatch",
+      daemonDetected: true,
+      runningAgentCount: 2,
+    };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: incompatible })} />);
+
+    expect(screen.queryByTestId("replace-daemon")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop daemon" })).toBeEnabled();
   });
 
   it("never reports daemon-start success when the start action fails", async () => {

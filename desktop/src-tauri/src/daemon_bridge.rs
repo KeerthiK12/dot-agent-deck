@@ -7,6 +7,8 @@ use dot_agent_deck::daemon_attach::{
 };
 use dot_agent_deck::daemon_client::{DaemonClient, issue_command};
 use dot_agent_deck::daemon_protocol::{AttachRequest, AttachResponse, PROTOCOL_VERSION};
+#[cfg(test)]
+use dot_agent_deck::daemon_protocol::RunningAgentsSummary;
 use dot_agent_deck::platform::ipc::IpcStream;
 
 use crate::dto::{
@@ -69,8 +71,16 @@ fn classify_handshake(response: &AttachResponse, client_build: &str) -> Handshak
                 .unwrap_or_else(|| "no version".into())
         ))
     } else if daemon_build_version.as_deref() != Some(client_build) {
+        let recovery = match running_agent_count {
+            Some(0) => "No live agents are reported; use Replace daemon to start the matching bundled build.".into(),
+            Some(count) => format!(
+                "The daemon reports {count} live agent{}; stop them individually before replacing the daemon.",
+                if count == 1 { "" } else { "s" }
+            ),
+            None => "The daemon could not report its live-agent count, so automatic replacement is disabled.".into(),
+        };
         Some(format!(
-            "build mismatch: desktop is {client_build}, daemon is {}. Stop the daemon deliberately and restart it with the matching dot-agent-deck binary; the desktop will not recycle running agents automatically.",
+            "build mismatch: desktop is {client_build}, daemon is {}. {recovery}",
             daemon_build_version.as_deref().unwrap_or("unreported")
         ))
     } else {
@@ -283,12 +293,30 @@ mod tests {
     }
 
     #[test]
-    fn build_mismatch_is_visible_without_automatic_recycle() {
-        let response = AttachResponse::hello(PROTOCOL_VERSION);
+    fn zero_agent_build_mismatch_points_to_safe_replacement() {
+        let response = AttachResponse::hello(PROTOCOL_VERSION)
+            .with_running_agents(RunningAgentsSummary::default());
         let info = classify_handshake(&response, "desktop-other-build");
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.unwrap();
         assert!(error.contains("build mismatch"));
-        assert!(error.contains("will not recycle running agents automatically"));
+        assert!(error.contains("use Replace daemon"));
+    }
+
+    #[test]
+    fn live_agent_build_mismatch_blocks_replacement() {
+        let response = AttachResponse::hello(PROTOCOL_VERSION).with_running_agents(
+            RunningAgentsSummary {
+                count: 2,
+                names: vec!["coder".into(), "tester".into()],
+            },
+        );
+        let info = classify_handshake(&response, "desktop-other-build");
+        assert_eq!(info.status, ConnectionStatus::Incompatible);
+        assert!(
+            info.error
+                .unwrap()
+                .contains("stop them individually before replacing")
+        );
     }
 }

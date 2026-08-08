@@ -10,6 +10,18 @@ export interface ConnectionView {
   status: ConnectionStatus;
   socketPath?: string;
   message?: string;
+  /** True when a daemon answered Hello but failed protocol/build compatibility. */
+  daemonDetected?: boolean;
+  /** Honest count reported by Hello; undefined when the daemon could not report it. */
+  runningAgentCount?: number;
+}
+
+export interface DeckProject {
+  id: string;
+  name: string;
+  cwd: string;
+  workflowName: string;
+  notes: string;
 }
 
 export interface WorkflowStage {
@@ -124,7 +136,8 @@ export type DeckAction =
   | { type: "advance_fixture" }
   | { type: "start_daemon" }
   | { type: "stop_daemon"; force?: boolean }
-  | { type: "start_workflow"; name: string; cwd: string; roles: WorkflowLaunchRole[]; rows: number; cols: number }
+  | { type: "restart_daemon" }
+  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number }
   | { type: "retry_stage"; stageId: string }
   | { type: "stop_agent"; agentId: string }
   | { type: "submit_text"; agentId: string; text: string };
@@ -138,6 +151,7 @@ export interface WorkflowLaunchRole {
 export interface WorkflowLaunchConfig {
   name: string;
   cwd: string;
+  taskPrompt: string;
   roles: WorkflowLaunchRole[];
   rows: number;
   cols: number;

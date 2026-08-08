@@ -66,7 +66,7 @@ describe("TauriDeckBridge", () => {
     delete incompatible.agents[0].activeTool;
     expect(mapDesktopSnapshot(incompatible)).toMatchObject({
       health: "failed",
-      connection: { status: "error" },
+      connection: { status: "error", daemonDetected: true, runningAgentCount: 1 },
       agents: [{ displayName: "Coder", cwd: "Unavailable", model: "Unavailable", task: "Task metadata unavailable from daemon" }],
     });
 
@@ -248,6 +248,16 @@ describe("TauriDeckBridge", () => {
     await bridge.runAction({ type: "stop_daemon" });
 
     expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "stop_daemon" } });
+    await bridge.dispose();
+  });
+
+  it("sends restart_daemon through the live bridge", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+
+    await bridge.runAction({ type: "restart_daemon" });
+
+    expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "restart_daemon" } });
     await bridge.dispose();
   });
 });

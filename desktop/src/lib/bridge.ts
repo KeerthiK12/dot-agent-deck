@@ -72,8 +72,9 @@ export type DesktopRunActionDto =
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
   | { type: "detach_terminal"; sessionId: string }
   | { type: "submit_text"; agentId: string; text: string }
-  | { type: "start_workflow"; name: string; cwd: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number }
-  | { type: "stop_daemon"; force?: boolean };
+  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number }
+  | { type: "stop_daemon"; force?: boolean }
+  | { type: "restart_daemon" };
 
 type SnapshotListener = (snapshot: DeckSnapshot) => void;
 type TerminalListener = (event: TerminalChunk) => void;
@@ -172,6 +173,8 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       status: dto.connection.status === "incompatible" ? "error" : dto.connection.status,
       socketPath: dto.connection.socketPath,
       message: dto.connection.error ?? (dto.connection.status === "connected" ? "Daemon responding" : dto.connection.status === "incompatible" ? `Protocol mismatch: desktop v${dto.connection.clientProtocolVersion}, daemon v${dto.connection.serverProtocolVersion ?? "unknown"}` : "Daemon unavailable"),
+      daemonDetected: dto.connection.status === "connected" || dto.connection.status === "incompatible",
+      runningAgentCount: dto.connection.runningAgentCount,
     },
     health: dto.connection.status === "incompatible" ? "failed" : dto.connection.status === "disconnected" ? "idle" : agents.some((agent) => agent.status === "failed") ? "failed" : "healthy",
     elapsed: previous?.elapsed ?? "—",
@@ -447,9 +450,9 @@ export class TauriDeckBridge implements DeckBridge {
 
   async runAction(action: DeckAction): Promise<void> {
     const invoke = await this.getInvoke();
-    if (action.type === "stop_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon") {
+    if (action.type === "stop_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon" || action.type === "restart_daemon") {
       await invoke("desktop_run_action", { action: action satisfies DesktopRunActionDto });
-      if (action.type === "stop_daemon") {
+      if (action.type === "stop_daemon" || action.type === "restart_daemon") {
         this.sessions.clear();
         this.attached.clear();
         this.terminalChannels.clear();
