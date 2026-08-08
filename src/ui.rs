@@ -506,42 +506,51 @@ Rules:
 - CONFIRM the full entry (every field, especially repo and max_per_run) with the user before you call `schedule add`.
 - AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, each dispatched issue surfaces live as its own tab on the deck.";
 
-/// PRD #220: display name of the built-in "dispatcher" authoring option in the
-/// new-pane Mode cycler — appended after `schedule: issues`. Selecting it opens
-/// a dispatcher tab: a seeded agent that decomposes work into parallel units and
-/// calls `dot-agent-deck dispatch <name>` per unit.
+/// PRD #220: display name of the built-in "dispatcher" option in the new-pane
+/// Mode cycler — appended after `schedule: issues`. Selecting it opens a
+/// dispatcher tab: an ordinary agent that additionally knows the
+/// `dot-agent-deck dispatch <name>` verb.
 const DISPATCHER_MODE_NAME: &str = "dispatcher";
 
-/// PRD #220 M3.0: the seed prompt for the dispatcher mode. Teaches the agent:
-/// decompose work → `dispatch` per unit → isolation is automatic → don't do the
-/// work yourself.
+/// PRD #220 M3.0: the seed prompt for the dispatcher mode.
+///
+/// Scope is deliberately MECHANICS ONLY — what the `dispatch` verb is, what it
+/// does, and the constraints that follow from process isolation. It carries no
+/// opinion on how the user should organise work, matching both schedule-authoring
+/// seeds (which cover only which CLI to use, which flags do not apply, and where
+/// results surface). An earlier version cast the pane as a planner ("decompose
+/// into independent units", "keep the number of units reasonable (2-6)", "NEVER
+/// do the work yourself") — that was cut: the deck does not own the user's
+/// workflow, and the last line actively forbade the pane from doing anything else
+/// the user asked. See the Design record in `prds/220-…md`.
 const DISPATCHER_SEED_PROMPT: &str = "\
-You are a parallel-work dispatcher. Your job is to decompose a task into independent units, then dispatch each unit into its own isolated git worktree where a fresh agent can work on it without interference.
+You are an ordinary assistant with one extra effector available: the `dot-agent-deck dispatch` verb, which starts an isolated line of work in its own git worktree. Help the user with whatever they ask, exactly as you normally would. When they say to START something as a separate line of work, reach for `dispatch` rather than doing that work here.
 
-## What you do
-1. Understand the user's goal.
-2. Break it into independent, parallel-ready units of work.
-3. For each unit, call:
-   dot-agent-deck dispatch <name> --task \"<detailed task description with file paths, constraints, and expected outcome>\"
-   - <name> is a short slug (e.g. `fix-auth-bug`, `add-rate-limiter`).
-   - The --task text must be self-contained — the dispatched agent has NO context about other units or the parent conversation.
-4. Report back to the user: which units were dispatched, where each worktree lives.
+## The verb
+  dot-agent-deck dispatch <name> [--task <text>] [--task-file <path>]
+
+- <name> is a short slug naming this line of work (e.g. `fix-auth-bug`, `prd-220`). It names the worktree and its branch.
+- --task carries the prompt the isolated agent receives. --task-file reads that text from a file (or `-` for stdin) instead; the two are mutually exclusive.
+
+## What it does
+- Creates a git worktree as a SIBLING of this repo, at ../<repo>-dispatch-<name>, on branch agent/dispatch-<name>. Isolation is automatic — never create or pick a worktree yourself.
+- Starts an agent inside it — or a full multi-role orchestration, depending on that repo's own config — delivering the --task text as its opening prompt.
+- Returns immediately and reports what was started and where.
 
 ## Rules
-- NEVER do the work yourself. You ONLY decompose and dispatch.
-- Each unit MUST be independent — if unit B depends on unit A, they are NOT parallel-ready.
-- The dispatch command creates a git worktree, spawns an agent in it, and returns immediately — it is fire-and-forget.
-- Keep the number of units reasonable (2-6). Too many units overwhelm the system.
-- After dispatching all units, tell the user each unit is running in its own isolated worktree, and report the worktree path for each so they can follow the work. Do NOT promise that units will report back to you when finished — there is no return edge yet, so completions do not come back to this pane.
+- The --task text must be SELF-CONTAINED. The dispatched agent is a fresh process with no access to this conversation, so spell out the files, constraints, and expected outcome it needs.
+- `dispatch` is fire-and-forget: there is NO return edge yet, so a dispatched unit's completion does NOT come back to this pane. Never tell the user results will report back here — give them the worktree path instead, and point at the unit's own tab on the deck.
+- A <name> is single-use. Removing a worktree keeps its branch, so re-dispatching the same name is refused while agent/dispatch-<name> still exists — pick a different name, or delete that branch once you are done with it.
+- Relay the path that `dispatch` reports for each line of work, so the user can follow it.";
 
-## Dispatch command reference
-  dot-agent-deck dispatch <name> [--task <text>] [--task-file <path>]";
-
-/// PRD #220: build the dispatcher `ModeConfig` — a seeded single-agent mode
-/// that teaches the agent to decompose work and call `dispatch` per unit.
+/// PRD #220: build the dispatcher `ModeConfig` — a seeded single-agent mode that
+/// teaches the agent the `dispatch` verb (see [`DISPATCHER_SEED_PROMPT`]).
+///
+/// Appends the pane's own `working_dir`, since the seed's `../<repo>-dispatch-…`
+/// layout is relative to it and the agent otherwise has to infer it.
 fn build_dispatcher_mode(working_dir: &std::path::Path) -> ModeConfig {
     let seed = format!(
-        "{seed}\n\nworking_dir: {dir}\n\nThe repo at this path is the main worktree. Dispatched worktrees are created as sibling directories at ../<repo>-dispatch-<name>.",
+        "{seed}\n\nworking_dir: {dir}\n\nThe repo at that path is the main worktree — the one dispatched worktrees are created as siblings of.",
         seed = DISPATCHER_SEED_PROMPT,
         dir = working_dir.display(),
     );
@@ -1169,12 +1178,18 @@ impl NewPaneFormState {
     }
 
     /// PRD #120: whether the current selection is a throwaway authoring option
-    /// (plain `schedule` OR `schedule: issues` OR `dispatcher`). Drives the shared
+    /// (plain `schedule` OR `schedule: issues`). Drives the shared
     /// "↳ authoring (one-off)" hint + its reserved render row.
+    ///
+    /// PRD #220: `dispatcher` is deliberately NOT a member. The schedule options
+    /// really are one-off — their own seeds tell the user the pane existed only to
+    /// write the schedule and can be closed. A dispatcher pane has continued
+    /// purpose: the user keeps talking to it and may dispatch again, and it is a
+    /// real mode tab rather than a throwaway authoring card (see
+    /// `build_new_pane_request`). Labelling it "authoring (one-off)" told the user
+    /// the opposite.
     fn is_authoring_selected(&self) -> bool {
-        self.is_schedule_selected()
-            || self.is_issue_dispatch_selected()
-            || self.is_dispatcher_selected()
+        self.is_schedule_selected() || self.is_issue_dispatch_selected()
     }
 
     fn mode_option_count(&self) -> usize {
@@ -25322,9 +25337,92 @@ mod tests {
             "seed must contain the working_dir, got:\n{seed}"
         );
         assert!(
-            seed.contains("sibling directories"),
+            seed.contains("siblings of"),
             "seed must mention sibling worktree layout, got:\n{seed}"
         );
+    }
+
+    /// PRD #220 seed scope: the seed teaches Agent Deck MECHANICS, not work
+    /// methodology. The planner framing was cut deliberately (see the Design
+    /// record in `prds/220-…md`), and "NEVER do the work yourself" in particular
+    /// forbade the pane from doing anything else the user asked. Pinned so it
+    /// cannot drift back in.
+    #[test]
+    fn dispatcher_seed_teaches_mechanics_not_work_methodology() {
+        for banned in [
+            "decompose",
+            "independent units",
+            "parallel-ready",
+            "2-6",
+            "NEVER do the work yourself",
+        ] {
+            assert!(
+                !DISPATCHER_SEED_PROMPT.contains(banned),
+                "the dispatcher seed must not carry work-methodology copy, found {banned:?}"
+            );
+        }
+        // The mechanics it MUST still carry.
+        for required in [
+            "dot-agent-deck dispatch <name>",
+            "SELF-CONTAINED",
+            "../<repo>-dispatch-<name>",
+            "single-use",
+            "fire-and-forget",
+        ] {
+            assert!(
+                DISPATCHER_SEED_PROMPT.contains(required),
+                "the dispatcher seed must still teach {required:?}"
+            );
+        }
+    }
+
+    /// PRD #220: the flag-ON cycler wiring. `dispatcher_index()` is index
+    /// arithmetic over two independently-gated options, which is exactly what
+    /// breaks silently — and the only other coverage is the credential-gated e2e
+    /// test, so without this the wiring is untested on a machine with no agent
+    /// CLI installed.
+    #[test]
+    fn dispatcher_occupies_the_last_cycler_slot_when_shown() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            vec![],
+        );
+        // Both experimental options on, independent of the ambient env flag.
+        f.show_issue_dispatch = true;
+        f.show_dispatcher = true;
+
+        // "No mode" + 1 mode + schedule + schedule: issues + dispatcher.
+        assert_eq!(f.mode_option_count(), 5);
+        let last = f.mode_option_count() - 1;
+        assert_eq!(
+            f.dispatcher_index(),
+            last,
+            "dispatcher must be the LAST cycler slot, after schedule: issues"
+        );
+        assert_eq!(f.mode_option_name(last), DISPATCHER_MODE_NAME);
+
+        f.selection_index = last;
+        assert!(f.is_dispatcher_selected());
+        assert_eq!(
+            f.selected_mode().map(|m| m.name.as_str()),
+            Some(DISPATCHER_MODE_NAME)
+        );
+        // PRD #220: a dispatcher pane has continued purpose, so it must NOT be
+        // labelled "↳ authoring (one-off)" the way the schedule options are.
+        assert!(
+            !f.is_authoring_selected(),
+            "dispatcher is a real mode tab, not throwaway authoring"
+        );
+
+        // Flag off: the cycler shape is the pre-feature baseline and the
+        // dispatcher is unreachable.
+        f.show_dispatcher = false;
+        f.selection_index = 0;
+        assert_eq!(f.mode_option_count(), 4);
+        assert!(!f.is_dispatcher_selected());
     }
 
     // --- PRD #127 M3.3: "Scheduled Tasks" manager dialog pure-data helpers ---

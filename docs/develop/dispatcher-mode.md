@@ -4,7 +4,9 @@
 
 ## What it is
 
-Dispatcher mode is a built-in seeded mode for `dot-agent-deck` that teaches an agent to decompose a large task into smaller isolated units and dispatch each one via the `dispatch` CLI subcommand. When the agent is running inside dispatcher mode its system prompt is augmented with instructions on how to use the `dispatch` subcommand for worktree-isolated work units.
+Dispatcher mode is a built-in seeded mode for `dot-agent-deck` that teaches an agent one extra effector: the `dispatch` CLI subcommand, which starts an isolated line of work in its own git worktree. A dispatcher pane is otherwise an **ordinary conversational agent** — it does whatever the user asks — and it reaches for `dispatch` when the user says to *start* something as a separate line of work.
+
+The seed is deliberately scoped to **Agent Deck mechanics, not work methodology**: what the verb is, what it does, and the constraints that follow from process isolation. It holds no opinion on how the user should split up their work, matching the two schedule-authoring seeds. (An earlier version cast the pane as a planner that had to decompose a goal into 2–6 independent units and never do work itself; that was cut — see the Design record in [PRD #220](../../prds/220-dispatcher-mode-worktree-dispatch.md).)
 
 ## How to activate it
 
@@ -22,7 +24,9 @@ Once the agent is running inside dispatcher mode, it can execute:
 dot-agent-deck dispatch <name> --task "..."
 ```
 
-This spawns an isolated sub-agent in a dedicated worktree. The agent is expected to decompose its work into named units and call `dispatch` for each one.
+This spawns an isolated agent — or a full multi-role orchestration, depending on the dispatched worktree's own `.dot-agent-deck.toml` — in a dedicated worktree. The `--task` text becomes that agent's opening prompt, and because it runs as a fresh process with no access to the dispatcher's conversation, the text has to be self-contained.
+
+Several dispatches from one pane are normal, and are not decomposition: working on three PRDs in parallel is three dispatches of three things the user named.
 
 ## Worktree isolation
 

@@ -33,7 +33,9 @@ Skills are deliberately **not** used to carry this knowledge. This repo does not
 
 ## Design record — intended dispatcher behaviour (2026-08-03)
 
-Captured during review of PR #232 (the implementation). The shipped seed prompt reads as a **work decomposer**, which is not what this PRD asked for, and the difference is large enough that it needs settling with the contributor before further changes. Recorded here so the reasoning survives the session.
+Captured during review of PR #232 (the implementation). The seed prompt as first shipped read as a **work decomposer**, which is not what this PRD asked for, and the difference was large enough to need settling with the contributor before further changes. Recorded here so the reasoning survives the session.
+
+**RESOLVED 2026-08-05.** The contributor agreed without reservation that the decomposer framing was a mistake, named the same narrower scope described below, and asked the maintainer to push the change. The seed was rewritten accordingly and `dispatcher` was dropped from `is_authoring_selected()`; the two open questions this record raised are now decisions. The reasoning is kept in full because it is the rationale for the seed-scope principle, which applies to every future mode seed.
 
 ### Canonical walkthrough
 
@@ -76,9 +78,14 @@ A dispatched orchestrator currently receives **only** the `--task` text. It is n
 
 `issue_dispatch` (#120) has the identical defect, since `dispatch` reuses that engine — this is exactly #222's "prompt order" parity item. Two implementation notes for whoever does it: nothing here is a *system* prompt (it is all PTY-typed user input, which is why combining protocol + intent into one delivery is easy), and multi-line prompts do not submit reliably through a PTY — so the shape is a combined context **file** plus a one-line pointer, following `compose_worker_task_file`, not string concatenation.
 
-### Open question for the contributor (blocking further seed work)
+### ~~Open question for the contributor (blocking further seed work)~~ — answered 2026-08-05
 
-Whether the decomposer framing was deliberate, and how far their model differs from the walkthrough above. Asked on PR #232. This is deliberately *not* being resolved unilaterally: the technical shape is a maintainer call, but the contributor's intent is not knowable without asking, and guessing risks building two different features. Also unresolved, and dependent on the answer: whether `dispatcher` should stay in `is_authoring_selected()` — the "↳ authoring (one-off)" hint is correct for the schedule modes (whose seeds say the pane existed only to create the schedule) but misleading for a dispatcher that has continued purpose.
+Asked on PR #232 whether the decomposer framing was deliberate, rather than resolved unilaterally: the technical shape was a maintainer call, but the contributor's intent was not knowable without asking, and guessing risked building two different features. **Asking was the right call and it settled cleanly** — the framing was not solving for anything the narrower reading loses, so nothing was thrown away.
+
+Both dependent items are now decided:
+
+- **Seed scope → verb-teacher.** Rewritten to mechanics only, per the keep/cut list above, and pinned by `dispatcher_seed_teaches_mechanics_not_work_methodology` so the planner copy cannot drift back in.
+- **`is_authoring_selected()` → `dispatcher` removed.** The "↳ authoring (one-off)" hint stays correct for the schedule modes, whose own seeds tell the user the pane existed only to write the schedule. A dispatcher pane has continued purpose and is spawned as a real mode tab (`mode_config: Some(...)`) rather than a throwaway authoring card, so the hint was telling the user the opposite of the truth.
 
 ## Scope
 
@@ -93,7 +100,7 @@ Whether the decomposer framing was deliberate, and how far their model differs f
 
 **The dispatcher mode (trigger):**
 
-- **A built-in dispatcher mode** — a `ModeConfig` with a `seed_prompt` (`src/project_config.rs:30`) — modeled on `build_schedule_authoring_mode` (`src/ui.rs:4271`). Its context file teaches: you help the user decompose and start lines of work; when the user has settled on a unit and says to start it, run the `dispatch` verb once per independent unit; isolation is automatic; do not do the work yourself.
+- **A built-in dispatcher mode** — a `ModeConfig` with a `seed_prompt` (`src/project_config.rs:30`) — modeled on `build_schedule_authoring_mode` (`src/ui.rs:4271`). Its seed teaches: the `dispatch` verb and its syntax; that `--task` must be self-contained because the unit is a fresh process; the sibling worktree layout, with isolation automatic; that a name is single-use until its branch is deleted; and that it is fire-and-forget with no return edge. (This bullet originally also said "you help the user decompose … do not do the work yourself" — cut per the seed-scope decision; the pane is an ordinary agent that additionally knows the verb.)
 - **Agent-agnostic, zero ambient overhead:** the seed is delivered only when the dispatcher mode tab is opened (the existing scoped seed-delivery path), so no unrelated session pays for it, and it works across Claude/OpenCode/Pi.
 
 **Lifecycle:**
@@ -152,7 +159,7 @@ A running orchestrator creating a worktree partway through and expecting its alr
 
 ### Phase 3: The dispatcher mode
 
-- [x] **M3.0** — Add the built-in dispatcher mode (`ModeConfig` + `seed_prompt`, `src/project_config.rs:30`) modeled on `build_schedule_authoring_mode` (`src/ui.rs:4271`); author its context file (what/when to call `dispatch`, one-unit-per-worktree, isolation is automatic, don't do the work). → Gated behind `features::show_dispatcher()`.
+- [x] **M3.0** — Add the built-in dispatcher mode (`ModeConfig` + `seed_prompt`, `src/project_config.rs:30`) modeled on `build_schedule_authoring_mode` (`src/ui.rs:4271`); author its context file (what/when to call `dispatch`, one-unit-per-worktree, isolation is automatic, don't do the work). → Gated behind `features::show_dispatcher()`. **Seed rewritten to mechanics only** after the 2026-08-05 seed-scope decision — the "don't do the work" clause in this milestone's own wording was cut, since it forbade the pane from doing anything else the user asked. Pinned by `dispatcher_seed_teaches_mechanics_not_work_methodology`.
 - [ ] **M3.1** — Verify the seed is delivered only on opening the dispatcher tab (scoped, zero ambient overhead) and reaches Claude/OpenCode/Pi panes uniformly. → **PARTIAL:** verified for Claude only (`prompt/new-pane/016` — the seed text is visible in the pane and the agent acts on it). OpenCode and Pi are unverified.
 
 ### Phase 4: Cross-type spawn + tests
@@ -194,11 +201,10 @@ A running orchestrator creating a worktree partway through and expecting its alr
 - **Worktree removal → fail toward leaking.** Dispatch drops `--force` and gates on `git status --porcelain`; a dirty tree survives with a warning. A leaked worktree costs disk, a force-removed one costs work, and that asymmetry decides it — Ctrl+W reads as "close this view", not "destroy uncommitted work". Issue-dispatch keeps forcing (see M1.2).
 - **Standalone vs #174 Phase 1 → ships standalone; #174 depends on THIS.** Recorded explicitly because the dependency has been stated backwards more than once (in `docs/develop/dispatcher-mode.md` and in PR #232 discussion, both of which deferred #220's return edge "to #174"). #174 is *Cross-project orchestration dispatch* — a separate open PRD issue, not a PR, and not a tracker for #220's Phase 2.
 - **Experimental flag → yes.** `features::show_dispatcher()`, its own wrapper per CLAUDE.md rule 9 (not a reuse of `show_issue_dispatch_authoring`). Gates ONLY the Mode-cycler option; the `dispatch` verb and its daemon handler are ungated. Graduation tracked as `graduate-dispatcher`, to be filed at merge.
+- **Seed scope → verb-teacher, not decomposer.** Settled with the contributor on 2026-08-05 (see the Design record). The seed teaches Agent Deck mechanics only; the planner copy is cut and pinned against by a unit test. **This generalises: a seed teaches Agent Deck mechanics, not work methodology** — the test for any future mode seed is "would this sentence still be needed if the user's work were of a completely different kind?"
+- **`is_authoring_selected()` membership → `dispatcher` excluded.** It is a real mode tab with continued purpose, not a throwaway authoring card, so the "↳ authoring (one-off)" hint does not apply.
 
 ## Open Questions
-
-- **Seed scope — decomposer vs verb-teacher.** BLOCKING further seed work; asked on PR #232. See the Design record above for the full reasoning and the walkthrough the seed should match.
-- **`is_authoring_selected()` membership.** Whether `dispatcher` belongs in the throwaway-authoring family with the schedule modes. Depends on the answer above.
 - **#140 handoff — prong 1 fate.** Once distinct-cwd worktree dispatch is the norm, #140's per-tab `orchestration_id` only protects the discouraged same-cwd-two-tabs case. Decide (on #140) whether to keep it as belt-and-suspenders or trim #140 to guard + docs. Recorded here as the cross-PRD dependency; the decision lives in #140.
 - **Soft dispatch cap.** Should the daemon or the dispatcher seed impose a soft limit on concurrent dispatched worktrees per session? Decide in M1 once the authority model is concrete. Note the shipped seed currently states a 2-6 range as prose advice with nothing enforcing it — if the limit is real it belongs in code.
 - ~~**Experimental flag (CLAUDE.md rule 9).**~~ Decided — see Decisions.
