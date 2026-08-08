@@ -208,6 +208,13 @@ fn resolve_daemon_executable() -> Result<PathBuf, String> {
         if sibling != current_exe && is_executable_file(&sibling) {
             return Ok(sibling);
         }
+
+        for ancestor in parent.ancestors() {
+            let candidate = ancestor.join(daemon_binary_name());
+            if candidate != current_exe && is_executable_file(&candidate) {
+                return Ok(candidate);
+            }
+        }
     }
 
     if let Some(path_env) = std::env::var_os("PATH") {
