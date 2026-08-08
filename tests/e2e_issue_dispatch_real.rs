@@ -288,22 +288,50 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
     run_now(&deck, SCHEDULE_NAME);
 
     // Precondition (daemon side): the dispatch flow really enumerated, cloned
-    // from GitHub, created the worktree, and spawned the orchestration's role
-    // agents under the schedule's friendly name (every role pane carries it as
-    // its display name). A generous timeout absorbs the live clone + `gh`
-    // round-trips. This isolates the showcase below to the attached TUI's live
-    // surfacing — the registry holds the agents regardless of whether a tab
-    // paints.
+    // from GitHub, created the worktree, and spawned BOTH of the orchestration's
+    // role agents. A generous timeout absorbs the live clone + `gh` round-trips.
+    // This isolates the showcase below to the attached TUI's live surfacing — the
+    // registry holds the agents regardless of whether a tab paints.
+    //
+    // Checked per ROLE NAME. Until `orchestration/dispatch/002` this looked for
+    // the schedule name on every role pane, because that is what a dispatched
+    // role's `display_name` used to be — which meant N identically-titled cards
+    // and no way for a user to tell the orchestrator from the worker. Role names
+    // are now what a role pane carries (matching the interactive `Ctrl+n` path),
+    // and requiring both of them is strictly stronger than the old check: one
+    // shared name could be satisfied by a single spawned pane.
+    //
+    // BOTH names share ONE budget, deliberately. Waiting for them in sequence
+    // gives a worst case of 2 x 120s, which overruns nextest's default 3 x 60s
+    // kill window — and being killed costs the `Records:` dump below, the only
+    // thing that distinguishes "the clone never happened" from "one role spawned".
+    // One budget for BOTH names (see above). 120s: standalone this precondition is
+    // ~8s. Widening it to 240s was tried and did NOT help — in a full
+    // `cargo test-e2e` run this test still registered ZERO agents, so the failure
+    // there is starvation, not slowness, and a longer budget only makes the red
+    // slower. Left at the value that fails fast.
+    const ROLES_WAIT: Duration = Duration::from_secs(120);
+    let missing_roles = || {
+        let present: Vec<String> = common::agent_records_on(deck.attach_socket_path())
+            .into_iter()
+            .filter_map(|r| r.display_name)
+            .collect();
+        ["orchestrator", "worker"]
+            .into_iter()
+            .filter(|role| !present.iter().any(|n| n == role))
+            .collect::<Vec<_>>()
+    };
     assert!(
-        common::wait_for_agent_display_name(
-            deck.attach_socket_path(),
-            SCHEDULE_NAME,
-            true,
-            Duration::from_secs(120),
-        ),
-        "the daemon must clone from GitHub + worktree + spawn the dispatched \
-         orchestration's role agents under the schedule name '{SCHEDULE_NAME}' \
-         (precondition for the showcase)"
+        common::wait_until(ROLES_WAIT, || missing_roles().is_empty()),
+        "the daemon must clone from GitHub + worktree + spawn BOTH of the dispatched \
+         orchestration's role agents within {}s (precondition for the showcase). \
+         Still missing: {:?}\nRecords: {:?}",
+        ROLES_WAIT.as_secs(),
+        missing_roles(),
+        common::agent_records_on(deck.attach_socket_path())
+            .iter()
+            .map(|r| (r.id.clone(), r.display_name.clone()))
+            .collect::<Vec<_>>()
     );
 
     // The load-bearing showcase assertion (RED today): the dispatched

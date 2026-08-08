@@ -2694,6 +2694,36 @@ impl AppState {
         self.pane_orchestration_map.remove(pane_id);
     }
 
+    /// Drop EVERY session belonging to `pane_id`, returning how many went.
+    ///
+    /// A pane can carry more than one session at a time. The close path removes
+    /// the session its CARD was built from, which is not necessarily all of them:
+    /// a pane also gets a placeholder session (`pane-<pane_id>`, minted by
+    /// [`Self::insert_placeholder_session`] on registration / hydration), and when
+    /// the agent's own `SessionStart` cannot reuse it, both live on. That happens
+    /// whenever the pane's command is one the deck cannot infer an agent type from
+    /// — a `devbox run agent-coder` style launcher — because such a command is not
+    /// wrapped, so the agent's hooks arrive under an identity the reuse guard does
+    /// not match.
+    ///
+    /// Closing then removed one and left the other rendering as a ghost card,
+    /// badged `No agent` (the placeholder's type), pointing at the closed pane's
+    /// directory (`dispatch/close/001`). Sessions are keyed by session id, so the
+    /// only way to catch every one of them is to sweep by `pane_id`.
+    pub fn remove_sessions_for_pane(&mut self, pane_id: &str) -> usize {
+        let doomed: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.pane_id.as_deref() == Some(pane_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let n = doomed.len();
+        for id in doomed {
+            self.sessions.remove(&id);
+        }
+        n
+    }
+
     /// PRD #126 + #140: the **orchestration** cwd for `orchestrator_pane_id` —
     /// the directory whose `.dot-agent-deck.toml` defines the orchestration, used
     /// to resolve `worker_response_timeout_minutes` before falling back to the

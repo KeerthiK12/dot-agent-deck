@@ -50,9 +50,13 @@ fn new_pane_007_schedule_authoring_option_visually_separated() {
     deck.send_keys(b" "); // Space → confirm dir → new-pane form
     deck.wait_for_string("No mode"); // Mode field is up (cycler at "No mode")
 
-    // Cycle the Mode field to the end of its options (select_next_mode caps at
-    // the last option). The built-in "schedule" authoring option lives there.
-    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8
+    // Saturate the cycler (it caps at the last option), then step back ONE.
+    // PRD #220: the built-in "schedule" option is no longer last — the graduated
+    // "dispatcher" option sits after it — so saturating alone lands on the wrong
+    // one. Saturate-then-Left is stable against the mode/orchestration counts of
+    // whatever fixture this runs on, which is why the Rights are not just counted.
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8 → dispatcher (cap)
+    deck.send_keys(b"\x1b[D"); // Left ×1 → schedule
 
     // Wait until selection actually LANDS on the schedule option before
     // snapshotting. The dialog title becomes "… — schedule mode" only when
@@ -143,7 +147,10 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // Space → confirm current dir → new-pane form
     deck.wait_for_string("No mode"); // Mode field is up (cycler at "No mode")
-    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8
+    // Right ×8 saturates the cycler on "dispatcher" (PRD #220: it graduated and is
+    // now the last slot); Left ×1 steps back to "schedule".
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8 → dispatcher (cap)
+    deck.send_keys(b"\x1b[D"); // Left ×1 → schedule
     deck.wait_for_string("schedule mode"); // selection landed on the schedule mode
 
     // Submit via the [Submit] button (deterministic — the schedule mode still
@@ -210,7 +217,10 @@ fn new_pane_009_schedule_chip_contained_when_row_overflows() {
     // Cycle the Mode field to the end of its options so the built-in `schedule`
     // authoring option is selected (`select_next_mode` caps at the last option,
     // so an over-count of Rights is safe).
-    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8
+    // Right ×8 saturates the cycler on "dispatcher" (PRD #220: it graduated and is
+    // now the last slot); Left ×1 steps back to "schedule".
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8 → dispatcher (cap)
+    deck.send_keys(b"\x1b[D"); // Left ×1 → schedule
 
     // Wait until selection actually LANDS on the schedule option before
     // snapshotting. The dialog title becomes "… — schedule mode" only when

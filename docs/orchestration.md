@@ -82,6 +82,8 @@ A new tab opens with one pane per role. The role cards appear on the left sideba
 
 ![Orchestration tab on launch — five role cards in the sidebar, orchestrator pane active on the right](./img/orchestration-start.png)
 
+An orchestration can also be started **in an isolated copy of the repository** rather than in your working tree, by asking a dispatcher pane for it — useful for running several orchestrations in parallel without them treading on each other. See [Dispatcher Mode](dispatcher-mode.md).
+
 ### Navigating the orchestration tab
 
 These require command mode — press `Ctrl+d` first if you are typing in a role pane:
