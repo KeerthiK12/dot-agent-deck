@@ -49,7 +49,48 @@ REQUIRED_APPROVALS="${REQUIRED_APPROVALS:-1}"
 # part of the ruleset source or owner organization`).
 ADMIN_BYPASS_MODE="${ADMIN_BYPASS_MODE:-always}"
 
+# Let the Renovate GitHub App bypass the pull_request rule.
+#
+# Renovate is an App, not a collaborator, so the RepositoryRole bypass above does
+# not cover it — apps are a separate actor_type. Without this entry, raising
+# REQUIRED_APPROVALS to 1 silently stalls every automerge group in renovate.json
+# (Rust patch crates, Rust minors at >=1.0, devbox packages, GitHub Actions, and
+# the docs-site npm deps), because a bot cannot approve its own pull request and
+# GitHub counts approvals only from write/admin accounts. Nothing errors; the
+# pull requests simply sit there, which is a slow and confusing way to find out.
+#
+# `pull_request` mode rather than `always`: Renovate may merge a pull request
+# that lacks the required approvals, but still cannot push directly to main. That
+# is strictly narrower than the admin bypass above.
+#
+# Defaults on. While REQUIRED_APPROVALS=0 there is nothing to bypass, so enabling
+# it early is inert — and the alternative is remembering this at the exact moment
+# a second maintainer is onboarded, which is precisely when attention is
+# elsewhere. Set RENOVATE_BYPASS=false to leave it out and review every
+# dependency bump by hand instead.
+RENOVATE_BYPASS="${RENOVATE_BYPASS:-true}"
+# `gh api /apps/renovate --jq .id` -> 2740 (the public Renovate app).
+RENOVATE_APP_ID="${RENOVATE_APP_ID:-2740}"
+
 usage() { sed -n '4,22p' "$0" >&2; exit 64; }
+
+# Render the ruleset's bypass_actors array. Kept out of the payload heredoc
+# because the Renovate entry is conditional.
+bypass_actors_json() {
+  printf '{ "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "%s" }' \
+    "$ADMIN_BYPASS_MODE"
+  if [ "$RENOVATE_BYPASS" = "true" ]; then
+    case "$RENOVATE_APP_ID" in
+      ''|*[!0-9]*)
+        echo >&2
+        echo "error: RENOVATE_APP_ID must be numeric, got '$RENOVATE_APP_ID'." >&2
+        return 1
+        ;;
+    esac
+    printf ',\n    { "actor_id": %s, "actor_type": "Integration", "bypass_mode": "pull_request" }' \
+      "$RENOVATE_APP_ID"
+  fi
+}
 
 # Echo the id of the `$RULESET_NAME` ruleset, or nothing if it does not exist.
 #
@@ -89,13 +130,18 @@ existing_ruleset_id() {
 }
 
 payload() {
+  local actors
+  # Assign on its own line so a non-zero return (bad RENOVATE_APP_ID) propagates
+  # under `set -e` instead of being masked, and so a malformed value can never
+  # reach the API as part of an otherwise valid-looking ruleset.
+  actors="$(bypass_actors_json)"
   cat <<JSON
 {
   "name": "$RULESET_NAME",
   "target": "branch",
   "enforcement": "active",
   "bypass_actors": [
-    { "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "$ADMIN_BYPASS_MODE" }
+    $actors
   ],
   "conditions": {
     "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] }

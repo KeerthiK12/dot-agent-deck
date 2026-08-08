@@ -47,7 +47,7 @@ The order matters. Each step is safe to stop at.
 
 **2. Create the PAT and set the secret.** A fine-grained PAT scoped to this repository with Contents: read and write, stored as `RELEASE_TOKEN`. Verify with `scripts/apply-branch-protection.sh status`, which reports whether the secret is visible.
 
-**3. Onboard the second maintainer.** Grant `write` (or `maintain`) access and add them to `MAINTAINERS.md` in the same change. Do not skip ahead while there is only one collaborator, or apply step 4 with `REQUIRED_APPROVALS=0`.
+**3. Onboard the second maintainer.** Grant `write` (or `maintain`) access and add them to `MAINTAINERS.md` in the same change. Do not skip ahead while there is only one collaborator, or apply step 4 with `REQUIRED_APPROVALS=0`. Raising approvals to 1 is also the moment the Renovate bypass starts mattering — see [Renovate and automerge](#renovate-and-automerge).
 
 **4. Apply the ruleset.**
 
@@ -70,6 +70,23 @@ This is the step that actually validates the token, and it has to come *after* s
 If the canary comes back `GH006`, the token cannot bypass. Fall back to a classic PAT (unambiguous, but `repo` scope reaches every repository the account can see) or move to the GitHub App variant below, which is both narrowly scoped and unambiguously a bypass actor.
 
 **6. Reconsider required status checks.** They were removed for the same `GH006` reason and can come back once the canary has proven the token bypasses. Add them to the ruleset's `rules` array as a `required_status_checks` entry.
+
+## Renovate and automerge
+
+`renovate.json` automerges five groups on green CI: Rust patch crates, Rust minors on crates already at 1.0, devbox packages, GitHub Actions, and the docs-site npm dependencies. Renovate merges these itself — PR #426 was merged by `renovate[bot]`, not by a human — so the ruleset applies to it like any other actor.
+
+**Renovate is a GitHub App, not a collaborator.** The `RepositoryRole: admin` bypass does not cover it; apps are a separate `actor_type` (`Integration`). That distinction is the whole hazard:
+
+- At `REQUIRED_APPROVALS=0` nothing breaks. A pull request is required, Renovate opens one anyway, and no approval is needed.
+- At `REQUIRED_APPROVALS=1` every automerge group **stalls silently**. A bot cannot approve its own pull request, and GitHub counts approvals only from write/admin accounts. Nothing errors and nothing is logged — the pull requests simply accumulate, which is a slow and confusing way to discover the cause.
+
+The script therefore adds Renovate (app id 2740, from `gh api /apps/renovate --jq .id`) as a bypass actor by default, in `pull_request` mode rather than `always`: it may merge a pull request that lacks the required approvals, but still cannot push directly to `main`. That is strictly narrower than the admin bypass.
+
+It is enabled by default deliberately. While approvals are 0 the entry is inert, so turning it on early costs nothing — and the alternative is remembering this at the exact moment a second maintainer is onboarded, which is when attention is elsewhere. Set `RENOVATE_BYPASS=false` to leave it out and review every dependency bump by hand.
+
+One consequence to accept: with the bypass in place, CI gating on dependency pull requests rests on Renovate's own configuration (it waits for branch status before merging), not on the ruleset. Adding `required_status_checks` in step 6 does not change that, because a bypass actor bypasses those too.
+
+The `required_review_thread_resolution` rule is not a problem here in practice — Greptile posts no review and no inline comments on Renovate pull requests (verified on #426, #389 and #384). It would become one if that ever changed.
 
 ## What is gated
 
