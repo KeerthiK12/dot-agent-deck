@@ -7181,6 +7181,11 @@ fn dispatch_action(
                         Ok(()) => {
                             let mut st = state.blocking_write();
                             st.sessions.remove(&session_id);
+                            // …and every OTHER session this pane carries. Removing
+                            // only the card's own left a ghost card behind whenever
+                            // the pane had a placeholder session too — see
+                            // `remove_sessions_for_pane`.
+                            st.remove_sessions_for_pane(&pane_id);
                             st.unregister_pane(&pane_id);
                             drop(st);
                             ui.pane_metadata.remove(&pane_id);

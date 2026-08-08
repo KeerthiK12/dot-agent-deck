@@ -98,20 +98,21 @@ fn dispatch_worktree_of(deck: &TuiDeck, unit: &str) -> PathBuf {
 /// here: this pane is the *caller*, never the thing under test, it stays alive on
 /// stdin, and it costs no tokens.
 ///
-/// `type_command` must be FALSE when the deck config sets a `default_command`:
-/// the form seeds its Command field from that config, so typing into it APPENDS
-/// (`cat` onto a seeded `cat` → `catcat`), the spawn fails, and no pane ever
-/// registers — which reads exactly like a dispatch bug two assertions later.
-fn open_cat_caller_pane_inner(deck: &TuiDeck, type_command: bool) -> String {
+/// The Command field is CLEARED before `cat` is typed. When the deck config sets a
+/// `default_command` the form seeds that field from it, so typing would APPEND
+/// (`cat` onto a seeded `claude …`), the spawn would fail, and no pane would ever
+/// register — which reads exactly like a dispatch bug two assertions later.
+/// Backspaces on an already-empty field are harmless, so this is unconditional
+/// rather than a flag the caller has to get right.
+fn open_cat_caller_pane(deck: &TuiDeck) -> String {
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // Space → confirm dir → new-pane form
     deck.wait_for_string("New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(b"caller");
     deck.send_keys(b"\t");
-    if type_command {
-        deck.send_keys(b"cat");
-    }
+    deck.send_keys(&[0x7f; 96]); // clear whatever the config seeded
+    deck.send_keys(b"cat");
     let (col, row) = deck
         .find_in_grid("[Submit]")
         .expect("the new-pane form should render a [Submit] button");
@@ -136,12 +137,6 @@ fn open_cat_caller_pane_inner(deck: &TuiDeck, type_command: bool) -> String {
         deck.snapshot_grid()
     );
     find_caller().expect("checked above")
-}
-
-/// [`open_cat_caller_pane_inner`] for a deck whose config sets no `default_command`
-/// — the ordinary case, where the Command field starts empty and must be typed.
-fn open_cat_caller_pane(deck: &TuiDeck) -> String {
-    open_cat_caller_pane_inner(deck, true)
 }
 
 /// What the daemon knows about ONE role pane of a dispatched orchestration.
@@ -527,7 +522,7 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
     // it is absent on a single-tab deck. Deliberately NOT asserting the string
     // "demo-orch": the fixture is named that, and the new-pane form paints an
     // `[Orch: demo-orch]` chip, so that assertion passed before any dispatch ran at
-    // all (caught by re-checking that this test can fail — CLAUDE.md rule 15).
+    // all (caught by re-checking that this test can fail — the `reproduce-first` skill).
     assert!(
         common::wait_until(TAB_WAIT, || deck.snapshot_grid().contains("Dashboard")),
         "no tab strip appeared within {}s, so the dispatched orchestration never \
@@ -830,14 +825,17 @@ fn confirm_close_selected(deck: &TuiDeck) {
     deck.send_keys(b"\r"); // confirm
 }
 
-/// Scenario: Dispatch a single agent (so the daemon owns a worktree for it), with a
-/// `git` whose `status` is slow — the state a real dispatched worktree is in once an
-/// agent has worked there. Select the dispatched card, press Ctrl+W and confirm Close
-/// ONCE. The card must disappear on that first confirm, rather than being retained
-/// while the agent is already dead and needing a second close.
+/// Scenario: Dispatch a single REAL agent (so the daemon owns a worktree for it),
+/// with a `git` whose `status` is slow — the state a real dispatched worktree is in
+/// once an agent has worked there. Wait until the card shows the live agent, then
+/// press Ctrl+W and confirm Close ONCE. The card must disappear on that first
+/// confirm, rather than lingering (as "No agent" or otherwise) and needing a second.
 #[spec("dispatch/close/001")]
 #[test]
 fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
+    // Decision 26 runtime-skip: missing CLI / credentials is environmental.
+    skip_unless!(common::check_claude_available());
+
     const UNIT: &str = "close-probe";
     /// The single-agent dispatch labels its card with the task name.
     const CARD: &str = "dispatch-close-probe";
@@ -846,12 +844,38 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
     // 8s: comfortably past the TUI's 5s `CTRL_W_STOP_TIMEOUT`, so the symptom is
     // deterministic rather than a race with a fast machine.
     let stub_bin = install_slow_git(scratch.path(), 8);
-    // `cat` as the dispatched agent: this test is about the daemon's CLOSE path,
-    // which is identical for every agent, and a real one would only add cost and
-    // LLM variance. The load-bearing difference from a stand-in here is the slow
-    // `git status`, which the stub supplies.
+    // The dispatched unit is a REAL agent, because that is what a user dispatches.
+    // This test previously used `cat` here, reasoning that the close path is the
+    // same for every agent — it is NOT, and that stand-in is exactly what let the
+    // reported bug survive a green run. A `cat` pane never emits a `SessionStart`,
+    // so it has ONE session (the daemon's synthetic surface event) and the card is
+    // whatever that says. A real agent emits its own, so the pane can carry a
+    // second session — and a close that removes only one of them leaves a card
+    // behind, which is the report ("the card stays, showing No agent").
+    //
+    // Pinned to Haiku, and never prompted: it only has to BE there when the close
+    // lands, so the run costs a cold boot and no turns.
+    //
+    // And it is launched through a WRAPPER SCRIPT, not as a bare `claude`. This
+    // mirrors the reported configuration, where every role runs `devbox run
+    // agent-<role>`: the deck cannot infer an agent type from such a command, so
+    // the card is badged `No agent` even though a real agent is running inside it.
+    // That is the exact shape the report describes ("the status in the card says
+    // no agent"), and a bare `claude` — which the deck DOES recognise — takes a
+    // different path through the card/session machinery.
+    let wrapper = stub_bin.join("agent-wrapper");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nexec claude --model claude-haiku-4-5-20251001 --allowedTools Bash \"$@\"\n",
+    )
+    .expect("write the agent wrapper");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("make the agent wrapper executable");
+    }
     let cfg = scratch.path().join("config.toml");
-    std::fs::write(&cfg, "default_command = \"cat\"\n").expect("write the deck config");
+    std::fs::write(&cfg, "default_command = \"agent-wrapper\"\n").expect("write the deck config");
 
     let deck = TuiDeck::builder()
         // Roomy: at the default width a card title is ellipsized
@@ -863,13 +887,21 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
             format!("{}:{}", stub_bin.display(), path_with_binary_dir()),
         )
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
+        .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
     commit_fixture_repo(deck.workdir());
 
-    // FALSE: this deck config sets `default_command`, so the form already seeds it.
-    let caller_pane = open_cat_caller_pane_inner(&deck, false);
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
+    // Trust the dispatched WORKTREE (where the agent runs) so claude's first-run
+    // gates clear without a keystroke and it reaches a live state to be closed.
+    common::seed_claude_trust_in_home(
+        deck.home_dir(),
+        &[expected_worktree.to_string_lossy().into_owned()],
+    )
+    .expect("seed Claude onboarding and project trust");
+
+    let caller_pane = open_cat_caller_pane(&deck);
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
@@ -885,11 +917,38 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    const SURFACE_WAIT: Duration = Duration::from_secs(60);
+    // Wait until the agent is REALLY RUNNING, not merely spawned. The report is
+    // about closing an agent that is up; closing one mid-boot tests something else.
+    //
+    // Gated on the agent's OWN PTY output (the Claude Code banner), NOT on the
+    // card's `ClaudeCode` badge: that badge is inferred from the COMMAND at spawn
+    // time, so it is on the card before claude has executed a single instruction.
+    // Gating on it let this test close a still-booting pane and pass.
+    const SURFACE_WAIT: Duration = Duration::from_secs(120);
+    let banner = common::search_key("Claude Code");
+    let dispatched_agent_id = || {
+        common::agent_records_on(deck.attach_socket_path())
+            .into_iter()
+            .find(|r| r.display_name.as_deref() == Some(CARD))
+            .map(|r| r.id)
+    };
     assert!(
-        common::wait_until(SURFACE_WAIT, || deck.snapshot_grid().contains(CARD)),
-        "the dispatched agent never surfaced a card within {}s.\nGrid:\n{}",
+        common::wait_until(SURFACE_WAIT, || {
+            dispatched_agent_id().is_some_and(|id| {
+                common::pane_search_key_on(deck.attach_socket_path(), &id).contains(&banner)
+            })
+        }),
+        "the dispatched agent never actually started within {}s — its pane never \
+         printed the Claude Code banner, so a close here would not be closing a \
+         running agent.\nGrid:\n{}",
         SURFACE_WAIT.as_secs(),
+        deck.snapshot_grid()
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(30), || deck
+            .snapshot_grid()
+            .contains(CARD)),
+        "the dispatched agent is running but never surfaced a card.\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
@@ -924,9 +983,19 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
 
     // The assertion. Generous, so a merely slow close still passes — what this
     // pins is a card that is never removed at all.
+    // NO card may remain for the closed pane — not the one that was closed, and not
+    // a ghost left over from a second session on the same pane. Matched on the
+    // dispatched worktree's basename, which every such card carries on its `Dir:`
+    // line whatever its title says: the ghost is titled `pane-sched-…`, so a needle
+    // bound to the card's NAME would miss it entirely.
+    let dir_marker = expected_worktree
+        .file_name()
+        .expect("worktree has a name")
+        .to_string_lossy()
+        .into_owned();
     const CLOSE_WAIT: Duration = Duration::from_secs(30);
     assert!(
-        common::wait_until(CLOSE_WAIT, || !deck.snapshot_grid().contains(CARD)),
+        common::wait_until(CLOSE_WAIT, || !deck.snapshot_grid().contains(&dir_marker)),
         "the dispatched card {CARD:?} was still on the deck {}s after ONE confirmed \
          close, while the SAME close removed the caller card immediately.\n\
          Two independent causes produce exactly this, and the daemon records below \
