@@ -22,7 +22,10 @@ set -euo pipefail
 #      or apply with REQUIRED_APPROVALS=0 to require a PR but not a review.
 
 REPO="${REPO:-vfarcic/dot-agent-deck}"
-RULESET_NAME="main-protected"
+# Overridable, like every other tunable here. existing_ruleset_id's ambiguity
+# error tells the operator to set this to disambiguate duplicate rulesets, so an
+# unconditional assignment would make that documented recovery path a dead end.
+RULESET_NAME="${RULESET_NAME:-main-protected}"
 
 # Require an approving review before merge. Set to 0 to require a PR but no
 # approval (useful as a first step while there is only one maintainer).
