@@ -1,0 +1,32 @@
+# Fixture for `orchestration/dispatch/002` — the REAL-agent half of the PRD #220
+# dispatch coverage.
+#
+# `orch-deck` (used by `orchestration/dispatch/001`) runs `cat` for every role.
+# That proves the wire, the worktree and the tab, and it is exactly why three
+# real defects shipped green: `cat` starts instantly, needs no credentials, has
+# no cold start, and cannot tell an agent apart from a `$SHELL`. A user's roles
+# are real agents, and "every role pane exists" is NOT the same claim as "every
+# role's AGENT actually started".
+#
+# So every role here is a REAL, fully interactive Claude Code pane pinned to
+# Haiku — no `-p`, no stand-in — and there are THREE of them, because the
+# reported symptom (panes up, no agent ever starts) is a CONTENTION shape: it
+# does not appear with one role. Cost stays low: the roles only have to boot,
+# and the dispatched task is a single trivial turn.
+[[orchestrations]]
+name = "real-team"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write"
+clear = false
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write"
+clear = false

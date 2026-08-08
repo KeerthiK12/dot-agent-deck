@@ -14,10 +14,13 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::TuiDeck;
+use dot_agent_deck::agent_pty::TabMembership;
+use dot_agent_deck::state::SessionStatus;
 use spec::spec;
 
 /// Removes a dispatch worktree on drop, including on panic.
@@ -71,6 +74,142 @@ fn commit_fixture_repo(dir: &Path) {
     run(&["config", "user.name", "Deck Test"]);
     run(&["add", "-A"]);
     run(&["commit", "-qm", "fixture baseline"]);
+}
+
+/// The sibling worktree a dispatch of `unit` must create — `../<repo>-dispatch-<unit>`.
+fn dispatch_worktree_of(deck: &TuiDeck, unit: &str) -> PathBuf {
+    deck.workdir()
+        .parent()
+        .expect("fixture dir has a parent")
+        .join(format!(
+            "{}-dispatch-{unit}",
+            deck.workdir()
+                .file_name()
+                .expect("fixture dir has a name")
+                .to_string_lossy()
+        ))
+}
+
+/// Open ONE ordinary `cat` pane and return its `DOT_AGENT_DECK_PANE_ID`.
+///
+/// A dispatch resolves its working dir from the CALLING pane's `AgentRecord.cwd`,
+/// so the daemon needs a registered pane to attribute the dispatch to — the same
+/// lookup a real dispatcher pane goes through. `cat` is deliberate here and only
+/// here: this pane is the *caller*, never the thing under test, it stays alive on
+/// stdin, and it costs no tokens.
+fn open_cat_caller_pane(deck: &TuiDeck) -> String {
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.send_keys(b" "); // Space → confirm dir → new-pane form
+    deck.wait_for_string("New Agent");
+    deck.send_keys(b"\t");
+    deck.send_keys(b"caller");
+    deck.send_keys(b"\t");
+    deck.send_keys(b"cat");
+    let (col, row) = deck
+        .find_in_grid("[Submit]")
+        .expect("the new-pane form should render a [Submit] button");
+    deck.click(col, row);
+    deck.wait_for_absence("[Submit]");
+
+    const PANE_WAIT: Duration = Duration::from_secs(60);
+    let find_caller = || {
+        common::agent_records_on(deck.attach_socket_path())
+            .into_iter()
+            .find_map(|r| r.pane_id_env.filter(|_| r.cwd.is_some()))
+    };
+    assert!(
+        common::wait_until(PANE_WAIT, || find_caller().is_some()),
+        "no registered pane with a cwd appeared within {}s — the dispatch has no \
+         caller to resolve.\nRecords: {:?}\nFinal grid:\n{}",
+        PANE_WAIT.as_secs(),
+        common::agent_records_on(deck.attach_socket_path())
+            .iter()
+            .map(|r| (r.id.clone(), r.pane_id_env.clone(), r.cwd.clone()))
+            .collect::<Vec<_>>(),
+        deck.snapshot_grid()
+    );
+    find_caller().expect("checked above")
+}
+
+/// What the daemon knows about ONE role pane of a dispatched orchestration.
+///
+/// An entry existing means a PANE was spawned and registered — true as soon as
+/// `spawn_agent` returns, and it says nothing about whether the process inside
+/// that PTY ever became an agent.
+#[derive(Debug)]
+struct RoleState {
+    /// Daemon registry id — the handle `AttachRequest::Snapshot` takes.
+    agent_id: String,
+    /// The daemon's EVENT-DERIVED live session for that pane. `Some` only once
+    /// the thing inside the PTY emitted a real agent event (`SessionStart`), so
+    /// this — not the pane's existence — is the "an agent actually started here"
+    /// signal.
+    live: Option<SessionStatus>,
+}
+
+/// Every role pane of orchestration `orch` the daemon currently holds, by role name.
+///
+/// Reads `ListAgents` rather than the grid because the question is per-ROLE and
+/// a card whose agent is still booting renders the same chrome as one whose agent
+/// never will.
+fn role_states(socket: &Path, orch: &str) -> BTreeMap<String, RoleState> {
+    let mut out: BTreeMap<String, RoleState> = BTreeMap::new();
+    for record in common::agent_records_on(socket) {
+        let Some(TabMembership::Orchestration {
+            name, role_name, ..
+        }) = record.tab_membership.clone()
+        else {
+            continue;
+        };
+        if name != orch {
+            continue;
+        }
+        out.insert(
+            role_name,
+            RoleState {
+                agent_id: record.id.clone(),
+                live: record.live.as_ref().map(|l| l.status.clone()),
+            },
+        );
+    }
+    out
+}
+
+/// Per-role failure diagnostics: for every EXPECTED role, whether it has a pane,
+/// whether an agent ever came alive in it, and the tail of what that PTY actually
+/// printed.
+///
+/// The PTY tail is the load-bearing part. "no agent started" has several very
+/// different causes — the command was never found, a first-run trust prompt is
+/// waiting for a keystroke, the agent crashed on boot — and they are
+/// indistinguishable from the daemon's record alone. They are all plainly visible
+/// in the pane's own bytes.
+fn role_diagnostics(deck: &TuiDeck, orch: &str, expected: &[&str]) -> String {
+    let socket = deck.attach_socket_path();
+    let found = role_states(socket, orch);
+    let mut out = String::new();
+    for role in expected {
+        match found.get(*role) {
+            None => out.push_str(&format!("\n- {role}: NO PANE — never spawned at all\n")),
+            Some(state) => {
+                out.push_str(&format!(
+                    "\n- {role}: pane {}, live={:?}\n",
+                    state.agent_id, state.live
+                ));
+                let text = common::strip_ansi(&common::pane_snapshot_on(socket, &state.agent_id));
+                let tail: Vec<&str> = text
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .rev()
+                    .take(12)
+                    .collect();
+                for line in tail.into_iter().rev() {
+                    out.push_str(&format!("    | {line}\n"));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Scenario: Launch the deck in the minimal fixture with the experimental flag
@@ -280,6 +419,327 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
          prompt with the task typed into it.\n\
          Final grid:\n{}",
         SURFACE_WAIT.as_secs(),
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Launch the deck on the two-role `orch-deck` fixture, open one ordinary
+/// `cat` pane so a registered pane exists to dispatch from, then run the REAL
+/// `dot-agent-deck dispatch <name> --orchestration demo-orch` CLI against the deck's
+/// own hook socket exactly as an agent in that pane would. A full orchestration tab
+/// labelled `demo-orch` must surface live on the tab strip, with the sibling worktree
+/// and the orchestrator's delegation context on disk.
+#[spec("orchestration/dispatch/001")]
+#[test]
+fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
+    const UNIT: &str = "team-probe";
+
+    let deck = TuiDeck::builder()
+        .with_env("PATH", path_with_binary_dir())
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active sessions");
+
+    // `git worktree add` needs a commit to branch from.
+    commit_fixture_repo(deck.workdir());
+
+    // One ordinary pane, so the daemon has a registered pane (with a cwd) to
+    // resolve the dispatch's caller from.
+    let caller_pane = open_cat_caller_pane(&deck);
+
+    let expected_worktree = dispatch_worktree_of(&deck, UNIT);
+    // Armed before the dispatch, so the sibling is reclaimed even on failure.
+    let _guard = SiblingWorktreeGuard(expected_worktree.clone());
+
+    // The REAL CLI, against the deck's own socket — the path an agent takes.
+    // `--orchestration=demo-orch` names the fixture's orchestration explicitly:
+    // this test is about the ORCHESTRATION shape, and the flag is what a
+    // dispatcher agent that picked a shape off `--list-targets` actually sends.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args([
+            "dispatch",
+            UNIT,
+            "--task",
+            "Say hello, then stop.",
+            "--orchestration=demo-orch",
+        ])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
+        .output()
+        .expect("the dispatch CLI should run");
+    assert!(
+        out.status.success(),
+        "`dispatch --orchestration demo-orch` failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // THE ASSERTION THAT WAS MISSING: the orchestration TAB surfaces live.
+    //
+    // Everything else this suite checks — the worktree on disk, the context file —
+    // can be right while no tab ever appears, which is precisely the state a user
+    // reported. The tab strip renders only with 2+ tabs (Dashboard + this one), so
+    // the orchestration's name on the grid means the tab was built mid-session with
+    // no reconnect.
+    const TAB_WAIT: Duration = Duration::from_secs(90);
+
+    // Structural proof first: BOTH roles spawned, carrying orchestration membership
+    // named `demo-orch`. Unambiguous, and it cannot be satisfied by chrome.
+    assert!(
+        common::wait_until(TAB_WAIT, || {
+            common::agent_records_on(deck.attach_socket_path())
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        &r.tab_membership,
+                        Some(dot_agent_deck::agent_pty::TabMembership::Orchestration { name, .. })
+                            if name == "demo-orch"
+                    )
+                })
+                .count()
+                >= 2
+        }),
+        "the dispatch did not start BOTH roles of `demo-orch` within {}s — a \
+         dispatched orchestration must spawn every role, not just one.\n\
+         Records: {:?}\nFinal grid:\n{}",
+        TAB_WAIT.as_secs(),
+        common::agent_records_on(deck.attach_socket_path())
+            .iter()
+            .map(|r| (r.id.clone(), r.tab_membership.clone()))
+            .collect::<Vec<_>>(),
+        deck.snapshot_grid()
+    );
+
+    // Then the user-visible half: a TAB exists. The tab strip renders only with 2+
+    // tabs, so the "Dashboard" label is present ONLY once a second tab was built —
+    // it is absent on a single-tab deck. Deliberately NOT asserting the string
+    // "demo-orch": the fixture is named that, and the new-pane form paints an
+    // `[Orch: demo-orch]` chip, so that assertion passed before any dispatch ran at
+    // all (caught by re-checking that this test can fail — CLAUDE.md rule 15).
+    assert!(
+        common::wait_until(TAB_WAIT, || deck.snapshot_grid().contains("Dashboard")),
+        "no tab strip appeared within {}s, so the dispatched orchestration never \
+         became a TAB on the deck — which is the symptom a user reported.\n\
+         Final grid:\n{}",
+        TAB_WAIT.as_secs(),
+        deck.snapshot_grid()
+    );
+
+    // And the unit is a real orchestration on disk, with its orchestrator told what
+    // it is (PRD #222 parity) rather than handed the bare task.
+    assert!(
+        common::wait_for_path(&expected_worktree, Duration::from_secs(30)),
+        "the dispatched worktree never appeared at {}",
+        expected_worktree.display()
+    );
+    let context = expected_worktree.join(".dot-agent-deck/orchestrator-context.md");
+    let content = std::fs::read_to_string(&context).unwrap_or_else(|e| {
+        panic!(
+            "the dispatched orchestration must get an orchestrator-context.md at {} \
+             — without it the orchestrator never learns it is one, and every worker \
+             sits idle: {e}",
+            context.display()
+        )
+    });
+    assert!(
+        content.contains("Delegation protocol"),
+        "the orchestrator must be told how to delegate:\n{content}"
+    );
+    assert!(
+        content.contains("## Your task") && content.contains("Say hello"),
+        "the caller's task must ride inside the context file:\n{content}"
+    );
+}
+
+/// Scenario: Launch the deck on the `dispatch-orch-real` fixture, whose `real-team`
+/// orchestration defines THREE roles that are all real interactive Claude Haiku
+/// agents, open one `cat` caller pane, and run the real `dot-agent-deck dispatch
+/// <name> --orchestration real-team` CLI against the deck's own hook socket. Every
+/// role named in the toml must reach LIVE-AGENT state in the dispatched worktree —
+/// the daemon holding an event-derived live session for each — not merely have a
+/// pane spawned for it.
+#[spec("orchestration/dispatch/002")]
+#[test]
+fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
+    // Decision 26 runtime-skip: missing CLI / credentials is an environmental
+    // condition, not a broken test.
+    skip_unless!(common::check_claude_available());
+
+    const UNIT: &str = "real-probe";
+    const ORCH: &str = "real-team";
+    /// Exactly the role names in `tests/fixtures/dispatch-orch-real/.dot-agent-deck.toml`.
+    /// EVERY one of them has to come alive: "some roles started" is the shape of
+    /// the reported failure, not a pass.
+    const ROLES: [&str; 3] = ["orchestrator", "coder", "reviewer"];
+
+    let deck = TuiDeck::builder()
+        // Three live agent panes in one tab; a roomy deck keeps each role card's
+        // PTY wide enough for a real claude TUI to render (and for the failure
+        // diagnostics to be readable).
+        .with_pty_size(200, 55)
+        .with_imported_claude_credentials()
+        // The branch build must win over any host-installed `dot-agent-deck`.
+        .with_env("PATH", path_with_binary_dir())
+        .launch_with_fixture("dispatch-orch-real");
+    deck.wait_for_string("No active sessions");
+
+    // `git worktree add` needs a commit to branch from — and the worktree is a
+    // HEAD checkout, so this is also what puts `.dot-agent-deck.toml` (and its
+    // three roles) inside the dispatched worktree at all.
+    commit_fixture_repo(deck.workdir());
+
+    // Trust BOTH the fixture dir and the dispatched WORKTREE for the interactive
+    // `claude` panes, so no first-run onboarding / per-folder trust dialog can
+    // swallow the spawn.
+    //
+    // The worktree matters and the fixture dir does not: the roles run in the
+    // worktree, which does not exist yet and is not covered by trusting its
+    // parent. Seeding it models the user whose agent config is already in order —
+    // so that if a role still fails to come alive, the cause is the dispatch path
+    // and not an unanswered dialog. Both the literal and canonical forms of the
+    // fixture dir are seeded because the deck picks its cwd up from the process,
+    // not from this path value; the worktree can only be named literally (it is
+    // not on disk yet, so it cannot be canonicalized).
+    let expected_worktree = dispatch_worktree_of(&deck, UNIT);
+    let mut trust_paths = vec![
+        deck.workdir().to_string_lossy().into_owned(),
+        expected_worktree.to_string_lossy().into_owned(),
+    ];
+    if let Ok(canonical) = deck.workdir().canonicalize() {
+        let canonical = canonical.to_string_lossy().into_owned();
+        if !trust_paths.contains(&canonical) {
+            trust_paths.push(canonical);
+        }
+    }
+    common::seed_claude_trust_in_home(deck.home_dir(), &trust_paths)
+        .expect("seed Claude onboarding and project trust");
+
+    // The pane the dispatch is attributed to. `cat` is fine HERE — it is the
+    // caller, not the thing under test.
+    let caller_pane = open_cat_caller_pane(&deck);
+
+    // Armed before the dispatch, so the sibling is reclaimed even on failure.
+    let _guard = SiblingWorktreeGuard(expected_worktree.clone());
+
+    // The REAL CLI, against the deck's own socket — the path an agent takes.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args([
+            "dispatch",
+            UNIT,
+            "--task",
+            "Reply with the single word READY and then stop. Do not delegate anything.",
+            &format!("--orchestration={ORCH}"),
+        ])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
+        .output()
+        .expect("the dispatch CLI should run");
+    assert!(
+        out.status.success(),
+        "`dispatch --orchestration {ORCH}` failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // First the weak claim `orchestration/dispatch/001` already makes with `cat`
+    // roles: a PANE exists for every role. Kept as a separate, earlier assertion
+    // so a failure says which of the two halves broke — "no panes at all" is a
+    // different bug from "panes but no agents".
+    const PANE_WAIT: Duration = Duration::from_secs(60);
+    assert!(
+        common::wait_until(PANE_WAIT, || {
+            let found = role_states(deck.attach_socket_path(), ORCH);
+            ROLES.iter().all(|r| found.contains_key(*r))
+        }),
+        "the dispatch did not spawn a pane for every role of `{ORCH}` within {}s — \
+         a dispatched orchestration must start EVERY role in its toml.{}\n\
+         Final grid:\n{}",
+        PANE_WAIT.as_secs(),
+        role_diagnostics(&deck, ORCH, &ROLES),
+        deck.snapshot_grid()
+    );
+
+    // Every role's AGENT really started — proven from the role's OWN PTY.
+    //
+    // Deliberately NOT `AgentRecord.live`: that is `Some(Idle)` for all three
+    // roles within ~1.5s of the dispatch, before a single byte has been written
+    // to any of those PTYs, so asserting on it is vacuous (measured while
+    // building this test). The daemon seeds a session for a surfaced role pane;
+    // it is a pane-level fact, not an agent-level one.
+    //
+    // The Claude Code banner is agent-level: a `cat` role, a `$SHELL`, or a
+    // command that failed to launch can never print it. That is precisely the
+    // class `orchestration/dispatch/001`'s `cat` roles cannot distinguish.
+    //
+    // The budget is generous because three real claude cold boots contend for the
+    // same machine, and a slow boot must not read as a broken one. `common::wait_until`
+    // rather than `deck.wait_until_grid`, which is hard-capped at the harness's 10s
+    // `WAIT_TIMEOUT` — far too short here, and using it would silently shorten the
+    // wait and make the test flaky by construction (Decision 21 keeps the polling
+    // in `common`).
+    const LIVE_WAIT: Duration = Duration::from_secs(240);
+    let banner = common::search_key("Claude Code");
+    assert!(
+        common::wait_until(LIVE_WAIT, || {
+            let found = role_states(deck.attach_socket_path(), ORCH);
+            ROLES.iter().all(|role| {
+                found.get(*role).is_some_and(|s| {
+                    common::pane_search_key_on(deck.attach_socket_path(), &s.agent_id)
+                        .contains(&banner)
+                })
+            })
+        }),
+        "not every role of `{ORCH}` started a REAL AGENT within {}s — each role pane must \
+         show the agent its toml names, not an empty PTY or a shell. A pane per role is \
+         NOT the promise: a dispatched orchestration whose panes exist but whose agents \
+         never start looks identical on the dashboard until you try to use it.{}\n\
+         Final grid:\n{}",
+        LIVE_WAIT.as_secs(),
+        role_diagnostics(&deck, ORCH, &ROLES),
+        deck.snapshot_grid()
+    );
+
+    // ===== And now the half a user actually looks at: the CARDS ==============
+    //
+    // Everything above is daemon-side truth. The reported class of failure is a
+    // deck that looks fine, so the test has to read what is on the screen: switch
+    // to the dispatched orchestration's tab and require that EVERY role named in
+    // the toml is on a card, beside the agent badge for the agent that is running
+    // in it (`<AgentType> · <role>` — the card title shape).
+    //
+    // Ctrl+PageDown, not `l`/`h`: on an orchestration tab a role pane holds
+    // keyboard focus and swallows plain keys as text.
+    //
+    // Without this assertion the test passes on a deck whose cards are labelled
+    // with claude's session UUIDs (`ClaudeCode · 6134822e-f2`), which is what a
+    // dispatched orchestration actually rendered when this test was written: the
+    // daemon knew every role name and the user could not see any of them.
+    deck.send_keys(b"\x1b[6;5~"); // Ctrl+PageDown → the dispatched orchestration tab
+    const CARD_WAIT: Duration = Duration::from_secs(60);
+    let card_label = |role: &str| format!("ClaudeCode · {role}");
+    // Matched on the CARD TITLE ROW, not anywhere on the grid: the tab's right
+    // half renders the focused role's live terminal, so a bare `grid.contains`
+    // could be satisfied by the agent's own output echoing the text back. A card
+    // title is the only row that carries the label AND the card's top-left corner.
+    let card_titled = |grid: &str, role: &str| {
+        grid.lines()
+            .any(|line| line.contains('┌') && line.contains(&card_label(role)))
+    };
+    assert!(
+        common::wait_until(CARD_WAIT, || {
+            let grid = deck.snapshot_grid();
+            ROLES.iter().all(|role| card_titled(&grid, role))
+        }),
+        "the dispatched orchestration's cards do not name the roles its toml defines. \
+         Every role must appear as `{}` on its own card, so the user can tell which card \
+         is which agent — the interactive `Ctrl+N` path already does this \
+         (`tabs/orchestration/006`). Missing: {:?}{}\n\
+         Final grid:\n{}",
+        card_label("<role>"),
+        ROLES
+            .iter()
+            .filter(|role| !card_titled(&deck.snapshot_grid(), role))
+            .collect::<Vec<_>>(),
+        role_diagnostics(&deck, ORCH, &ROLES),
         deck.snapshot_grid()
     );
 }
