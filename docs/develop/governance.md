@@ -47,11 +47,9 @@ The order matters. Each step is safe to stop at.
 
 **2. Create the PAT and set the secret.** A fine-grained PAT scoped to this repository with Contents: read and write, stored as `RELEASE_TOKEN`. Verify with `scripts/apply-branch-protection.sh status`, which reports whether the secret is visible.
 
-**3. Cut one release with the secret in place but no ruleset.** This proves the PAT path works while the safety net is still down. If the tag completes and the chart bump lands, the token is correct.
+**3. Onboard the second maintainer.** Grant `write` (or `maintain`) access and add them to `MAINTAINERS.md` in the same change. Do not skip ahead while there is only one collaborator, or apply step 4 with `REQUIRED_APPROVALS=0`.
 
-**4. Onboard the second maintainer.** Grant `write` (or `maintain`) access and add them to `MAINTAINERS.md` in the same change. Do not skip ahead to step 5 while there is only one collaborator, or apply step 5 with `REQUIRED_APPROVALS=0`.
-
-**5. Apply the ruleset.**
+**4. Apply the ruleset.**
 
 ```bash
 scripts/apply-branch-protection.sh apply
@@ -59,7 +57,19 @@ scripts/apply-branch-protection.sh apply
 
 The script refuses to run if `RELEASE_TOKEN` is unset. It defaults to one approving review; `REQUIRED_APPROVALS=0` requires a pull request without requiring a review, which is the sensible setting if the gate goes up before a second maintainer does.
 
-**6. Reconsider required status checks.** They were removed for the same `GH006` reason and can now come back, since the PAT bypasses them too. Add them to the ruleset's `rules` array as a `required_status_checks` entry once step 3 has proven the token.
+**5. Fire the canary immediately — do not wait for a real release.**
+
+```bash
+gh workflow run docs-publish.yml --repo vfarcic/dot-agent-deck
+```
+
+This is the step that actually validates the token, and it has to come *after* step 4. A push to an unprotected `main` proves only that the PAT can write; it says nothing about whether the PAT can **bypass a ruleset**, because with no ruleset there is nothing to bypass. The two are separate mechanisms: writing is a token permission, bypassing is evaluated against the actor's role in `bypass_actors`. A fine-grained PAT carries its own permission model alongside the role, so this is exactly the combination where a surprise is plausible.
+
+`docs-publish` is the right canary because it pushes to `main` the same way the release flow does, is `workflow_dispatch`-able on demand, and costs nothing if it fails. Discovering a bypass problem here costs a re-run; discovering it during a release burns a version tag, which is how v0.35.6 died.
+
+If the canary comes back `GH006`, the token cannot bypass. Fall back to a classic PAT (unambiguous, but `repo` scope reaches every repository the account can see) or move to the GitHub App variant below, which is both narrowly scoped and unambiguously a bypass actor.
+
+**6. Reconsider required status checks.** They were removed for the same `GH006` reason and can come back once the canary has proven the token bypasses. Add them to the ruleset's `rules` array as a `required_status_checks` entry.
 
 ## What is gated
 
