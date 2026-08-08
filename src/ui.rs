@@ -10620,7 +10620,21 @@ pub fn run_tui(
         // half by calling `clear_waiting_pane_latch`; the flag needs the same
         // compensation, done here rather than edge-tracked because holding no
         // latch at all is the honest state while the surface does not exist.
-        if !crate::features::show_command_entry_lock() {
+        // Read ONCE per frame into a local. The `else if` below tests
+        // `ui.command_entry_locked` — a `UiState` bool, not the flag — so this
+        // is already a single read and the local changes no behaviour; it is
+        // here to keep that property obvious, so a later edit cannot introduce
+        // a second read that disagrees with this one mid-frame.
+        //
+        // Note also why a torn read could not persist even if one occurred: the
+        // clear below is LEVEL-triggered, running on every frame the flag is
+        // off, not edge-triggered on the transition. So a frame that somehow
+        // observed the wrong value self-corrects on the next one (~16ms) —
+        // orders of magnitude faster than a human can resolve a waiting pane.
+        // That is the reason this compensates unconditionally rather than
+        // tracking the on->off edge.
+        let command_entry_lock_enabled = crate::features::show_command_entry_lock();
+        if !command_entry_lock_enabled {
             tab_manager.clear_waiting_pane_latch();
         } else if ui.command_entry_locked {
             let pane_status_for_focus: HashMap<&str, SessionStatus> = build_pane_status(&snapshot);
