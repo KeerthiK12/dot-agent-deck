@@ -58,12 +58,28 @@ usage() { sed -n '4,22p' "$0" >&2; exit 64; }
 # (`local id` then `id="$(…)"`), so a non-zero return here propagates under
 # `set -e` rather than being masked by `local`'s own exit status.
 existing_ruleset_id() {
-  local out
+  local out count
   if ! out="$(gh api "repos/$REPO/rulesets" \
       --jq ".[] | select(.name == \"$RULESET_NAME\") | .id")"; then
     echo "error: could not list rulesets on $REPO." >&2
     echo "Refusing to guess whether $RULESET_NAME exists — check auth (gh auth status)," >&2
     echo "rate limits, and network, then retry." >&2
+    return 1
+  fi
+  # GitHub identifies rulesets by numeric id and does not require names to be
+  # unique, so this filter can match more than one. Returning them all would
+  # interpolate `123\n456` into a URL; refusing is better than picking one,
+  # because updating or deleting a single match while a same-named sibling keeps
+  # enforcing is the same false-success failure the error handling above exists
+  # to prevent.
+  count="$(printf '%s' "$out" | grep -c . || true)"
+  if [ "$count" -gt 1 ]; then
+    echo "error: $count rulesets on $REPO are named '$RULESET_NAME':" >&2
+    while IFS= read -r rid; do
+      [ -n "$rid" ] && echo "  id=$rid" >&2
+    done <<<"$out"
+    echo "Refusing to act on an ambiguous target. Remove or rename the duplicates in" >&2
+    echo "Settings > Rules, or set RULESET_NAME to address a specific one." >&2
     return 1
   fi
   printf '%s' "$out"
