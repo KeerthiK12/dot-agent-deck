@@ -143,7 +143,7 @@ Reproduce the spawn decision table above in `docs/orchestration.md` so users can
 - A dispatch to an **undeclared** peer found by search prompts for human confirmation before any write; a dispatch to a **non-existent** target halts, pages the human via the bell/waiting-for-input surface, **and** delivers a `blocked` outcome that releases the originator (verified: X resumes with a blocked message rather than hanging).
 - The originator's wait terminates on all four outcomes (`done | failed | timeout | blocked`); none leaves X idle indefinitely.
 - The peer map in `.dot-agent-deck.toml` is the authorization boundary: a dispatch target not in the map (and not human-confirmed) is never written to.
-- `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test-fast` pass; `cargo test-e2e` passes before the PR (CLAUDE.md rules 2 & 5).
+- `cargo fmt --check`, `cargo clippy --all-targets --features e2e -- -D warnings`, and `cargo test-fast` pass; `cargo test-e2e` passes before the PR (CLAUDE.md rules 2 & 5).
 - User docs describe the dispatch command, `info|work` intent, peer-map config, the decision table, and escalation behavior; the stale concurrent-orchestration warning is corrected.
 
 ## Milestones

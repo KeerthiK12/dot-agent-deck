@@ -143,9 +143,19 @@ build_ok=true
 # CI: `cargo fmt --check` (CLAUDE.md rule 2).
 wanted fmt && { run_step fmt "cargo fmt --check" || true; } || skip fmt "not in --only"
 
-# CI matches this exactly — no --all-targets, so a test-only lint cannot fail
-# in CI while passing here (see the build-windows comment in ci.yml).
-wanted clippy && { run_step clippy "cargo clippy -- -D warnings" || true; } || skip clippy "not in --only"
+# CLAUDE.md rule 2, and the Linux `build` job in ci.yml matches this exactly.
+# Both flags matter (issue #407): without `--all-targets` no test target is
+# built at all, and without `--features e2e` every `tests/e2e_*.rs` compiles to
+# an empty crate — so the bare `cargo clippy` this used to run reported clean
+# over a build that never contained the e2e code under review. That is exactly
+# the wrong answer for a PR review to give.
+#
+# The e2e step further down still runs the tier itself; this one only
+# type-checks and lints it, in seconds, before the expensive steps start.
+#
+# build-windows/build-macos still run bare `cargo clippy` (the L2 tier is
+# Unix-only), so a Linux-only lint here is expected and correct.
+wanted clippy && { run_step clippy "cargo clippy --all-targets --features e2e -- -D warnings" || true; } || skip clippy "not in --only"
 
 if wanted build; then
   run_step build "cargo build --release" || build_ok=false

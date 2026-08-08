@@ -136,7 +136,7 @@ Idle events ride the existing raw-`AgentEvent` wire with no new fields, so per [
 - Claude, OpenCode, Pi, and Codex status behaviour is **byte-identical** to before — the existing test suite passes unedited, and no hook-fed card changes what it reports.
 - Steady-state CPU with N idle panes shows no regression attributable to screen tracking (the event-driven design's justification).
 - [PRD #211](211-gemini-adapter.md) can be implemented against this mechanism without a `classify_line` rule set, demonstrated by a real Gemini agent on a cheap model reaching a correct `Idle`.
-- `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test-fast` pass; `cargo test-e2e` passes before the PR.
+- `cargo fmt --check`, `cargo clippy --all-targets --features e2e -- -D warnings`, `cargo test-fast` pass; `cargo test-e2e` passes before the PR.
 
 ## Milestones
 

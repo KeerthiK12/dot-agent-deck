@@ -53,7 +53,7 @@ Gemini CLI   →  wrapper strategy  (THIS PRD)  →  AgentEvent  →  daemon
 - A wrapped Gemini session renders history-only (no live-input affordance), consistent with Codex.
 - Claude Code, OpenCode, Pi, and Codex integrations continue to work unchanged — the existing test suite passes without edits.
 - A real Gemini agent on a cheap model lists a directory and reports a fixture sentinel in a wrapped, PTY-attached e2e.
-- `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test-fast` pass; `cargo test-e2e` passes before the PR.
+- `cargo fmt --check`, `cargo clippy --all-targets --features e2e -- -D warnings`, and `cargo test-fast` pass; `cargo test-e2e` passes before the PR.
 - The change is a registry entry + a rule set + detection + tests — no new mechanism — confirming the wrapper strategy is reusable as PRD #20 designed.
 
 ## Milestones

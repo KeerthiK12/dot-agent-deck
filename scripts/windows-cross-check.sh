@@ -18,7 +18,10 @@
 # Windows job does not compile those targets either. Tracked by #164.
 #
 # Only ERRORS matter. CI's Windows job runs `cargo clippy -- -D warnings`
-# without `--all-targets`, so test-target warnings do not fail it.
+# without `--all-targets`, so test-target warnings do not fail it. That stayed
+# true when issue #407 moved the LINUX job to
+# `cargo clippy --all-targets --features e2e -- -D warnings`: the Windows and
+# macOS jobs deliberately did not follow, for the same #164 reason as above.
 
 set -euo pipefail
 

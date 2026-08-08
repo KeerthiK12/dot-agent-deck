@@ -119,7 +119,7 @@ It does not bundle or vendor the Pi/Node runtime, does not replace `claude`/`ope
 - Real-`pi` e2e coverage is sized to confidence, not to token budget (Design Decision #7); it passes in `cargo test-e2e` before the PR.
 - The `agent-event` addition is classified per rule #12 (protocol bump or `.breaking.md` recorded), and the cross-version manual test passes: a previous-release daemon with a Pi orchestrator under the branch TUI still routes delegates and receives status.
 - The surface ships **un-gated** (visible by default): the `experimental` gate added during development was removed before merge (see Design Decision #8), so no `graduate-pi-agent` follow-up is needed.
-- `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test-fast` pass for the Rust crates; the extension's TS tests pass; `cargo test-e2e` passes before the PR (CLAUDE.md rules 2, 5, 8).
+- `cargo fmt --check`, `cargo clippy --all-targets --features e2e -- -D warnings`, `cargo test-fast` pass for the Rust crates; the extension's TS tests pass; `cargo test-e2e` passes before the PR (CLAUDE.md rules 2, 5, 8).
 
 ## Milestones
 
