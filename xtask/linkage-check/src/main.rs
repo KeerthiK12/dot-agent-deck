@@ -22,6 +22,18 @@
 //!      `.dot-agent-deck/` is gitignored dev-time state and would
 //!      not exist on a fresh clone.
 //!
+//!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
+//!   through the SAME syn walker rule 7 uses
+//!   ([`xtask_docs::discover_tests`]) rather than a line regex. Issue
+//!   #406: the old regex matched `^\s*fn\s+` only, so an `async fn`
+//!   test was invisible and its annotation silently re-bound to the
+//!   next plain `fn` in the file — which either blamed an unrelated,
+//!   correctly-named function for a prefix mismatch or, when that
+//!   function happened to share the prefix, let a wrongly-named test
+//!   pass unchecked. A text scan still locates every annotation so
+//!   that one syn could NOT bind to a function is reported explicitly
+//!   instead of drifting onto its neighbour.
+//!
 //! - `docs` — invokes the `xtask-docs` binary's logic (paired-`.md`
 //!   generator). Forwards remaining args.
 //! - `clean-e2e-tmp` — issue #322: reaps stale e2e harness temp dirs left
@@ -103,20 +115,22 @@ fn main() -> ExitCode {
         }
     }
 
-    // Scan tests/ AND src/ for `#[spec(...)]` annotations + function
-    // defs. PRD #83 added per-tab-selection `#[spec]` unit tests in
-    // `src/tab.rs`; the e2e-only checks below key off the `e2e_`
-    // filename prefix, so library sources never trip the sleep/polling
-    // rules.
+    // Scan tests/ AND src/ for `#[spec(...)]` annotations. PRD #83
+    // added per-tab-selection `#[spec]` unit tests in `src/tab.rs`; the
+    // e2e-only checks below key off the `e2e_` filename prefix, so
+    // library sources never trip the sleep/polling rules.
+    //
+    // This text scan no longer decides which FUNCTION an annotation
+    // belongs to — syn does that below (issue #406). It only records
+    // where each annotation is, so an annotation syn could not bind is
+    // reported at its own line.
     let mut test_files = collect_test_rs_files(&tests_dir);
     test_files.extend(collect_test_rs_files(&root.join("src")));
-    let mut annotations: Vec<SpecAnnotation> = Vec::new();
+    let mut occurrences: Vec<SpecOccurrence> = Vec::new();
     let mut e2e_violations: Vec<String> = Vec::new();
     let mut ignore_violations: Vec<String> = Vec::new();
 
     let spec_re = Regex::new(r#"#\[spec\("([^"]+)"\)\]"#).expect("spec attr regex compiles");
-    let fn_re = Regex::new(r"^\s*fn\s+([A-Za-z_][A-Za-z0-9_]*)").expect("fn regex compiles");
-    let ignore_re = Regex::new(r"#\[ignore\b").expect("ignore regex compiles");
     // Decision 21: forbidden in test bodies.
     let sleep_re =
         Regex::new(r"(std::thread::sleep|tokio::time::sleep)\b").expect("sleep regex compiles");
@@ -133,12 +147,11 @@ fn main() -> ExitCode {
         };
 
         // M2.1 auditor Nit 5: strip line + block comments before running
-        // the no-sleep / no-ignore regex checks so a comment that
-        // mentions `std::thread::sleep` (e.g. explaining why the
-        // harness does NOT call it) does not register as a violation.
-        // The spec-attribute and fn regexes do NOT use the stripped
-        // copy — they intentionally allow the `#[spec(...)]` line to
-        // sit next to `// doc comment` content.
+        // the no-sleep regex check so a comment that mentions
+        // `std::thread::sleep` (e.g. explaining why the harness does
+        // NOT call it) does not register as a violation. The spec-
+        // attribute scan uses the stripped copy too, so a commented-out
+        // `#[spec(...)]` is not counted as a live annotation.
         let stripped = strip_rust_comments(&text);
         let raw_lines: Vec<&str> = text.lines().collect();
         let stripped_lines: Vec<&str> = stripped.lines().collect();
@@ -149,37 +162,12 @@ fn main() -> ExitCode {
             .to_string();
         let is_e2e = file_name.starts_with("e2e_") && file_name.ends_with(".rs");
 
-        // Walk lines, link each `#[spec("...")]` to the next function
-        // definition. The annotation may be followed by other
-        // attributes (`#[test]`, `#[ignore]`) before the `fn`; we
-        // accumulate those and stop at the first `fn`. Use the stripped
-        // view so `#[ignore]` inside a comment does not count.
-        for (i, line) in stripped_lines.iter().enumerate() {
-            if let Some(caps) = spec_re.captures(line) {
-                let id = caps.get(1).unwrap().as_str().to_string();
-                let mut fn_name: Option<String> = None;
-                let mut between_ignored = false;
-                for next in &stripped_lines[i + 1..] {
-                    if ignore_re.is_match(next) {
-                        between_ignored = true;
-                    }
-                    if let Some(c) = fn_re.captures(next) {
-                        fn_name = Some(c.get(1).unwrap().as_str().to_string());
-                        break;
-                    }
-                }
-                if between_ignored {
-                    ignore_violations.push(format!(
-                        "{}: #[spec({id:?})] annotates an #[ignore]-d test (Decision 26)",
-                        file.display()
-                    ));
-                }
-                annotations.push(SpecAnnotation {
-                    id,
-                    file: file.clone(),
-                    fn_name,
-                });
-            }
+        for (id, line_no) in scan_spec_occurrences(&stripped_lines, &spec_re) {
+            occurrences.push(SpecOccurrence {
+                id,
+                file: file.clone(),
+                line: line_no,
+            });
         }
 
         if is_e2e {
@@ -208,16 +196,35 @@ fn main() -> ExitCode {
         }
     }
 
+    // Bind every annotation to its test function with syn — the same
+    // walker rule 7 runs (issue #406). A parse failure here is fatal:
+    // with no reliable binding, checks 1/2/4/6 would report garbage.
+    let docs_config = xtask_docs::DocsConfig::from_workspace(root.clone());
+    let discovered = match discover_spec_tests(&docs_config) {
+        Ok(tests) => tests,
+        Err(e) => {
+            eprintln!("failed to parse #[spec] test sources: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Issue #406, the honest-failure half: every `#[spec(...)]` the text
+    // scan found must correspond to a function syn bound. One that does
+    // not (annotating a non-`fn` item, or emitted from inside a macro
+    // body syn does not expand) is named at its own file:line rather
+    // than silently attaching itself to a neighbouring function.
+    failures.extend(unattached_annotation_failures(&occurrences, &discovered));
+
     let mut annotated_ids: BTreeSet<&str> = BTreeSet::new();
-    for ann in &annotations {
-        annotated_ids.insert(&ann.id);
+    for ann in &discovered {
+        annotated_ids.insert(&ann.spec_id);
 
         // Check 2: annotation references a real catalog ID.
-        if !catalog_ids.contains(&ann.id) {
+        if !catalog_ids.contains(&ann.spec_id) {
             failures.push(format!(
                 "[2] {} carries #[spec({:?})] which is not in the catalog",
-                ann.file.display(),
-                ann.id
+                ann.source_path.display(),
+                ann.spec_id
             ));
         }
 
@@ -235,22 +242,27 @@ fn main() -> ExitCode {
         // (`help_001`, `form_001`, `live_001`, `spawn_001`,
         // `selection_001`, `layout_001`, …) — keep passing. See
         // `fn_name_matches_spec`.
-        if let Some(fname) = &ann.fn_name {
-            if !fn_name_matches_spec(&ann.id, fname) {
-                failures.push(format!(
-                    "[4] {} fn `{}` does not start with `{}` (short) or `{}` (category-qualified) (Decision 17, derived from #[spec({:?})])",
-                    ann.file.display(),
-                    fname,
-                    sub_area_prefix(&ann.id).unwrap_or_default(),
-                    qualified_id_prefix(&ann.id).unwrap_or_default(),
-                    ann.id
-                ));
-            }
-        } else {
+        if !fn_name_matches_spec(&ann.spec_id, &ann.fn_name) {
             failures.push(format!(
-                "[4] {} #[spec({:?})] is not followed by a `fn` definition",
-                ann.file.display(),
-                ann.id
+                "[4] {} fn `{}` does not start with `{}` (short) or `{}` (category-qualified) (Decision 17, derived from #[spec({:?})])",
+                ann.source_path.display(),
+                ann.fn_name,
+                sub_area_prefix(&ann.spec_id).unwrap_or_default(),
+                qualified_id_prefix(&ann.spec_id).unwrap_or_default(),
+                ann.spec_id
+            ));
+        }
+
+        // Check 6 (Decision 26): read straight off the function's own
+        // attributes. The old line scan credited this test with any
+        // `#[ignore]` sitting between the annotation and the next plain
+        // `fn`, which could belong to a different function entirely.
+        if ann.ignored {
+            ignore_violations.push(format!(
+                "{}: #[spec({:?})] annotates an #[ignore]-d test `{}` (Decision 26)",
+                ann.source_path.display(),
+                ann.spec_id,
+                ann.fn_name
             ));
         }
     }
@@ -282,7 +294,6 @@ fn main() -> ExitCode {
     // failure modes we want to surface here. The byte-identity check
     // against on-disk `.md` is gone in M4.3: `.dot-agent-deck/` is
     // gitignored, so on a fresh clone there is no `.md` to compare.
-    let docs_config = xtask_docs::DocsConfig::from_workspace(root.clone());
     if let Err(e) = xtask_docs::check_rule_7(&docs_config) {
         failures.push(format!("[7] {e}"));
     }
@@ -291,7 +302,7 @@ fn main() -> ExitCode {
         println!(
             "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 7 rules)",
             catalog_ids.len(),
-            annotations.len(),
+            discovered.len(),
             allowlist.len()
         );
         ExitCode::SUCCESS
@@ -380,10 +391,91 @@ fn run_list_tests(args: &[String]) -> ExitCode {
     }
 }
 
-struct SpecAnnotation {
+/// One `#[spec("…")]` attribute as *located by text scan* — where it is
+/// written, not what it annotates. Deciding which function it belongs to
+/// is syn's job (issue #406); this exists so an annotation syn does not
+/// bind can be reported at its own line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpecOccurrence {
     id: String,
     file: PathBuf,
-    fn_name: Option<String>,
+    line: usize,
+}
+
+/// Find every `#[spec("…")]` in `lines` (already comment-stripped),
+/// returning `(catalog id, 1-based line number)` in source order.
+///
+/// This deliberately does NOT look for a following `fn`. The old walker
+/// did, with `^\s*fn\s+`, and scanned to end-of-file for a match — so an
+/// `async fn` test was skipped and its annotation re-bound to whatever
+/// plain `fn` came next, hundreds of lines away (issue #406).
+fn scan_spec_occurrences(lines: &[&str], spec_re: &Regex) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(caps) = spec_re.captures(line) {
+            out.push((caps.get(1).unwrap().as_str().to_string(), i + 1));
+        }
+    }
+    out
+}
+
+/// Collect every `#[spec]` test under `tests/` and `src/` using the
+/// generator's syn walker, so linkage-check and rule 7 can never
+/// disagree about which functions exist (issue #406).
+fn discover_spec_tests(
+    config: &xtask_docs::DocsConfig,
+) -> Result<Vec<xtask_docs::DiscoveredTest>, String> {
+    let mut tests = xtask_docs::discover_tests(&config.tests_dir)?;
+    // PRD #83: `#[spec]` tests also live in the library crate.
+    tests.extend(xtask_docs::discover_tests(&config.src_dir)?);
+    Ok(tests)
+}
+
+/// Report any `#[spec(...)]` occurrence that syn did not bind to a
+/// function. Matching is per `(file, catalog id)` by COUNT: syn knows
+/// the function name but not its line, and the same id may legitimately
+/// be annotated on more than one test in a file, so an excess of text
+/// occurrences over bound functions is the reliable signal. The message
+/// carries every line the id appears on in that file, which is enough to
+/// find the stray one.
+fn unattached_annotation_failures(
+    occurrences: &[SpecOccurrence],
+    discovered: &[xtask_docs::DiscoveredTest],
+) -> Vec<String> {
+    let mut bound: BTreeMap<(&Path, &str), usize> = BTreeMap::new();
+    for t in discovered {
+        *bound
+            .entry((t.source_path.as_path(), t.spec_id.as_str()))
+            .or_insert(0) += 1;
+    }
+    let mut scanned: BTreeMap<(&Path, &str), Vec<usize>> = BTreeMap::new();
+    for o in occurrences {
+        scanned
+            .entry((o.file.as_path(), o.id.as_str()))
+            .or_default()
+            .push(o.line);
+    }
+
+    let mut out = Vec::new();
+    for ((file, id), lines) in scanned {
+        let bound_count = bound.get(&(file, id)).copied().unwrap_or(0);
+        if lines.len() <= bound_count {
+            continue;
+        }
+        let unbound = lines.len() - bound_count;
+        let where_ = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(format!(
+            "[4] {} {unbound} of {} #[spec({id:?})] annotation(s) (line(s) {where_}) is not attached to a `fn` definition \
+             — an attribute on a non-function item, or inside a macro body the parser does not expand",
+            file.display(),
+            lines.len(),
+        ));
+    }
+    out
 }
 
 /// Locate the workspace root by walking up from the binary's
@@ -835,6 +927,125 @@ mod tests {
         // Malformed IDs have no derivable prefix; check 3 flags the
         // format, so check 4 must not double-report.
         assert!(fn_name_matches_spec("not-an-id", "whatever_name"));
+    }
+
+    /// Build a `DiscoveredTest` standing in for one syn-bound test.
+    fn bound(file: &str, spec_id: &str, fn_name: &str) -> xtask_docs::DiscoveredTest {
+        xtask_docs::DiscoveredTest {
+            spec_id: spec_id.to_string(),
+            fn_name: fn_name.to_string(),
+            source_path: PathBuf::from(file),
+            scenario: Some("Scenario: synthetic.".to_string()),
+            steps: Vec::new(),
+            ignored: false,
+        }
+    }
+
+    fn occurrence(file: &str, id: &str, line: usize) -> SpecOccurrence {
+        SpecOccurrence {
+            id: id.to_string(),
+            file: PathBuf::from(file),
+            line,
+        }
+    }
+
+    #[test]
+    fn scan_spec_occurrences_records_ids_and_line_numbers() {
+        let spec_re = Regex::new(r#"#\[spec\("([^"]+)"\)\]"#).expect("regex");
+        let lines = vec![
+            "mod common;",
+            r#"#[spec("hooks/delivery/001")]"#,
+            "#[tokio::test]",
+            "async fn delivery_001_async() {}",
+            "",
+            r#"#[spec("dashboard/pane/005")]"#,
+            "#[test]",
+            "fn pane_005_plain() {}",
+        ];
+        assert_eq!(
+            scan_spec_occurrences(&lines, &spec_re),
+            vec![
+                ("hooks/delivery/001".to_string(), 2),
+                ("dashboard/pane/005".to_string(), 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_spec_occurrences_is_indifferent_to_what_follows() {
+        // Issue #406: the scan no longer looks for a following `fn` at
+        // all, so an `async fn` (or any other item shape) is recorded
+        // identically. Binding is syn's job.
+        let spec_re = Regex::new(r#"#\[spec\("([^"]+)"\)\]"#).expect("regex");
+        let lines = vec![r#"#[spec("hooks/delivery/001")]"#, "async fn whatever() {}"];
+        assert_eq!(
+            scan_spec_occurrences(&lines, &spec_re),
+            vec![("hooks/delivery/001".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn unattached_annotations_are_silent_when_every_one_is_bound() {
+        let occ = vec![
+            occurrence("tests/a.rs", "hooks/delivery/001", 10),
+            occurrence("tests/a.rs", "dashboard/pane/005", 20),
+        ];
+        let found = vec![
+            bound("tests/a.rs", "hooks/delivery/001", "delivery_001_x"),
+            bound("tests/a.rs", "dashboard/pane/005", "pane_005_y"),
+        ];
+        assert!(unattached_annotation_failures(&occ, &found).is_empty());
+    }
+
+    #[test]
+    fn unattached_annotation_is_reported_at_its_own_location() {
+        // The honest-failure half of issue #406: an annotation syn could
+        // not bind is named in ITS file, with its line — never silently
+        // charged to a neighbouring function.
+        let occ = vec![occurrence("tests/a.rs", "hooks/delivery/001", 42)];
+        let failures = unattached_annotation_failures(&occ, &[]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("tests/a.rs"), "{}", failures[0]);
+        assert!(failures[0].contains("line(s) 42"), "{}", failures[0]);
+        assert!(
+            failures[0].contains("hooks/delivery/001"),
+            "{}",
+            failures[0]
+        );
+    }
+
+    #[test]
+    fn unattached_annotation_counts_duplicates_per_file_and_id() {
+        // The same catalog ID may legitimately be annotated on more than
+        // one test in a file, so the check compares COUNTS: two
+        // occurrences with one bound fn means exactly one is stray.
+        let occ = vec![
+            occurrence("tests/a.rs", "hooks/delivery/001", 10),
+            occurrence("tests/a.rs", "hooks/delivery/001", 30),
+        ];
+        let found = vec![bound("tests/a.rs", "hooks/delivery/001", "delivery_001_x")];
+        let failures = unattached_annotation_failures(&occ, &found);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("1 of 2"), "{}", failures[0]);
+        assert!(failures[0].contains("line(s) 10, 30"), "{}", failures[0]);
+
+        // Two occurrences, two bound fns → nothing to report.
+        let found_both = vec![
+            bound("tests/a.rs", "hooks/delivery/001", "delivery_001_x"),
+            bound("tests/a.rs", "hooks/delivery/001", "delivery_001_y"),
+        ];
+        assert!(unattached_annotation_failures(&occ, &found_both).is_empty());
+    }
+
+    #[test]
+    fn unattached_annotation_does_not_match_across_files() {
+        // A bound test in another file must not satisfy this file's
+        // annotation.
+        let occ = vec![occurrence("tests/a.rs", "hooks/delivery/001", 10)];
+        let found = vec![bound("tests/b.rs", "hooks/delivery/001", "delivery_001_x")];
+        let failures = unattached_annotation_failures(&occ, &found);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("tests/a.rs"), "{}", failures[0]);
     }
 
     #[test]
