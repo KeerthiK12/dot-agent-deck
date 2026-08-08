@@ -10,6 +10,14 @@ For `cargo test-e2e` chain-smoke tests you also need the agent CLIs (`claude` an
 
 L1 widget/layout regressions are pinned by `insta` file snapshots under `tests/snapshots/`. When a PR's diff includes a new or modified `.snap` file, read the snapshot diff like a rendered screen — each line corresponds to one row of the dashboard's parsed grid. Accept the change only if the new rendering matches the catalog entry's prose; otherwise loop the change back to the author. Locally, `cargo insta review` walks pending diffs interactively.
 
+## Reported bugs start with a failing test
+
+When someone reports that something is broken, the first deliverable is a test that fails *for their reason* — not a fix. Then fix it and watch that same test pass. Assert the outcome at the altitude the reporter is looking at it: a file on disk, a log line, or a registry entry can all be correct while the screen is wrong. Before trusting a new test, confirm you have seen it fail, and after fixing, revert the fix once to confirm it goes red again — an assertion never observed failing is not evidence that it covers anything.
+
+Prefer the reporter's configuration over a convenient stand-in. A `cat` role or a print-mode agent proves the plumbing and hides everything else — several defects here shipped green because the only coverage used one. Where a stand-in is necessary for cost, say so in the test and name what it stands in for.
+
+(Agents working in this repo: the `reproduce-first` skill carries the full procedure and the traps that have cost real time.)
+
 ## TDD loop
 
 Fast tier (per-task gate):
