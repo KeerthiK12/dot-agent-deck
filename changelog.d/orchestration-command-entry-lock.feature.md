@@ -1,4 +1,6 @@
-## Typing Into a Worker Pane Is Now a Decision, Not a Reflex
+## Typing Into a Worker Pane Can Now Be a Decision Rather Than a Reflex (Experimental)
+
+**This ships behind the `experimental` feature flag and is off by default.** Nothing about how you work today changes unless you turn it on: set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1`. It is gated precisely because it changes a reflex you already have — the default is deliberately restrictive, and that deserves real use before it reaches everyone. Everything below describes what you get once it is on.
 
 An orchestration is one workflow with a single coordinator, but every worker pane sits there with a cursor in it, inviting you to answer its question on the spot. Doing that puts a second, uncoordinated actor inside the workflow: you change state the orchestrator believes it owns, with no path for it to learn that you did. The deck does not look broken afterwards — it looks fine, and the model behind it has quietly diverged. Most often it is not even deliberate: you open a worker pane to check on it, get distracted, and type your next instruction into the pane in front of you instead of the one you meant.
 

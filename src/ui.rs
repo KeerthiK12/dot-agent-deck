@@ -9096,7 +9096,18 @@ fn handle_key_event(
         // typing at. Un-resolving it lets the key fall through to the normal
         // `PaneInput` forwarding path (`0x05`) instead.
         let is_orchestration_tab = matches!(tab_manager.active_tab(), Tab::Orchestration { .. });
-        action = scope_command_entry_lock(action, is_orchestration_tab, ui.mode);
+        // PRD #393 experimental gate (CLAUDE.md #9). Passing `false` for the
+        // tab term when the flag is off makes `scope_command_entry_lock`
+        // un-resolve `Ctrl+E` everywhere, exactly as it already does off an
+        // Orchestration tab — so the key falls through to the PTY and the lock
+        // has no binding at all. Expressed through the existing tab term rather
+        // than a second branch so there is only one place that decides whether
+        // the chord is claimed.
+        action = scope_command_entry_lock(
+            action,
+            is_orchestration_tab && crate::features::show_command_entry_lock(),
+            ui.mode,
+        );
         // PRD #336: the split toggle resolves only on an orchestration tab, in
         // command mode. This is the first point in the funnel with tab context,
         // so narrow it here — otherwise `Ctrl+l` is claimed everywhere and
@@ -9185,13 +9196,22 @@ fn handle_key_event(
                 // the plain `build_pane_status` the pane borders read: it omits
                 // any `pane_id` claimed by more than one session, so an
                 // ambiguous pane can never earn the carve-out.
-                let gated = gate_pane_input_key(
-                    candidate.clone(),
-                    ui,
-                    tab_manager,
-                    pane,
-                    &build_pane_status_for_gate(snapshot),
-                );
+                //
+                // PRD #393 experimental gate (CLAUDE.md #9): with the flag off
+                // the keystroke is forwarded untouched, which also skips
+                // building the status join above — the lock is the only reader
+                // of it, so there is nothing to compute when it cannot act.
+                let gated = if crate::features::show_command_entry_lock() {
+                    gate_pane_input_key(
+                        candidate.clone(),
+                        ui,
+                        tab_manager,
+                        pane,
+                        &build_pane_status_for_gate(snapshot),
+                    )
+                } else {
+                    candidate.clone()
+                };
                 if matches!(candidate, Action::ForwardToPane(_))
                     && matches!(gated, Action::Continue)
                 {
@@ -10580,7 +10600,14 @@ pub fn run_tui(
         // handler calls `clear_waiting_pane_latch` on the locked→unlocked half
         // to compensate (see that method's doc comment for the straddling trace
         // this protects).
-        if ui.command_entry_locked {
+        //
+        // PRD #393 experimental gate (CLAUDE.md #9). The steering is part of the
+        // gated surface rather than a separate feature: it only ever ran while
+        // locked, so with the flag off it must not run either — otherwise the
+        // deck would move focus on its own for a lock the user cannot see or
+        // reach. Flag off therefore means no automatic focus movement at all,
+        // which is exactly v0.35.8's behaviour.
+        if crate::features::show_command_entry_lock() && ui.command_entry_locked {
             let pane_status_for_focus: HashMap<&str, SessionStatus> = build_pane_status(&snapshot);
             // The observation runs FIRST and outside the chain, because it must
             // happen on every locked frame no matter which branch below wins.

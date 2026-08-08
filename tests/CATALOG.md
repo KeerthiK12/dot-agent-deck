@@ -2195,6 +2195,13 @@ without depending on the config struct API.
 - **Does not assert:** anything when skipped — where credentials are absent this test executes nothing, so `orchestration/lock/008`/`011` carry the CI-visible coverage.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 
+##### orchestration/lock/014 — With the `experimental` flag OFF (the default), the command-entry lock surface is absent entirely.
+- **Layer:** L2 (PTY end-to-end).
+- **Agent:** none (`orch-deck` fixture, two stub `cat` roles). Deliberately launched WITHOUT `DOT_AGENT_DECK_EXPERIMENTAL`, unlike every other test in the file.
+- **Asserts:** on a real orchestration tab a keystroke typed at the focused non-orchestrator worker reaches its PTY with no unlock chord at all; the `Pane locked` message never appears; and `Ctrl+e` sent in command mode is not claimed, so no `Pane entry:` report is produced. This is the other side of the PRD #393 gate — a regression that shipped the lock unconditionally fails here rather than reaching every user silently.
+- **Does not assert:** the locked behaviour itself (`orchestration/lock/008`); that the focus steering is gated too (no automatic focus movement is asserted here).
+- **Platform coverage:** mac+linux.
+
 #### orchestration/focus
 
 ##### orchestration/focus/001 — Auto-focus follows the lowest-order `WaitingForInput` role pane on the active tab, and never touches another tab.
