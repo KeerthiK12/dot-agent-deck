@@ -99,6 +99,12 @@ pub struct DiscoveredTest {
     pub source_path: PathBuf,
     pub scenario: Option<String>,
     pub steps: Vec<String>,
+    /// Whether the test carries `#[ignore]` / `#[ignore = "…"]`.
+    /// Issue #406: linkage-check's Decision-26 check reads this rather
+    /// than scanning the lines between the annotation and the next
+    /// `fn`, which could charge an unrelated function's `#[ignore]` to
+    /// this test.
+    pub ignored: bool,
 }
 
 /// Generate the `.md` content for every `#[spec]` test under
@@ -369,12 +375,14 @@ fn collect_spec_tests_from_items(items: &[syn::Item], path: &Path, out: &mut Vec
                     let fn_name = item_fn.sig.ident.to_string();
                     let scenario = read_scenario_doc(&item_fn.attrs);
                     let steps = extract_steps_from_body(&item_fn.block);
+                    let ignored = has_ignore_attr(&item_fn.attrs);
                     out.push(DiscoveredTest {
                         spec_id,
                         fn_name,
                         source_path: path.to_path_buf(),
                         scenario,
                         steps,
+                        ignored,
                     });
                 }
             }
@@ -431,6 +439,15 @@ fn read_spec_attr(attrs: &[syn::Attribute]) -> Option<String> {
         }
     }
     None
+}
+
+/// Does this function carry `#[ignore]` or `#[ignore = "reason"]`?
+/// Feeds [`DiscoveredTest::ignored`], which linkage-check's Decision-26
+/// rule reads (issue #406). `#[cfg_attr(…, ignore)]` is deliberately
+/// NOT matched — the attribute is conditional, so it is not an
+/// unconditional `#[ignore]` on the test.
+fn has_ignore_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| attr.path().is_ident("ignore"))
 }
 
 /// Scan the function's doc attributes for the first `/// Scenario:`
@@ -1130,5 +1147,73 @@ mod tests {
             "doubly-nested mod should also be walked: {ids:?}"
         );
         assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn collect_spec_tests_from_items_binds_async_fn() {
+        // Issue #406: an `async fn` test is a first-class `Item::Fn`,
+        // so the walker binds it by name like any other. linkage-check
+        // now reads its bindings from here instead of a `^\s*fn\s+`
+        // line regex that skipped `async fn` entirely and silently
+        // re-bound the annotation to the next plain `fn` in the file.
+        let src = r#"
+            #[spec("hooks/delivery/001")]
+            #[tokio::test]
+            /// Scenario: an async test.
+            async fn delivery_001_async() {}
+
+            /// A plain fn further down that must NOT absorb the
+            /// annotation above.
+            fn some_unrelated_helper() {}
+        "#;
+        let parsed = syn::parse_file(src).expect("test src parses");
+        let mut out: Vec<DiscoveredTest> = Vec::new();
+        collect_spec_tests_from_items(
+            &parsed.items,
+            std::path::Path::new("tests/synthetic.rs"),
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "exactly one #[spec] test: {out:?}");
+        assert_eq!(out[0].fn_name, "delivery_001_async");
+        assert_eq!(out[0].spec_id, "hooks/delivery/001");
+    }
+
+    #[test]
+    fn collect_spec_tests_from_items_reads_ignore_attribute() {
+        // Issue #406: `ignored` comes off the function's own attribute
+        // list, so an `#[ignore]` on a DIFFERENT function nearby is
+        // never charged to this test (which the old between-the-lines
+        // scan in linkage-check did).
+        let src = r#"
+            #[spec("hooks/delivery/001")]
+            #[test]
+            /// Scenario: not ignored.
+            fn delivery_001_plain() {}
+
+            #[ignore]
+            #[test]
+            fn unrelated_ignored_test() {}
+
+            #[spec("dashboard/pane/005")]
+            #[ignore = "flaky"]
+            #[tokio::test]
+            /// Scenario: genuinely ignored.
+            async fn pane_005_ignored() {}
+        "#;
+        let parsed = syn::parse_file(src).expect("test src parses");
+        let mut out: Vec<DiscoveredTest> = Vec::new();
+        collect_spec_tests_from_items(
+            &parsed.items,
+            std::path::Path::new("tests/synthetic.rs"),
+            &mut out,
+        );
+        assert_eq!(out.len(), 2);
+        assert!(
+            !out[0].ignored,
+            "the neighbouring #[ignore] belongs to another fn: {:?}",
+            out[0]
+        );
+        // `#[ignore = "reason"]` counts the same as bare `#[ignore]`.
+        assert!(out[1].ignored, "{:?}", out[1]);
     }
 }

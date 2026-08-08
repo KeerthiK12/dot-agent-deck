@@ -135,10 +135,15 @@ jobs:
       # Unix-only in practice, so `--features e2e` against the Windows target
       # yields dozens of E0425s (scripts/windows-cross-check.sh, issue #164).
       #
-      # NOT `--workspace`: cargo's default target selection is the root package,
-      # so the xtask members stay unlinted. That is issue #436, kept separate
-      # because it fails on main today.
-      - run: cargo clippy --all-targets --features e2e -- -D warnings
+      # `--workspace` (issue #436): cargo's default target selection is the
+      # root package ALONE, so `xtask/docs`, `xtask/linkage-check` and
+      # `xtask/spec` were linted by no gate anywhere. `xtask/spec` and
+      # `xtask-docs` are path dev-deps so they were at least built, but
+      # building is not linting and `xtask/linkage-check` was not even built.
+      # A live `unnecessary_sort_by` had been sitting in its `clean_tmp.rs`
+      # unnoticed; it is fixed in the same commit that added this flag, so the
+      # widened gate landed green rather than red on its first run.
+      - run: cargo clippy --workspace --all-targets --features e2e -- -D warnings
       - run: cargo build --release
       # `cargo nextest run`, NOT `cargo test` — the same runner as the
       # `cargo test-fast` local gate, and as build-macos/build-windows which
