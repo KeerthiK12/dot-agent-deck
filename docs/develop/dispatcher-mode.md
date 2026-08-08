@@ -24,9 +24,17 @@ Once the agent is running inside dispatcher mode, it can execute:
 dot-agent-deck dispatch <name> --task "..."
 ```
 
-This creates a dedicated worktree and starts a line of work inside it. The `--task` text becomes the opening prompt, and because it runs as a fresh process with no access to the dispatcher's conversation, the text has to be self-contained.
+This creates a dedicated worktree and starts a line of work inside it. The `--task` text becomes the opening prompt.
 
 Several dispatches from one pane are normal, and are not decomposition: working on three PRDs in parallel is three dispatches of three things the user named.
+
+### Reference the repo, don't paste it
+
+"Self-contained" means independent of the **dispatcher's conversation**, not of the repo. The unit works in a copy of the same repo, so it already has the code, the docs, the PRDs and the skills — 59 skill files, `CLAUDE.md` and every PRD are tracked, so `--task "Execute the /prd-full skill for PRD 220"` is complete as it stands. Pasting a skill's contents into `--task` is waste, and it can go stale against the copy the unit actually holds.
+
+Paths must be **relative to the repo root**. An absolute path into the dispatcher's own checkout points the unit back at the directory the dispatcher is in, which destroys the isolation the worktree exists to provide and puts two agents on the same files — the cross-delivery hazard PRD #140 documents.
+
+One sharp edge the seed deliberately does *not* carry, to keep it short — worth knowing as a maintainer. `git worktree add` checks out the **last commit**, so a dispatched worktree contains committed content only. Measured: an uncommitted edit, an untracked file and a gitignored file are all absent. In this repo that matters for `.claude/settings.local.json`, which is untracked (`verify-pr`'s own `setup.sh` copies it by hand for exactly this reason). If a unit needs something uncommitted, commit it first — otherwise the unit silently reads an older version of the file it was pointed at. This is the same working-tree-vs-HEAD divergence that made an earlier `--list-targets` offer targets the spawn could not start.
 
 ## Choosing the shape: one agent, or a team
 

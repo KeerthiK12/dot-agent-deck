@@ -549,7 +549,9 @@ Reuse the answer for later dispatches in the same conversation rather than askin
 - Returns immediately and reports what was started and where.
 
 ## Rules
-- The --task text must be SELF-CONTAINED. The dispatched agent is a fresh process with no access to this conversation, so spell out the files, constraints, and expected outcome it needs.
+- The --task text must be SELF-CONTAINED — independent of THIS CONVERSATION, not of the repo. The dispatched agent is a fresh process and cannot see anything said here, so state the goal and the expected outcome in the task itself.
+- The unit works in a copy of THIS REPO, so it already has the code, the docs, the PRDs and the skills. REFERENCE them by path instead of pasting their contents: `--task \"Execute the /prd-full skill for PRD 220\"` is complete as it stands. Never paste a skill's or a file's contents into --task.
+- Use paths RELATIVE to the repo root. An absolute path into this checkout points the unit back at the directory you are in, which defeats the isolation it was just given.
 - Pass --single or --orchestration explicitly. With neither, the shape falls back to whatever the repo's config implies, which is the guess this asking exists to avoid.
 - `dispatch` is fire-and-forget: there is NO return edge yet, so a dispatched unit's completion does NOT come back to this pane. Never tell the user results will report back here — give them the worktree path instead, and point at the unit's own tab on the deck.
 - A <name> is single-use. Removing a worktree keeps its branch, so re-dispatching the same name is refused while agent/dispatch-<name> still exists — pick a different name, or delete that branch once you are done with it.
@@ -25242,6 +25244,11 @@ mod tests {
             "--single",
             "--orchestration",
             "ASK, do not guess",
+            // The unit shares the repo, so referencing beats pasting — and paths
+            // must be relative, or an absolute one points the unit back at the
+            // caller's checkout and undoes the isolation.
+            "REFERENCE them by path",
+            "RELATIVE to the repo root",
         ] {
             assert!(
                 DISPATCHER_SEED_PROMPT.contains(required),
