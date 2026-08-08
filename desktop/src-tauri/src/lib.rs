@@ -15,8 +15,8 @@ use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{AgentType, BroadcastMsg, EventType, SendResult};
 use dot_agent_deck::project_config::{OrchestrationConfig, load_project_config};
 use dot_agent_deck::ui::{
-    AUTOMATIC_PROMPT_DEADLINE, SPAWN_TIME_READINESS_BUFFER, SPAWN_TIME_READINESS_TIMEOUT,
-    describe_send_result, is_terminal_send_result, send_retry_delay,
+    AUTOMATIC_PROMPT_DEADLINE, SPAWN_TIME_READINESS_TIMEOUT, describe_send_result,
+    is_terminal_send_result, send_retry_delay,
 };
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
@@ -32,6 +32,20 @@ use crate::terminal::DesktopState;
 
 const WATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 const COORDINATOR_DELIVERY_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Post-`SessionStart` wait before injecting the coordinator seed. See the
+/// call site in `deliver_coordinator_prompt` for why the TUI's 500 ms is not
+/// enough here. Env override in milliseconds, clamped to 0..=30_000.
+fn desktop_seed_buffer() -> Duration {
+    const DEFAULT: Duration = Duration::from_millis(3_000);
+    match std::env::var("DOT_AGENT_DECK_DESKTOP_SEED_BUFFER_MS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) => Duration::from_millis(ms.min(30_000)),
+            Err(_) => DEFAULT,
+        },
+        Err(_) => DEFAULT,
+    }
+}
 
 /// Minimum spacing between full-snapshot refreshes driven by the daemon event
 /// stream.
@@ -147,10 +161,7 @@ fn prepare_workflow_launch(
             safe_message(cwd)
         )
     })?;
-    Ok((
-        roles,
-        format!("{seed}\n\n## User task\n\n{task_prompt}\n"),
-    ))
+    Ok((roles, format!("{seed}\n\n## User task\n\n{task_prompt}\n")))
 }
 
 fn validate_desktop_coordinator(roles: &[WorkflowRoleInput]) -> Result<&WorkflowRoleInput, String> {
@@ -398,8 +409,13 @@ async fn deliver_coordinator_prompt<D: WorkflowDaemon + Sync>(
         {
             Ok(Some(session_id)) => {
                 // SessionStart precedes reliable submit handling on slower
-                // machines. Match the TUI's post-readiness buffer.
-                daemon.wait(SPAWN_TIME_READINESS_BUFFER).await;
+                // machines. The TUI's 500 ms buffer proved too short for
+                // Claude Code's boot on this hardware — the seed reached the
+                // PTY (SendResult Applied) but was discarded by the still-
+                // rendering TUI, leaving the coordinator idle at an empty
+                // prompt. Default to a longer wait, overridable via
+                // DOT_AGENT_DECK_DESKTOP_SEED_BUFFER_MS (clamped to 30 s).
+                daemon.wait(desktop_seed_buffer()).await;
                 Some(session_id)
             }
             Ok(None) => None,
@@ -1334,7 +1350,7 @@ description = "Implements the requested change"
 
         assert_eq!(
             *daemon.sleeps.lock().unwrap(),
-            [SPAWN_TIME_READINESS_BUFFER, send_retry_delay(1)]
+            [desktop_seed_buffer(), send_retry_delay(1)]
         );
         assert!(daemon.stopped.lock().unwrap().is_empty());
     }
