@@ -946,7 +946,9 @@ struct NewPaneFormState {
     /// that teaches the agent to decompose work and call `dispatch` per unit.
     dispatcher_authoring: ModeConfig,
     /// PRD #220: when true the cycler offers the `dispatcher` option after
-    /// `schedule: issues`. Gated behind the experimental feature flag.
+    /// `schedule: issues`. True for the ordinary `Ctrl+n` form (the feature has
+    /// graduated out of the experimental flag); false only for the mode-locked
+    /// form, which renders no cycler at all.
     show_dispatcher: bool,
     selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations, then "schedule" [, "schedule: issues"]
     /// PRD #20 finding #8: the selected agent's index into
@@ -1055,9 +1057,12 @@ impl NewPaneFormState {
             // all observe one consistent value.
             show_issue_dispatch: crate::features::show_issue_dispatch_authoring(),
             dispatcher_authoring,
-            // PRD #220: gated behind the dedicated dispatcher experimental flag
-            // (CLAUDE.md #9); can be promoted to permanent when the feature stabilizes.
-            show_dispatcher: crate::features::show_dispatcher(),
+            // PRD #220: GRADUATED — the `dispatcher` option is offered to everyone.
+            // It shipped behind `features::show_dispatcher()`; that wrapper is gone
+            // and this branch is inlined (CLAUDE.md #9). The field itself stays,
+            // because the mode-locked form below still sets it `false` — for an
+            // unrelated reason (that form hides the cycler entirely).
+            show_dispatcher: true,
             selection_index: 0,
             agent_selection: None,
             has_mode_field,
@@ -25090,7 +25095,9 @@ mod tests {
             vec![],
         );
         // PRD #127 M3.2: + the built-in "schedule" authoring option.
-        assert_eq!(f.mode_option_count(), 3); // "No mode" + 1 mode + "schedule"
+        // PRD #220: + the built-in "dispatcher" option, which graduated out of the
+        // experimental flag and is now offered on every `Ctrl+n` form.
+        assert_eq!(f.mode_option_count(), 4); // "No mode" + 1 mode + "schedule" + "dispatcher"
 
         let f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
@@ -25099,7 +25106,7 @@ mod tests {
             vec![],
             vec![],
         );
-        assert_eq!(f.mode_option_count(), 2); // "No mode" + "schedule"
+        assert_eq!(f.mode_option_count(), 3); // "No mode" + "schedule" + "dispatcher"
     }
 
     #[test]
@@ -25126,9 +25133,15 @@ mod tests {
         assert_eq!(f.selection_index, 3);
         assert!(f.is_schedule_selected());
 
-        // Can't go past last (schedule)
+        // PRD #220: index 4 is the built-in "dispatcher" option, now the LAST slot
+        // (it graduated out of the experimental flag, so every form offers it).
         f.select_next_mode();
-        assert_eq!(f.selection_index, 3);
+        assert_eq!(f.selection_index, 4);
+        assert!(f.is_dispatcher_selected());
+
+        // Can't go past last (dispatcher)
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 4);
     }
 
     #[test]
@@ -25190,8 +25203,9 @@ mod tests {
             vec![make_mode("dev")],
             vec![make_orchestration("tdd")],
         );
-        // 0=No mode, 1=dev, 2=tdd, 3=schedule (PRD #127 M3.2 built-in).
-        assert_eq!(f.mode_option_count(), 4);
+        // 0=No mode, 1=dev, 2=tdd, 3=schedule (PRD #127 M3.2 built-in),
+        // 4=dispatcher (PRD #220, graduated out of the experimental flag).
+        assert_eq!(f.mode_option_count(), 5);
 
         f.select_next_mode();
         f.select_next_mode();
@@ -25204,9 +25218,14 @@ mod tests {
         assert!(f.is_schedule_selected());
         assert!(f.selected_orchestration().is_none());
 
-        // Can't go past last (schedule)
+        // PRD #220: index 4 is the built-in "dispatcher" option, now the LAST slot.
         f.select_next_mode();
-        assert_eq!(f.selection_index, 3);
+        assert_eq!(f.selection_index, 4);
+        assert!(f.is_dispatcher_selected());
+
+        // Can't go past last (dispatcher)
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 4);
     }
 
     #[test]
@@ -25749,7 +25768,7 @@ mod tests {
     // carries it. This test pins both: the option is last/selectable, and
     // submitting it produces a seeded request.
     #[test]
-    fn unified_form_builtin_schedule_option_is_last_and_seeded() {
+    fn unified_form_builtin_schedule_option_is_offered_and_seeded() {
         let mut f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
             String::new(),
@@ -25757,14 +25776,22 @@ mod tests {
             vec![make_mode("build")],
             vec![make_orchestration("review")],
         );
-        // 0=No mode, 1=build, 2=review, 3=schedule.
+        // 0=No mode, 1=build, 2=review, 3=schedule, 4=dispatcher.
         assert_eq!(f.schedule_index(), 3);
-        assert_eq!(f.mode_option_count(), 4);
+        assert_eq!(f.mode_option_count(), 5);
 
-        // Cycling Right to the cap lands on the schedule option.
+        // PRD #220: `schedule` is no longer the LAST slot — the graduated
+        // `dispatcher` option now sits after it, so cycling to the cap lands
+        // there. This test is about the schedule option's own identity and seed,
+        // so select it directly rather than by saturating the cycler.
         for _ in 0..10 {
             f.select_next_mode();
         }
+        assert!(
+            f.is_dispatcher_selected(),
+            "the cycler cap must now land on `dispatcher`, the last slot"
+        );
+        f.selection_index = f.schedule_index();
         assert!(f.is_schedule_selected());
 
         // It is a real (synthetic) mode named `schedule`, NOT misread as an

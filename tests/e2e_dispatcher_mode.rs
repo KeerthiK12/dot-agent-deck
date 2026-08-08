@@ -2,8 +2,8 @@
 
 //! L2 PTY-attached reel test for PRD #220 dispatcher mode.
 //!
-//! Exercises the full user-visible path: launch the deck with the experimental
-//! flag ON, open the new-pane form, select the "dispatcher" option, submit, give
+//! Exercises the full user-visible path: launch a default deck (no experimental
+//! flag), open the new-pane form, select the "dispatcher" option, submit, give
 //! the seeded agent a goal, and verify it really dispatches — the daemon creates
 //! the sibling git worktree the feature promises.
 //!
@@ -220,10 +220,10 @@ fn role_diagnostics(deck: &TuiDeck, orch: &str, expected: &[&str]) -> String {
     out
 }
 
-/// Scenario: Launch the deck in the minimal fixture with the experimental flag
-/// ON and real Claude credentials imported. Open the new-pane form (Ctrl+N →
-/// Space confirms the dir), cycle the Mode field to the experimental "dispatcher"
-/// option (the last cycler slot after `schedule: issues`), and click [Submit] —
+/// Scenario: Launch the deck in the minimal fixture with real Claude credentials
+/// imported and NO experimental flag set. Open the new-pane form (Ctrl+N →
+/// Space confirms the dir), cycle the Mode field to the "dispatcher" option
+/// (the last cycler slot after `schedule: issues`), and click [Submit] —
 /// the dispatcher must surface live as a dashboard card. Then type a goal asking
 /// for one unit named `probe-unit`; the seeded agent runs
 /// `dot-agent-deck dispatch probe-unit` itself and the daemon creates the sibling
@@ -235,7 +235,10 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
 
     let deck = TuiDeck::builder()
         .with_imported_claude_credentials()
-        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        // Deliberately NO `DOT_AGENT_DECK_EXPERIMENTAL`: the dispatcher option has
+        // graduated out of the flag, so reaching it from a default deck is part of
+        // what this test pins. Setting the flag here would hide a regression that
+        // put the option back behind it.
         // The branch build must win over any host-installed `dot-agent-deck`, or
         // the agent cannot see the `dispatch` verb at all.
         .with_env("PATH", path_with_binary_dir())

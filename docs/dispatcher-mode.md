@@ -1,20 +1,16 @@
 # Dispatcher Mode
 
-> **Developer / maintainer reference.** This page documents an internal development mechanism and is intentionally excluded from the published documentation site.
-
 ## What it is
 
 Dispatcher mode is a built-in seeded mode for `dot-agent-deck` that teaches an agent one extra effector: the `dispatch` CLI subcommand, which starts an isolated line of work in its own git worktree. A dispatcher pane is otherwise an **ordinary conversational agent** — it does whatever the user asks — and it reaches for `dispatch` when the user says to *start* something as a separate line of work.
 
-The seed is deliberately scoped to **Agent Deck mechanics, not work methodology**: what the verb is, what it does, and the constraints that follow from process isolation. It holds no opinion on how the user should split up their work, matching the two schedule-authoring seeds. (An earlier version cast the pane as a planner that had to decompose a goal into 2–6 independent units and never do work itself; that was cut — see the Design record in [PRD #220](../../prds/220-dispatcher-mode-worktree-dispatch.md).)
+The seed is deliberately scoped to **Agent Deck mechanics, not work methodology**: what the verb is, what it does, and the constraints that follow from process isolation. It holds no opinion on how the user should split up their work, matching the two schedule-authoring seeds. (An earlier version cast the pane as a planner that had to decompose a goal into 2–6 independent units and never do work itself; that was cut — see the Design record in [PRD #220](https://github.com/vfarcic/dot-agent-deck/blob/main/prds/220-dispatcher-mode-worktree-dispatch.md).)
 
 ## How to activate it
 
 1. Open a new pane with `Ctrl+n`
 2. Cycle through the available modes until `dispatcher` appears in the mode selector
 3. Select it and confirm
-
-The dispatcher mode is currently gated behind the `experimental` feature flag — see [experimental-flag.md](experimental-flag.md).
 
 ## How the agent uses `dispatch`
 
