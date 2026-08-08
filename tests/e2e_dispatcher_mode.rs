@@ -83,7 +83,7 @@ fn commit_fixture_repo(dir: &Path) {
 /// worktree `../<repo>-dispatch-probe-unit`, which the test waits for on disk.
 #[spec("prompt/new-pane/016")]
 #[test]
-fn dispatcher_001_opens_mode_tab_with_real_agent() {
+fn new_pane_016_dispatcher_opens_mode_tab_with_real_agent() {
     skip_unless!(common::check_claude_available());
 
     let deck = TuiDeck::builder()
@@ -191,10 +191,13 @@ fn dispatcher_001_opens_mode_tab_with_real_agent() {
     // is the whole budget, and it stays inside this test's nextest kill window
     // (see `.config/nextest.toml`) so the assertion below — and its grid dump —
     // actually runs instead of the process being killed mid-wait.
+    // The per-round wait is `common::wait_for_path`, the harness's bounded
+    // path-appearance poll — Decision 21 keeps all sleeping/polling in `common`
+    // rather than in a test body.
     const NUDGE_EVERY: Duration = Duration::from_secs(70);
     const NUDGES: u32 = 3;
     let mut dispatched = false;
-    'outer: for round in 0..NUDGES {
+    for round in 0..NUDGES {
         if round > 0 {
             deck.send_keys(
                 b"You have not called the dispatch command yet. \
@@ -202,13 +205,9 @@ fn dispatcher_001_opens_mode_tab_with_real_agent() {
                   with no further questions.\r",
             );
         }
-        let until = std::time::Instant::now() + NUDGE_EVERY;
-        while std::time::Instant::now() < until {
-            if expected_worktree.is_dir() {
-                dispatched = true;
-                break 'outer;
-            }
-            std::thread::sleep(Duration::from_millis(500));
+        if common::wait_for_path(&expected_worktree, NUDGE_EVERY) {
+            dispatched = true;
+            break;
         }
     }
 
