@@ -81,6 +81,11 @@ pub struct SpawnRequest {
     pub command: Option<String>,
     /// Prompt delivered into the spawned agent / orchestrator pane.
     pub prompt: String,
+    /// PRD #220: explicit spawn shape, overriding what the target dir's config
+    /// implies. `None` (the scheduler and issue-dispatch producers) keeps the
+    /// config-derived behaviour untouched; `dispatch` sets it from the user's
+    /// answer. See [`SpawnShapeOverride`].
+    pub shape_override: Option<SpawnShapeOverride>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -167,6 +172,104 @@ pub enum SpawnTarget {
     Orchestration { name: String, roles: Vec<RoleSpawn> },
 }
 
+/// PRD #220: a caller's explicit choice of spawn shape, overriding what the
+/// target dir's config would imply.
+///
+/// Exists because the config-derived default is not knowable by the caller's
+/// intent: "work on this feature" wants a team, "verify this PR" wants one
+/// agent, and both arrive as the same `dispatch` call into the same repo. Only
+/// the user knows which, so `dispatch` asks and passes the answer down. Absent
+/// (`None`), [`decide_target`]'s config-derived behaviour is unchanged, which is
+/// what keeps the scheduler and issue-dispatch paths exactly as they were.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnShapeOverride {
+    /// Force a single agent even when the dir defines `[[orchestrations]]`.
+    SingleAgent,
+    /// Force an orchestration: `None` = the dir's first (same as the config
+    /// default), `Some(name)` = the one with that `name`, or an error if no
+    /// orchestration carries it.
+    Orchestration(Option<String>),
+}
+
+/// [`decide_target`], with an optional caller override (PRD #220).
+///
+/// `Err` only for an override naming an orchestration the dir does not define —
+/// a silent fallback there would spawn something other than what the user chose,
+/// which is exactly the class of surprise this selector exists to remove. The
+/// message lists what IS available so the caller can correct itself.
+pub fn decide_target_with_override(
+    config: Option<&ProjectConfig>,
+    dir: &Path,
+    schedule_command: Option<&str>,
+    over: Option<&SpawnShapeOverride>,
+) -> Result<SpawnTarget, String> {
+    match over {
+        None => Ok(decide_target(config, dir, schedule_command)),
+        Some(SpawnShapeOverride::SingleAgent) => Ok(SpawnTarget::SingleAgent {
+            command: schedule_command.map(|c| c.to_string()),
+        }),
+        Some(SpawnShapeOverride::Orchestration(None)) => {
+            match decide_target(config, dir, schedule_command) {
+                orch @ SpawnTarget::Orchestration { .. } => Ok(orch),
+                SpawnTarget::SingleAgent { .. } => Err(format!(
+                    "no orchestration is defined in {}: add an `[[orchestrations]]` \
+                     section with at least one role, or dispatch a single agent instead",
+                    dir.display()
+                )),
+            }
+        }
+        Some(SpawnShapeOverride::Orchestration(Some(want))) => {
+            let cfg = config.ok_or_else(|| {
+                format!(
+                    "no `.dot-agent-deck.toml` in {}, so no orchestration named '{want}' exists",
+                    dir.display()
+                )
+            })?;
+            let orch = cfg
+                .orchestrations
+                .iter()
+                .find(|o| resolve_orchestration_name(&o.name, dir) == *want)
+                .ok_or_else(|| {
+                    let available: Vec<String> = cfg
+                        .orchestrations
+                        .iter()
+                        .filter(|o| !o.roles.is_empty())
+                        .map(|o| resolve_orchestration_name(&o.name, dir))
+                        .collect();
+                    if available.is_empty() {
+                        format!("no orchestration named '{want}', and none are defined")
+                    } else {
+                        format!(
+                            "no orchestration named '{want}'; available: {}",
+                            available.join(", ")
+                        )
+                    }
+                })?;
+            if orch.roles.is_empty() {
+                return Err(format!("orchestration '{want}' defines no roles"));
+            }
+            Ok(SpawnTarget::Orchestration {
+                name: resolve_orchestration_name(&orch.name, dir),
+                roles: roles_of(orch),
+            })
+        }
+    }
+}
+
+/// Flatten one orchestration's configured roles into [`RoleSpawn`]s.
+fn roles_of(orch: &crate::project_config::OrchestrationConfig) -> Vec<RoleSpawn> {
+    orch.roles
+        .iter()
+        .enumerate()
+        .map(|(i, r)| RoleSpawn {
+            role_index: i,
+            role_name: r.name.clone(),
+            command: r.command.clone(),
+            is_start_role: r.start,
+        })
+        .collect()
+}
+
 /// Decide what to open from the target dir's config and the schedule's command.
 /// `[[orchestrations]]` with at least one role → orchestration; otherwise a
 /// single-agent card. `dir` is used only to resolve an unnamed orchestration's
@@ -181,18 +284,10 @@ pub fn decide_target(
         && !orch.roles.is_empty()
     {
         let name = resolve_orchestration_name(&orch.name, dir);
-        let roles = orch
-            .roles
-            .iter()
-            .enumerate()
-            .map(|(i, r)| RoleSpawn {
-                role_index: i,
-                role_name: r.name.clone(),
-                command: r.command.clone(),
-                is_start_role: r.start,
-            })
-            .collect();
-        return SpawnTarget::Orchestration { name, roles };
+        return SpawnTarget::Orchestration {
+            name,
+            roles: roles_of(orch),
+        };
     }
     SpawnTarget::SingleAgent {
         command: schedule_command.map(|c| c.to_string()),
@@ -246,9 +341,18 @@ pub async fn spawn(
         });
     }
 
-    // 2. Branch on the target dir's config.
+    // 2. Branch on the target dir's config, unless the caller chose explicitly
+    //    (PRD #220 `dispatch --single` / `--orchestration`). A named
+    //    orchestration that the dir does not define is an error, never a silent
+    //    fallback to something the user did not pick.
     let config = load_config_for_dir(dir);
-    let target = decide_target(config.as_ref(), dir, req.command.as_deref());
+    let target = decide_target_with_override(
+        config.as_ref(),
+        dir,
+        req.command.as_deref(),
+        req.shape_override.as_ref(),
+    )
+    .map_err(SpawnError::Agent)?;
 
     // 3. Spawn + deliver.
     match target {
@@ -996,6 +1100,168 @@ mod tests {
             }
             other => panic!("expected orchestration, got {other:?}"),
         }
+    }
+
+    // --- PRD #220: the caller's explicit shape override ---
+
+    fn two_orchestration_config() -> ProjectConfig {
+        parse_config(
+            "[[orchestrations]]\nname = \"digest\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"sh\"\n\n\
+             [[orchestrations]]\nname = \"review\"\n\n\
+             [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"cat\"\nstart = true\n",
+        )
+    }
+
+    /// `None` must leave the config-derived behaviour byte-for-byte unchanged —
+    /// that is what keeps the scheduler and issue-dispatch producers untouched.
+    #[test]
+    fn shape_override_absent_matches_plain_decide_target() {
+        let cfg = two_orchestration_config();
+        let dir = Path::new("/tmp/x");
+        for cmd in [Some("claude"), None] {
+            assert_eq!(
+                decide_target_with_override(Some(&cfg), dir, cmd, None),
+                Ok(decide_target(Some(&cfg), dir, cmd))
+            );
+            assert_eq!(
+                decide_target_with_override(None, dir, cmd, None),
+                Ok(decide_target(None, dir, cmd))
+            );
+        }
+    }
+
+    /// The "verify these PRs" case: one agent, even though the repo defines
+    /// orchestrations. Without the override this dir always yields a team.
+    #[test]
+    fn shape_override_single_agent_wins_over_config_orchestrations() {
+        let cfg = two_orchestration_config();
+        let dir = Path::new("/tmp/x");
+        assert!(matches!(
+            decide_target(Some(&cfg), dir, Some("claude")),
+            SpawnTarget::Orchestration { .. }
+        ));
+        assert_eq!(
+            decide_target_with_override(
+                Some(&cfg),
+                dir,
+                Some("claude"),
+                Some(&SpawnShapeOverride::SingleAgent)
+            ),
+            Ok(SpawnTarget::SingleAgent {
+                command: Some("claude".to_string())
+            })
+        );
+    }
+
+    /// A bare `--orchestration` takes the dir's first (matching the config
+    /// default); a named one picks that orchestration even when it is NOT first.
+    #[test]
+    fn shape_override_orchestration_by_name_selects_beyond_the_first() {
+        let cfg = two_orchestration_config();
+        let dir = Path::new("/tmp/x");
+
+        let first = decide_target_with_override(
+            Some(&cfg),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(None)),
+        );
+        assert!(matches!(
+            first,
+            Ok(SpawnTarget::Orchestration { ref name, .. }) if name == "digest"
+        ));
+
+        let second = decide_target_with_override(
+            Some(&cfg),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(Some("review".into()))),
+        );
+        match second {
+            Ok(SpawnTarget::Orchestration { name, roles }) => {
+                assert_eq!(name, "review");
+                assert_eq!(
+                    roles.len(),
+                    1,
+                    "the SECOND orchestration's roles, not the first's"
+                );
+                assert_eq!(roles[0].role_name, "lead");
+            }
+            other => panic!("expected the named orchestration, got {other:?}"),
+        }
+    }
+
+    /// A name the dir does not define must ERROR, never silently fall back —
+    /// spawning something other than what the user chose is the exact surprise
+    /// this selector exists to remove. The message names what IS available.
+    #[test]
+    fn shape_override_unknown_orchestration_errors_and_lists_available() {
+        let cfg = two_orchestration_config();
+        let dir = Path::new("/tmp/x");
+        let err = decide_target_with_override(
+            Some(&cfg),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(Some("nope".into()))),
+        )
+        .expect_err("an unknown orchestration name must not silently fall back");
+        assert!(err.contains("nope"), "error must name the request: {err}");
+        assert!(
+            err.contains("digest") && err.contains("review"),
+            "error must list the available orchestrations: {err}"
+        );
+    }
+
+    /// Asking for an orchestration where none is defined errors too, rather than
+    /// quietly starting a single agent the user did not ask for.
+    #[test]
+    fn shape_override_orchestration_without_any_defined_errors() {
+        let dir = Path::new("/tmp/x");
+        let bare = decide_target_with_override(
+            None,
+            dir,
+            Some("claude"),
+            Some(&SpawnShapeOverride::Orchestration(None)),
+        );
+        assert!(bare.is_err(), "no config → no orchestration to start");
+
+        let modes_only = parse_config("[[modes]]\nname = \"dev\"\n");
+        assert!(
+            decide_target_with_override(
+                Some(&modes_only),
+                dir,
+                None,
+                Some(&SpawnShapeOverride::Orchestration(None))
+            )
+            .is_err(),
+            "a config with modes but no orchestrations → error"
+        );
+    }
+
+    /// A roleless `[[orchestrations]]` is skipped by `decide_target`, so naming it
+    /// must error rather than spawn an empty team.
+    #[test]
+    fn shape_override_roleless_orchestration_errors() {
+        // `roles` carries no serde default, so the empty list must be explicit.
+        let cfg = parse_config("[[orchestrations]]\nname = \"empty\"\nroles = []\n");
+        let dir = Path::new("/tmp/x");
+        assert!(
+            decide_target_with_override(
+                Some(&cfg),
+                dir,
+                None,
+                Some(&SpawnShapeOverride::Orchestration(Some("empty".into())))
+            )
+            .is_err(),
+            "an orchestration with no roles is not a spawnable target"
+        );
+        // And it is invisible to `--list-targets`, so it is never offered.
+        assert!(
+            crate::dispatch::available_orchestrations(Some(&cfg), dir).is_empty(),
+            "a roleless orchestration must not be listed as a target"
+        );
     }
 
     #[test]

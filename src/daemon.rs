@@ -843,6 +843,9 @@ fn make_schedule_callback(
         working_dir: task.working_dir.clone(),
         command: task.command.clone(),
         prompt: task.prompt.clone(),
+        // `None`: a scheduled task's shape still comes from its working dir's
+        // config. The PRD #220 selector is a `dispatch`-only surface.
+        shape_override: None,
     };
     let new_tab_per_fire = task.new_tab_per_fire;
     Arc::new(move || {
@@ -1095,6 +1098,7 @@ async fn run_hook_loop(
                                         &ctx,
                                         &signal.name,
                                         task,
+                                        signal.shape.as_ref(),
                                     )
                                     .await;
 

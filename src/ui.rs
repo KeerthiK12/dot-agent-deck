@@ -527,18 +527,30 @@ const DISPATCHER_SEED_PROMPT: &str = "\
 You are an ordinary assistant with one extra effector available: the `dot-agent-deck dispatch` verb, which starts an isolated line of work in its own git worktree. Help the user with whatever they ask, exactly as you normally would. When they say to START something as a separate line of work, reach for `dispatch` rather than doing that work here.
 
 ## The verb
-  dot-agent-deck dispatch <name> [--task <text>] [--task-file <path>]
+  dot-agent-deck dispatch <name> [--task <text>] [--task-file <path>] (--single | --orchestration [<name>])
+  dot-agent-deck dispatch --list-targets
 
 - <name> is a short slug naming this line of work (e.g. `fix-auth-bug`, `prd-220`). It names the worktree and its branch.
 - --task carries the prompt the isolated agent receives. --task-file reads that text from a file (or `-` for stdin) instead; the two are mutually exclusive.
 
+## Choosing the shape — ASK, do not guess
+A unit can start as ONE agent or as a multi-role ORCHESTRATION (a team that divides the work). Which one the user wants is not inferable from the request: \"work on these three features\" usually wants a team per feature, while \"verify these three PRs\" usually wants one agent each — and both arrive here as the same words. Guessing wrong is expensive and visible.
+
+So, before the FIRST dispatch of a session:
+1. Run `dot-agent-deck dispatch --list-targets`. It prints the shapes this repo actually offers (always `single`, plus each orchestration by name).
+2. If more than one is offered, show the user the list and ask which they want. If only `single` is offered, say so and use it — there is nothing to ask.
+3. Pass their answer on every dispatch: `--single`, or `--orchestration <name>`.
+
+Reuse the answer for later dispatches in the same conversation rather than asking again, unless the user changes it or the new unit is clearly different in kind.
+
 ## What it does
 - Creates a git worktree as a SIBLING of this repo, at ../<repo>-dispatch-<name>, on branch agent/dispatch-<name>. Isolation is automatic — never create or pick a worktree yourself.
-- Starts an agent inside it — or a full multi-role orchestration, depending on that repo's own config — delivering the --task text as its opening prompt.
+- Starts the shape you selected inside it, delivering the --task text as its opening prompt.
 - Returns immediately and reports what was started and where.
 
 ## Rules
 - The --task text must be SELF-CONTAINED. The dispatched agent is a fresh process with no access to this conversation, so spell out the files, constraints, and expected outcome it needs.
+- Pass --single or --orchestration explicitly. With neither, the shape falls back to whatever the repo's config implies, which is the guess this asking exists to avoid.
 - `dispatch` is fire-and-forget: there is NO return edge yet, so a dispatched unit's completion does NOT come back to this pane. Never tell the user results will report back here — give them the worktree path instead, and point at the unit's own tab on the deck.
 - A <name> is single-use. Removing a worktree keeps its branch, so re-dispatching the same name is refused while agent/dispatch-<name> still exists — pick a different name, or delete that branch once you are done with it.
 - Relay the path that `dispatch` reports for each line of work, so the user can follow it.";
@@ -6316,10 +6328,22 @@ fn record_candidate(command: &str) -> Option<String> {
 /// Shared by the Enter-submit key arm and the `[Submit]` button
 /// ([`Action::FormSubmit`]) so click and key spawn an identical pane.
 fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> NewPaneRequest {
-    // PRD #220: the dispatcher mode — a seeded single-agent tab that teaches
-    // the agent to decompose work into independent units and call
-    // `dot-agent-deck dispatch <name>` per unit. Spawned as a mode tab
-    // carrying the dispatcher seed prompt via `ModeConfig::seed_prompt`.
+    // PRD #220: the dispatcher option — a seeded single agent that knows the
+    // `dot-agent-deck dispatch <name>` verb.
+    //
+    // Spawned as a dashboard CARD (`mode_config: None`) carrying the seed via
+    // `seed_prompt`, exactly like the two schedule options below and for the
+    // same reason PRD #127 gave: a mode tab routes through `render_mode_tab`'s
+    // 50/50 split, so a mode declaring no side panes (which is what the
+    // dispatcher is — `panes: []`, `reactive_panes: 0`) renders the agent at
+    // half width with an empty column beside it. `mode_side_pane_dims` halves
+    // the width unconditionally, so there is no way to opt out of the split
+    // while remaining a mode tab.
+    //
+    // The synthetic `ModeConfig` is still built for the CYCLER (title + chip via
+    // `selected_mode`); only the spawn shape differs. Same split as
+    // `schedule: issues`, whose synthetic mode names the cycler while its seed
+    // rides on the request.
     if form.is_dispatcher_selected() {
         return NewPaneRequest {
             dir: form.dir.clone(),
@@ -6329,9 +6353,9 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             } else {
                 form.command.clone()
             },
-            mode_config: Some(build_dispatcher_mode(&form.dir)),
+            mode_config: None,
             orchestration_config: None,
-            seed_prompt: None,
+            seed_prompt: build_dispatcher_mode(&form.dir).seed_prompt,
         };
     }
     // PRD #120: the flag-gated "schedule: issues" authoring option — like the
@@ -25368,6 +25392,13 @@ mod tests {
             "../<repo>-dispatch-<name>",
             "single-use",
             "fire-and-forget",
+            // The shape choice is a deck mechanic (which spawn shape to start),
+            // not a work-methodology opinion — so it belongs, and the seed must
+            // tell the agent to ASK rather than infer it.
+            "--list-targets",
+            "--single",
+            "--orchestration",
+            "ASK, do not guess",
         ] {
             assert!(
                 DISPATCHER_SEED_PROMPT.contains(required),
@@ -25423,6 +25454,59 @@ mod tests {
         f.selection_index = 0;
         assert_eq!(f.mode_option_count(), 4);
         assert!(!f.is_dispatcher_selected());
+    }
+
+    /// PRD #220: submitting the dispatcher option must spawn a dashboard CARD,
+    /// never a mode tab.
+    ///
+    /// A mode tab routes through `render_mode_tab`'s 50/50 split, and
+    /// `mode_side_pane_dims` halves the width unconditionally — so a mode with no
+    /// side panes (which the dispatcher is) renders the agent at half width beside
+    /// an empty column. PRD #127 hit this first and fixed it the same way for the
+    /// `schedule` option. This pins the spawn shape so it cannot regress: the
+    /// synthetic mode is for the cycler's title/chip only, and the seed must ride
+    /// on the REQUEST.
+    #[test]
+    fn dispatcher_submits_as_a_dashboard_card_not_a_mode_tab() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp/repo"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![],
+        );
+        f.show_issue_dispatch = true;
+        f.show_dispatcher = true;
+        f.selection_index = f.dispatcher_index();
+        assert!(
+            f.is_dispatcher_selected(),
+            "test targets the dispatcher slot"
+        );
+
+        let req = build_new_pane_request(&f, "claude");
+        assert!(
+            req.mode_config.is_none(),
+            "the dispatcher must NOT spawn a mode tab — that is the 50/50-split bug"
+        );
+        assert!(req.orchestration_config.is_none());
+        let seed = req
+            .seed_prompt
+            .as_deref()
+            .expect("the dispatcher card must carry its seed on the request");
+        assert!(
+            seed.starts_with(DISPATCHER_SEED_PROMPT),
+            "the card's seed must be the dispatcher seed, got:\n{seed}"
+        );
+        assert!(
+            seed.contains("working_dir: /tmp/repo"),
+            "the seed must still be dir-qualified, got:\n{seed}"
+        );
+
+        // The cycler still names it, via the synthetic mode.
+        assert_eq!(
+            f.selected_mode().map(|m| m.name.as_str()),
+            Some(DISPATCHER_MODE_NAME)
+        );
     }
 
     // --- PRD #127 M3.3: "Scheduled Tasks" manager dialog pure-data helpers ---

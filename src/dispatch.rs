@@ -8,7 +8,65 @@ use crate::issue_dispatch_run::{
     remove_worktree, run_status,
 };
 use crate::scheduler::StderrNotifier;
-use crate::spawn::{SpawnKind, SpawnRequest, spawn};
+use crate::spawn::{SpawnKind, SpawnRequest, SpawnShapeOverride, spawn};
+
+/// PRD #220: the orchestrations a dispatch out of `dir` could start, by resolved
+/// name. Empty means only a single agent is available.
+///
+/// Deliberately a LOCAL config read rather than a daemon round-trip: the
+/// dispatched worktree is a copy of this repo, so this repo's
+/// `.dot-agent-deck.toml` is the same config the spawn will branch on. Keeping it
+/// local means `--list-targets` adds no hook-socket message and no protocol
+/// surface at all.
+///
+/// Roleless `[[orchestrations]]` are filtered out because [`crate::spawn::decide_target`]
+/// skips them too — listing one would offer a target that cannot be spawned.
+pub fn available_orchestrations(
+    config: Option<&crate::project_config::ProjectConfig>,
+    dir: &Path,
+) -> Vec<(String, usize)> {
+    config
+        .map(|cfg| {
+            cfg.orchestrations
+                .iter()
+                .filter(|o| !o.roles.is_empty())
+                .map(|o| {
+                    (
+                        crate::project_config::resolve_orchestration_name(&o.name, dir),
+                        o.roles.len(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Human-readable `--list-targets` output, read by the dispatcher agent and
+/// relayed to the user.
+///
+/// Schedule/authoring modes are absent by construction: a schedule creates a
+/// FUTURE task, so it is not something a dispatch can start, and the dispatcher
+/// option itself is not a target either. Only real spawn shapes appear.
+pub fn render_available_targets(orchestrations: &[(String, usize)]) -> String {
+    let mut out = String::from("Available dispatch targets:\n");
+    out.push_str("  single            one agent (--single)\n");
+    if orchestrations.is_empty() {
+        out.push_str(
+            "\nNo orchestrations are defined here, so `single` is the only target.\n\
+             Dispatch with `--single`.\n",
+        );
+        return out;
+    }
+    for (name, roles) in orchestrations {
+        out.push_str(&format!(
+            "  orchestration     '{name}' — {roles} roles (--orchestration {name})\n"
+        ));
+    }
+    out.push_str(
+        "\nAsk the user which they want before dispatching, then pass the matching flag.\n",
+    );
+    out
+}
 
 fn sanitize_name(name: &str) -> String {
     let slug_chars: String = name
@@ -79,7 +137,27 @@ pub struct DispatchContext {
     pub worktrees: WorktreeRegistry,
 }
 
-pub async fn handle_dispatch(ctx: &DispatchContext, name: &str, task: &str) -> DispatchResult {
+/// Translate the wire choice into the spawn-side override.
+///
+/// `None` on the wire means "whatever the dispatched worktree's config implies",
+/// which is [`SpawnShapeOverride`]-absent — i.e. exactly the pre-selector
+/// behaviour, so an older CLI keeps working against a newer daemon.
+fn shape_override_of(shape: Option<&crate::event::DispatchShape>) -> Option<SpawnShapeOverride> {
+    match shape {
+        None => None,
+        Some(crate::event::DispatchShape::SingleAgent) => Some(SpawnShapeOverride::SingleAgent),
+        Some(crate::event::DispatchShape::Orchestration { name }) => {
+            Some(SpawnShapeOverride::Orchestration(name.clone()))
+        }
+    }
+}
+
+pub async fn handle_dispatch(
+    ctx: &DispatchContext,
+    name: &str,
+    task: &str,
+    shape: Option<&crate::event::DispatchShape>,
+) -> DispatchResult {
     let paths = derive_dispatch_paths(&ctx.working_dir, name);
     let clone_dir = ctx.working_dir.clone();
 
@@ -142,6 +220,7 @@ pub async fn handle_dispatch(ctx: &DispatchContext, name: &str, task: &str) -> D
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
         command: None,
         prompt,
+        shape_override: shape_override_of(shape),
     };
 
     let notifier = StderrNotifier;
@@ -423,5 +502,105 @@ mod tests {
             take_worktree(&reg, &dispatch_wt).map(|e| e.policy),
             Some(RemovalPolicy::KeepIfDirty)
         );
+    }
+
+    // --- PRD #220: the target listing + the wire choice ---
+
+    fn cfg(toml: &str) -> crate::project_config::ProjectConfig {
+        toml::from_str(toml).expect("parse project config")
+    }
+
+    /// The listing offers `single` always, plus every ROLE-BEARING orchestration
+    /// by resolved name. Schedule/authoring modes never appear — they create a
+    /// future task rather than starting a line of work, so they are not targets.
+    #[test]
+    fn available_targets_list_single_plus_every_role_bearing_orchestration() {
+        let c = cfg("[[modes]]\nname = \"dev\"\n\n\
+             [[orchestrations]]\nname = \"digest\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"sh\"\n\n\
+             [[orchestrations]]\nname = \"review\"\n\n\
+             [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"cat\"\nstart = true\n");
+        let found = available_orchestrations(Some(&c), Path::new("/tmp/repo"));
+        assert_eq!(
+            found,
+            vec![("digest".to_string(), 2), ("review".to_string(), 1)]
+        );
+
+        let rendered = render_available_targets(&found);
+        assert!(rendered.contains("--single"), "single is always offered");
+        assert!(rendered.contains("--orchestration digest"));
+        assert!(rendered.contains("--orchestration review"));
+        assert!(
+            !rendered.contains("schedule") && !rendered.contains("dev"),
+            "modes and schedule authoring are not dispatch targets:\n{rendered}"
+        );
+    }
+
+    /// An unnamed orchestration is listed under the name it will actually spawn
+    /// as — the dir basename — so the name the agent passes back matches.
+    #[test]
+    fn available_targets_resolve_an_unnamed_orchestration_to_the_dir_basename() {
+        let c = cfg("[[orchestrations]]\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n");
+        let found = available_orchestrations(Some(&c), Path::new("/home/u/morning-digest"));
+        assert_eq!(found, vec![("morning-digest".to_string(), 1)]);
+    }
+
+    /// No config at all: only `single`, and the text says so rather than leaving
+    /// the agent to infer it from an empty list.
+    #[test]
+    fn available_targets_without_config_offer_single_only() {
+        let found = available_orchestrations(None, Path::new("/tmp/repo"));
+        assert!(found.is_empty());
+        let rendered = render_available_targets(&found);
+        assert!(rendered.contains("--single"));
+        assert!(
+            rendered.contains("No orchestrations are defined"),
+            "the empty case must state the situation:\n{rendered}"
+        );
+    }
+
+    /// The wire choice maps onto the spawn override, and ABSENT stays absent —
+    /// that is what preserves the pre-selector behaviour for an older CLI.
+    #[test]
+    fn wire_shape_maps_onto_the_spawn_override() {
+        use crate::event::DispatchShape;
+        assert_eq!(shape_override_of(None), None);
+        assert_eq!(
+            shape_override_of(Some(&DispatchShape::SingleAgent)),
+            Some(SpawnShapeOverride::SingleAgent)
+        );
+        assert_eq!(
+            shape_override_of(Some(&DispatchShape::Orchestration { name: None })),
+            Some(SpawnShapeOverride::Orchestration(None))
+        );
+        assert_eq!(
+            shape_override_of(Some(&DispatchShape::Orchestration {
+                name: Some("review".into())
+            })),
+            Some(SpawnShapeOverride::Orchestration(Some("review".into())))
+        );
+    }
+
+    /// The `shape` field is additive: a payload written by a CLI that predates it
+    /// still deserializes, and lands as `None` (= config-derived), so an older
+    /// client keeps working against a newer daemon.
+    #[test]
+    fn dispatch_signal_without_shape_still_deserializes_as_config_derived() {
+        let legacy = r#"{"message_type":"dispatch","pane_id":"p1","name":"unit",
+                         "task":"do it","timestamp":"2026-08-08T00:00:00Z"}"#;
+        let msg: crate::event::DaemonMessage =
+            serde_json::from_str(legacy).expect("a pre-selector dispatch payload must still parse");
+        match msg {
+            crate::event::DaemonMessage::Dispatch(sig) => {
+                assert_eq!(sig.name, "unit");
+                assert!(
+                    sig.shape.is_none(),
+                    "an omitted shape must mean config-derived, not a parse failure"
+                );
+            }
+            other => panic!("expected a dispatch message, got {other:?}"),
+        }
     }
 }

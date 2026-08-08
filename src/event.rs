@@ -745,7 +745,34 @@ pub struct DispatchSignal {
     pub name: String,
     #[serde(default)]
     pub task: Option<String>,
+    /// PRD #220: the shape the USER chose for this unit — `single` for one
+    /// agent, `orchestration[:name]` for a team. Absent means "whatever the
+    /// dispatched worktree's config implies", the pre-selector behaviour.
+    ///
+    /// `#[serde(default)]` keeps this additive: an older daemon that never knew
+    /// the field is unaffected (it rejects the whole `dispatch` variant anyway),
+    /// and an older CLI omitting it still deserializes against a newer daemon.
+    /// So the hook-socket shape is unchanged and `PROTOCOL_VERSION` does not move.
+    #[serde(default)]
+    pub shape: Option<DispatchShape>,
     pub timestamp: DateTime<Utc>,
+}
+
+/// PRD #220: the wire form of the user's single-vs-orchestration choice.
+///
+/// Its own type rather than a bare string so an unrecognised value fails at
+/// deserialization instead of being silently read as "use the default" — the
+/// selector exists to remove exactly that class of surprise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DispatchShape {
+    /// One agent, even where the dir defines `[[orchestrations]]`.
+    SingleAgent,
+    /// A full orchestration; `name` absent = the dir's first.
+    Orchestration {
+        #[serde(default)]
+        name: Option<String>,
+    },
 }
 
 /// Signal sent by a worker via `dot-agent-deck work-done`.

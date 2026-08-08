@@ -30,7 +30,7 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 # updated in lockstep with any rename — a stale filter matches nothing and
 # silently drops this test back to the 3 x 60s default, killing it mid-wait.
 [[profile.default.overrides]]
-filter = 'test(new_pane_016_dispatcher_opens_mode_tab_with_real_agent)'
+filter = 'test(new_pane_016_dispatcher_opens_dashboard_card_with_real_agent)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 # Issue #250: `lifecycle/version/001` is the only test that has to `cargo build`

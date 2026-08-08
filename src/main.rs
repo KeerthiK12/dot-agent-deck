@@ -123,11 +123,13 @@ enum Commands {
         #[arg(long)]
         to: Vec<String>,
     },
-    /// Create a git worktree and spawn an isolated orchestration inside it.
-    /// Agent-callable one-step parallel line of work (PRD #220).
+    /// Create a git worktree and start an isolated line of work inside it.
+    /// Agent-callable, one step (PRD #220).
     Dispatch {
         /// Short name for the dispatch unit (used for worktree naming).
-        name: String,
+        /// Omit it only with --list-targets.
+        #[arg(required_unless_present = "list_targets")]
+        name: Option<String>,
         /// Task description with context, file paths, and constraints.
         /// Mutually exclusive with --task-file.
         #[arg(long, conflicts_with = "task_file")]
@@ -136,6 +138,19 @@ enum Commands {
         /// Mutually exclusive with --task.
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
+        /// Start ONE agent, even where this repo defines `[[orchestrations]]`.
+        /// Mutually exclusive with --orchestration.
+        #[arg(long, conflicts_with = "orchestration")]
+        single: bool,
+        /// Start a full orchestration. Bare `--orchestration` uses this repo's
+        /// first; `--orchestration <name>` picks one by name. Mutually exclusive
+        /// with --single.
+        #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+        orchestration: Option<String>,
+        /// Print the spawn targets available in this repo, then exit. Ask the
+        /// user which one they want before dispatching.
+        #[arg(long)]
+        list_targets: bool,
     },
     /// Signal task completion back to the orchestrator
     WorkDone {
@@ -684,7 +699,31 @@ fn main() -> ExitCode {
             name,
             task,
             task_file,
+            single,
+            orchestration,
+            list_targets,
         }) => {
+            // `--list-targets` is a pure LOCAL read of this repo's config — no
+            // pane id, no daemon round-trip, no wire message. The dispatched
+            // worktree is a copy of this repo, so this config is the one the
+            // spawn will branch on.
+            if list_targets {
+                let dir = match std::env::current_dir() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("Error: could not resolve the current directory: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let config = dot_agent_deck::spawn::load_config_for_dir(&dir);
+                let orchestrations =
+                    dot_agent_deck::dispatch::available_orchestrations(config.as_ref(), &dir);
+                print!(
+                    "{}",
+                    dot_agent_deck::dispatch::render_available_targets(&orchestrations)
+                );
+                return ExitCode::SUCCESS;
+            }
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
                 Err(_) => {
@@ -695,6 +734,11 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // `required_unless_present = "list_targets"` guarantees this.
+            let Some(name) = name else {
+                eprintln!("Error: a dispatch name is required.");
+                return ExitCode::FAILURE;
+            };
             let task_text = match resolve_task(task, task_file, std::io::stdin().lock()) {
                 Ok(t) => t,
                 Err(e) => {
@@ -702,10 +746,21 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // clap's `conflicts_with` already rejects both flags together. A bare
+            // `--orchestration` arrives as `Some("")` via `default_missing_value`
+            // and means "this repo's first".
+            let shape = match (single, orchestration) {
+                (true, _) => Some(dot_agent_deck::event::DispatchShape::SingleAgent),
+                (false, Some(n)) => Some(dot_agent_deck::event::DispatchShape::Orchestration {
+                    name: if n.trim().is_empty() { None } else { Some(n) },
+                }),
+                (false, None) => None,
+            };
             let signal = dot_agent_deck::event::DispatchSignal {
                 pane_id,
                 name,
                 task: Some(task_text),
+                shape,
                 timestamp: chrono::Utc::now(),
             };
             let msg = dot_agent_deck::event::DaemonMessage::Dispatch(signal);

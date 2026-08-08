@@ -3,14 +3,14 @@
 //! L2 PTY-attached reel test for PRD #220 dispatcher mode.
 //!
 //! Exercises the full user-visible path: launch the deck with the experimental
-//! flag ON, open the new-pane form, select the "dispatcher" authoring option,
-//! submit, give the seeded agent a goal, and verify it really dispatches — the
-//! daemon creates the sibling git worktree the feature promises.
+//! flag ON, open the new-pane form, select the "dispatcher" option, submit, give
+//! the seeded agent a goal, and verify it really dispatches — the daemon creates
+//! the sibling git worktree the feature promises.
 //!
 //! Marked [reel] — this is the genuine spawn → agent → work path (CLAUDE.md
 //! rule 4). The agent receives the dispatcher seed prompt via gated delivery,
-//! decomposes the goal, and invokes `dot-agent-deck dispatch` itself; the
-//! assertion is on the resulting worktree, so nothing here is a stand-in.
+//! acts on the goal, and invokes `dot-agent-deck dispatch` itself; the assertion
+//! is on the resulting worktree, so nothing here is a stand-in.
 
 mod common;
 
@@ -77,13 +77,13 @@ fn commit_fixture_repo(dir: &Path) {
 /// ON and real Claude credentials imported. Open the new-pane form (Ctrl+N →
 /// Space confirms the dir), cycle the Mode field to the experimental "dispatcher"
 /// option (the last cycler slot after `schedule: issues`), and click [Submit] —
-/// the dispatcher tab must surface live on the tab strip. Then type a goal asking
+/// the dispatcher must surface live as a dashboard card. Then type a goal asking
 /// for one unit named `probe-unit`; the seeded agent runs
 /// `dot-agent-deck dispatch probe-unit` itself and the daemon creates the sibling
 /// worktree `../<repo>-dispatch-probe-unit`, which the test waits for on disk.
 #[spec("prompt/new-pane/016")]
 #[test]
-fn new_pane_016_dispatcher_opens_mode_tab_with_real_agent() {
+fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     skip_unless!(common::check_claude_available());
 
     let deck = TuiDeck::builder()
@@ -136,28 +136,40 @@ fn new_pane_016_dispatcher_opens_mode_tab_with_real_agent() {
         .expect("the new-pane form should render a [Submit] button");
     deck.click(scol, srow);
 
-    // Submitting closes the form and spawns the dispatcher mode tab.
+    // Submitting closes the form and spawns the dispatcher CARD.
     deck.wait_for_absence("[Submit]");
 
-    // The dispatcher tab must surface live on the tab strip. The tab strip
-    // appears only when 2+ tabs exist (Dashboard + dispatcher mode tab), so
-    // seeing "dispatcher" on the grid means a real mode tab was created live
-    // and the strip is painting.
-    let saw_tab = deck.wait_for_stream_string_within("dispatcher", Duration::from_secs(60));
-    assert!(
-        saw_tab,
-        "the dispatcher tab never surfaced a LIVE tab labelled \"dispatcher\" \
-         within 60s — expected the dispatcher mode tab to appear in the attached \
-         TUI's tab strip without a reconnect.\n\
-         Final grid:\n{}",
-        deck.snapshot_grid()
-    );
+    // The dispatcher must surface live as a DASHBOARD CARD, not a mode tab.
+    //
+    // This is the PRD #127 card shape (`mode_config: None` + `seed_prompt`), and
+    // asserting it is the point: a mode tab routes through `render_mode_tab`'s
+    // 50/50 split, so the dispatcher — which declares no side panes — rendered at
+    // half width beside an empty column. `1 session(s)` with no tab strip is what
+    // distinguishes the fixed shape from the broken one.
+    // Asserted on the GRID, not the raw stream: this is redrawn dashboard chrome,
+    // so the bytes carrying it are interleaved with cursor-positioning escapes and
+    // the text never appears contiguously in the stream. The rendered grid is the
+    // only surface where "what the user sees" is actually a substring.
+    deck.wait_until_grid("a single dispatcher session on the dashboard", |g| {
+        g.contains("1 session(s)")
+    });
+
+    // The seed really reached the pane — the delivery that makes this a
+    // *dispatcher* rather than a bare agent. The card's `Prmt:` line echoes the
+    // seed's opening words, so an unseeded pane cannot pass this.
+    deck.wait_until_grid("the dispatcher seed on the card's Prmt line", |g| {
+        g.contains("You are an ordinary assistant")
+    });
 
     // Give the seeded agent an actual goal. Without one it correctly stalls
     // asking for a task, which is why an earlier version of this test observed
     // no work at all. The instruction is deliberately directive and names the
     // unit, so the assertion below survives LLM phrasing and tool variance.
-    deck.wait_for_string("dispatcher");
+    //
+    // The seed tells the agent to ask which shape the user wants — but this
+    // fixture defines no `[[orchestrations]]`, so `--list-targets` offers only
+    // `single` and the seed's own "nothing to ask" branch applies. The explicit
+    // "do not ask me anything first" keeps that deterministic either way.
     deck.send_keys(
         b"Dispatch exactly one unit named probe-unit, with the task \"list the files here\". \
           Call the dispatch command now. Do not ask me anything first.\r",
