@@ -964,7 +964,7 @@ fn mode_banner_005_same_drain_mode_edges_preserve_banner_semantics() {
     }
 }
 
-/// Scenario: Render the same selected Dashboard card in command mode and PaneInput through the production card renderer. Both must keep the `▸ ` marker, the agent's own status colour and a thick border; only the emphasis differs, command mode adding BOLD where PaneInput adds nothing. Neither may carry `Modifier::DIM`, since fading the selection is what made it read as an idle card; a colour-and-modifier-aware snapshot pins both states.
+/// Scenario: Render the same selected Dashboard card in command mode and PaneInput through the production card renderer. Both must keep the `▸ ` marker, a border in the terminal's own foreground, and a thick glyph; only the emphasis differs, command mode adding BOLD where PaneInput adds nothing. Neither may carry `Modifier::DIM`, since fading the selection is what made it read as an idle card; a colour-and-modifier-aware snapshot pins both states.
 #[spec("mode/deck/001")]
 #[test]
 fn mode_deck_001_selected_card_accent_tracks_mode() {
@@ -1014,14 +1014,15 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
     let command_border = &command[(0, border_y)];
     let typing_border = &typing[(0, border_y)];
 
-    // Issue #442: colour is STATUS in both modes — the fixture is `Working`, so
-    // both borders must be Green. Selection no longer spends a colour, so it can
-    // no longer hide what the agent is doing.
+    // Issue #442: a SELECTED card's border is the terminal's own foreground in
+    // BOTH modes — the one colour that contrasts on a light and a dark theme
+    // alike. Resting on the status colour would make a selected idle card
+    // (DarkGray) invisible on a dark background however thick its border was.
     for (label, cell) in [("command", command_border), ("PaneInput", typing_border)] {
         assert_eq!(
             cell.fg,
-            Color::Green,
-            "{label}-mode selected card must keep its Working status colour, got {:?}",
+            Color::Reset,
+            "{label}-mode selected card must use the terminal's own foreground, got {:?}",
             cell.fg
         );
         assert_eq!(

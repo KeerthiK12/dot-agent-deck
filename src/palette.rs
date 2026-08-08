@@ -10,22 +10,27 @@
 //! ## Border policy (Option A — identical in both render paths)
 //!
 //! The card/pane border encodes **STATUS** in both the dashboard deck and the
-//! embedded panes. The unified border-resolution precedence is:
+//! embedded panes, unless something more urgent claims it. The unified
+//! border-resolution precedence is:
 //!
-//! 1. **focused AND live** (embedded panes only) → [`FOCUSED`] (Cyan).
-//! 2. else → the agent's **status** role ([`status_color`]).
+//! 1. **selected** (deck cards only) → [`SELECTED`] (`Color::Reset`, the
+//!    terminal's own foreground) + `BorderType::Thick` + the `▸ ` title marker.
+//! 2. else **focused AND live** (embedded panes only) → [`FOCUSED`] (Cyan).
+//! 3. else → the agent's **status** role ([`status_color`]).
 //!
-//! **Selection is deliberately absent from that list** (issue #442). A deck card
-//! signals selection on the *glyph* channel — `BorderType::Thick` plus the `▸ `
-//! title marker — and never with a colour of its own, so a selected card keeps
-//! reporting the state of its agent. The full ladder, including how the
-//! command / `PaneInput` mode distinction rides on emphasis, lives in exactly
-//! one place: `ui::card_border_glyph`.
+//! Selection wins outright because it must be findable at a glance whatever the
+//! agent is doing, and a status colour cannot guarantee that: [`STATUS_IDLE`] is
+//! DarkGray, which on a dark background is barely distinguishable from the
+//! background itself (issue #442). Three cues ride together — high-contrast
+//! colour, heavier glyph, `▸ ` marker — because each of the first two failed on
+//! its own in a real report. The full ladder, including how the command /
+//! `PaneInput` distinction rides on emphasis, lives in exactly one place:
+//! `ui::card_border_glyph` plus its caller.
 //!
-//! The per-card status **badge** shows status too, so the focus override in (1)
-//! never loses status information.
+//! The per-card status **badge** always shows status, so the overrides in (1)
+//! and (2) never lose status information.
 //!
-//! ### Why (1) requires "live" (issue #88 follow-up)
+//! ### Why (2) requires "live" (issue #88 follow-up)
 //!
 //! For an **embedded pane**, "focused" and "keystrokes reach it" are different
 //! facts: in command mode the focused pane is still the one `Ctrl+D` / `Enter`
@@ -34,9 +39,9 @@
 //! here" while the keyboard was driving the deck — the mode was invisible on a
 //! full-screen mode tab, where nothing else in the frame changes.
 //!
-//! So for panes, (1) applies only in `UiMode::PaneInput`
+//! So for panes, (2) applies only in `UiMode::PaneInput`
 //! (`TerminalWidget::with_input_active`). In command mode the focused pane
-//! falls through to (2) and reports its agent's status like any other pane,
+//! falls through to (3) and reports its agent's status like any other pane,
 //! while **border thickness** (`BorderType::Thick`) carries focus instead.
 //! Colour answers "are my keystrokes landing here?", thickness answers "which
 //! pane is focused?" — one channel each, no longer competing.
@@ -44,30 +49,36 @@
 //! ### Why a deck card is mode-aware too (PRD #341 M4, revised by issue #442)
 //!
 //! A card carries no cursor and takes no keystrokes of its own, so it has no
-//! input mode in the sense (1) means. But *the deck* does: in command mode the
+//! input mode in the sense (2) means. But *the deck* does: in command mode the
 //! keyboard drives the cards, and in `UiMode::PaneInput` it drives a pane while
 //! the selection merely persists. The selection cue rendered identically in
 //! both, which left the Dashboard — where the pane overlay is weakest and the
 //! user's eyes are on the deck — looking equally live either way.
 //!
 //! `UiMode` is therefore threaded into card rendering as well. PRD #341 M4
-//! originally spent COLOUR on this — Magenta + BOLD in command mode, Magenta +
-//! `Modifier::DIM` in `UiMode::PaneInput` — and issue #442 removed that: DIM
-//! Magenta on a dark theme is indistinguishable from [`STATUS_IDLE`], so the
-//! selected card read as an idle one. Cards now do what panes already did, one
-//! step further: colour is status, thickness is selection, and **emphasis**
-//! (BOLD or nothing — never DIM) is the mode. See `ui::card_border_glyph`.
+//! originally spent the SELECTION COLOUR on this — Magenta + BOLD in command
+//! mode, Magenta + `Modifier::DIM` in `UiMode::PaneInput` — and issue #442
+//! removed that, because DIM Magenta on a dark theme is indistinguishable from
+//! [`STATUS_IDLE`]. Mode now rides on **emphasis** alone: BOLD in command mode,
+//! nothing in `PaneInput`, and **never DIM**. De-emphasis by fading is banned on
+//! this path outright; the selected card must never be harder to see than an
+//! unselected one. See `ui::card_border_glyph`.
 //!
-//! Thickness was chosen over a further accent colour because the 16-colour-safe
-//! palette is full (green/blue/yellow/red are statuses, cyan is focus) and the
-//! remaining candidates are grays — the exact light-background hazard PRD #13
-//! exists to prevent. `BorderType` never feeds `Block::inner`, so it costs no
-//! layout: the pane's inner area, its PTY size, the card's inner area, and the
-//! PRD #84 invariant-3 contract are all unaffected.
+//! Thickness accompanies the colour rather than replacing it because the
+//! 16-colour-safe palette has no spare *hue* (green/blue/yellow/red are
+//! statuses, cyan is focus) and the remaining candidates are grays — the exact
+//! light-background hazard PRD #13 exists to prevent. [`SELECTED`] sidesteps
+//! that by not being a hue at all. `BorderType` never feeds `Block::inner`, so
+//! the thicker glyph costs no layout: the pane's inner area, its PTY size, the
+//! card's inner area, and the PRD #84 invariant-3 contract are all unaffected.
 //!
-//! All roles are **named ANSI** colors only — no absolute `Color::Rgb`, which
-//! the theme guards (`theme/contrast/001`) forbid so terminal themes can remap
-//! them.
+//! All roles are **named ANSI** colors (or `Color::Reset`) only — no absolute
+//! `Color::Rgb`, which the theme guards (`theme/contrast/001`) forbid so
+//! terminal themes can remap them. Note that a *named* colour is not
+//! automatically safe either: `Color::White` would be as invisible on a light
+//! theme as `Color::DarkGray` is on a dark one. Where a role must contrast on
+//! BOTH, `Color::Reset` is the only correct answer, because the terminal
+//! resolves it against its own background.
 
 use ratatui::style::Color;
 
@@ -92,18 +103,39 @@ pub const STATUS_IDLE: Color = Color::DarkGray;
 // Accent roles (must be distinct from every status color and from each other)
 // ---------------------------------------------------------------------------
 
-/// The focused embedded pane — the one accent role left. Cyan was originally
-/// used for focus *and* selection; PRD #155 Option A split them by giving
-/// selection a Magenta accent of its own, and issue #442 retired that accent
-/// entirely in favour of border thickness. So focus keeps Cyan and nothing else
-/// claims a colour.
-///
-/// There is deliberately **no `SELECTED` colour role**. Selection is a glyph
-/// (`BorderType::Thick`) plus the `▸ ` title marker — see `ui::card_border_glyph`.
-/// Do not reintroduce a selection colour here: it would put a third meaning back
-/// on the border's colour channel, which is what made the selected card
-/// indistinguishable from an idle one (issue #442).
+/// The focused embedded pane. Cyan was originally used for focus *and*
+/// selection; PRD #155 Option A split them so the two are provably distinct.
 pub const FOCUSED: Color = Color::Cyan;
+
+/// The selected deck card's border (paired with `BorderType::Thick` and the
+/// `▸ ` title marker — see `ui::card_border_glyph`).
+///
+/// This is [`Color::Reset`] — the **terminal's own default foreground** — and
+/// that is the entire point. It is not "no colour": a terminal draws its default
+/// foreground near-white on a dark theme and near-black on a light one, so this
+/// single role is high-contrast against the user's background on BOTH themes
+/// without the TUI ever detecting which one is in use. It cannot collide with
+/// anything either, because every other role here is a named hue.
+///
+/// ## Why not a hue (issue #442)
+///
+/// Selection was Magenta, dimmed in `UiMode::PaneInput` — and dimmed magenta on
+/// a dark background sits in the same band as [`STATUS_IDLE`], so the selected
+/// card read as an idle one. The first fix moved selection off colour entirely
+/// and onto border thickness alone. That cured the fading but left a second
+/// hole: a selected IDLE card then drew a THICK border in [`STATUS_IDLE`]
+/// DarkGray, and thickening a line that is nearly the colour of the background
+/// does not make it any easier to see. The missing property was contrast, not
+/// weight — so selection now carries both.
+///
+/// Hardcoding `Color::White` would reintroduce the same bug mirrored: a white
+/// border is invisible on a light theme exactly as DarkGray is on a dark one.
+/// `Color::Reset` delegates the choice to the terminal, the only party that
+/// knows. This is the same reasoning behind PRD #13's ban on absolute colours.
+///
+/// The cost, accepted knowingly: a selected card's BORDER no longer reports
+/// status. Its status badge still does, at full colour, in the top-right corner.
+pub const SELECTED: Color = Color::Reset;
 
 /// Resolve a session status to its centralized border/badge role color. This
 /// is the single source of truth shared by the deck-card render path

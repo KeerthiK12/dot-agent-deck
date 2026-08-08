@@ -561,13 +561,13 @@ fn contrast_001_overlays_reference_frame() {
 /// the keyboard drives the deck), then assert two terminal-relative
 /// properties. (a) NO rendered cell across any surface has a `Color::Rgb(..)`
 /// background — backgrounds must be `Color::Reset` so the terminal's own
-/// background shows through. (b) Selection is cued by a `▸ ` title prefix plus a
-/// THICKER border glyph (`┃` where an unselected card draws `│`) — NOT an
-/// absolute background tint, and NOT a colour of its own: the selected card's
-/// border must differ from the unselected card's while keeping exactly the same
-/// colour, since colour belongs to status alone (issue #442). A regression that
-/// filled any surface with an absolute background, or that spent a colour on
-/// selection again, would fail one of these assertions.
+/// background shows through. (b) Selection is cued by a `▸ ` title prefix, a
+/// border in the terminal's own foreground (`Color::Reset`), and a THICKER glyph
+/// (`┃` where an unselected card draws `│`) — never an absolute background tint
+/// and never a DIM. A regression that filled any surface with an absolute
+/// background, or that let the selected border fall back to a fixed White/Black
+/// or a low-contrast status colour, would fail one of these assertions (issue
+/// #442).
 #[spec("theme/guard/001")]
 #[test]
 fn guard_001_no_absolute_backgrounds() {
@@ -588,13 +588,13 @@ fn guard_001_no_absolute_backgrounds() {
         );
     }
 
-    // (b) Selection is signalled by a `▸ ` title prefix and a THICKER border
-    //     glyph — both terminal-relative cues, NOT an absolute background.
-    //     Read the left-border cell (at a mid-height row) of each card: the
-    //     selected one must DIFFER from the unselected one, and it must differ
-    //     in the GLYPH (`┃` vs `│`) while keeping the very same colour. Issue
-    //     #442 moved selection off the colour channel entirely, so colour is
-    //     free to mean status and nothing else; `mode/deck/001` owns the
+    // (b) Selection is signalled by a `▸ ` title prefix, the terminal's own
+    //     foreground on the border, and a THICKER glyph — all terminal-relative
+    //     cues, NOT an absolute background fill. Read the left-border cell (at a
+    //     mid-height row) of each card: the selected one must DIFFER from the
+    //     unselected one, must be `Color::Reset` (which contrasts on any theme,
+    //     unlike a fixed White/Black or a low-contrast status colour), must not
+    //     be DIM, and must thicken. Issue #442; `mode/deck/001` owns the
     //     command-vs-PaneInput emphasis recipe.
     let border_cell = |buf: &ratatui::buffer::Buffer| {
         let y = buf.area().height / 2;
@@ -609,14 +609,20 @@ fn guard_001_no_absolute_backgrounds() {
         "selected card border must differ from the unselected card border"
     );
     assert_eq!(
-        sel_fg, unsel_fg,
-        "selecting a card must NOT change its border colour — colour is the status \
-         channel (issue #442), got selected={sel_fg:?} unselected={unsel_fg:?}"
+        sel_fg,
+        Color::Reset,
+        "the selected card's border must be the terminal's own foreground, so it \
+         contrasts on light and dark alike — not an absolute tint, not a \
+         low-contrast status colour (issue #442), got {sel_fg:?}"
+    );
+    assert!(
+        !sel_mod.contains(Modifier::DIM),
+        "the selected card's border must not be DIM, got {sel_mod:?}"
     );
     assert_eq!(
         (unsel_sym.as_str(), sel_sym.as_str()),
         ("│", "┃"),
-        "selection must be carried by border thickness: unselected `│`, selected `┃`"
+        "selection must also thicken the border: unselected `│`, selected `┃`"
     );
 
     // The `▸ ` selection prefix appears only on the selected card's title row.
@@ -1168,14 +1174,16 @@ fn palette_002_pane_border_matches_deck_status_color() {
 }
 
 /// Scenario: Render a SELECTED deck card in **command mode** (`UiMode::Normal`)
-/// for a Working agent and assert its border still reports that STATUS — Green,
-/// never an accent colour — while selection shows up as a thick `┃` glyph,
-/// `Modifier::BOLD` and the `▸ ` title marker. This pins the issue #442 rule
-/// that selection costs no colour, so a selected card keeps saying what its
-/// agent is doing (`mode/deck/001` owns the PaneInput half of the recipe).
+/// for a Working agent and assert its border is the terminal's own foreground
+/// (`Color::Reset`) rather than the working-status Green, carried together with
+/// a thick `┃` glyph, `Modifier::BOLD` and the `▸ ` title marker — three cues,
+/// none of which can be dimmed or camouflaged away. Also assert the border is
+/// neither of the retired accents (Magenta) nor the focused-pane Cyan. This pins
+/// the issue #442 rule that a selected card must be visible whatever its agent
+/// is doing (`mode/deck/001` owns the PaneInput half of the recipe).
 #[spec("theme/palette/003")]
 #[test]
-fn palette_003_selected_card_border_is_status_thick_marker() {
+fn palette_003_selected_card_border_is_terminal_fg_thick_marker() {
     let session = palette_session(SessionStatus::Working);
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1194,8 +1202,15 @@ fn palette_003_selected_card_border_is_status_thick_marker() {
     let (fg, modifier) = border_style_at_mid(&buffer);
     assert_eq!(
         fg,
+        Color::Reset,
+        "a selected card's border must be the terminal's own foreground, which \
+         contrasts on light and dark alike, got {fg:?}"
+    );
+    assert_ne!(
+        fg,
         Color::Green,
-        "a selected Working card must keep the working-status Green, got {fg:?}"
+        "a selected card must not rest on its status colour — for idle that would \
+         be DarkGray, invisible on a dark background (issue #442)"
     );
     assert!(
         modifier.contains(Modifier::BOLD),
@@ -1208,7 +1223,7 @@ fn palette_003_selected_card_border_is_status_thick_marker() {
     assert_eq!(
         buffer[(0, buffer.area().height / 2)].symbol(),
         "┃",
-        "selection must be carried by a thick border glyph"
+        "selection must also be carried by a thick border glyph"
     );
     assert_ne!(
         fg,
@@ -1358,16 +1373,18 @@ fn palette_005_command_mode_focused_pane_drops_cyan_accent() {
 
 /// Scenario: For every agent status, and in BOTH command and PaneInput mode,
 /// render the same deck card selected and unselected and compare the two
-/// borders. Selecting a card must only ever ADD emphasis: the colour must be
-/// identical either way, the glyph must thicken from `│` to `┃`, and the
-/// selected border must never gain `Modifier::DIM` that the unselected one
-/// lacks. This is the direct regression guard for issue #442, where selection
-/// was signalled by dimming a Magenta accent in PaneInput — landing the selected
-/// card in the same visual band as `palette::STATUS_IDLE` (DarkGray) and making
-/// it read as just another idle agent.
+/// borders. A selected card must be visible whatever its agent is doing: its
+/// border takes the terminal's OWN foreground (`Color::Reset`) — near-white on a
+/// dark theme, near-black on a light one — thickens from `│` to `┃`, and never
+/// carries `Modifier::DIM`. The control in the same loop is that an UNSELECTED
+/// card is untouched and still reports its status role, so an idle agent keeps
+/// receding. Guards issue #442 both ways: the selected card must not fade
+/// (the original DIM-magenta report) and must not inherit the low-contrast
+/// `palette::STATUS_IDLE` (DarkGray), which on a dark background left a selected
+/// idle card as invisible as an unselected one however thick its border was.
 #[spec("theme/palette/006")]
 #[test]
-fn palette_006_selection_only_adds_emphasis() {
+fn palette_006_selection_is_visible_at_every_status() {
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
     let height = density.rendered_height();
@@ -1394,27 +1411,47 @@ fn palette_006_selection_only_adds_emphasis() {
             let (unsel, sel) = (&unselected[(0, y)], &selected[(0, y)]);
             let context = format!("{status:?} in {mode:?}");
 
+            // The reported symptom: a selected card whose border colour is the
+            // status colour is only as visible as that status colour, and
+            // `STATUS_IDLE` on a dark ground is barely visible at all. The
+            // terminal's own foreground is the one colour guaranteed to contrast
+            // with the terminal's own background, on either theme.
             assert_eq!(
-                sel.fg, unsel.fg,
-                "{context}: selecting a card must not change its border colour — \
-                 colour is the status channel"
+                sel.fg,
+                Color::Reset,
+                "{context}: a selected card's border must use the terminal's own \
+                 foreground so it contrasts on every theme, got {:?}",
+                sel.fg
             );
-            assert_eq!(
+            assert_ne!(
                 sel.fg, role,
-                "{context}: a selected card must still report its status role"
+                "{context}: a selected border must not inherit the status colour — \
+                 for idle that is DarkGray, which is invisible on a dark background \
+                 no matter how thick the border is (issue #442)"
+            );
+
+            // CONTROL: selection changed, the resting state did not. An
+            // unselected idle card must still recede exactly as before.
+            assert_eq!(
+                unsel.fg, role,
+                "{context}: an UNSELECTED card must still report its status role"
             );
             assert_eq!(
-                (unsel.symbol(), sel.symbol()),
-                ("│", "┃"),
-                "{context}: selection must thicken the border glyph"
+                unsel.symbol(),
+                "│",
+                "{context}: an unselected card must keep the thin border"
+            );
+
+            assert_eq!(
+                sel.symbol(),
+                "┃",
+                "{context}: selection must also thicken the border glyph"
             );
             assert!(
-                !sel.modifier.contains(Modifier::DIM) || unsel.modifier.contains(Modifier::DIM),
-                "{context}: selection added DIM the unselected card does not carry — \
-                 selection may only ever ADD emphasis (issue #442), got \
-                 selected={:?} unselected={:?}",
-                sel.style(),
-                unsel.style()
+                !sel.modifier.contains(Modifier::DIM),
+                "{context}: a selected border must never be DIM — that is what made \
+                 it read as an idle card (issue #442), got {:?}",
+                sel.style()
             );
         }
     }

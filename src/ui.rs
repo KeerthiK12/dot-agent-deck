@@ -16236,15 +16236,16 @@ fn grid_columns(width: u16) -> usize {
     }
 }
 
-/// Issue #442 — how a deck card's border encodes selection and the keyboard
-/// locus. **Colour is not part of the answer.**
+/// Issue #442 — the *glyph and emphasis* half of how a deck card's border
+/// encodes selection. The colour half lives in [`render_session_card`], which
+/// pairs every state below with [`palette::SELECTED`] when selected and the
+/// agent's status colour when not.
 ///
-/// The border keeps its STATUS colour in every selection state (see
-/// [`render_session_card`]), so a selected working agent still reads green and a
-/// selected waiting one still reads yellow. Selection rides the *glyph* channel
-/// instead — exactly the split the embedded-pane path already uses for focus
-/// (`TerminalWidget`, `BorderType::Thick`), which deck cards never adopted.
-/// The ladder:
+/// Together they give selection three simultaneous cues — a high-contrast
+/// colour, a heavier glyph, and the `▸ ` title marker — because two separate
+/// reports showed that any single one of them can fail: a colour can be dimmed
+/// into the background, and a thicker line is no easier to see when its colour
+/// already matches the background. The ladder:
 ///
 /// | state                         | border        | emphasis |
 /// |-------------------------------|---------------|----------|
@@ -16252,6 +16253,8 @@ fn grid_columns(width: u16) -> usize {
 /// | selected, `UiMode::PaneInput` | `Thick` (`┃`) | —        |
 /// | selected, command mode        | `Thick` (`┃`) | BOLD     |
 ///
+/// Thickness is the same channel the embedded-pane path already uses for focus
+/// (`TerminalWidget`, `BorderType::Thick`), which deck cards never adopted.
 /// The `▸ ` title marker stays in BOTH selected states (PRD #341 Decision 5:
 /// the user must still be able to tell WHAT is selected while typing), so the
 /// mode distinction is carried by weight alone.
@@ -16378,22 +16381,25 @@ fn render_session_card(
     let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
     let title_spans = truncate_styled_segments(title_segments, max_title);
 
-    // Issue #442: COLOUR is status, always — selection no longer overrides it,
-    // so the selected card keeps reporting the state of its agent instead of
-    // going Magenta and leaving only the badge to say what it is doing.
-    let base_border_style = if is_placeholder {
+    // Issue #442. An UNSELECTED card's border colour is its STATUS, so an idle
+    // agent recedes and a working one reads green. A SELECTED card's border
+    // switches to the terminal's own foreground (`palette::SELECTED`), which is
+    // the one colour guaranteed to contrast with the terminal's own background
+    // on either theme — see that constant for why a status colour cannot carry
+    // selection on its own. Status is not lost: the badge still reports it.
+    let base_border_style = if is_selected {
+        Style::default().fg(palette::SELECTED)
+    } else if is_placeholder {
         // Placeholder ("No agent") cards read as secondary: dim the terminal's
         // own foreground (matching the prior DarkGray intent) so the empty slot
-        // doesn't draw a full-strength border like a live agent. Note this DIM
-        // is a property of the EMPTY SLOT, not of selection — it is applied
-        // identically whether or not the card is selected, so it never makes
-        // selecting a card dim it.
+        // doesn't draw a full-strength border like a live agent. Selecting one
+        // takes the branch above, so an empty slot is never dim while selected.
         text_dim()
     } else {
         Style::default().fg(status_color)
     };
-    // …and SELECTION is the glyph, plus a mode-tracking emphasis that is only
-    // ever additive. See `card_border_glyph`.
+    // Selection ALSO thickens the glyph and, in command mode, adds BOLD — three
+    // cues rather than one. See `card_border_glyph`.
     let (border_type, border_emphasis) = card_border_glyph(is_selected, mode);
     let border_style = base_border_style.add_modifier(border_emphasis);
 
