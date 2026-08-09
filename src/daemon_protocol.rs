@@ -1366,18 +1366,17 @@ async fn handle_connection(
                                 cwd: orch_cwd,
                             },
                         };
-                        let mut st = state.write().await;
-                        st.register_pane(pane_id.to_string());
-                        st.pane_role_map
-                            .insert(pane_id.to_string(), role_name.clone());
-                        st.pane_orchestration_map
-                            .insert(pane_id.to_string(), identity);
-                        if let Some(c) = cwd_for_state.clone() {
-                            st.pane_cwd_map.insert(pane_id.to_string(), c);
-                        }
-                        if is_start_role {
-                            st.orchestrator_pane_ids.insert(pane_id.to_string());
-                        }
+                        // Shared with the daemon-internal spawn path
+                        // (`crate::spawn::spawn`) — see
+                        // [`crate::state::AppState::register_orchestration_role`]
+                        // for why this must not be inlined again.
+                        state.write().await.register_orchestration_role(
+                            pane_id,
+                            &role_name,
+                            is_start_role,
+                            identity,
+                            cwd_for_state.as_deref(),
+                        );
                     }
                     write_resp(&mut stream, &AttachResponse::with_id(id)).await?
                 }
@@ -1767,6 +1766,7 @@ async fn handle_connection(
                     reuse_registry.clone(),
                     worktree_registry.clone(),
                     event_tx.clone(),
+                    state.clone(),
                 ),
             );
             registry.change_notify().notify_one();

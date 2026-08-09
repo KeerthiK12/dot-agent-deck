@@ -706,6 +706,38 @@ pub struct ListedOrchestration {
     pub roles: usize,
 }
 
+/// The daemon's reply to a [`DaemonMessage::Delegate`], one JSON line back on
+/// the hook-socket connection (the [`GetSeedResponse`] / [`ListTargetsResponse`]
+/// pattern).
+///
+/// `delegate` used to be fire-and-forget, and that is half of a reported bug: an
+/// orchestration started by `dispatch --orchestration` could not delegate at all,
+/// yet every `dot-agent-deck delegate` it ran printed nothing and exited 0. The
+/// orchestrator therefore announced that its worker was working and waited
+/// forever for a `work-done` that could not arrive. A delegation that reached
+/// nobody has to be distinguishable from one that reached somebody, and the only
+/// place that distinction exists is the daemon.
+///
+/// `error` is a routing failure that stopped the delegate outright (the sender is
+/// not a pane the daemon holds a role for, or is not an orchestrator).
+/// `unresolved_roles` is the partial case: the sender was fine, but one or more
+/// `--to` roles matched no worker pane. Both are failures for the caller —
+/// see the `Delegate` arm of `main.rs` — and they are kept separate so the
+/// message can say which happened.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DelegateResponse {
+    /// Roles whose dispatch was queued to a worker pane.
+    #[serde(default)]
+    pub delivered: Vec<String>,
+    /// Roles named by `--to` that resolved to no worker pane in this
+    /// orchestration.
+    #[serde(default)]
+    pub unresolved_roles: Vec<String>,
+    /// Set when the delegate could not be routed at all.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// Signal sent by the orchestrator via `dot-agent-deck delegate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateSignal {

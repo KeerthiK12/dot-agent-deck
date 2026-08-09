@@ -2681,6 +2681,50 @@ impl AppState {
         }
     }
 
+    /// Register ONE orchestration role pane in the daemon-side maps that
+    /// [`Self::handle_delegate`] and [`Self::handle_work_done`] route on.
+    ///
+    /// This is the single registrar for those maps, and it exists as one because
+    /// it used not to be. The registration was inlined in the
+    /// `AttachRequest::StartAgent` handler — the path a TUI-initiated (`Ctrl+N`)
+    /// orchestration takes, and the ONLY path that went through it. An
+    /// orchestration the daemon spawns *itself* (`dispatch --orchestration`, a
+    /// scheduled fire, issue dispatch) reaches `AgentPtyRegistry::spawn_agent`
+    /// directly via [`crate::spawn::spawn`] and so never touched this state: its
+    /// orchestrator was absent from `orchestrator_pane_ids`, and every
+    /// `dot-agent-deck delegate` that orchestrator ran was dropped at the first
+    /// check in `handle_delegate` with `delegate from unknown pane`. Panes came
+    /// up, cards were labelled, the tab looked right — and no worker could ever
+    /// be delegated to (`orchestration/dispatch/001`).
+    ///
+    /// Keeping ONE function called from both spawn paths is the point: a second
+    /// inlined copy is how the two drifted apart in the first place.
+    ///
+    /// `cwd` is the pane's own working directory (`pane_cwd_map`), which may
+    /// differ per role; the orchestration IDENTITY passed in is what scopes
+    /// routing, and is shared across every role of one orchestration.
+    pub fn register_orchestration_role(
+        &mut self,
+        pane_id: &str,
+        role_name: &str,
+        is_start_role: bool,
+        identity: OrchestrationIdentity,
+        cwd: Option<&str>,
+    ) {
+        self.register_pane(pane_id.to_string());
+        self.pane_role_map
+            .insert(pane_id.to_string(), role_name.to_string());
+        self.pane_orchestration_map
+            .insert(pane_id.to_string(), identity);
+        if let Some(cwd) = cwd {
+            self.pane_cwd_map
+                .insert(pane_id.to_string(), cwd.to_string());
+        }
+        if is_start_role {
+            self.orchestrator_pane_ids.insert(pane_id.to_string());
+        }
+    }
+
     /// Unregister a pane ID (e.g., when closing a pane).
     ///
     /// PRD #140 M2.3: `pane_orchestration_map`'s value type changed but the
@@ -2850,15 +2894,30 @@ impl AppState {
     /// same orchestration (via `pane_orchestration_map`) so a parallel
     /// orchestration tab's `coder` pane doesn't receive a sibling tab's
     /// task.
+    ///
+    /// Returns what the caller's `dot-agent-deck delegate` should report. Every
+    /// early return below used to be a bare `return` whose only trace was a
+    /// `warn!` in the daemon log — invisible to the orchestrator, which exited 0
+    /// and reported progress that was never going to happen. The outcome now goes
+    /// back over the hook socket; see [`DelegateResponse`].
     pub async fn handle_delegate(
         &self,
         signal: DelegateSignal,
         registry: &Arc<AgentPtyRegistry>,
         event_tx: &broadcast::Sender<BroadcastMsg>,
-    ) {
+    ) -> crate::event::DelegateResponse {
+        use crate::event::DelegateResponse;
         if !self.pane_role_map.contains_key(&signal.pane_id) {
             warn!(pane_id = %signal.pane_id, "delegate from unknown pane");
-            return;
+            return DelegateResponse {
+                error: Some(format!(
+                    "the daemon holds no orchestration role for pane {}, so this delegate \
+                     was routed nowhere. Only a pane spawned as part of an orchestration \
+                     can delegate.",
+                    signal.pane_id
+                )),
+                ..Default::default()
+            };
         }
         if !self.orchestrator_pane_ids.contains(&signal.pane_id) {
             let role = self
@@ -2867,7 +2926,14 @@ impl AppState {
                 .cloned()
                 .unwrap_or_default();
             warn!(pane_id = %signal.pane_id, role = %role, "delegate from non-orchestrator pane");
-            return;
+            return DelegateResponse {
+                error: Some(format!(
+                    "pane {} is the `{role}` role, not this orchestration's orchestrator, \
+                     so it may not delegate.",
+                    signal.pane_id
+                )),
+                ..Default::default()
+            };
         }
 
         let orchestration = self.pane_orchestration_map.get(&signal.pane_id).cloned();
@@ -2881,6 +2947,33 @@ impl AppState {
         // orchestrator's own pane) lives in `delegate_targets`, which also
         // applies PRD #126 M1 audit finding 3's duplicate-role de-duplication.
         let targets = self.delegate_targets(&signal.pane_id, &signal.to);
+
+        // Which of the caller's `--to` roles actually resolved to a worker pane.
+        // `delegate_targets` already logs a `warn!` per empty role and then
+        // silently drops it, which is fine for the fan-out but is exactly the
+        // information the orchestrator needs and never got: `--to coder` naming a
+        // role this orchestration does not have delegated to nobody and still
+        // exited 0. Derived by comparing the request against the resolved set
+        // rather than plumbed out of `delegate_targets`, so the routing rules stay
+        // in one place and this stays a pure read of its result.
+        let delivered: Vec<String> = {
+            let mut seen: Vec<String> = Vec::new();
+            for (role, _) in &targets {
+                if !seen.iter().any(|r| r == role) {
+                    seen.push(role.clone());
+                }
+            }
+            seen
+        };
+        let unresolved_roles: Vec<String> = {
+            let mut missing: Vec<String> = Vec::new();
+            for role in &signal.to {
+                if !delivered.iter().any(|r| r == role) && !missing.iter().any(|r| r == role) {
+                    missing.push(role.clone());
+                }
+            }
+            missing
+        };
 
         // PRD #92 F9 followup-6: async-dispatch. Each per-target future
         // runs in its own `tokio::spawn` so `handle_delegate` (and the
@@ -2967,6 +3060,18 @@ impl AppState {
                 )
                 .await;
             });
+        }
+
+        // Reported once the fan-out is QUEUED, not once each worker has answered.
+        // The dispatches are deliberately detached (see above), so waiting here
+        // would re-introduce the multi-second stall that async-dispatch removed.
+        // "Queued to a resolved worker pane" is the strongest claim this call can
+        // honestly make, and it is precisely the claim the old silent exit-0 made
+        // falsely.
+        crate::event::DelegateResponse {
+            delivered,
+            unresolved_roles,
+            error: None,
         }
     }
 

@@ -688,6 +688,11 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // Kept for the error messages below — the signal is moved into the
+            // wire message, and a failure has to name the pane and the roles it
+            // could not reach.
+            let pane_id_for_report = pane_id.clone();
+            let signal_roles = to.clone();
             let signal = dot_agent_deck::event::DelegateSignal {
                 pane_id,
                 task,
@@ -702,8 +707,56 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
-                eprintln!("Failed to send delegate signal to daemon socket.");
+            // A REQUEST, not a fire-and-forget send. The daemon is the only place
+            // that knows whether this delegate resolved to a worker, and until it
+            // answered, `delegate` printed nothing and exited 0 no matter what
+            // happened on the other side — so an orchestrator whose delegation was
+            // dropped announced that its worker was working and then waited
+            // forever for a `work-done` that could not arrive.
+            //
+            // `send_and_await_reply`, not `request_from_socket`: the latter folds
+            // "no daemon" and "old daemon that does not answer this verb" into one
+            // `None`, and those must not be reported the same way — the first is a
+            // real failure, the second has to stay a success or every delegate
+            // against an older daemon reports a phantom error.
+            use dot_agent_deck::hook::SocketReply;
+            let line = match dot_agent_deck::hook::send_and_await_reply(&json) {
+                SocketReply::Unreachable => {
+                    eprintln!(
+                        "Error: could not reach the dot-agent-deck daemon socket, so the \
+                         delegate to {} was NOT delivered.",
+                        signal_roles.join(", ")
+                    );
+                    return ExitCode::FAILURE;
+                }
+                // Delivered to a daemon predating this response. Pre-response
+                // contract: delivered, unverifiable. See `SocketReply::NoReply`.
+                SocketReply::NoReply => return ExitCode::SUCCESS,
+                SocketReply::Reply(line) => line,
+            };
+            let resp = match serde_json::from_str::<dot_agent_deck::event::DelegateResponse>(&line)
+            {
+                Ok(r) => r,
+                // Same reasoning as `NoReply`: a line we cannot parse is a daemon
+                // we do not understand, not a proven failure.
+                Err(_) => return ExitCode::SUCCESS,
+            };
+            if let Some(error) = resp.error {
+                eprintln!("Error: delegate from pane {pane_id_for_report} failed: {error}");
+                return ExitCode::FAILURE;
+            }
+            if !resp.unresolved_roles.is_empty() {
+                eprintln!(
+                    "Error: delegate from pane {pane_id_for_report} reached no worker for \
+                     role(s): {}. This orchestration has no pane for {} — check the role \
+                     names in .dot-agent-deck.toml.",
+                    resp.unresolved_roles.join(", "),
+                    if resp.unresolved_roles.len() == 1 {
+                        "it"
+                    } else {
+                        "them"
+                    }
+                );
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS

@@ -438,6 +438,66 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     })
 }
 
+/// Outcome of [`send_and_await_reply`] — what a caller that must report success
+/// or failure to a human/agent is allowed to conclude.
+///
+/// The three cases exist because two of them look identical to
+/// [`request_from_socket`], which folds both into `None`, and conflating them
+/// makes a correct delegate report as broken. Only [`Self::Unreachable`] means
+/// the signal was not delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocketReply {
+    /// The signal never left this process — no socket, or the write failed.
+    /// The only case a caller may report as "not delivered".
+    Unreachable,
+    /// Delivered, but the daemon answered nothing readable on this verb. That
+    /// is an OLDER DAEMON: `delegate` was fire-and-forget before the response
+    /// existed, so the pre-response contract applies — delivered, unverifiable.
+    ///
+    /// On Unix this arrives promptly: the half-close makes the old daemon's line
+    /// reader hit EOF, end its task and drop the connection, which we read as an
+    /// empty line. On Windows (no half-close primitive) it is the sync client's
+    /// 5s default timeout instead — a stall, but only in the mixed-version case,
+    /// and a stall that ends in "assume delivered" rather than a false failure.
+    NoReply,
+    /// Delivered and answered with one line.
+    Reply(String),
+}
+
+/// Send a line to the daemon hook socket and classify what came back.
+///
+/// [`request_from_socket`]'s `None` cannot distinguish "no daemon" from "old
+/// daemon that does not answer this verb", which is fine for `get-seed` (both
+/// degrade to "no seed") and wrong for `delegate`, where the first is a failure
+/// the orchestrator must see and the second must stay a success or every
+/// delegate against an older daemon starts reporting a phantom error.
+pub fn send_and_await_reply(json: &str) -> SocketReply {
+    let path = socket_path();
+    let Ok(mut stream) = crate::platform::ipc::IpcClient::connect(&path) else {
+        return SocketReply::Unreachable;
+    };
+    let msg = format!("{json}\n");
+    if stream.write_all(msg.as_bytes()).is_err() || stream.flush().is_err() {
+        return SocketReply::Unreachable;
+    }
+    // Past this point the daemon HAS the signal, so no failure below may be
+    // reported as non-delivery.
+    let _ = stream.shutdown_write();
+    let mut reader = std::io::BufReader::new(&mut stream);
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(_) => {
+            let line = line.trim_end_matches(['\n', '\r']).to_string();
+            if line.trim().is_empty() {
+                SocketReply::NoReply
+            } else {
+                SocketReply::Reply(line)
+            }
+        }
+        Err(_) => SocketReply::NoReply,
+    }
+}
+
 pub fn send_to_socket(json: &str) -> Option<()> {
     let path = socket_path();
     let mut stream = crate::platform::ipc::IpcClient::connect(&path).ok()?;
