@@ -11,6 +11,11 @@
 //! visibly releasing it once resolved, `Ctrl+e` handing control back, and a
 //! manual focus choice actually sticking once it does.
 //!
+//! This contract is part of the experimental command-entry-lock surface, so
+//! the deck launches with `DOT_AGENT_DECK_EXPERIMENTAL=1`. Without that flag,
+//! the production gate intentionally disables both the lock and its focus
+//! steering, and this test would assert on a surface that is not enabled.
+//!
 //! Uses the `orch-focus-lifecycle` fixture (`orchestrator` start role plus
 //! `alpha` and `beta`, all plain `printf`+`sleep` stubs — no LLM tokens
 //! spent). A 3-role fixture is required rather than the 2-role `orch-deck`:
@@ -170,6 +175,7 @@ fn focus_007_lock_governed_focus_contract_on_real_binary() {
 
     let deck = TuiDeck::builder()
         .with_pty_size(160, 45)
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .launch_with_fixture("orch-focus-lifecycle");
     deck.wait_for_string("No active sessions");
 
