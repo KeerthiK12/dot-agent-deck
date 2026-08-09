@@ -598,6 +598,8 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (synthetic — a `cat`-stub worker pane driven to `Thinking` over the daemon's hook socket with a distinctive sentinel seeded into `user_prompt`, landing in `SessionState::last_user_prompt`/`first_prompts`).
 - **Asserts:** the subprocess exits successfully and the seeded sentinel never appears anywhere in its combined stdout/stderr.
 - **Does not assert:** `--json` output (the design doc scopes the no-prompt-text requirement to the human view); task-file/delegate text (out of scope for `ListAgents`-derived data).
+- **Platform coverage:** mac+linux.
+
 #### worktree/reclaim
 
 ##### worktree/reclaim/001 — `dot-agent-deck worktree list` succeeds in a git repo and names the worktree it examined.
