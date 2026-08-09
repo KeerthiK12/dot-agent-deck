@@ -3585,31 +3585,216 @@ fn traversal_objection(uid: u32, mode: u32, euid: u32) -> Option<String> {
     None
 }
 
-/// Filesystem-facing wrapper: stat one component of a candidate base and report
-/// why it cannot be trusted, if it cannot.
-fn path_component_objection(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
-    if meta.file_type().is_symlink() {
-        // Rejected rather than resolved: pathname resolution follows symlinks in
-        // ancestors, so a link in an attacker-writable location can be re-pointed
-        // between one use of the path and the next.
-        return Some(format!("{} is a symlink", path.display()));
+/// Which rule one directory in a candidate chain is judged by.
+///
+/// Ancestors of the base are ordinary system directories — `/`, `/var`, sticky
+/// `/var/tmp`, somebody's `$HOME` — so they are judged by
+/// [`traversal_objection`]: root-owned and sticky are normal, what matters is
+/// that no *other* unprivileged user can rename or replace them underneath us.
+/// The base itself, and every directory the harness creates or adopts on the way
+/// down to it, is where the harness puts its own credential-bearing state, so it
+/// is judged by [`private_dir_objection`] — ours, with no group or other bits at
+/// all, the same bar the default `/var/tmp/dad-e2e-<uid>` parent has to meet.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum ChainRole {
+    Ancestor,
+    Ours,
+}
+
+/// How every directory in the walk below is opened: one component at a time,
+/// relative to an already-open parent, never following a symlink at the end.
+///
+/// `O_PATH` where the platform has it, because it needs only *search* permission
+/// on the directory — exactly what the `stat` walk this replaces needed. An
+/// ancestor that is traversable but not readable (`/home` at 0711 is a real
+/// configuration) must not turn into a refusal just because the check got
+/// stricter about *when* it looks. Elsewhere `O_RDONLY` is the portable
+/// spelling.
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+const DIR_HANDLE_FLAGS: libc::c_int =
+    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const DIR_HANDLE_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+/// One path component as a C string, for the `*at` calls below.
+#[cfg(unix)]
+fn component_name(name: &std::ffi::OsStr) -> Result<std::ffi::CString, String> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| format!("{} contains a NUL byte", Path::new(name).display()))
+}
+
+/// `openat(2)` a single component below `parent` — or an absolute path, when
+/// `parent` is `None` — without following a symlink at the end of it.
+///
+/// Returning the descriptor rather than the name is the whole point: a
+/// descriptor names an *inode*, so once it is open the entry it came from cannot
+/// be renamed or replaced underneath the next step, and the permission check
+/// runs against the very object the next `openat` resolves from. A `stat` of a
+/// path followed by a *use* of that same path is two lookups, and anything with
+/// write access to a component can swap what the second one finds.
+#[cfg(unix)]
+fn open_dir_nofollow(
+    parent: Option<&std::fs::File>,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::io::FromRawFd;
+    let dirfd = parent.map_or(libc::AT_FDCWD, |dir| dir.as_raw_fd());
+    // SAFETY: `name` is NUL-terminated and outlives the call, which only reads
+    // it; `dirfd` is either `AT_FDCWD` or a descriptor owned by the live `File`
+    // borrowed above.
+    let fd = unsafe { libc::openat(dirfd, name.as_ptr(), DIR_HANDLE_FLAGS) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    if !meta.is_dir() {
-        return Some(format!("{} is not a directory", path.display()));
+    // SAFETY: `fd` is a fresh descriptor this call owns and hands over exactly
+    // once, so the `File` is its sole owner.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// `mkdirat(2)` a single component below `parent`, owner-only.
+///
+/// Deliberately *not* `create_dir_all` semantics: this fails with `EEXIST`
+/// rather than accepting whatever already occupies the name, which is what lets
+/// the caller judge an entry that appeared in the meantime instead of adopting
+/// it sight unseen. The mode is applied by `mkdir(2)` itself and a umask can
+/// only clear bits, so the directory is never visible at anything looser, even
+/// briefly.
+#[cfg(unix)]
+fn mkdir_owner_only_at(parent: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: as in `open_dir_nofollow` — a live directory descriptor and a
+    // NUL-terminated name the call only reads.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        use std::os::unix::fs::PermissionsExt;
-        if let Some(why) = traversal_objection(
-            meta.uid(),
-            meta.permissions().mode() & 0o7777,
-            effective_uid(),
-        ) {
-            return Some(format!("{} is {why}", path.display()));
+    Ok(())
+}
+
+/// Judge an already-open directory by `fstat(2)` **on its descriptor** — never
+/// by a second lookup of its name, which is exactly the window this avoids.
+#[cfg(unix)]
+fn open_dir_objection(dir: &std::fs::File, role: ChainRole, euid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    let meta = match dir.metadata() {
+        Ok(meta) => meta,
+        Err(e) => return Some(format!("cannot be stat'ed: {e}")),
+    };
+    let mode = meta.permissions().mode() & 0o7777;
+    match role {
+        ChainRole::Ancestor => traversal_objection(meta.uid(), mode, euid),
+        ChainRole::Ours => private_dir_objection(meta.uid(), mode, euid),
+    }
+}
+
+/// Word an `openat` failure. The refusal has already happened — in the kernel,
+/// because `O_NOFOLLOW | O_DIRECTORY` would not open the entry — so the extra
+/// look this takes to distinguish a symlink from a plain file decides nothing
+/// but the message. (`O_NOFOLLOW` reports a symlink as `ELOOP`, except under
+/// `O_PATH`, where `O_DIRECTORY` rejects it as `ENOTDIR` instead.)
+#[cfg(unix)]
+fn unopenable_component_message(path: &Path, e: &std::io::Error) -> String {
+    let is_symlink =
+        || std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    match e.raw_os_error() {
+        Some(libc::ELOOP) => format!("{} is a symlink", path.display()),
+        Some(libc::ENOTDIR) if is_symlink() => format!("{} is a symlink", path.display()),
+        Some(libc::ENOTDIR) => format!("{} is not a directory", path.display()),
+        _ => format!("cannot open {}: {e}", path.display()),
+    }
+}
+
+/// Open one component below `parent` and judge what came back, appending it to
+/// `walked` so every message names the path as far as it got.
+#[cfg(unix)]
+fn descend_into(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    walked: &mut PathBuf,
+    role: ChainRole,
+    euid: u32,
+) -> Result<std::fs::File, String> {
+    let c_name = component_name(name)?;
+    walked.push(name);
+    let dir = open_dir_nofollow(Some(parent), &c_name)
+        .map_err(|e| unopenable_component_message(walked, &e))?;
+    match open_dir_objection(&dir, role, euid) {
+        Some(why) => Err(format!("{} — {why}", walked.display())),
+        None => Ok(dir),
+    }
+}
+
+/// Create one component of the base below `parent`, or adopt what is already
+/// there — and judge what was *actually* got, on its descriptor, either way.
+///
+/// This is the answer to the adoption race: a component that was missing when
+/// the path was resolved can be created by another local user before the harness
+/// reaches it, and a recursive create would then adopt their directory (or their
+/// symlink) without ever looking at it. `mkdirat(2)` fails with `EEXIST` instead,
+/// and `EEXIST` is not treated as success — it falls through to the same
+/// open-and-judge a freshly created directory gets, under the strict
+/// [`ChainRole::Ours`] rule. Whoever won the race, what the harness ends up
+/// holding is a directory it has validated at the moment it adopted it.
+#[cfg(unix)]
+fn create_or_adopt_component(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    walked: &mut PathBuf,
+    euid: u32,
+) -> Result<std::fs::File, String> {
+    let c_name = component_name(name)?;
+    match mkdir_owner_only_at(parent, &c_name) {
+        Ok(()) => {}
+        // Somebody got there first — us on an earlier run, or someone else.
+        // Which of those it was is decided by the judgement below, not here.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            walked.push(name);
+            return Err(format!("cannot create {}: {e}", walked.display()));
         }
     }
-    None
+    descend_into(parent, name, walked, ChainRole::Ours, euid)
+}
+
+/// Split a candidate base into the longest prefix that already exists —
+/// resolved with `canonicalize`, so what comes back is a real path with no
+/// symlink left in it — and the components below that still have to be created.
+///
+/// Resolving rather than refusing a symlinked ancestor is what makes this work
+/// on macOS at all: `/var` is a symlink to `/private/var` there, so
+/// `std::env::temp_dir()` and anything under `/var/tmp` has a symlinked ancestor
+/// on a completely healthy machine, and refusing those rejected the entire
+/// platform. Safety is judged after resolution instead, on the path the kernel
+/// will actually walk — and judged with descriptors, so a link swapped in
+/// *after* this resolution cannot be followed either (see [`descend_into`]).
+#[cfg(unix)]
+fn resolve_existing_prefix(raw: &Path) -> Result<(PathBuf, Vec<std::ffi::OsString>), String> {
+    let mut probe: PathBuf = raw.components().collect();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&probe) {
+            Ok(existing) => {
+                missing.reverse();
+                return Ok((existing, missing));
+            }
+            // A dangling symlink also lands here, and is then handled where
+            // every other surprise is: `mkdirat` says `EEXIST`, `openat` refuses
+            // to follow it, and the value is rejected.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let name = probe
+                    .file_name()
+                    .ok_or_else(|| format!("{} has no ancestor that exists", raw.display()))?
+                    .to_os_string();
+                missing.push(name);
+                probe.pop();
+            }
+            Err(e) => return Err(format!("cannot resolve {}: {e}", probe.display())),
+        }
+    }
 }
 
 /// Structural objections to an override value, before anything is stat'ed.
@@ -3633,44 +3818,94 @@ fn override_shape_objection(raw: &Path) -> Option<String> {
 
 /// Validate `DAD_E2E_TMPDIR` and return the base to use.
 ///
-/// Absolute and traversal-free (checked above), every component that exists
-/// stat'ed once and rejected if it is a symlink, foreign-owned, or writable by
-/// others without the sticky bit. Because no component is a symlink, the value
-/// *is* its own resolved form — resolved once here, with no second resolution
-/// later that could land somewhere else. Anything missing is then created
-/// owner-only.
+/// Absolute and traversal-free (checked above), then resolved **once** with
+/// `canonicalize` and walked from `/` one component at a time with
+/// descriptor-relative, no-follow opens. Every directory is judged by `fstat` on
+/// the descriptor it was opened with, so nothing is ever adopted on the strength
+/// of an earlier `stat` of its name: ancestors must not be replaceable by another
+/// unprivileged user, and the base — plus every component created on the way down
+/// to it — must be ours with no group or other bits.
 ///
-/// The returned path is rebuilt from `components()`, so it is normalized: `.`
-/// and repeated separators are gone, and nothing downstream — the socket-length
-/// budget included — sees a spelling the filesystem does not.
+/// Missing components are created with `mkdirat`, which *fails* rather than
+/// adopting an entry that appeared in between; `EEXIST` is judged, not trusted.
+/// The base is then revalidated on the descriptor the walk finished on.
+///
+/// Two things this deliberately does not claim. The descriptors are dropped when
+/// it returns, so what the caller gets is a *validated path*, not a pinned
+/// handle: every later use resolves the name again. What makes that safe is the
+/// property proved on the way down — every ancestor is owned by us or by root
+/// and is not writable by others except under the sticky bit, where only an
+/// entry's own owner may rename or remove it. And the returned path is the
+/// resolved one, so a symlink the operator pointed at is followed exactly once,
+/// here, and never again downstream.
+#[cfg(unix)]
 fn validated_override_base(raw: &Path) -> Result<PathBuf, String> {
     if let Some(why) = override_shape_objection(raw) {
         return Err(why);
     }
+    let (existing, missing) = resolve_existing_prefix(raw)?;
+    let euid = effective_uid();
+    let root = component_name(std::ffi::OsStr::new("/"))?;
+    let mut walked = PathBuf::from("/");
+    let mut dir =
+        open_dir_nofollow(None, &root).map_err(|e| unopenable_component_message(&walked, &e))?;
+
+    // The resolved prefix, laxly: these are the machine's directories, not the
+    // harness's. `components()` on a canonical path yields `RootDir` first and
+    // nothing but `Normal` after it, so the skip is exact.
+    for component in existing.components().skip(1) {
+        dir = descend_into(
+            &dir,
+            component.as_os_str(),
+            &mut walked,
+            ChainRole::Ancestor,
+            euid,
+        )?;
+    }
+    // Then everything the harness has to make, strictly.
+    for name in &missing {
+        dir = create_or_adopt_component(&dir, name, &mut walked, euid)?;
+    }
+    // And the base itself, once the chain is complete — the check that has to
+    // hold at the moment of *use*, whether the directory was just created, was
+    // adopted, or was already there when the walk started.
+    if let Some(why) = open_dir_objection(&dir, ChainRole::Ours, euid) {
+        return Err(format!("{} — {why}", walked.display()));
+    }
+    Ok(walked)
+}
+
+/// Windows has neither POSIX ownership nor mode bits to judge a candidate by,
+/// and no `openat`-shaped API reachable from `std`, so the value is checked for
+/// shape, refused if a component is a symlink or not a directory, and created.
+/// The ACL-based equivalent of the Unix walk above is #163/#164.
+#[cfg(not(unix))]
+fn validated_override_base(raw: &Path) -> Result<PathBuf, String> {
+    if let Some(why) = override_shape_objection(raw) {
+        return Err(why);
+    }
+    // Normalized, so nothing downstream — the socket-length budget included —
+    // sees a spelling the filesystem does not.
+    let normalized: PathBuf = raw.components().collect();
     let mut walked = PathBuf::new();
-    let mut has_missing = false;
-    for component in raw.components() {
+    for component in normalized.components() {
         walked.push(component);
-        if has_missing {
-            // Everything below the first missing component is missing too, and
-            // will be created owner-only rather than adopted.
-            continue;
-        }
         match std::fs::symlink_metadata(&walked) {
-            Ok(meta) => {
-                if let Some(why) = path_component_objection(&walked, &meta) {
-                    return Err(why);
-                }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!("{} is a symlink", walked.display()));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => has_missing = true,
+            Ok(meta) if !meta.is_dir() => {
+                return Err(format!("{} is not a directory", walked.display()));
+            }
+            Ok(_) => {}
+            // Everything below the first missing component is missing too.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
             Err(e) => return Err(format!("cannot stat {}: {e}", walked.display())),
         }
     }
-    if has_missing {
-        create_dir_private(&walked)
-            .map_err(|e| format!("cannot create {}: {e}", walked.display()))?;
-    }
-    Ok(walked)
+    std::fs::create_dir_all(&normalized)
+        .map_err(|e| format!("cannot create {}: {e}", normalized.display()))?;
+    Ok(normalized)
 }
 
 /// Why the private `/var/tmp` parent could not be used — and, the load-bearing
@@ -3864,9 +4099,12 @@ fn refused_override_message(raw: &Path, why: &str) -> String {
          than ignored: falling through would silently place them somewhere you did \
          not ask for — usually the system temp dir, which is commonly a RAM-backed \
          tmpfs and is exactly what issue #322 is about.\n\n\
-         Point {TEMP_BASE_ENV} at a short, absolute, disk-backed directory you own, \
-         with no `..` and no symlinked or foreign-owned component — or unset it to \
-         use the default {SHARED_VAR_TMP}/dad-e2e-<uid>.",
+         Point {TEMP_BASE_ENV} at a short, absolute, disk-backed directory you own \
+         with no `..`, no component another unprivileged user could replace, and \
+         no group or other permission bits on the directory itself (`chmod 700` — \
+         the same bar the default parent has to meet, since this is where the \
+         harness seeds real agent credentials) — or unset it to use the default \
+         {SHARED_VAR_TMP}/dad-e2e-<uid>.",
         raw.display(),
     )
 }
@@ -6245,45 +6483,113 @@ mod harness_unit_tests {
     /// everything downstream — including what the reaper would be pointed at.
     /// A `.` is a different matter: it is not a widening, and `components()`
     /// removes it before anything sees the path.
+    ///
+    /// What counts as absolute is a *platform* question, and the fixtures are
+    /// split accordingly: `/var/tmp/e2e` is absolute on Unix and is not on
+    /// Windows, where an absolute path needs a drive letter. The rule is one
+    /// rule — `Path::is_absolute` — asserted against each platform's own
+    /// spelling of it.
     #[test]
     fn an_override_that_is_relative_or_traversing_is_refused() {
+        // True everywhere: a bare relative path is absolute on no platform.
         assert!(override_shape_objection(Path::new("scratch/e2e")).is_some());
         assert!(override_shape_objection(Path::new("./scratch/e2e")).is_some());
-        assert!(override_shape_objection(Path::new("/var/tmp/../../etc")).is_some());
-        assert_eq!(override_shape_objection(Path::new("/var/tmp/e2e")), None);
-        assert_eq!(override_shape_objection(Path::new("/var/tmp/./e2e")), None);
+        #[cfg(unix)]
+        {
+            assert!(override_shape_objection(Path::new("/var/tmp/../../etc")).is_some());
+            assert_eq!(override_shape_objection(Path::new("/var/tmp/e2e")), None);
+            assert_eq!(override_shape_objection(Path::new("/var/tmp/./e2e")), None);
+        }
+        #[cfg(windows)]
+        {
+            // Rooted but not absolute: no drive letter, so it resolves against
+            // whatever drive is current — exactly the ambiguity being refused.
+            assert!(override_shape_objection(Path::new(r"\scratch\e2e")).is_some());
+            assert!(override_shape_objection(Path::new(r"C:\tmp\..\..\Windows")).is_some());
+            assert_eq!(override_shape_objection(Path::new(r"C:\tmp\e2e")), None);
+            assert_eq!(override_shape_objection(Path::new(r"C:\tmp\.\e2e")), None);
+        }
     }
 
-    /// The value is resolved exactly once, into a normalized path. A spelling
-    /// the filesystem does not use would otherwise be what the socket-length
-    /// budget is measured against, and what every later message names.
+    /// The directory a scratch anchor really lives at, with every symlink in it
+    /// resolved. On macOS `/var` is a symlink to `/private/var`, so the harness
+    /// roots these tests build under are reached through one on a completely
+    /// healthy machine — and [`validated_override_base`] returns the resolved
+    /// spelling, which is what the assertions below have to compare against.
+    #[cfg(unix)]
+    fn resolved(path: &Path) -> PathBuf {
+        path.canonicalize()
+            .unwrap_or_else(|e| panic!("canonicalize {}: {e}", path.display()))
+    }
+
+    /// The value is resolved exactly once, into a normalized, symlink-free path.
+    /// A spelling the filesystem does not use would otherwise be what the
+    /// socket-length budget is measured against, and what every later message
+    /// names.
     #[cfg(unix)]
     #[test]
     fn a_validated_override_base_comes_back_normalized() {
         let anchor = race_safe_tempdir();
         let noisy = anchor.path().join(".").join("base");
-        let resolved = validated_override_base(&noisy).expect("a fresh base under our own dir");
-        assert_eq!(resolved, anchor.path().join("base"));
+        let base = validated_override_base(&noisy).expect("a fresh base under our own dir");
+        assert_eq!(base, resolved(anchor.path()).join("base"));
     }
 
-    /// A symlinked component is refused rather than resolved. Pathname
-    /// resolution follows links in *ancestors* every time the path is used, so
-    /// a link in a writable location can be re-pointed between one use and the
-    /// next — a base collected now and deleted later is the concrete risk.
+    /// A symlinked *ancestor* is resolved, not refused — and the resolved form
+    /// is what comes back, so nothing downstream ever walks the link again.
+    ///
+    /// This is the macOS case: `/var` is a symlink to `/private/var` there, so
+    /// `std::env::temp_dir()` and everything under `/var/tmp` has a symlinked
+    /// ancestor on a healthy machine, and refusing symlinked components outright
+    /// rejected the platform's own temp directory. A root-owned system symlink
+    /// is not the threat; a component an unprivileged attacker could plant or
+    /// swap is, and that is judged after resolution — see the two tests below.
     #[cfg(unix)]
     #[test]
-    fn an_override_reached_through_a_symlink_is_refused() {
+    fn an_override_reached_through_a_symlink_resolves_to_the_real_directory() {
+        use std::os::unix::fs::DirBuilderExt;
         let anchor = race_safe_tempdir();
         let real = anchor.path().join("real");
-        std::fs::create_dir(&real).expect("create real dir");
+        // Owner-only, because this ends up an *ancestor* of the base: a bare
+        // `create_dir` under `umask 002` is 0775, and a group-writable ancestor
+        // is refused on its own merits — a different rule from the one under
+        // test here.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&real)
+            .expect("create real dir");
         let link = anchor.path().join("link");
         std::os::unix::fs::symlink(&real, &link).expect("create symlink");
-        let via_link = link.join("base");
-        let err = validated_override_base(&via_link).expect_err("a symlinked ancestor is refused");
-        assert!(err.contains("symlink"), "{err}");
+        let base = validated_override_base(&link.join("base")).expect("a symlinked ancestor");
+        assert_eq!(base, resolved(&real).join("base"));
+        assert!(base.is_dir(), "{} was not created", base.display());
         assert!(
-            !via_link.exists(),
-            "nothing may be created under a refused path"
+            !base.starts_with(&link),
+            "{} still names the link {}",
+            base.display(),
+            link.display(),
+        );
+    }
+
+    /// Resolving a symlink does not lower the bar for what it resolves *to*: a
+    /// link is a fine way to name a directory and a terrible way to inherit
+    /// trust, so the target is judged exactly as if it had been named directly.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_target_is_judged_like_any_other_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let anchor = race_safe_tempdir();
+        let target = anchor.path().join("target");
+        std::fs::create_dir(&target).expect("create the target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen the target");
+        let link = anchor.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        let err = validated_override_base(&link).expect_err("a group-readable target is refused");
+        assert!(err.contains("mode is 0o755"), "{err}");
+        assert!(
+            err.contains(&resolved(&target).display().to_string()),
+            "{err}"
         );
     }
 
@@ -6295,10 +6601,10 @@ mod harness_unit_tests {
         use std::os::unix::fs::PermissionsExt;
         let anchor = race_safe_tempdir();
         let base = anchor.path().join("outer").join("inner");
-        let resolved = validated_override_base(&base).expect("a fresh base under our own dir");
-        assert_eq!(resolved, base);
-        for created in [anchor.path().join("outer"), base] {
-            let mode = std::fs::metadata(&created)
+        let created = validated_override_base(&base).expect("a fresh base under our own dir");
+        assert_eq!(created, resolved(anchor.path()).join("outer").join("inner"));
+        for component in [created.parent().expect("outer").to_path_buf(), created] {
+            let mode = std::fs::metadata(&component)
                 .expect("stat created component")
                 .permissions()
                 .mode()
@@ -6307,9 +6613,121 @@ mod harness_unit_tests {
                 mode,
                 0o700,
                 "{} was created 0o{mode:o}, not owner-only",
-                created.display(),
+                component.display(),
             );
         }
+    }
+
+    /// The base is held to the same bar whether the harness created it or found
+    /// it: it is where real agent credentials get seeded, so ours-and-owner-only
+    /// is the point, and an ancestor's laxer rule does not apply to it. Refused,
+    /// never repaired — chmod'ing a directory the harness does not own is what
+    /// this whole check exists to avoid.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_override_base_must_still_be_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let anchor = race_safe_tempdir();
+        let base = anchor.path().join("base");
+        std::fs::create_dir(&base).expect("plant the base");
+        let mode_of = |p: &Path| {
+            std::fs::symlink_metadata(p)
+                .expect("stat the base")
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen the base");
+        let err = validated_override_base(&base).expect_err("a group-readable base is refused");
+        assert!(err.contains("mode is 0o755"), "{err}");
+        assert!(
+            err.contains(&resolved(&base).display().to_string()),
+            "{err}"
+        );
+        assert_eq!(mode_of(&base), 0o755, "the refused base was modified");
+
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            .expect("tighten the base");
+        assert_eq!(
+            validated_override_base(&base).expect("an owner-only base is adopted"),
+            resolved(&base),
+        );
+    }
+
+    /// The adoption race (Greptile P1). A component that was missing when the
+    /// path was resolved can be created by another local user before the harness
+    /// gets to it, and a recursive create would adopt whatever is there — their
+    /// directory, or their symlink — without ever looking at it.
+    ///
+    /// Winning a real race in a test is not practical, so what is pinned is the
+    /// *decision*: planting the entry before the call reproduces exactly the
+    /// state losing that race leaves behind. Each shape an attacker could leave
+    /// must be refused on the descriptor the harness actually opened, whatever
+    /// an earlier stat of the name said.
+    #[cfg(unix)]
+    #[test]
+    fn a_component_that_appears_before_creation_is_judged_not_adopted() {
+        use std::os::unix::fs::PermissionsExt;
+        let anchor = race_safe_tempdir();
+        let euid = effective_uid();
+        // Each shape needs its own parent, since they all plant the same name.
+        let parent_of = |kind: &str| -> (PathBuf, std::fs::File) {
+            let dir = anchor.path().join(kind);
+            std::fs::create_dir(&dir).expect("stand-in parent");
+            let handle = std::fs::File::open(&dir).expect("open the parent");
+            (dir, handle)
+        };
+        let adopt = |path: &Path, handle: &std::fs::File| {
+            let mut walked = path.to_path_buf();
+            create_or_adopt_component(handle, std::ffi::OsStr::new("base"), &mut walked, euid)
+                .map(|_| walked)
+        };
+
+        // Nothing there: created by `mkdirat` at 0o700 and accepted.
+        let (fresh, handle) = parent_of("fresh");
+        let made = adopt(&fresh, &handle).expect("a fresh component is created");
+        assert_eq!(made, fresh.join("base"));
+        let mode = std::fs::symlink_metadata(&made)
+            .expect("stat the created component")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "{} is 0o{mode:o}", made.display());
+
+        // A directory that is ours but not owner-only — the shape a lost race
+        // leaves when the winner made it world-readable.
+        let (loose, handle) = parent_of("loose");
+        let planted = loose.join("base");
+        std::fs::create_dir(&planted).expect("plant a directory");
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen it");
+        let err = adopt(&loose, &handle).expect_err("a loose directory is refused");
+        assert!(err.contains("mode is 0o755"), "{err}");
+        assert!(err.contains(&planted.display().to_string()), "{err}");
+
+        // A symlink at the name: `O_NOFOLLOW` refuses it, and — the part that
+        // matters — nothing is created at the far end of it.
+        let (linked, handle) = parent_of("symlink");
+        let target = anchor.path().join("symlink-target");
+        std::fs::create_dir(&target).expect("link target");
+        std::os::unix::fs::symlink(&target, linked.join("base")).expect("plant a symlink");
+        let err = adopt(&linked, &handle).expect_err("a symlink is refused");
+        assert!(err.contains("is a symlink"), "{err}");
+        assert_eq!(
+            std::fs::read_dir(&target)
+                .expect("read the link target")
+                .count(),
+            0,
+            "the symlink was followed and written through",
+        );
+
+        // A plain file at the name.
+        let (filed, handle) = parent_of("file");
+        std::fs::write(filed.join("base"), b"not a directory").expect("plant a file");
+        let err = adopt(&filed, &handle).expect_err("a file is refused");
+        assert!(err.contains("is not a directory"), "{err}");
     }
 
     /// The `dad-tests-<pid>-*` name is load-bearing: `cargo xtask
