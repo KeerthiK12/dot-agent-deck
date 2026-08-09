@@ -43,6 +43,8 @@ Note that `GITHUB_TOKEN` **cannot** be named as a ruleset bypass actor on a user
 
 The order matters. Each step is safe to stop at.
 
+> **Where this stands:** steps 1–5 are done. The gate went up at `REQUIRED_APPROVALS=0` on 2026-08-08, and was raised to `1` on 2026-08-09 when [@prageethw](https://github.com/prageethw) joined as the second maintainer (issue #432). Step 6 — required status checks — is still open, and is now a sharper decision than it looks: see CLAUDE.md rule 8 for why a required check binds a `write` maintainer but not the admin owner. The steps below are kept as the procedure for onboarding the *next* maintainer.
+
 **1. Merge the plumbing.** The `token:` change, `scripts/apply-branch-protection.sh`, `MAINTAINERS.md`, and this page. Nothing is enforced yet and nothing changes behaviour.
 
 **2. Create the PAT and set the secret.** A fine-grained PAT scoped to this repository with Contents: read and write, stored as `RELEASE_TOKEN`. Verify with `scripts/apply-branch-protection.sh status`, which reports whether the secret is visible.
