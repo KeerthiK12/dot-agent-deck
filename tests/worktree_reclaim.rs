@@ -272,6 +272,68 @@ impl Fixture {
         std::fs::write(git_dir.join("dot-agent-deck-owner"), "deck\n").expect("write owner marker");
     }
 
+    /// Like [`Self::add_worktree_with_commit`], but for a worktree DIRECTORY
+    /// NAME that may contain non-UTF-8 bytes. `name` is joined and passed to
+    /// `git worktree add` as a raw `OsStr` via `Command::arg`, never through
+    /// a `&str`/`to_string_lossy` conversion — a lossy round-trip here would
+    /// corrupt the very bytes `worktree_reclaim_008` exists to exercise
+    /// before git ever saw them.
+    #[cfg(target_os = "linux")]
+    fn add_worktree_with_commit_raw(&self, name: &std::ffi::OsStr, branch: &str) -> PathBuf {
+        let path = self._scratch.path().join(name);
+        let add = Command::new("git")
+            .current_dir(&self.repo)
+            .arg("worktree")
+            .arg("add")
+            .arg("-b")
+            .arg(branch)
+            .arg(&path)
+            .arg("main")
+            .output()
+            .unwrap_or_else(|e| panic!("git worktree add (raw path) failed to spawn: {e}"));
+        assert!(
+            add.status.success(),
+            "git worktree add (raw path) failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        std::fs::write(path.join("work.txt"), "work\n").expect("write work file");
+        git(&path, &["add", "work.txt"]);
+        git(&path, &["commit", "--quiet", "-m", "work"]);
+        path
+    }
+
+    /// Like [`Self::mark_owned`], but resolves `git rev-parse --git-dir`'s
+    /// stdout as raw bytes instead of `String::from_utf8_lossy`.
+    /// `mark_owned`'s lossy conversion is harmless for every other fixture
+    /// (ASCII names round-trip losslessly), but for a worktree whose name —
+    /// and therefore whose `.git/worktrees/<name>` git-dir — contains a
+    /// non-UTF-8 byte, it corrupts the resolved git-dir path into one that
+    /// does not exist on disk, so the owner-marker write fails before the
+    /// fixture is even set up. That would be a bug in this HARNESS, not the
+    /// production code `worktree_reclaim_008` targets, hence the separate
+    /// raw-byte-safe path.
+    #[cfg(target_os = "linux")]
+    fn mark_owned_raw(&self, worktree: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let out = Command::new("git")
+            .current_dir(worktree)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .expect("git rev-parse --git-dir");
+        let mut bytes = out.stdout;
+        while matches!(bytes.last(), Some(b'\n') | Some(b'\r')) {
+            bytes.pop();
+        }
+        let git_dir = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+        let git_dir = if git_dir.is_absolute() {
+            git_dir
+        } else {
+            worktree.join(git_dir)
+        };
+        std::fs::write(git_dir.join("dot-agent-deck-owner"), "deck\n").expect("write owner marker");
+    }
+
     fn run(&self, args: &[&str]) -> std::process::Output {
         let path = format!(
             "{}:{}",
@@ -669,5 +731,87 @@ fn worktree_reclaim_007_pr_state_resolved_against_worktree_own_remote_not_caller
          actually carry the `remove` verdict the column above claims; got reason column {:?} \
          from line:\n{line}\nfull output:\n{text}",
         fields[6]
+    );
+}
+
+/// Scenario: A deck-owned worktree whose PR is MERGED and whose tree is clean
+/// is fully reclaimable by every measure except one: its directory name
+/// contains a byte that is not valid UTF-8. `examine_worktrees` lossy-converts
+/// the parsed `PathBuf` into a `String` before `run_reclaim` hands it to `git
+/// worktree remove`, so git is asked to remove a path that does not exist and
+/// the worktree survives `reclaim --yes` untouched. Asserts the directory is
+/// gone afterward, and that the report actually says so.
+#[spec("worktree/reclaim/008")]
+#[test]
+#[cfg(target_os = "linux")]
+fn worktree_reclaim_008_non_utf8_path_is_reclaimed() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fx = Fixture::new();
+    let name = OsStr::from_bytes(b"wt-\xff-nonutf8");
+    let branch = "feat/nonutf8";
+    let wt = fx.add_worktree_with_commit_raw(name, branch);
+    fx.set_pr_state(branch, "MERGED");
+    fx.mark_owned_raw(&wt);
+
+    // Fixture precondition: the directory must exist on disk with the EXACT
+    // bytes intended, not a filesystem-normalised or -rejected stand-in.
+    // Without this, a filesystem that silently rejected or altered the name
+    // would make every assertion below pass for the wrong reason -- the
+    // "pass by doing nothing" trap `worktree_reclaim_003`/`004`/`005` guard
+    // against, one layer earlier: at fixture creation rather than at the
+    // subcommand dispatch.
+    let entries: Vec<_> = std::fs::read_dir(fx._scratch.path())
+        .expect("read scratch dir")
+        .map(|e| e.expect("dir entry").file_name())
+        .collect();
+    assert!(
+        entries.iter().any(|e| e.as_bytes() == name.as_bytes()),
+        "fixture precondition: the scratch dir must contain an entry whose raw bytes exactly \
+         match {name:?} -- the filesystem may have normalised or rejected the non-UTF-8 name; \
+         got entries: {entries:?}"
+    );
+
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    // As in `003`/`004`/`005`: rule out clap's own usage/parse-error exit
+    // code first, so a rejected/unrecognized subcommand cannot be mistaken
+    // for a correctly-handled removal below.
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "exit code 2 is clap's own generic usage/parse-error code; an implemented `worktree \
+         reclaim` correctly removing this non-UTF-8-named worktree must use a code that does \
+         not collide with it; status={:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !combined(&out).contains("Usage:"),
+        "stderr still carries clap's own subcommand-usage banner, meaning `worktree reclaim` \
+         was not recognized as a real subcommand; out={}",
+        combined(&out)
+    );
+
+    let text = combined(&out);
+    assert!(
+        !text.contains("Removed: none"),
+        "the command must actually REPORT this worktree as removed, not merely have its \
+         directory absent for an unrelated reason -- e.g. the fixture never having created it \
+         would also satisfy \"gone\" below without this defect ever being exercised; got:\n{text}"
+    );
+    assert!(
+        text.contains("Removed:"),
+        "the report must carry a non-empty \"Removed:\" section naming what was reclaimed; \
+         got:\n{text}"
+    );
+
+    assert!(
+        !wt.exists(),
+        "a deck-owned, MERGED, clean worktree must be reclaimed even when its directory name \
+         contains a non-UTF-8 byte, exactly like any other reclaimable worktree -- {} still \
+         exists\n{}",
+        wt.display(),
+        text
     );
 }

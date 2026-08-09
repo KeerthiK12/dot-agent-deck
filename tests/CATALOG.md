@@ -651,6 +651,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the `reclaim` (removal) path for this fixture, or JSON output — same gate, already covered elsewhere (`002`, `006`); the "unrelated repo's coincidental MERGED PR" framing from the fix's own doc comment, which this suite could not reproduce (see the test's doc comment and `set_worktree_origin`) because it requires the common config to ALSO carry a resolvable `origin`, which the list-accumulation behavior above rules out.
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/008 — A reclaimable worktree whose DIRECTORY NAME contains a non-UTF-8 byte is still removed by `reclaim --yes`.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a worktree directory built from raw bytes via `OsStr::from_bytes`/`Command::arg`, never through a `&str`/`to_string_lossy` conversion that would corrupt the byte before git ever saw it).
+- **Asserts:** first, a **fixture precondition** that the scratch dir genuinely contains an entry whose raw bytes exactly match the intended non-UTF-8 name — ruling out "the filesystem silently normalised or rejected it" as the reason later assertions pass; then, as in `003`/`004`/`005`, that the exit code/stderr rule out clap's own unrecognized-subcommand error; then that the human report actually carries a non-empty `Removed:` section (not `Removed: none`) — ruling out "the directory was simply never created" as the reason it's absent; and finally that the worktree directory is gone. Pins Greptile P1 (upstream PR #427, `src/worktree_reclaim.rs:482`): `examine_worktrees` lossy-converts the parsed `PathBuf` into a `String`, and `run_reclaim` feeds that mangled string to `git worktree remove`, so a worktree whose path contains non-UTF-8 bytes is never reclaimed even though it is otherwise fully eligible.
+- **Does not assert:** behaviour on non-Linux filesystems (APFS/HFS+ reject non-UTF-8 filenames outright, so this scenario cannot exist there); which specific byte is preserved, only that the exact bytes round-trip.
+- **Platform coverage:** linux.
+
 ### Prompts
 
 #### prompt/permission
