@@ -60,7 +60,17 @@ What happens next is a single resolution followed by a descriptor walk:
 
 What this does **not** claim: the harness ends up holding a validated *path*, not an open handle, so every later use resolves the name again. What makes that safe is the property proved on the way down — no ancestor is writable by another unprivileged user except under the sticky bit, where only an entry's own owner may rename or remove it — not the walk itself. Closing the remaining gap would mean keeping the descriptor and doing every subsequent operation relative to it, which is a much larger change than a temp-directory chooser warrants.
 
-Windows gets the shape check and a symlink/not-a-directory refusal, and nothing else: there are no POSIX ownership or mode bits to judge a candidate by, and no `openat`-shaped API reachable from `std`. The ACL-based equivalent is #163/#164.
+### What happens on Windows instead
+
+There are no POSIX ownership or mode bits to judge a candidate by there, and no `openat`-shaped API reachable from `std`, so steps 2–4 above have no equivalent. What the non-Unix arm does is the same walk **by name**: the shape check, then one component at a time, each stat'ed with `symlink_metadata` and refused if it is a symlink, a junction, any other reparse point, or not a directory. A component that is missing is created with `create_dir`, **not** `create_dir_all` — so it fails with `AlreadyExists` rather than accepting whatever appeared in the meantime, and `AlreadyExists` is judged rather than treated as success. `FILE_ATTRIBUTE_REPARSE_POINT` is checked directly rather than relying on `FileType::is_symlink`, which is true only for the two tags `std` classifies as links (symlinks and junctions) and misses cloud-file placeholders and `AppExecLink` entries; the attribute bit is reachable from `std` via `MetadataExt`, so this costs no dependency.
+
+That closes the *silent adoption*: a pre-planted entry can no longer redirect the credential-bearing harness tree into storage somebody else chose. Three things it does **not** close, and cannot from `std`:
+
+1. The judgement is a **second lookup of the name**, not an `fstat` on the descriptor the entry was opened with. The name can be swapped between the `AlreadyExists` and the `symlink_metadata`, and again before every later use. The window is narrowed, not removed.
+2. There is **no ownership check**, so a plain directory another local user planted at a missing component is still adopted — Windows ACLs are not reachable from `std` and there is no `uid` to compare. Redirection is refused; a co-located directory owned by somebody else is not detected.
+3. Directories are created with **inherited ACLs**, not the 0700 equivalent `mkdir(2)` gives the Unix arm, so a permissive parent stays permissive.
+
+All three are the ACL-and-handle work tracked by #163/#164, deliberately not fixed with a `windows-sys` dependency for a platform whose L2 tier does not run yet. One deliberate difference from the Unix arm: a symlinked **ancestor** is refused rather than resolved. Resolving is a concession the Unix side has to make because macOS's own `/var` is a symlink to `/private/var`; Windows has no such component on a healthy machine, and `canonicalize` there returns a `\\?\` verbatim path that would then be the spelling every message and length budget used.
 
 A rejected value **is** fatal, and more plainly so than a rejected default: setting the variable states where the temp dirs must go, so a value that cannot be honoured — for any reason, including "could not be created" — stops the harness rather than being ignored. There is no reading of an explicit instruction under which silently doing something else is the helpful answer.
 
@@ -126,7 +136,7 @@ The 2 GB default is a "this run is doomed" floor rather than a capacity guarante
 
 | Variable | Default | Effect |
 |---|---|---|
-| `DAD_E2E_TMPDIR` | unset | Temp base for the harness root. Validated (absolute, no `..`, resolved once, then walked with `openat`/`O_NOFOLLOW`; ancestors not replaceable by another unprivileged user, the base itself owned by you and 0700), then outranks every other candidate — including the socket-length veto, which only warns. A value that fails validation stops the harness rather than being ignored. |
+| `DAD_E2E_TMPDIR` | unset | Temp base for the harness root. Validated (absolute, no `..`, resolved once, then walked with `openat`/`O_NOFOLLOW`; ancestors not replaceable by another unprivileged user, the base itself owned by you and 0700 — on Windows, the weaker by-name walk described above), then outranks every other candidate — including the socket-length veto, which only warns. A value that fails validation stops the harness rather than being ignored. |
 | `TMPDIR` | system temp | Only reaches the last-resort candidate (3). It no longer relocates the harness root on its own — use `DAD_E2E_TMPDIR`. |
 | `DAD_E2E_MIN_FREE_MB` | `2048` | Free space the e2e tier requires on the chosen base. `0` disables the check. |
 | `DAD_E2E_IMPORT_CLAUDE_PLUGINS` | unset (off) | Set to `1` to copy the host's `~/.claude/plugins` into every seeded HOME. Off by default: it is ~11 MB per HOME, nothing in the suite depends on it, and with dozens of tests running concurrently it is a real share of peak temp demand. |

@@ -3875,12 +3875,140 @@ fn validated_override_base(raw: &Path) -> Result<PathBuf, String> {
     Ok(walked)
 }
 
-/// Windows has neither POSIX ownership nor mode bits to judge a candidate by,
-/// and no `openat`-shaped API reachable from `std`, so the value is checked for
-/// shape, refused if a component is a symlink or not a directory, and created.
-/// The ACL-based equivalent of the Unix walk above is #163/#164.
-#[cfg(not(unix))]
-fn validated_override_base(raw: &Path) -> Result<PathBuf, String> {
+/// Whether an entry carries the Windows reparse-point attribute at all.
+///
+/// Broader on purpose than `FileType::is_symlink`, which on Windows is true only
+/// for the two tags `std` classifies as links (`IO_REPARSE_TAG_SYMLINK` and
+/// `IO_REPARSE_TAG_MOUNT_POINT`, i.e. junctions). Other tags also redirect —
+/// cloud-file placeholders, `AppExecLink`, an app-execution alias — and the
+/// harness has no business writing credentials through any of them. The
+/// attribute bit itself is reachable from `std` via `MetadataExt`, so this costs
+/// no new dependency; the ACL half of the same question is not, and is #163/#164.
+#[cfg(windows)]
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    /// `FILE_ATTRIBUTE_REPARSE_POINT`, spelled out rather than pulled in from
+    /// `windows-sys` — one documented constant is not worth a dependency on a
+    /// platform whose e2e tier does not run yet.
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Elsewhere there is no such attribute, and `is_symlink` already answers the
+/// whole question.
+#[cfg(not(windows))]
+fn is_reparse_point(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Pure decision half of the by-name walk below: `Some(why)` when an entry with
+/// these observed properties must be refused, `None` when it is an ordinary
+/// directory the harness may walk through or use.
+///
+/// Taking the flags rather than a `Metadata` is what makes the reparse-point
+/// rule testable at all — that shape only exists on Windows, and the Windows
+/// arm cannot be exercised from the Unix host this suite runs on.
+fn chain_entry_verdict(
+    path: &Path,
+    is_symlink: bool,
+    is_reparse_point: bool,
+    is_dir: bool,
+) -> Option<String> {
+    if is_symlink {
+        return Some(format!("{} is a symlink", path.display()));
+    }
+    if is_reparse_point {
+        return Some(format!("{} is a reparse point", path.display()));
+    }
+    (!is_dir).then(|| format!("{} is not a directory", path.display()))
+}
+
+/// Judge one `symlink_metadata` reading through [`chain_entry_verdict`].
+fn chain_entry_verdict_for(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
+    chain_entry_verdict(
+        path,
+        meta.file_type().is_symlink(),
+        is_reparse_point(meta),
+        meta.is_dir(),
+    )
+}
+
+/// Filesystem-facing adapter over [`chain_entry_verdict`]: stat `path` and judge
+/// what came back. A missing entry is a refusal too — every caller reaches this
+/// only for something that is supposed to be there by then.
+fn chain_entry_objection(path: &Path) -> Option<String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => chain_entry_verdict_for(path, &meta),
+        Err(e) => Some(format!("cannot stat {}: {e}", path.display())),
+    }
+}
+
+/// Create one component of a by-name chain, or judge what is already there —
+/// never adopt it sight unseen.
+///
+/// `create_dir` rather than `create_dir_all` is the whole point, and it is the
+/// portable half of what `mkdirat` does for [`create_or_adopt_component`]: it
+/// fails with `AlreadyExists` instead of accepting whatever occupies the name,
+/// so an entry another local user planted between the walk and this moment is
+/// *looked at* rather than used. Windows reports `ERROR_ALREADY_EXISTS` for a
+/// file, a directory, a junction and a symlink alike, so every shape an attacker
+/// could leave arrives here and is judged.
+fn create_or_refuse_component(path: &Path) -> Result<(), String> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        // Somebody got there first — an earlier run, or someone else. Which of
+        // those it was is not answerable by name alone; what *is* answerable is
+        // whether the entry redirects somewhere, and that is refused.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            chain_entry_objection(path).map_or(Ok(()), Err)
+        }
+        Err(e) => Err(format!("cannot create {}: {e}", path.display())),
+    }
+}
+
+/// The by-name equivalent of [`validated_override_base`]'s descriptor walk, for
+/// platforms where `std` offers no `openat`.
+///
+/// Kept free of `cfg` so it compiles — and is unit-tested — on the Unix host
+/// this suite actually runs on, even though only the `#[cfg(not(unix))]` arm
+/// calls it. The logic is plain `std::fs`, so what a Linux test observes here is
+/// what Windows executes; the two Windows-only pieces are the reparse-point
+/// attribute (pinned separately through [`chain_entry_verdict`]) and the exact
+/// error codes `CreateDirectoryW` returns.
+///
+/// **What this closes.** Nothing is adopted silently any more: every component,
+/// existing or created, is stat'ed with `symlink_metadata` and refused if it is
+/// a symlink, a junction, any other reparse point, or not a directory. That is
+/// the redirection Greptile's finding names — a pre-planted entry at a missing
+/// component aiming the credential-bearing harness tree at storage somebody else
+/// chose.
+///
+/// Unlike the Unix arm, a symlinked **ancestor** is refused rather than resolved
+/// — the behaviour this arm already had. Resolving is a concession the Unix side
+/// has to make because macOS's own `/var` is a symlink to `/private/var`, so
+/// refusing it rejected the platform; Windows has no such component on a healthy
+/// machine, and `canonicalize` there returns a `\\?\` verbatim path that would
+/// then be the spelling every downstream message and length budget used. Strict
+/// is both simpler and safer here.
+///
+/// **What it does not close, and cannot from `std`.** Three things, stated
+/// plainly rather than implied:
+///
+/// 1. The judgement is a **second lookup of the name**, not an `fstat` of the
+///    descriptor the entry was opened with. Between the `AlreadyExists` and the
+///    `symlink_metadata` — and again between that and every later use — the name
+///    can be swapped. The window is narrowed, not removed.
+/// 2. There is **no ownership check**. A plain directory another local user
+///    planted at a missing component is still adopted, because Windows ACLs are
+///    not reachable from `std` and there is no `uid` to compare. Redirection is
+///    refused; a co-located directory owned by somebody else is not detected.
+/// 3. Directories are created with **inherited ACLs**, not the 0700 equivalent
+///    `mkdir(2)` gives the Unix arm, so a permissive parent stays permissive.
+///
+/// All three are the ACL-and-handle work tracked by #163/#164. Deliberately not
+/// fixed here with `windows-sys`: that is a real dependency decision for a
+/// platform whose L2 tier does not run yet.
+fn override_base_by_name(raw: &Path) -> Result<PathBuf, String> {
     if let Some(why) = override_shape_objection(raw) {
         return Err(why);
     }
@@ -3890,22 +4018,52 @@ fn validated_override_base(raw: &Path) -> Result<PathBuf, String> {
     let mut walked = PathBuf::new();
     for component in normalized.components() {
         walked.push(component);
-        match std::fs::symlink_metadata(&walked) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(format!("{} is a symlink", walked.display()));
-            }
-            Ok(meta) if !meta.is_dir() => {
-                return Err(format!("{} is not a directory", walked.display()));
-            }
-            Ok(_) => {}
-            // Everything below the first missing component is missing too.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+        // The anchor — `/`, a drive root, a UNC share — is not something the
+        // harness can create or could meaningfully judge, and `CreateDirectoryW`
+        // on a drive root reports access denied rather than "already exists", so
+        // trying would fail every Windows path. `components()` yields these
+        // first and nothing but `Normal` after, so the skip is exact.
+        if !matches!(component, std::path::Component::Normal(_)) {
+            continue;
+        }
+        let existing = match std::fs::symlink_metadata(&walked) {
+            Ok(meta) => Some(meta),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("cannot stat {}: {e}", walked.display())),
+        };
+        match existing {
+            // Already there: judged, never created over. Attempting a create on
+            // every existing ancestor would buy nothing and would make the walk
+            // depend on which of `EEXIST` and `EROFS`/`EACCES` a filesystem
+            // reports first.
+            Some(meta) => {
+                if let Some(why) = chain_entry_verdict_for(&walked, &meta) {
+                    return Err(why);
+                }
+            }
+            // Missing, so the harness makes it — and refuses to adopt whatever
+            // may have appeared between that stat and this create.
+            None => create_or_refuse_component(&walked)?,
         }
     }
-    std::fs::create_dir_all(&normalized)
-        .map_err(|e| format!("cannot create {}: {e}", normalized.display()))?;
+    // And the base itself, once the chain is complete — the check that has to
+    // hold at the moment of *use*, whether the directory was just created or was
+    // already there when the walk started.
+    if let Some(why) = chain_entry_objection(&normalized) {
+        return Err(why);
+    }
     Ok(normalized)
+}
+
+/// Windows has neither POSIX ownership nor mode bits to judge a candidate by,
+/// and no `openat`-shaped API reachable from `std`, so the value gets the shape
+/// check and then the by-name walk above: created one component at a time, and
+/// refused rather than adopted where something is already there. See
+/// [`override_base_by_name`] for exactly what that does and does not buy; the
+/// ACL-based equivalent of the Unix walk is #163/#164.
+#[cfg(not(unix))]
+fn validated_override_base(raw: &Path) -> Result<PathBuf, String> {
+    override_base_by_name(raw)
 }
 
 /// Why the private `/var/tmp` parent could not be used — and, the load-bearing
@@ -6728,6 +6886,221 @@ mod harness_unit_tests {
         std::fs::write(filed.join("base"), b"not a directory").expect("plant a file");
         let err = adopt(&filed, &handle).expect_err("a file is refused");
         assert!(err.contains("is not a directory"), "{err}");
+    }
+
+    /// The same adoption race in the `#[cfg(not(unix))]` arm (Greptile P1 on
+    /// #472), which used to hand the whole unchecked pathname to
+    /// `create_dir_all` and take whatever was there.
+    ///
+    /// [`override_base_by_name`] is what that arm now calls, and it is
+    /// deliberately `cfg`-free so this runs on the Unix host the suite actually
+    /// executes on: the logic is plain `std::fs`, so what is observed here is
+    /// what Windows executes. As on the Unix side, winning a real race in a test
+    /// is not practical, so what is pinned is the *decision* — planting the entry
+    /// before the call reproduces exactly the state losing that race leaves
+    /// behind.
+    ///
+    /// The last case pins a **limit, not a guarantee**: a plain directory
+    /// somebody else planted is still adopted, because `std` exposes no owner on
+    /// Windows. Asserting it keeps the residual honest rather than implied.
+    #[test]
+    fn a_by_name_override_component_is_created_or_refused_never_adopted() {
+        // Held for the whole test: dropping it removes the tree underneath.
+        let guard = race_safe_tempdir();
+        // Resolved, because this walk refuses a symlinked ancestor rather than
+        // following it (see [`override_base_by_name`]) and on macOS `/var` — the
+        // harness root's own parent — is a symlink to `/private/var`. That is a
+        // property of the *fixture path*, not of the rule under test.
+        let anchor = guard
+            .path()
+            .canonicalize()
+            .expect("resolve the scratch anchor");
+        // Each shape needs its own parent, since they all plant the same name.
+        let parent_of = |kind: &str| -> PathBuf {
+            let dir = anchor.join(kind);
+            std::fs::create_dir(&dir).expect("stand-in parent");
+            dir
+        };
+
+        // Nothing there: the ordinary path still works, through a component that
+        // does not exist either.
+        let fresh = parent_of("fresh").join("outer").join("base");
+        let made = override_base_by_name(&fresh).expect("a fresh base is created");
+        assert_eq!(made, fresh, "the value comes back as the normalized path");
+        assert!(made.is_dir(), "{} was not created", made.display());
+
+        // And a second call over the same path adopts it rather than failing —
+        // the concurrent-test-process case, which must not be a refusal.
+        assert_eq!(
+            override_base_by_name(&fresh).expect("an existing base is adopted"),
+            fresh,
+        );
+
+        // `.` noise is dropped, so nothing downstream sees a spelling the
+        // filesystem does not.
+        let noisy = parent_of("noisy").join(".").join("base");
+        let base = override_base_by_name(&noisy).expect("a fresh base under our own dir");
+        assert_eq!(base, anchor.join("noisy").join("base"));
+
+        // A plain file at a missing component.
+        let filed = parent_of("file");
+        std::fs::write(filed.join("base"), b"not a directory").expect("plant a file");
+        let err = override_base_by_name(&filed.join("base").join("deeper"))
+            .expect_err("a file is refused");
+        assert!(err.contains("is not a directory"), "{err}");
+
+        // A symlink at a missing component — the redirection the finding is
+        // about. Unix-only *as a fixture*: `std::os::windows::fs::symlink_dir`
+        // needs Developer Mode or `SeCreateSymbolicLinkPrivilege`, so the shape
+        // is planted where it can be, and the rule it exercises is the same one
+        // `chain_entry_verdict` states for every platform.
+        #[cfg(unix)]
+        {
+            let linked = parent_of("symlink");
+            let target = anchor.join("symlink-target");
+            std::fs::create_dir(&target).expect("link target");
+            std::os::unix::fs::symlink(&target, linked.join("base")).expect("plant a symlink");
+            let err =
+                override_base_by_name(&linked.join("base")).expect_err("a symlink is refused");
+            assert!(err.contains("is a symlink"), "{err}");
+            // The part that matters: nothing was created at the far end of it.
+            let err = override_base_by_name(&linked.join("base").join("deeper"))
+                .expect_err("a symlinked ancestor is refused too");
+            assert!(err.contains("is a symlink"), "{err}");
+            assert_eq!(
+                std::fs::read_dir(&target)
+                    .expect("read the link target")
+                    .count(),
+                0,
+                "the symlink was followed and written through",
+            );
+        }
+
+        // The residual, asserted so it cannot rot into an assumed guarantee: a
+        // plain pre-existing directory is adopted. On Unix that is safe because
+        // the arm above judges ownership and mode; here there is nothing to
+        // judge it by, and #163/#164 is what closes it.
+        let planted = parent_of("planted").join("base");
+        std::fs::create_dir(&planted).expect("plant a directory");
+        assert_eq!(
+            override_base_by_name(&planted).expect("a plain directory is adopted"),
+            planted,
+            "adoption of a plain directory is the documented residual",
+        );
+    }
+
+    /// The race branch on its own. The walk above stats before it creates, so a
+    /// pre-planted entry is caught by the stat; the branch that decides the
+    /// actual race is the one where `create_dir` comes back `AlreadyExists`
+    /// because the entry appeared *after* that stat.
+    ///
+    /// [`create_or_refuse_component`] is where that lands, and planting the entry
+    /// before calling it reproduces exactly the state losing the race leaves
+    /// behind. `AlreadyExists` must not be success — which is what
+    /// `create_dir_all` treated it as, and is the whole of Greptile's finding.
+    #[test]
+    fn a_by_name_component_that_appears_before_creation_is_judged_not_adopted() {
+        let guard = race_safe_tempdir();
+        let anchor = guard
+            .path()
+            .canonicalize()
+            .expect("resolve the scratch anchor");
+        // Each shape needs its own parent, since they all plant the same name.
+        let parent_of = |kind: &str| -> PathBuf {
+            let dir = anchor.join(kind);
+            std::fs::create_dir(&dir).expect("stand-in parent");
+            dir
+        };
+
+        // Nothing there: created, and accepted.
+        let made = parent_of("fresh").join("base");
+        create_or_refuse_component(&made).expect("a fresh component is created");
+        assert!(made.is_dir(), "{} was not created", made.display());
+
+        // A plain file at the name.
+        let filed = parent_of("file").join("base");
+        std::fs::write(&filed, b"not a directory").expect("plant a file");
+        let err = create_or_refuse_component(&filed).expect_err("a file is refused");
+        assert!(err.contains("is not a directory"), "{err}");
+
+        // A symlink at the name — Unix-only as a *fixture* (Windows needs
+        // Developer Mode to create one), same rule either way.
+        #[cfg(unix)]
+        {
+            let linked = parent_of("symlink").join("base");
+            let target = anchor.join("symlink-target");
+            std::fs::create_dir(&target).expect("link target");
+            std::os::unix::fs::symlink(&target, &linked).expect("plant a symlink");
+            let err = create_or_refuse_component(&linked).expect_err("a symlink is refused");
+            assert!(err.contains("is a symlink"), "{err}");
+            assert_eq!(
+                std::fs::read_dir(&target)
+                    .expect("read the link target")
+                    .count(),
+                0,
+                "the symlink was followed and written through",
+            );
+        }
+
+        // And the residual once more, at the level that decides it: a plain
+        // directory somebody else could have planted is adopted, because `std`
+        // exposes no owner on Windows to tell it from one of ours.
+        let planted = parent_of("planted").join("base");
+        std::fs::create_dir(&planted).expect("plant a directory");
+        create_or_refuse_component(&planted).expect("a plain directory is adopted");
+    }
+
+    /// The rule the by-name walk judges every component against, as a pure
+    /// function — which is the only way the **reparse-point** case can be
+    /// pinned at all: junctions, cloud-file placeholders and `AppExecLink`
+    /// entries exist only on Windows, and `FileType::is_symlink` covers just the
+    /// first two of the three. A redirection the harness would write agent
+    /// credentials through must be refused whichever tag it carries.
+    #[test]
+    fn a_chain_entry_verdict_refuses_every_kind_of_redirection() {
+        let path = Path::new("/anchor/base");
+        let named = |verdict: Option<String>| verdict.unwrap_or_default();
+
+        // A plain directory is the one shape that passes.
+        assert_eq!(chain_entry_verdict(path, false, false, true), None);
+
+        // A symlink or junction — what `std` classifies as a link.
+        assert!(named(chain_entry_verdict(path, true, true, true)).contains("is a symlink"));
+        // A reparse point `std` does not classify as a link. This is the case
+        // `is_symlink` alone misses.
+        assert!(
+            named(chain_entry_verdict(path, false, true, true)).contains("is a reparse point"),
+            "an unclassified reparse point must still be refused",
+        );
+        // A file, or anything else that is not a directory.
+        assert!(
+            named(chain_entry_verdict(path, false, false, false)).contains("is not a directory")
+        );
+
+        // Every refusal names the path, since the message is all the operator
+        // gets — `refused_override_message` wraps it verbatim.
+        for (link, reparse, dir) in [
+            (true, true, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            let why = named(chain_entry_verdict(path, link, reparse, dir));
+            assert!(why.contains("/anchor/base"), "{why}");
+        }
+    }
+
+    /// The by-name walk applies the same shape rule as the descriptor walk —
+    /// a relative value or one with `..` never reaches the filesystem at all.
+    #[test]
+    fn a_by_name_override_base_refuses_the_same_shapes() {
+        let err = override_base_by_name(Path::new("scratch/e2e")).expect_err("relative is refused");
+        assert!(err.contains("is not an absolute path"), "{err}");
+        #[cfg(unix)]
+        {
+            let err = override_base_by_name(Path::new("/var/tmp/../../etc"))
+                .expect_err("`..` is refused");
+            assert!(err.contains("contains a `..` component"), "{err}");
+        }
     }
 
     /// The `dad-tests-<pid>-*` name is load-bearing: `cargo xtask
