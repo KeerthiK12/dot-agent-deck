@@ -388,6 +388,15 @@ jobs:
   docs:
     needs: [prepare, finalize]
     uses: ./.github/workflows/docs-publish.yml
+    # A reusable workflow invoked via `uses:` receives NO secrets unless the
+    # caller passes them, so without this line `secrets.RELEASE_TOKEN` is empty
+    # inside docs-publish.yml. Its checkout then silently falls back to
+    # `github.token`, whose push to `main` the `main-protected` ruleset rejects
+    # with `GH013: … Changes must be made through a pull request` — which is
+    # exactly how v0.35.9's "Commit chart changes" step failed. The image had
+    # already been pushed to GHCR by then, so the symptom was a docs site that
+    # never rolled forward rather than an obviously broken release.
+    secrets: inherit
     with:
       image_tag: v${{ needs.prepare.outputs.version }}
       chart_version: ${{ needs.prepare.outputs.version }}
