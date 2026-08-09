@@ -2324,8 +2324,8 @@ pub fn check_codex_available() -> Result<(), String> {
         return Err("Codex is not authenticated — log in with `codex login`".into());
     }
 
-    let final_message = tempfile::NamedTempFile::new()
-        .map_err(|e| format!("could not create Codex probe output file: {e}"))?;
+    let final_message =
+        harness_tempfile().map_err(|e| format!("could not create Codex probe output file: {e}"))?;
     let probe = std::process::Command::new("codex")
         .args([
             "exec",
@@ -3325,6 +3325,24 @@ pub fn harness_tempdir() -> std::io::Result<tempfile::TempDir> {
     let dir = tempfile::Builder::new().tempdir_in(harness_temp_root())?;
     harden_dir_0700(dir.path());
     Ok(dir)
+}
+
+/// The single-*file* counterpart of [`harness_tempdir`], and correct for the
+/// same reason: it resolves [`harness_temp_root`] before it allocates.
+///
+/// `tempfile::NamedTempFile::new()` is a bare constructor exactly like
+/// `tempfile::tempdir()` — it lands in the OS temp dir when it is the process's
+/// first allocation — but rule 8 did not match it, so it sat inside the rule's
+/// own scope unnoticed. Measured on `5e8e0ed`: the Codex-auth pre-flight
+/// created four zero-byte `/tmp/.tmp*` files, because the pre-flight can run
+/// before anything has asked the harness for a directory. Zero bytes is not the
+/// point — an asserted guarantee that a measurement disproves is.
+///
+/// `NamedTempFile` already creates its file 0600, so there is no mode to
+/// re-apply the way [`harden_dir_0700`] does for a directory.
+#[allow(dead_code)]
+pub fn harness_tempfile() -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new().tempfile_in(harness_temp_root())
 }
 
 /// Re-apply 0o700 to a harness-created directory.

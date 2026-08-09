@@ -14,6 +14,10 @@
 //! actually owns:
 //!
 //! - `dad-tests-*` — the current harness root. Ours, unambiguously.
+//! - `dad-unit-*` — scratch dirs from tests that do not link the harness at all
+//!   (`src/test_temp.rs`). Not process roots: no fixture, no seeded HOME, and
+//!   no exit hook, so a SIGKILL leaves one behind with nothing else to reclaim
+//!   it. Named rather than left as `.tmp*` precisely so this command can.
 //! - `dot-agent-deck-test-lock-*` — the pre-fix lock dirs. Also ours; still
 //!   present in bulk on machines that ran the suite before the leak was fixed.
 //! - `.tmp*` — **not** reaped unless `--include-untagged` is passed. That is
@@ -52,7 +56,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 /// Directory-name prefixes this repo owns outright and may reap by default.
-const OWNED_PREFIXES: &[&str] = &["dad-tests-", "dot-agent-deck-test-lock-"];
+const OWNED_PREFIXES: &[&str] = &["dad-tests-", "dad-unit-", "dot-agent-deck-test-lock-"];
 
 /// The `tempfile` crate's default prefix — shared with every other Rust
 /// program, so it is opt-in only.
@@ -743,6 +747,10 @@ mod tests {
     fn owned_prefixes_are_reaped_by_default() {
         assert!(is_owned("dad-tests-1234-AbCdEf", false));
         assert!(is_owned("dot-agent-deck-test-lock-AbCdEf", false));
+        // `src/test_temp.rs` dirs. Without this they would be unreclaimable:
+        // they live under the private `/var/tmp` parent, which
+        // `--include-untagged` deliberately never reaches.
+        assert!(is_owned("dad-unit-AbCdEf", false));
     }
 
     /// The tempfile crate's default prefix belongs to every Rust program on the

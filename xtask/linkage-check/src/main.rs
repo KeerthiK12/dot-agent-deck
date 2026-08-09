@@ -21,8 +21,10 @@
 //!      The byte-identity diff against the on-disk `.md` is gone:
 //!      `.dot-agent-deck/` is gitignored dev-time state and would
 //!      not exist on a fresh clone.
-//!   8. No bare `tempfile::tempdir()` / `TempDir::new()` in
-//!      `tests/e2e_*.rs` or `tests/common/` — issue #322. See
+//!   8. No bare `tempfile` constructor — directory (`tempdir()`,
+//!      `TempDir::new()`) *or* file (`NamedTempFile::new()`,
+//!      `tempfile()`) — in `tests/e2e_*.rs`, `tests/common/`, or
+//!      the files on [`EXTRA_TEMP_COVERED`]. Issue #322. See
 //!      [`BARE_TEMPDIR_RULE`].
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
@@ -88,14 +90,78 @@ const TESTS_DIR: &str = "tests";
 /// allocates inside it. This rule is what keeps that true — the ordering
 /// argument is invisible in a diff, so it cannot be left to review.
 ///
+/// **Files, not just directories.** The rule originally matched only the
+/// directory constructors, which left a hole inside the territory it claimed to
+/// cover: `tempfile::NamedTempFile::new()` allocates in the OS temp dir on
+/// exactly the same terms, and the Codex-auth pre-flight in `tests/common/`
+/// used one. Measured on `5e8e0ed` as four zero-byte `/tmp/.tmp*` files. The
+/// byte count is irrelevant — the rule's job is to keep the containment claim
+/// true, and a constructor it cannot see makes the claim false. The `…_in`
+/// forms (`tempdir_in`, `tempfile_in`, `new_in`) name their parent explicitly
+/// and are therefore fine; the no-argument forms are not.
+///
+/// **Scope.** `tests/e2e_*.rs` and `tests/common/` — where the allocations are
+/// whole cloned repositories and seeded credentials — plus two files outside
+/// the e2e tier that were measured allocating anyway and now have a wrapper:
+/// [`EXTRA_TEMP_COVERED`].
+///
 /// The escape hatch is [`BARE_TEMPDIR_ALLOW`] on the same line, which the
 /// harness's own defence-in-depth regression test uses.
-const BARE_TEMPDIR_RULE: &str = "bare tempfile constructor — use `common::harness_tempdir()` so the dir \
+const BARE_TEMPDIR_RULE: &str = "bare tempfile constructor — use `common::harness_tempdir()` / \
+     `harness_tempfile()` (or `test_temp::tempdir()` outside the harness) so it \
      lands under the harness temp root even when it is the process's FIRST \
      allocation (issue #322)";
 
+/// Files outside `tests/e2e_*.rs` and `tests/common/` that check 8 also covers.
+///
+/// Both were measured allocating in the OS temp dir during a recorded
+/// `cargo test-e2e` and both now route through a wrapper, so the rule is what
+/// stops a bare constructor coming back:
+///
+/// - `src/dispatch.rs` — lib-target unit tests that build real git repos and
+///   worktrees; they do not link `tests/common/` at all, and use
+///   `crate::test_temp::tempdir()`.
+/// - `tests/daemon_protocol.rs` — a fast-tier crate that binds Unix domain
+///   sockets and is included in `cargo test-e2e`; it `#[path]`-includes the
+///   same `test_temp` module rather than the whole PTY harness.
+///
+/// Paths are repo-relative and compared with the platform separator
+/// normalised, so this works on Windows too.
+const EXTRA_TEMP_COVERED: &[&str] = &["src/dispatch.rs", "tests/daemon_protocol.rs"];
+
 /// Opt-out marker for check 8, on the offending line.
 const BARE_TEMPDIR_ALLOW: &str = "linkage-check:allow-bare-tempdir";
+
+/// The `tempfile` constructors that allocate in the **default** temp dir.
+///
+/// Directories: `tempfile::tempdir()`, `TempDir::new()`, and the builder's
+/// `.tempdir()`. Files: `NamedTempFile::new()`, `tempfile::tempfile()`, and the
+/// builder's `.tempfile()`. Every `…_in(parent)` / `…_new_in(parent)` form
+/// names its destination and is deliberately NOT matched — that is what the
+/// wrappers themselves call.
+///
+/// Factored out of `main` so it can be unit-tested; the file half of it was
+/// missing for a while and nothing caught that.
+fn bare_temp_ctor_re() -> Regex {
+    Regex::new(
+        r"tempfile::tempdir\s*\(|TempDir::new\s*\(|\.tempdir\s*\(\s*\)|NamedTempFile::new\s*\(|tempfile::tempfile\s*\(|\.tempfile\s*\(\s*\)",
+    )
+    .expect("bare temp constructor regex compiles")
+}
+
+/// Whether check 8 applies to `file`.
+///
+/// `tests/e2e_*.rs` plus everything under `tests/common/`, plus the explicit
+/// [`EXTRA_TEMP_COVERED`] list. `is_e2e` is passed in because the caller has
+/// already derived it from the file name.
+fn temp_ctor_rule_covers(file: &Path, root: &Path, tests_dir: &Path, is_e2e: bool) -> bool {
+    if is_e2e || file.starts_with(tests_dir.join("common")) {
+        return true;
+    }
+    EXTRA_TEMP_COVERED
+        .iter()
+        .any(|rel| file == root.join(rel).as_path())
+}
 
 fn main() -> ExitCode {
     // PRD #77 M4: route subcommands through this binary so the
@@ -171,12 +237,7 @@ fn main() -> ExitCode {
         Regex::new(r"(std::thread::sleep|tokio::time::sleep)\b").expect("sleep regex compiles");
     let polling_re =
         Regex::new(r"for\s+_\s+in\s+0\.\.\s*\d+\s*\{").expect("polling regex compiles");
-    // Check 8 (issue #322): the two constructors that allocate in the OS temp
-    // dir. `Builder::…::tempdir_in(...)` names its parent explicitly and is
-    // fine; `Builder::…::tempdir()` does not, so it is matched too.
-    let bare_tempdir_re =
-        Regex::new(r"tempfile::tempdir\s*\(|TempDir::new\s*\(|\.tempdir\s*\(\s*\)")
-            .expect("bare tempdir regex compiles");
+    let bare_tempdir_re = bare_temp_ctor_re();
     let mut bare_tempdir_violations: Vec<String> = Vec::new();
 
     for file in &test_files {
@@ -220,11 +281,12 @@ fn main() -> ExitCode {
         // `TempDir` is small, drops on the normal path, and its file is not
         // linked against the harness at all, so requiring the wrapper there
         // would mean pulling the whole PTY harness into another binary to fix
-        // something that is not leaking. Run against the stripped view so a
-        // comment naming the constructor is not a violation, but report the raw
-        // line number.
-        let is_harness = file.starts_with(tests_dir.join("common"));
-        if is_e2e || is_harness {
+        // something that is not leaking. The two exceptions on
+        // `EXTRA_TEMP_COVERED` are files that were measured allocating in `/tmp`
+        // during a recorded e2e run and that got a wrapper cheaper than the
+        // harness. Run against the stripped view so a comment naming the
+        // constructor is not a violation, but report the raw line number.
+        if temp_ctor_rule_covers(file, &root, &tests_dir, is_e2e) {
             for (idx, raw) in raw_lines.iter().enumerate() {
                 let stripped_line = stripped_lines.get(idx).copied().unwrap_or("");
                 if bare_tempdir_re.is_match(stripped_line) && !raw.contains(BARE_TEMPDIR_ALLOW) {
@@ -871,6 +933,75 @@ fn fn_name_matches_spec(id: &str, fname: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Check 8 must see the *file* constructors, not only the directory ones.
+    /// This is the hole that let the Codex-auth pre-flight's
+    /// `NamedTempFile::new()` sit inside the rule's own scope, measured live in
+    /// `/tmp` on `5e8e0ed`.
+    #[test]
+    fn bare_temp_ctor_re_matches_file_constructors() {
+        let re = bare_temp_ctor_re();
+        for line in [
+            "    let f = tempfile::NamedTempFile::new()",
+            "    let f = NamedTempFile::new().unwrap();",
+            "    let f = tempfile::tempfile().unwrap();",
+            "    let f = tempfile::Builder::new().tempfile()?;",
+        ] {
+            assert!(re.is_match(line), "should be a violation: {line}");
+        }
+    }
+
+    #[test]
+    fn bare_temp_ctor_re_still_matches_dir_constructors() {
+        let re = bare_temp_ctor_re();
+        for line in [
+            "    let d = tempfile::tempdir().unwrap();",
+            "    let d = TempDir::new().unwrap();",
+            "    let d = tempfile::Builder::new().tempdir()?;",
+        ] {
+            assert!(re.is_match(line), "should be a violation: {line}");
+        }
+    }
+
+    /// The `…_in` forms name their parent explicitly — they are what the
+    /// wrappers themselves call, so matching them would make the rule
+    /// unsatisfiable.
+    #[test]
+    fn bare_temp_ctor_re_allows_explicit_parent_forms() {
+        let re = bare_temp_ctor_re();
+        for line in [
+            "    tempfile::Builder::new().tempdir_in(harness_temp_root())",
+            "    tempfile::Builder::new().tempfile_in(harness_temp_root())",
+            "    NamedTempFile::new_in(parent)?",
+            "    TempDir::new_in(parent)?",
+            "    tempfile::tempfile_in(parent)?",
+        ] {
+            assert!(!re.is_match(line), "should NOT be a violation: {line}");
+        }
+    }
+
+    /// Scope: the e2e tier, the harness, and the two explicitly-listed files
+    /// that were measured allocating anyway — but not the rest of the fast
+    /// tier, which stays excluded on the measured grounds documented in
+    /// `docs/develop/e2e-temp-dirs.md`.
+    #[test]
+    fn temp_ctor_rule_covers_the_documented_scope() {
+        let root = Path::new("/repo");
+        let tests_dir = root.join("tests");
+        let covers = |rel: &str, is_e2e: bool| {
+            temp_ctor_rule_covers(&root.join(rel), root, &tests_dir, is_e2e)
+        };
+
+        assert!(covers("tests/e2e_handshake.rs", true));
+        assert!(covers("tests/common/mod.rs", false));
+        assert!(covers("tests/daemon_protocol.rs", false));
+        assert!(covers("src/dispatch.rs", false));
+
+        assert!(!covers("tests/rehydration.rs", false));
+        assert!(!covers("tests/pane_close.rs", false));
+        assert!(!covers("tests/codex_hooks_safety.rs", false));
+        assert!(!covers("src/config.rs", false));
+    }
 
     #[test]
     fn sub_area_prefix_handles_plain_sub_area() {
