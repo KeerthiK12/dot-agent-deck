@@ -561,6 +561,71 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
     );
 }
 
+fn card_label(role: &str) -> String {
+    format!("ClaudeCode · {role}")
+}
+
+/// Match a role label only within one same-weight card top-border span.
+///
+/// The focused role's live terminal occupies these same rows to the right, so
+/// cropping at the card's own right corner prevents aligned agent output from
+/// supplying the label.
+fn card_titled(grid: &str, role: &str) -> bool {
+    let label = card_label(role);
+    grid.lines().any(|line| {
+        let chars: Vec<char> = line.chars().collect();
+        chars.iter().enumerate().any(|(start, left)| {
+            let right = match *left {
+                '┌' => '┐',
+                '┏' => '┓',
+                _ => return false,
+            };
+            let Some(end) = chars
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find_map(|(index, ch)| (*ch == right).then_some(index))
+            else {
+                return false;
+            };
+            chars[start..=end]
+                .iter()
+                .collect::<String>()
+                .contains(&label)
+        })
+    })
+}
+
+#[test]
+fn card_titled_rejects_labels_outside_card_span() {
+    // This models the historical false pass: UUID-titled sidebar cards have a
+    // top-left corner on rows where the adjacent live pane prints every role.
+    // The role text is present on each row, but outside both cards' right edge.
+    const FALSE_PASS_GRID: &str = "\
+┌─ ClaudeCode · 6134822e-f2 ─┐  ┃ ClaudeCode · orchestrator ClaudeCode · coder ClaudeCode · reviewer
+│ waiting                    │  ┃
+└────────────────────────────┘  ┃
+┏━ ClaudeCode · c15a2be1-77 ━┓  ┃ ClaudeCode · orchestrator ClaudeCode · coder ClaudeCode · reviewer
+┃ working                    ┃  ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  ┃";
+    assert!(
+        !card_titled(FALSE_PASS_GRID, "coder"),
+        "a role label in the agent pane must not make a UUID-titled sidebar card match\n\
+         Adversarial grid:\n{FALSE_PASS_GRID}"
+    );
+
+    const PLAIN_CARD_GRID: &str = "\
+┌─ ClaudeCode · coder ──────┐  ┃ live agent output
+│                              │  ┃
+└──────────────────────────────┘  ┃";
+    const THICK_CARD_GRID: &str = "\
+┏━ ClaudeCode · coder ━━━━━━┓  ┃ live agent output
+┃                              ┃  ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  ┃";
+    assert!(card_titled(PLAIN_CARD_GRID, "coder"));
+    assert!(card_titled(THICK_CARD_GRID, "coder"));
+}
+
 /// Scenario: Launch the deck on the `dispatch-orch-real` fixture, whose `real-team`
 /// orchestration defines THREE roles that are all real interactive Claude Haiku
 /// agents, open one `cat` caller pane, and run the real `dot-agent-deck dispatch
@@ -726,35 +791,6 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     // daemon knew every role name and the user could not see any of them.
     deck.send_keys(b"\x1b[6;5~"); // Ctrl+PageDown → the dispatched orchestration tab
     const CARD_WAIT: Duration = Duration::from_secs(60);
-    let card_label = |role: &str| format!("ClaudeCode · {role}");
-    // Match only within one same-weight top-border span. The focused role's live
-    // terminal occupies these same rows to the right, so cropping at the card's
-    // own right corner prevents aligned agent output from supplying the label.
-    let card_titled = |grid: &str, role: &str| {
-        let label = card_label(role);
-        grid.lines().any(|line| {
-            let chars: Vec<char> = line.chars().collect();
-            chars.iter().enumerate().any(|(start, left)| {
-                let right = match *left {
-                    '┌' => '┐',
-                    '┏' => '┓',
-                    _ => return false,
-                };
-                let Some(end) = chars
-                    .iter()
-                    .enumerate()
-                    .skip(start + 1)
-                    .find_map(|(index, ch)| (*ch == right).then_some(index))
-                else {
-                    return false;
-                };
-                chars[start..=end]
-                    .iter()
-                    .collect::<String>()
-                    .contains(&label)
-            })
-        })
-    };
     assert!(
         common::wait_until(CARD_WAIT, || {
             let grid = deck.snapshot_grid();
