@@ -5,6 +5,7 @@ Maintainers may approve and merge pull requests. There is no per-area ownership:
 | Maintainer | GitHub | Role |
 | --- | --- | --- |
 | Viktor Farcic | [@vfarcic](https://github.com/vfarcic) | Owner |
+| Prageeth Warnak | [@prageethw](https://github.com/prageethw) | Maintainer |
 
 ## How this list is enforced
 
