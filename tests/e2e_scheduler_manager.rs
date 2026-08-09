@@ -171,10 +171,10 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
             &path,
             format!(
                 "#!/bin/sh\n\
-                 printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"authoring\"}}' \
-                 | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
+                 {hook}\
                  while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; done\n",
-                rec = record.to_string_lossy()
+                rec = record.to_string_lossy(),
+                hook = common::claude_session_start_line(bin, "authoring"),
             ),
         )
         .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
@@ -575,10 +575,10 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
         format!(
             "#!/bin/sh\n\
              pwd >> \"{rec}\"\n\
-             printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"authoring\"}}' \
-             | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
+             {hook}\
              while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; done\n",
-            rec = record.to_string_lossy()
+            rec = record.to_string_lossy(),
+            hook = common::claude_session_start_line(bin, "authoring"),
         ),
     )
     .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
@@ -1465,7 +1465,8 @@ fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // Space → confirm current dir → new-pane form
     deck.wait_for_string("No mode"); // Mode field is up (cycler at "No mode")
-    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8 → saturate
+    deck.send_keys(b"\x1b[D"); // Left ×1 → schedule: issues (before dispatcher)
     // The dialog title becomes "… — schedule: issues mode" only when the
     // issue-dispatch option is the SELECTED one, so it is a selection-dependent
     // signal (the bare `[schedule: issues]` chip renders at every cycler index).

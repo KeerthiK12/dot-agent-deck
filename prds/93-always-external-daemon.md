@@ -59,7 +59,7 @@ Concretely:
 - Quitting the deck with no running agents shuts the daemon down within the idle timeout.
 - Quitting the deck with running agents leaves them running; reconnecting picks them back up — same as today's remote behavior.
 - All PRD #76 IPC-boundary regressions (M2.11–M2.20 fixes) are exercised by the standard `cargo test` run because they now sit in the only code path.
-- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` pass. `cargo test` passes.
+- `cargo fmt --check` and `cargo clippy --all-targets --features e2e -- -D warnings` pass. `cargo test` passes.
 - User can run the deck locally without ever noticing anything has changed in the common case.
 
 ## Milestones

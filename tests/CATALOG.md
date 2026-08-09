@@ -83,6 +83,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** delivery feedback or daemon send results (covered by `prompt/pane-input/004`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/010 — A pane keeps exactly one card when a hook reports on it without an `agent_id` (issue #398).
+- **Layer:** L1 (in-process `AppState::apply_event` + ratatui `TestBackend` buffer text assertion).
+- **Agent:** none (a tagged spawn placeholder plus one synthetic untagged `WaitingForInput` `AgentEvent`).
+- **Asserts:** after an `agent_id: None` event lands on a pane that already carries a tagged session, exactly one session claims that `pane_id`, that session carries the reported `WaitingForInput` status, and the rendered card grid contains exactly one status badge. Before #398 the untagged event minted a second session, so the deck drew two cards for one pane and `build_pane_status` picked between their statuses by `HashMap` iteration order.
+- **Does not assert:** that the tagged session keeps its accumulated history (the `pre_f9_hook_with_no_agent_id_*` unit tests in `src/state.rs` pin that half); the `WaitingForInput` command-entry carve-out that reads the collision-hardened join (`orchestration/lock/007`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
@@ -614,6 +621,36 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** actual pane delivery or rendered feedback (covered by `prompt/pane-input/004`).
 - **Platform coverage:** mac+linux+windows.
 
+#### daemon/status
+
+##### daemon/status/001 — `dot-agent-deck daemon status` names a managed agent and visibly reflects a driven live status, not a placeholder identical to an agent with no session.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status` CLI as a subprocess + an in-process daemon attach socket, `common::spawn_inprocess_daemon`, + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — two `cat`-stub worker panes registered as managed; one is driven to `Thinking` over the daemon's hook socket exactly as `agent-event --type running` would, the other never receives an event, as a same-daemon control).
+- **Asserts:** the subprocess exits successfully; its stdout names both the driven and the control agent by pane id; and, after normalizing BOTH the pane id and the registry agent id out of each agent's own output lines (the latter differs per spawn regardless of live status), the driven agent's text differs from the control agent's — proving the command actually surfaces the live status rather than an identical placeholder or one that differs only by identity fields. Deliberately does not pin column layout, exact status wording, or row ordering.
+- **Does not assert:** `--json` output shape (`daemon/status/002`); the no-daemon path (`daemon/status/003`); prompt/task redaction (`daemon/status/004`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/status/002 — `dot-agent-deck daemon status --json` emits a machine-readable document carrying `schema_version` with an entry for the managed agent.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status --json` CLI as a subprocess + an in-process daemon attach socket + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a `cat`-stub worker pane driven to `Thinking` over the daemon's hook socket).
+- **Asserts:** the subprocess exits successfully; its stdout parses as a JSON object; the parsed document carries a `schema_version` key; and the raw JSON text names the managed agent by its pane id. Deliberately does not pin any field name beyond `schema_version`, since the rest of the document shape is the coder's to choose (the design rationale).
+- **Does not assert:** the human-readable table (`daemon/status/001`); full field-by-field JSON shape.
+- **Platform coverage:** mac+linux.
+
+##### daemon/status/003 — `dot-agent-deck daemon status` against an unreachable daemon fails distinguishably from a crash and from clap's own unrecognized-subcommand error, and never brings a daemon into existence at the socket it queried.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status` CLI as a subprocess against a scratch attach-socket path with nothing listening; no in-process daemon, no PTY, no LLM, no `e2e` feature gate).
+- **Agent:** none.
+- **Asserts:** the subprocess does not report success; its stderr carries no Rust panic; its exit code is not clap's own generic usage/parse-error code (`2`) and its stderr carries no clap `Usage:` banner — ruling out "this build's CLI does not understand the `status` subcommand" as the reason for the failure, so it stays distinguishable from a genuinely-handled "no daemon reachable" outcome; and the queried socket path still does not exist on disk afterward, proving the diagnostic never spawned a daemon. Deliberately does not pin the exact exit code value or message wording (the design rationale).
+- **Does not assert:** the live-agent path (`daemon/status/001`/`002`); prompt redaction (`daemon/status/004`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/status/004 — `dot-agent-deck daemon status` never prints prompt text into its output.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status` CLI as a subprocess + an in-process daemon attach socket + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a `cat`-stub worker pane driven to `Thinking` over the daemon's hook socket with a distinctive sentinel seeded into `user_prompt`, landing in `SessionState::last_user_prompt`/`first_prompts`).
+- **Asserts:** the subprocess exits successfully and the seeded sentinel never appears anywhere in its combined stdout/stderr.
+- **Does not assert:** `--json` output (the design doc scopes the no-prompt-text requirement to the human view); task-file/delegate text (out of scope for `ListAgents`-derived data).
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
@@ -1034,6 +1071,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** launch wrapping (covered by `codex/spawn/*` and `codex/live/001`) or custom command arguments.
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/016 — Selecting the "dispatcher" option in the new-pane form opens a live dispatcher dashboard card whose real Claude agent, given a goal, invokes `dot-agent-deck dispatch` itself and the daemon creates the promised sibling git worktree (PRD #220). [reel]
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness with imported Claude credentials — records a `full-stream.cast`). The freshly-built binary's dir is prepended to the PATH the deck → daemon → agents inherit, so the agent's `dot-agent-deck dispatch` resolves to the build under test rather than a host-installed binary that predates the verb.
+- **Agent:** Claude Code (interactive `claude`, real Anthropic API — receives the dispatcher seed prompt via gated delivery, acts on the typed goal, and runs the `dispatch` verb itself; no stand-in).
+- **Asserts:** the dispatcher surfaces LIVE as a dashboard CARD within 60s of form submission (`1 session(s)`, no tab strip — a mode tab would instead route through `render_mode_tab`'s 50/50 split and render the agent at half width beside an empty column, which is the shape this pins against); that the seed actually reached the pane (a distinctive `DISPATCHER_SEED_PROMPT` phrase, so it cannot pass on an unseeded agent); then, after a directive one-unit goal is typed into the pane, the sibling worktree `../<repo>-dispatch-probe-unit` appears on disk within 180s — proving agent → `dispatch` CLI → daemon → `git worktree add` end to end, at the sibling (never nested) path.
+- **Also asserts (added after real use found three defects underneath the original green run):** that the unit comes up as a real AGENT — a second live session whose card carries an agent type — because `SpawnRequest.command: None` reads as `$SHELL` in the spawn path, so the previous assertions passed while the unit was a bash prompt with the task text typed into it. Verified to be capable of failing by reintroducing `command: None`. The typed goal also names `--single`, so the shape selector is exercised end to end rather than steering the agent back onto the legacy config-derived path.
+- **Does not assert:** the dispatched unit's own OUTPUT; an `--orchestration` dispatch (covered deterministically by `dispatch::tests::an_orchestration_dispatch_writes_the_delegation_protocol_and_the_task`, which spawns `cat` roles and asserts the orchestrator-context file — no LLM tokens); the return edge (#220's own deferred Phase 2 — NOT #174, which depends on this PRD rather than tracking it); cleanup on tab close (covered by `src/dispatch.rs` unit tests).
+- **Platform coverage:** mac+linux.
+- **Note:** the fixture repo is given an initial commit by the test — the harness `git init`s fixtures but never commits, and `git worktree add` cannot branch from an unborn HEAD.
+
 ### Focus / navigation
 
 #### focus/dashboard
@@ -1189,6 +1235,34 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** (a) with `orchestrator` focused/expanded, the settled grid carries no collapsed `Borders::TOP` title-bar frame for either non-focused role (`alpha`, `beta`) — matched by a row that, after trimming only leading blank columns, begins with the bare role name directly followed by border-fill dashes, a pattern only the collapsed-pane block itself can produce; (b) `beta`'s sidebar status card visibly transitions to `Working` purely from its own self-posted hook events while never becoming the focused pane, proving a non-focused role's agent lifecycle (PTY, hook delivery, status) is untouched by the rendering change; (c) driving `j`/`k` (Normal mode) round-trips focus orchestrator -> alpha -> beta -> alpha -> orchestrator, and each role's own sentinel text is visible again once it becomes the expanded pane, proving no lost scrollback or stale fragment across a focus switch.
 - **Does not assert:** PTY resizing of the reclaimed area (`resize_panes_to_layout`); the L1 geometry math (covered by `orchestration/layout/002`); a real LLM agent (all three roles are shell stand-ins); dashboard-tab (non-orchestration) collapsed frames.
 - **Platform coverage:** mac+linux.
+
+##### tabs/orchestration/007 — In command mode `Ctrl+l` toggles an orchestration tab's sidebar/pane-column split between the default 34/66 and a narrower-sidebar 25/75 and back, while in PaneInput the same chord does nothing to the split (PRD #336).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness, `tests/e2e_orchestration_pane_column.rs`).
+- **Agent:** none (`orch-deck` fixture — two stub `cat` roles, no LLM tokens spent).
+- **Asserts:** opening a real orchestration tab on a 120-column PTY renders the role-pane column's left edge at the default 34%-width boundary (col 40/41); `Ctrl+l` pressed while still in PaneInput does NOT move it (the chord belongs to the role pane's agent there); after `Ctrl+d` to command mode, `Ctrl+l` moves the boundary to the narrower-sidebar 25%-width position (col 29/30) and a second press restores 34%. The boundary is read from the `orchestrator` role-pane box's top-left corner (exactly `panes_area.x`), matching any corner glyph — PRD #341 renders the focused pane's border heavier in command mode, so pinning one glyph would break on the mode switch.
+- **Does not assert:** the global scope of the toggle across multiple open orchestration tabs (covered by `orchestration/layout/004`); persistence of the toggled state across restart (out of scope per PRD #336); remapping the chord via config.
+- **Platform coverage:** mac+linux.
+
+##### tabs/orchestration/008 — `Ctrl+l` still forwards to a live pane's PTY when the active tab is NOT an orchestration tab (PRD #336 scope guard).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness, `tests/e2e_orchestration_pane_column.rs`).
+- **Agent:** none (a `cat -v` pane on the Dashboard, no LLM tokens spent).
+- **Asserts:** on a Dashboard (non-orchestration) tab with a live `cat -v` pane in PaneInput mode, typing a unique sentinel then pressing `Ctrl+l` then Enter makes the pane echo `<sentinel>^L` — `cat -v` renders the received `0x0c` as the two characters `^L`, so the echo appears only if the raw byte actually reached the PTY. Pins the PRD #336 scope rule that `Action::ToggleOrchestrationSplit` claims `Ctrl+l` only on an orchestration tab; regression coverage for the Greptile P1 on PR #342, where the global resolver claimed it unconditionally and swallowed the key on every other tab.
+- **Does not assert:** the orchestration-tab toggle behavior itself (covered by `tabs/orchestration/007`); Mode-tab or other non-Dashboard tab types (Dashboard is sufficient to prove the missing tab-context check). Deliberately does NOT rely on a shell's readline `clear-screen` side effect, which depends on the host terminal setup and made an earlier version of this test fail where forwarding was in fact correct.
+- **Platform coverage:** mac+linux.
+
+##### tabs/orchestration/009 — An orchestration tab's tab-bar label renders in the color of the single highest-priority state among its panes (PRD #333).
+- **Layer:** L1 (in-process `TestBackend` render via `render_tab_bar_to_buffer`, `tests/render_tab_strip.rs`).
+- **Agent:** none (synthetic `SessionStatus` values, no panes/PTYs).
+- **Asserts:** given an orchestration tab whose panes carry a mix of `SessionStatus` values, the rendered tab-bar label's foreground color is `palette::status_color()` of the SINGLE highest-priority status among them, in the fixed order Error(Red) > WaitingForInput(Yellow) > Working(Green) > Thinking/Compacting(Blue) > Idle/Unknown(no tint) — covering (a) one `Error` among several `Idle` panes -> Red; (b) one `WaitingForInput` among `Working`/`Idle` (no `Error`) -> Yellow; (c) all `Idle` -> the SAME base label color as an ordinary tab, NOT `Color::DarkGray` (PRD #333 defect B: PRD #13 reserves DarkGray for purely-decorative elements, not label text); (d) a mix of `Thinking` and `Working` (no higher-priority state) -> Green, since Working outranks Thinking. Also asserts a non-orchestration tab's label is unaffected (same base color as any other unaffected tab).
+- **Does not assert:** the aggregate-priority resolver as a standalone pure-function unit test (PRD #333 M1, may land separately); per-pane sidebar status rendering (covered by `focus/orchestration/002`); pane-column geometry (covered by `orchestration/layout/002`/`004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/orchestration/010 — An ACTIVE orchestration tab carries no status tint, and an inactive Idle orchestration tab renders with no grey (PRD #333).
+- **Layer:** L1 (in-process `TestBackend` render via `render_tab_bar_to_buffer`, `tests/render_tab_strip.rs`).
+- **Agent:** none (synthetic `SessionStatus` values, no panes/PTYs).
+- **Asserts:** an orchestration tab made the ACTIVE tab with a non-idle (`Error`) pane renders with NO status `fg` tint at all — its `fg` and modifiers must match an active non-orchestration (Dashboard) tab exactly (`REVERSED | BOLD`, no absolute color), since stacking a status `fg` on `Modifier::REVERSED` would invert the color into a background at display time (defect A). Also asserts an INACTIVE orchestration tab whose aggregate status is `Idle` renders with the same base label color as an ordinary tab, not `Color::DarkGray` (defect B), and that an INACTIVE orchestration tab with a non-idle (`Error`) aggregate status still colors its label text with neither `REVERSED` nor `BOLD` (regression guard, unchanged from before).
+- **Does not assert:** the aggregate-priority resolver (covered by `tabs/orchestration/009`); per-pane sidebar status rendering (covered by `focus/orchestration/002`); pane-column geometry (covered by `orchestration/layout/002`/`004`).
+- **Platform coverage:** mac+linux+windows.
 
 #### tabs/selection
 
@@ -1582,6 +1656,24 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** after SIGKILLing the intermediate parent, the daemon process terminates within a few seconds, even though idle shutdown is disabled so only the orphan watchdog can end it.
 - **Does not assert:** the max-lifetime backstop (`DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, covered by the daemon pure-data unit tests) or production daemons (the watchdog is OFF unless the env var is set).
 - **Platform coverage:** mac+linux.
+
+#### lifecycle/sigterm
+
+##### lifecycle/sigterm/001 — A daemon sent SIGTERM (what `daemon stop` / `daemon restart` deliver) exits through its graceful shutdown path AND logs the signal, instead of dying silently under the default disposition.
+- **Layer:** L2.
+- **Agent:** none (a bare `daemon serve` with idle shutdown disabled, so only the signal handler can end it).
+- **Asserts:** after a plain `kill(pid, SIGTERM)` the daemon process terminates within a few seconds, and its `DOT_AGENT_DECK_LOG` file contains a termination line naming `SIGTERM`.
+- **Does not assert:** agent teardown ordering under signal shutdown, or `SIGINT` (the handler treats both identically and the CLI only ever sends `SIGTERM`); `--force`'s SIGKILL escalation stays with `lifecycle/stop/003`.
+- **Regression origin:** the daemon installed no signal handler at all, so a stopped daemon left no log line — a real session lost seven live agent panes and the daemon's own log said nothing about why.
+- **Platform coverage:** linux+mac (Unix signals; the Windows build watches Ctrl-C instead).
+
+##### lifecycle/sigterm/002 — A second SIGTERM during shutdown forces an immediate exit instead of being swallowed, so a wedged daemon is still killable with `pkill`.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** after the daemon logs the first termination signal, a second SIGTERM leaves the process gone within a few seconds.
+- **Does not assert:** the exact exit status (`143`), since a shutdown fast enough to finish before the second signal exits `0` and both outcomes satisfy "the daemon does not linger".
+- **Regression origin:** installing a handler replaces the default disposition process-wide, so once the first signal is consumed every later SIGTERM would be absorbed by a stream nobody reads — removing the `pkill` escape hatch that the pre-handler behaviour always provided.
+- **Platform coverage:** linux+mac (Unix signals).
 
 #### lifecycle/version
 
@@ -2091,6 +2183,171 @@ without depending on the config struct API.
 - **Does not assert:** exact warning copy or styling; daemon `list_agents` transport; worktree creation; blocking spawn behavior (the warning is informational).
 - **Platform coverage:** mac+linux+windows.
 
+#### orchestration/lock
+
+##### orchestration/lock/001 — `scope_command_entry_lock` claims `Ctrl+E` only on an Orchestration tab in command mode.
+- **Layer:** L1 (pure function, `src/ui.rs`'s own `#[cfg(test)]` module — the scoping helper is module-private).
+- **Agent:** none.
+- **Asserts:** table-driven over the full cross product of `is_orchestration_tab` (true/false) × every `UiMode` variant × the action being `ToggleOrchestrationLock`, some other action (`Quit`), or `None`: the toggle survives ONLY at `(true, UiMode::Normal)`; every other action passes through untouched in EVERY cell (including `(false, non-Normal)`, ruling out a blanket "drop the action" implementation); `None` in always yields `None` out. The `UiMode` list is guarded by an exhaustive match so a new variant cannot silently drop out of the cross product.
+- **Does not assert:** anything about a real pane — this is a mechanism test, present so a later failure localises. The real-pane proof is `orchestration/lock/009`.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/002 — A freshly opened orchestration tab observes the deck-global command-entry lock LOCKED.
+- **Layer:** L1 (real `Action::SpawnPane` dispatched through `dispatch_action` against a capturing pane controller).
+- **Agent:** none (two-role `cat` stub orchestration config).
+- **Asserts:** after a real spawn, the active tab is a `Tab::Orchestration` and `ui.command_entry_locked` is `true`. Locked-by-default is load-bearing: a lock you must remember to engage protects nothing.
+- **Does not assert:** the gate's own behaviour (`orchestration/lock/006`/`008`); persistence across restarts (the lock is not persisted).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/003 — `Ctrl+e` resolves to the toggle from command mode and flips the deck-global lock both ways.
+- **Layer:** L1 (`key_action_for_mode`, the production `KeyEvent -> Action` seam, plus two real `dispatch_action` calls).
+- **Agent:** none.
+- **Asserts:** with the DEFAULT keybinding config, `Ctrl+e` in `UiMode::Normal` resolves to `Action::ToggleOrchestrationLock`; dispatching it once unlocks and twice re-locks `ui.command_entry_locked`.
+- **Does not assert:** the full `is_orchestration_tab × mode` matrix (that is `orchestration/lock/001`); a user-remapped chord.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/004 — Toggling the lock on ANY Orchestration tab changes what EVERY Orchestration tab observes, and a new tab adopts the current value.
+- **Layer:** L1 (two real orchestration tabs spawned through `dispatch_action`, plus real `switch_to` round-trips).
+- **Agent:** none.
+- **Asserts:** tab A starts locked and toggling on A unlocks; a brand-new tab B ADOPTS the unlocked value rather than resetting to locked; switching back to A observes the same unlocked value; toggling FROM B and returning to A shows A observing B's change. Pins that unlocking never has to be repeated per tab.
+- **Does not assert:** that the lock reaches beyond Orchestration tabs — deck-global storage moves where the value lives, not how far it reaches (`orchestration/lock/005`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/005 — Dashboard and Mode tabs are never gated, even while the deck-global lock is engaged.
+- **Layer:** L1 (`gate_pane_input_key` called directly against a real Dashboard tab and a real spawned Mode tab).
+- **Agent:** none.
+- **Asserts:** with `ui.command_entry_locked = true` (the strongest case) and an EMPTY status map (so the `WaitingForInput` carve-out cannot fire and the pass-through can only come from the tab-kind match), `Action::ForwardToPane` passes through UNCHANGED on both tab types. Guards the obvious mis-reading of deck-global storage as deck-global reach.
+- **Does not assert:** the Orchestration-tab gate itself (`orchestration/lock/006`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/006 — A locked non-orchestrator pane reporting `WaitingForInput` passes keystrokes through, and the gate re-engages the moment the status clears.
+- **Layer:** L1 (`gate_pane_input_key` against a real two-role orchestration and a focus-echoing pane controller).
+- **Agent:** none (synthetic `pane_id -> SessionStatus` maps).
+- **Asserts:** walking both edges on the SAME worker pane — no recorded status (dropped, the baseline) → `WaitingForInput` (passes through unchanged) → `Working` (dropped again, so the hole cannot outlive the status that opened it). Also that the orchestrator pane's own input is never gated whatever status is attached to it (proving the never-gated rule is not reordered behind the new check), and that an unlocked deck ignores `WaitingForInput` entirely.
+- **Does not assert:** that any particular agent actually emits `WaitingForInput` — that is the agent's contract, not this feature's. An agent that never reports it gets no carve-out and still needs a deliberate unlock.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/007 — An ambiguous pane status (two sessions sharing one `pane_id`) DENIES the carve-out — fail closed, not fail open.
+- **Layer:** L1 (`build_pane_status_for_gate` feeding the unchanged `gate_pane_input_key`, against a real locked orchestration with its worker focused).
+- **Agent:** none (two synthetic `AppState`s standing in for the daemon-observed collision).
+- **Asserts:** two sessions colliding on one `pane_id` and DISAGREEING on `WaitingForInput`-ness resolve to no exemption and the keystroke is dropped; a single, unambiguous `WaitingForInput` session still resolves to `WaitingForInput` and still passes the keystroke through — so failing closed cannot be bought by breaking the carve-out outright. The guard has to live in the producer: a `HashMap<&str, SessionStatus>` cannot represent the collision, so by the time the gate reads the map the ambiguity is already gone.
+- **Does not assert:** the collision semantics of `build_pane_status` itself, which is deliberately left as-is — its consumers are cosmetic, and only the lock's feed hardens. The rule here is "any duplicate", not "any disagreeing duplicate".
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/013 — A `WaitingForInput` written by a producer that named no generation does NOT open the lock (issue #398, PR #443 review).
+- **Layer:** L1 (in-process gate resolution against a real orchestration tab).
+- **Agent:** none (a synthetic single `WaitingForInput` session plus the pane's untagged-status mark).
+- **Asserts:** with exactly ONE unambiguous `WaitingForInput` session on the focused locked worker pane, `build_pane_status_for_gate` still omits the pane while its status provenance is untagged, and `gate_pane_input_key` drops the keystroke; clearing the mark — what an identified hook does — restores the carve-out and the keystroke passes through unchanged.
+- **Does not assert:** the duplicate-session denial, which is a separate rule (`orchestration/lock/007`); that untagged status is hidden from cards or borders (it deliberately still renders).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/008 — On a real locked orchestration tab the orchestrator's own input still reaches its PTY while a worker's does not, and `Ctrl+d`,`Ctrl+e` reverses that.
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness).
+- **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
+- **Asserts:** a sentinel typed into the focused orchestrator pane echoes on the grid even though the deck is LOCKED by default; after jumping to the non-orchestrator `worker` role, a second sentinel does NOT appear within 2s; after `Ctrl+d` → `Ctrl+e` → `Ctrl+d`, a third sentinel typed into the still-focused worker pane echoes normally.
+- **Does not assert:** what a real agent does with the forwarded bytes (`orchestration/lock/012`); the `WaitingForInput` carve-out (`orchestration/lock/011`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/009 — `Ctrl+e` reaches a focused role pane's PTY in `PaneInput`, is claimed by the deck in command mode, and toggles the lock there.
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness; rendered-grid observation).
+- **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
+- **Asserts:** with a partial line typed into the focused orchestrator pane, `Ctrl+e` makes a literal `^E` appear immediately after it — the tty line discipline's own caret echo (`ECHOCTL`), proving `0x05` genuinely reached the PTY rather than being claimed as `Action::ToggleOrchestrationLock`. Then `Ctrl+d` into command mode and `Ctrl+e` again: the deck reports `Pane entry: unlocked`, NO second `^E` joins the first (claimed there means not forwarded — the mirror of the first half), and jumping to the worker role with `2` lets a sentinel reach its PTY, proving the chord still toggles the lock from the mode it IS claimed in.
+- **Does not assert:** what a given program does with `0x05` once it arrives — that is the program's business. The oracle is deliberately the terminal's caret echo, not readline: an earlier revision drove a real `bash --noprofile --norc -i` role and asserted readline's `beginning-of-line`/`end-of-line` cursor moves, which fails outright wherever bash is built without readline (this repo's own devbox bash offers no `emacs` option, so `Ctrl+a` echoed `^A` and moved the cursor two columns the wrong way).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/010 — Global chords still fire while a worker pane is focused and the deck is locked.
+- **Layer:** L2 PTY-attached.
+- **Agent:** none (fixture `tests/fixtures/orch-deck`).
+- **Asserts:** with the non-orchestrator worker role focused and the deck LOCKED, `Ctrl+t` (`toggle_layout`) surfaces its `Layout:` status message — global chords resolve before the PTY-forward fallback the lock gates. Regression guard against an overly-broad gate.
+- **Does not assert:** the layout change itself (covered by the layout tests).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/011 — On a real locked pane, a reported `WaitingForInput` opens the gate and the status clearing closes it again.
+- **Layer:** L2 PTY-attached; the status is injected as a bare `AgentEvent` over the hook socket — the SAME wire the real `dot-agent-deck agent-event` CLI rides.
+- **Agent:** none, deliberately. A real agent would self-skip wherever credentials are absent, leaving this headline behaviour with ZERO automated CI coverage; the status arrives over the genuine production wire either way, and what a stand-in gives up is only proof that some particular agent emits that status.
+- **Asserts:** the baseline drop with no status recorded; then, after injecting `WaitingForInput` for the worker's real `(pane_id_env, agent_id)` pair, a keystroke reaches the worker's PTY and echoes; then, after injecting `Thinking`, a re-focused worker drops keystrokes again. The injector blocks on `ListAgents`' live-status join rather than the daemon's broadcast, so the daemon's own state — not just its wire — is known to reflect the change before focus/echo is asserted.
+- **Does not assert:** that any real agent emits `WaitingForInput`; the auto-focus steering that the same status also drives (`orchestration/focus/*`) — the worker is re-focused explicitly so this cannot ride that as a proxy.
+- **Platform coverage:** mac+linux (unix-only: the injector writes to a Unix-domain hook socket).
+
+##### orchestration/lock/012 — A REAL Claude agent never receives a directive typed at a locked worker pane, and does receive it once unlocked.
+- **Layer:** L2 PTY-attached, real-agent tier. Runtime-skipped when the `claude` CLI or credentials are absent.
+- **Agent:** REAL Claude Code (Haiku, `claude-haiku-4-5-20251001`, `--allowedTools Bash`) as the non-orchestrator `worker` role; the orchestrator stays `cat` (already proven never-gated) to keep the run to a single real agent turn. Fixture `tests/fixtures/orch-lock-live`.
+- **Asserts:** a create-a-sentinel-file directive typed into the locked worker pane never results in that file existing (20s); after `Ctrl+d` → `Ctrl+e` → `Ctrl+d`, a second directive with a DIFFERENT sentinel does result in its file being created (120s); and the first sentinel STILL does not exist afterwards, proving gated keystrokes are dropped outright rather than queued for delivery once unlocked. On-disk file presence is the observable, so the assertion survives LLM phrasing and terminal-redraw variance.
+- **Does not assert:** anything when skipped — where credentials are absent this test executes nothing, so `orchestration/lock/008`/`011` carry the CI-visible coverage.
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+
+##### orchestration/lock/014 — With the `experimental` flag OFF (the default), the command-entry lock surface is absent entirely.
+- **Layer:** L2 (PTY end-to-end).
+- **Agent:** none (`orch-deck` fixture, two stub `cat` roles). Deliberately launched WITHOUT `DOT_AGENT_DECK_EXPERIMENTAL`, unlike every other test in the file.
+- **Asserts:** on a real orchestration tab a keystroke typed at the focused non-orchestrator worker reaches its PTY with no unlock chord at all; the `Pane locked` message never appears; and `Ctrl+e` sent in command mode is not claimed, so no `Pane entry:` report is produced. This is the other side of the PRD #393 gate — a regression that shipped the lock unconditionally fails here rather than reaching every user silently.
+- **Does not assert:** the locked behaviour itself (`orchestration/lock/008`); that the focus steering is gated too (no automatic focus movement is asserted here).
+- **Platform coverage:** mac+linux.
+
+#### orchestration/focus
+
+##### orchestration/focus/001 — Auto-focus follows the lowest-order `WaitingForInput` role pane on the active tab, and never touches another tab.
+- **Layer:** L1 (`TabManager::auto_focus_waiting_pane` driven with synthetic `SessionStatus` maps; `src/tab.rs`).
+- **Agent:** none (three-role orchestration: `orchestrator` < `alpha` < `beta`).
+- **Asserts:** nothing waiting leaves manual focus alone; a newly-waiting pane steals focus; ties resolve to the LOWEST-order waiting pane, even stealing focus mid-input from a higher-order pane that is itself still waiting; an already-lowest focused pane is a no-op (no flicker); resolving the focused pane advances to the next-lowest still-waiting pane. A second orchestration tab then proves a background tab's newly-waiting pane has zero effect and never flips which tab is active.
+- **Does not assert:** the all-clear return move (`orchestration/focus/002`); ordering by wait time — ascending `role_pane_ids` order is the contract, and "longest blocked first" would need a new per-pane timestamp.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/002 — The all-clear move back to the orchestrator is edge-triggered, fires exactly once per waiting episode, and re-arms for the next.
+- **Layer:** L1 (the real per-frame sequence — `observe_waiting_panes`, then `auto_focus_waiting_pane` → `auto_focus_all_clear` — gated exactly as the `src/ui.rs` render-loop site gates it).
+- **Agent:** none.
+- **Asserts:** a manual focus is left alone while nothing is waiting; a newly-waiting pane steals focus; once it resolves, focus snaps back to the orchestrator role exactly ONCE — not on every subsequent frame, and not again for a later manual focus change until a NEW pane starts and resolves waiting. A level-triggered version would pin focus to the orchestrator every frame and the human could never look at another pane at all. A second (background) orchestration tab proves the move never touches an inactive tab or switches which tab is active.
+- **Does not assert:** the single-frame episode (`orchestration/focus/003`); the render-loop application of the returned id (`orchestration/focus/007`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/003 — A waiting episode observed in a SINGLE frame still edge-triggers the all-clear move.
+- **Layer:** L1 (the real per-frame sequence).
+- **Agent:** none.
+- **Asserts:** a role goes `WaitingForInput` on one frame and resolves by the next, with no intervening frame in which it is both still waiting and already focused. The first frame steers focus onto it — so `auto_focus_waiting_pane` WINS the chain and `auto_focus_all_clear` never runs on the only frame the episode is observed — and the second frame must still fire the all-clear. This is why the observation lives OUTSIDE the chain: recording the edge inside `auto_focus_all_clear` loses it entirely and strands focus on the resolved pane.
+- **Does not assert:** the multi-frame episode (`orchestration/focus/002`), which always has a still-waiting frame in between and is exactly where a dropped edge hides.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/004 — While LOCKED, focus visits every waiting role in ascending order and returns to the orchestrator on the all-clear.
+- **Layer:** L1 (the real per-frame sequence; four-role orchestration `orchestrator` < `alpha` < `beta` < `gamma`).
+- **Agent:** none.
+- **Asserts:** all three non-orchestrator roles go `WaitingForInput` together and focus lands on `alpha` first, advancing to `beta` then `gamma` as each resolves, then returning to the orchestrator once nothing is left waiting, with a further quiet frame moving nothing. Three concurrent waiters are needed: with fewer, "picked one" and "advanced through them in order" are indistinguishable.
+- **Does not assert:** the unlocked half (`orchestration/focus/005`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/005 — While UNLOCKED no auto-focus branch fires at all, and re-locking must not replay a stale all-clear edge.
+- **Layer:** L1 (the real per-frame sequence with the call site's `locked` gate modelled explicitly, plus `TabManager::clear_waiting_pane_latch`).
+- **Agent:** none.
+- **Asserts:** a waiting pane already in flight does not steal focus while unlocked, and its later resolution fires no all-clear either, so a manual focus choice survives the whole stretch untouched. Then THE STALE-LATCH ASSERTION: re-locking must NOT fire an all-clear for the episode the human already handled by hand — without the latch clearing, `observe_waiting_panes` compares its frozen `had_waiting_pane == true` against the now-idle status and misreads it as a fresh edge, yanking focus off where the human left it. Finally, re-locking resumes normal steering and all-clear pinning for a fresh episode.
+- **Does not assert:** an episode that both begins AND ends inside the unlocked stretch — that case is already safe with no fix (the chain is fully skipped, so nothing touches the latch), which is why this test is written against the STRADDLING trace instead. A test written against the simpler wording passes without the fix and proves nothing.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/006 — The locked→unlocked transition clears EVERY Orchestration tab's latch, not just the active one.
+- **Layer:** L1 (two orchestration tabs; the real per-frame sequence with the `locked` gate modelled).
+- **Agent:** none.
+- **Asserts:** tab A latches a waiting episode while active and locked; the user switches to tab B and unlocks, so the deck-global toggle's latch-clearing call fires with B active, not A; A's worker resolves unobserved; on re-lock and return to A, A's first locked frame must treat the resolved role as old news rather than a fresh edge, leaving focus where the user left it. This is `orchestration/focus/005`'s bug reappearing across tabs whenever the clearing is scoped to the active tab instead of the deck-global lock it compensates for.
+- **Does not assert:** the mechanism used to reach that outcome — only that every Orchestration tab's edge state is reset on the transition.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/007 — The whole lock-governed focus contract, on the real binary, as a user sees it.
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness), asserted purely on the rendered grid via the expanded-pane header `┌<role>`, which only the currently focused role ever draws.
+- **Agent:** none (fixture `tests/fixtures/orch-focus-lifecycle`: `orchestrator` + `alpha` + `beta`, all `printf`+`sleep` stubs). Three roles are required: the "manual focus sticks" half needs a role OTHER than the one going `WaitingForInput`, since where the focused and waiting role are the same pane a genuine stick is indistinguishable from `auto_focus_waiting_pane`'s own same-pane no-op. `WaitingForInput` is injected over the hook socket exactly as `orchestration/lock/011` does.
+- **Asserts:** (1) a freshly opened tab shows the orchestrator's expanded box — LOCKED by default; (2) injecting `WaitingForInput` for `alpha` visibly steers focus onto ITS box; (3) injecting `Thinking` visibly returns focus to the orchestrator — the all-clear edge; (4) `Ctrl+d`,`Ctrl+e` surfaces `Pane entry: unlocked`; (5) manually jumping to `beta` and then injecting a fresh `WaitingForInput`/`Thinking` pair for `alpha` moves focus NOWHERE — `beta`'s box survives both events, and a sentinel typed at the end appears inside `beta`'s own box, proving it still holds live PTY focus rather than merely still being drawn.
+- **Does not assert:** the `TabManager`-level contract in isolation (`orchestration/focus/001`-`006`); the keystroke gate (`orchestration/lock/*`).
+- **Platform coverage:** mac+linux (unix-only: the injector writes to a Unix-domain hook socket).
+
+##### orchestration/focus/008 — The waiting-focus branch defers a focus steal, rather than applying it immediately, while a keystroke is still queued for the currently-focused waiting pane.
+- **Layer:** L1 (in-process unit test; `src/tab.rs`, alongside `orchestration/focus/001`-`006`).
+- **Agent:** none (mock `PaneController`; synthetic `SessionStatus` map, no panes/PTYs).
+- **Asserts:** with a real `TabManager`-opened 3-role Orchestration tab (`orchestrator` < `alpha` < `beta`), `beta` (higher role order) goes `WaitingForInput` and steals focus with no input pending, as `orchestration/focus/001` pins; `alpha` (LOWER role order than `beta`) then ALSO goes `WaitingForInput` on a frame where `input_pending` is true (modeling a keystroke still queued for `beta`) — the steal to `alpha` must be deferred, returning `None` and leaving focus on `beta`, not yanked away from the pane the queued keystroke is aimed at; once `input_pending` clears on a later frame, the deferred steer to `alpha` must still fire, proving the guard DEFERS the move rather than dropping it, mirroring `TabManager::auto_focus_all_clear`'s existing "no one-shot latch" contract. Drives `TabManager::auto_focus_locked(pane_status, input_pending)`, the seam that folds both `auto_focus_waiting_pane` and `auto_focus_all_clear` behind ONE shared `input_pending` guard mirroring the real per-frame call site's shape.
+- **Does not assert:** the real `src/ui.rs` per-frame call site actually computing `input_pending` from `crossterm::event::poll` or applying the result via `pane.focus_pane` (out of L1 `TabManager` reach — it would need a PTY-attached L2 test, and an L2 test was evaluated and rejected: the underlying terminal race is not economically reproducible there, since it requires a keystroke to be sitting in the terminal's input queue on the exact frame a lower-order pane transitions to `WaitingForInput`); the deck-global lock gate itself (`ui.command_entry_locked`, covered by `orchestration/focus/005`/`006`); the multi-waiter ordering contract, covered exhaustively by `orchestration/focus/001`/`004`.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/009 — Turning the `experimental` flag OFF mid-session clears the waiting-episode latch, so re-enabling it replays no stale all-clear edge.
+- **Layer:** L1 (in-process unit test; `src/tab.rs`, alongside `orchestration/focus/001`-`006`/`008`).
+- **Agent:** none (mock `PaneController`; synthetic `SessionStatus` map, no panes/PTYs).
+- **Asserts:** with the flag on and the deck locked, `alpha` goes `WaitingForInput`, latching the episode and stealing focus; the flag then flips OFF (the watcher re-reads `.dot-agent-deck.toml` roughly every 2s, so this is reachable without a restart) and `alpha` resolves unobserved; on the first frame after the flag returns, no focus move may be produced. A latch left standing while the flag was off would read there as a stale `true` -> `false` all-clear and yank focus to the orchestrator for an episode already dealt with. Mirrors `orchestration/focus/006`, which pins the same contract for the `Ctrl+E` unlock — the flag is simply a second way to stop observing.
+- **Does not assert:** the real `src/ui.rs` per-frame call site (out of L1 `TabManager` reach, as `orchestration/focus/008` records); the gating of the keystroke path or the `Ctrl+E` binding (`orchestration/lock/014`).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/layout
 
 ##### orchestration/layout/001 — Seven decks fit the single-column orchestration card area without scrolling (PRD #147).
@@ -2106,6 +2363,63 @@ without depending on the config struct API.
 - **Asserts:** with no pane explicitly focused (so `stacked_expanded_index` falls back to the first role, `orchestrator`), the expanded role's OUTER rect height equals the full pane-column height with no rows ceded to collapsed frames; none of the other 6 roles' pane ids appear anywhere in the rendered grid (i.e. no `Borders::TOP` collapsed title block is drawn for a non-focused pane).
 - **Does not assert:** PTY resizing of the reclaimed area (`resize_panes_to_layout`); mode-tab side-pane geometry (covered by `tabs/mode/001`); the sidebar deck-card capacity math (covered by `orchestration/layout/001`).
 - **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/003 — `Ctrl+l` resolves to `Action::ToggleOrchestrationSplit`, and an orchestration tab's frame geometry is the default 34/66 split untoggled and the narrower-sidebar 25/75 split toggled (PRD #336).
+- **Layer:** L1 (pure-data `compute_frame_layout` geometry + `key_action_for_mode`, the public L1 seam over the same mode-aware resolver chain the event loop runs; no PTY, no TestBackend render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `compute_frame_layout` and `ActiveTabView` are module-private. Note the resolver is deliberately tab-agnostic — the orchestration-tab scoping is a separate step, covered by `orchestration/layout/005`.
+- **Agent:** none.
+- **Asserts:** resolving a simulated `Ctrl+l` `KeyEvent` through `key_action_for_mode` with the default keybinding config yields `Action::ToggleOrchestrationSplit` specifically (not merely "some action"); an untoggled orchestration tab's `dashboard_area`/`panes_area` widths are 34/66; a toggled one's are 25/75. The split travels on `ActiveTabView::Orchestration::split_narrow`, so the test sets it directly on the render snapshot with no shared state to seed or reset.
+- **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/orchestration/007`); the real dispatch and its global scope across tabs (covered by `orchestration/layout/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/004 — The orchestration split is GLOBAL: toggling one orchestration tab changes every other one too, including a tab opened later, which adopts the current global split instead of the 34/66 default (PRD #336).
+- **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
+- **Agent:** none (two `cat`-role orchestration tabs opened through `TabManager::open_orchestration_tab`).
+- **Asserts:** dispatching `Action::ToggleOrchestrationSplit` on the Dashboard tab is a no-op (it cannot mutate unrelated tab state); opening tab A alone starts at the default (`split_narrow == false`) and toggling it flips the flag to `true`; opening tab B AFTER that toggle shows B starting already narrow, not reset to the default; toggling from B (now active) flips BOTH tabs back to `false`; switching back to A and toggling again flips both to `true`. This is PRD #336's revised "toggling one tab changes all of them, and a new tab adopts the live global value" criterion, asserted on the real field.
+- **Does not assert:** the resulting rendered geometry (covered by `orchestration/layout/003`); spawn-time PTY dims (covered by `orchestration/layout/006`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/005 — `scope_orchestration_split` claims the split toggle only on an orchestration tab in command mode, un-resolving it everywhere else so `Ctrl+l` reaches the pane's PTY, and passes every other action through untouched (PRD #336).
+- **Layer:** L1 (pure function, no PTY, no render).
+- **Agent:** none.
+- **Asserts:** `Some(ToggleOrchestrationSplit)` survives only for (orchestration tab, `UiMode::Normal`); it becomes `None` off an orchestration tab in any mode, and on an orchestration tab in `PaneInput`/`Filter`/`Help`/`NewPaneForm` (so the key falls through to the `PaneInput` forwarding path). The mode half mirrors `close_pane` (PRD #241 M1), which is command-mode only so `Ctrl+w` still reaches the PTY as word-delete. `ToggleLayout`, `DetachToNormal` and `None` pass through unchanged for every tab/mode pair, proving the guard is surgical rather than a general-purpose filter.
+- **Does not assert:** that the event loop actually calls it (covered end-to-end by `tabs/orchestration/008`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/006 — A role pane spawned while the GLOBAL orchestration split is already narrow gets its PTY sized at the 75%-width column, not the 66%-width default (PRD #336, PR #342).
+- **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController` extended to record each spawn's `(rows, cols)`; no PTY, no TestBackend render).
+- **Agent:** none (two 2-role `cat` orchestration tabs opened through the real `Action::SpawnPane` dispatch path).
+- **Asserts:** open tab A through `Action::SpawnPane` at the default split; toggle the GLOBAL split narrow via `Action::ToggleOrchestrationSplit` dispatched from tab A (the only way a real user reaches the narrow state, since the toggle only resolves on an active orchestration tab); then open tab B, also through `Action::SpawnPane`, while the global is already narrow. Every role pane spawned for tab B must be recorded with `cols == 73` (the 75%-width inner column on a 100-wide frame), not `64` (the 66%-width default) — the `dispatch_action` new-tab-open branch must read `tab_manager.orchestration_split_narrow()` rather than a hardcoded `false` when computing `spawn_dims`. This is the spawn-time-dims gap `orchestration/layout/004` explicitly left uncovered. Verified with teeth: reverting the seed to a hardcoded `false` at the call site reproduces the pre-fix bug and fails this test with `left: 64, right: 73`.
+- **Does not assert:** the restore/hydrate call site in `run_tui`'s `apply_snapshot` branch, which reads the same `tab_manager.orchestration_split_narrow()` at its own spawn-dims call — not reachable at L1 (embedded in `run_tui`, which needs a real `Terminal` and a disk-loaded `SavedSession`, with no factored-out testable seam) and, per the current call graph, not distinguishable at ANY layer today: that branch runs exactly once, before the event loop starts, when `TabManager`'s global is still at its just-constructed default (`false`) — so `tab_manager.orchestration_split_narrow()` and the old hardcoded `false` currently always agree there, and no test could show them diverging without also changing when restore can run.
+- **Platform coverage:** mac+linux+windows.
+
+#### orchestration/dispatch
+
+##### orchestration/dispatch/001 — An agent-callable `dispatch --orchestration <name>` makes a full orchestration TAB surface live on the deck, with the dispatched worktree and the orchestrator's delegation context on disk (PRD #220 / #222).
+- **Layer:** L2 PTY-attached (`TuiDeck` on the `orch-deck` fixture) driving the REAL `dot-agent-deck dispatch` CLI against the deck's own hook socket, exactly as an agent in a pane does — so the CLI parse, the wire hop, the daemon's shape resolution, the role spawn and the live tab surfacing are all in the path.
+- **Agent:** none — the fixture's two roles run `cat`, which stays alive on stdin. No LLM tokens.
+- **Asserts:** the CLI exits 0; the orchestration TAB labelled `demo-orch` appears on the tab strip within 90s WITHOUT a reconnect; the sibling worktree `../<repo>-dispatch-<name>` exists; and `.dot-agent-deck/orchestrator-context.md` inside it carries the delegation protocol plus the caller's task under `## Your task`.
+- **Why it exists:** three PRD #220 defects shipped green because the only dispatch coverage asserted a file on disk or the worktree's existence — never the tab the user actually looks at. A dispatched orchestration that comes up with no tab, or with an orchestrator that was never told it is one, passes every other assertion in this suite (the `reproduce-first` skill / CONTRIBUTING's "Reported bugs start with a failing test").
+- **Does not assert:** the roles' own output or a real delegation round-trip (`cat` cannot delegate); the return edge.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/dispatch/002 — A dispatched orchestration whose roles are REAL agents brings every role in the toml up as a live agent, and names each one on its own card (PRD #220).
+- **Layer:** L2 PTY-attached (`TuiDeck` on the `dispatch-orch-real` fixture) driving the REAL `dot-agent-deck dispatch <name> --orchestration real-team` CLI against the deck's own hook socket, then reading both the daemon's `ListAgents` and the rendered orchestration tab.
+- **Agent:** THREE real, fully interactive Claude Code panes pinned to Haiku (`orchestrator`, `coder`, `reviewer`) — no `-p`, no `cat` stand-in. Cost is three cold boots plus one trivial orchestrator turn.
+- **Asserts:** the CLI exits 0; a pane exists for every toml role; every role's own PTY shows a REAL agent booted (the Claude Code banner, which no shell or `cat` can print); and on the dispatched orchestration's TAB every role appears on a card as `<AgentType> · <role>`, so the user can tell the orchestrator from a worker.
+- **Why it exists:** `orchestration/dispatch/001`'s `cat` roles start instantly, need no credentials and have no cold start, so they cannot tell an agent from a `$SHELL` — which is how three PRD #220 defects shipped green. This test found a fourth: a dispatched orchestration labelled every card with claude's session UUID (`ClaudeCode · 6134822e-f2`) while the daemon knew all three role names, because only the interactive `Ctrl+n` path set a per-role display name. Fixed by naming the role on the spawn AND emitting the per-role synthetic `SessionStart` that carries the name to an already-attached TUI.
+- **Does not assert:** `AgentRecord.live` — deliberately. It is `Some(Idle)` for every role within ~1.5s of the dispatch, before a byte reaches any of those PTYs (measured), so it is a pane-level fact and an assertion on it is vacuous. Also not asserted: a delegation round-trip (`orchestration/route/001` owns that), or the return edge.
+- **Platform coverage:** mac+linux.
+
+#### dispatch/close
+
+##### dispatch/close/001 — A dispatched single-agent card closes on the FIRST confirmed Ctrl+W, instead of surviving until the user closes it a second time (PRD #220 follow-up).
+- **Layer:** L2 PTY-attached (`TuiDeck` on the `minimal` fixture) driving the REAL `dot-agent-deck dispatch --single` CLI, then closing the resulting card through the production Ctrl+W → confirm path.
+- **Agent:** a REAL interactive Claude Code (Haiku) as the dispatched unit, launched through a **wrapper script** (`default_command = "agent-wrapper"`), never prompted — it only has to be running when the close lands, so the cost is one cold boot and no turns. The caller pane is `cat`; it is the caller, not the thing under test. The wrapper is load-bearing, not convenience: it mirrors the reported config, where every command is `devbox run agent-<role>`, which the deck cannot infer an agent type from and therefore does not wrap. A bare `claude` IS recognised and takes a different path through the session machinery — which is exactly why an earlier `cat`-based version of this test passed while the reported bug was live.
+- **Stand-in, named:** a PATH `git` stub that sleeps on `status --porcelain` (and ONLY on that — the dispatch's own `git worktree add` runs at full speed). It supplies the one property of a real dispatched worktree a fixture cannot cheaply have: an agent has been working in it, so the status walk takes seconds, not milliseconds.
+- **Asserts:** the dispatched agent really starts (its own PTY prints the Claude Code banner — NOT the card's `ClaudeCode` badge, which is inferred from the command at spawn and is on the card before the agent has executed anything); the CALLER card (which owns no worktree) closes on its first confirm — the control, so a later failure is attributable to the dispatched card specifically; then, after ONE confirmed close, NO card for the dispatched worktree remains. Matched on the worktree basename from the card's `Dir:` line rather than on its title, because the ghost card is titled `pane-sched-…` and a name-bound needle misses it.
+- **Why it exists:** a user reported closing a dispatched agent leaving its card behind. It reproduced THREE independent defects, and the failure message distinguishes the first two by whether the daemon still holds the agent: (a) a daemon-spawned card has no local pane until focused, so `close_pane` returned `Pane <id> not found`, the PRD #92 F4 policy preserved the card, and the agent kept running; (b) with that fixed, the daemon still awaited the worktree cleanup before answering, blowing the TUI's 5s `CTRL_W_STOP_TIMEOUT`; (c) with BOTH fixed and a real agent behind a non-inferable command, the close removed only the session its card was built from and left the pane's *other* session rendering as a ghost card badged `No agent` — the symptom as reported. Reverting any one fix alone turns this test red (verified).
+- **Does not assert:** the worktree's own removal (`KeepIfDirty` leaves a dirty one in place by design); the orchestration close path, where the last role's close is the cleanup trigger.
+- **Platform coverage:** mac+linux.
 
 #### orchestration/route
 
@@ -2814,11 +3128,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### theme/guard
 
-##### theme/guard/001 — No absolute background on any cheaply-seamable surface; command-mode selection is cued by the Magenta+BOLD border, not an absolute fill.
+##### theme/guard/001 — No absolute background on any cheaply-seamable surface; command-mode selection is cued by the terminal's own foreground plus a thickened border, not an absolute fill.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none.
-- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states **in command mode** (`UiMode::Normal`), (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card is distinguished from the unselected one by a terminal-relative cue (the `▸ ` title prefix and a `Color::Magenta`+BOLD border — the dedicated PRD #155 `selected` accent role, which never reuses a status color or the `focused` cyan) rather than an absolute `selected_bg` fill.
-- **Does not assert:** named-ANSI accents/status colors; the `render_frame` canvas/tab-bar fills (not cheaply reachable through a render seam — guarded by `theme/guard/002`); the PaneInput de-emphasis of the same accent (PRD #341 M4 — covered by `mode/deck/001`).
+- **Asserts:** rendering the five overlay seams plus a session card in both the unselected and selected states **in command mode** (`UiMode::Normal`), (a) no cell carries a `Color::Rgb(..)` background — backgrounds must be `Color::Reset`; and (b) the selected card is distinguished from the unselected one by terminal-relative cues — the `▸ ` title prefix, a border in the terminal's own foreground (`Color::Reset`), and a thickened `┃` glyph where the unselected card draws `│` — rather than an absolute `selected_bg` fill, and that the selected border is never `DIM` (issue #442).
+- **Does not assert:** named-ANSI accents/status colors; the `render_frame` canvas/tab-bar fills (not cheaply reachable through a render seam — guarded by `theme/guard/002`); the per-mode emphasis of the selection (covered by `mode/deck/001`); the all-statuses sweep proving a selected border never inherits a low-contrast status colour (covered by `theme/palette/006`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/guard/002 — `src/ui.rs` carries no forbidden absolute-background patterns (source lint).
@@ -2840,8 +3154,8 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### theme/palette/001 — Deck-card border encodes status via the centralized palette roles.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none (six live session fixtures, one per status).
-- **Asserts:** rendering a deck card (not selected, not focused) for each agent status resolves its border to the matching centralized status role — working=`Color::Green`, thinking=`Color::Blue`, compacting=`Color::Blue` (shares the thinking role), waiting=`Color::Yellow`, error=`Color::Red`, idle=`Color::DarkGray`; and that no status border reuses an accent role (`Color::Magenta`=selected, `Color::Cyan`=focused), so a status never collides with selection/focus.
-- **Does not assert:** the per-card status badge text/glyph; selection/focus accents (covered by `theme/palette/003-004`); the palette module's internal API (reads the rendered border color).
+- **Asserts:** rendering a deck card (not selected, not focused) for each agent status resolves its border to the matching centralized status role — working=`Color::Green`, thinking=`Color::Blue`, compacting=`Color::Blue` (shares the thinking role), waiting=`Color::Yellow`, error=`Color::Red`, idle=`Color::DarkGray`; and that no status border reuses the `focused` accent (`Color::Cyan`) or the retired `selected` accent (`Color::Magenta`), so a status never collides with focus.
+- **Does not assert:** the per-card status badge text/glyph; the selection glyph and the focus accent (covered by `theme/palette/003-004`, `theme/palette/006`); the palette module's internal API (reads the rendered border color).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/palette/002 — Embedded-pane border uses the SAME status color the deck card uses (deck/pane consistency).
@@ -2851,17 +3165,17 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** pane content/title rendering; the focused/selected pane accents (covered by `theme/palette/004` / `theme/guard/001`).
 - **Platform coverage:** mac+linux+windows.
 
-##### theme/palette/003 — Selected deck-card border in command mode is the dedicated `selected` accent (Magenta+BOLD+marker), never a status/focus color.
+##### theme/palette/003 — Selected deck-card border in command mode is the terminal's own foreground, with a thick glyph + BOLD + marker.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none (one selected live session fixture).
-- **Asserts:** rendering a selected deck card **in command mode** (`UiMode::Normal`) resolves its border to `Color::Magenta` + `Modifier::BOLD` with a `▸ ` title marker, and that this color is neither the working-status green nor the focused-pane cyan — the `selected` role never collides with the status palette or the `focused` accent.
-- **Does not assert:** the status badge (still shows status independent of selection); the absolute-background guard (covered by `theme/guard/001`); the de-emphasised PaneInput strength of the same accent (PRD #341 M4 — covered by `mode/deck/001`).
+- **Asserts:** rendering a selected deck card for a Working agent **in command mode** (`UiMode::Normal`) resolves its border to `palette::SELECTED` (`Color::Reset`, the terminal's own foreground) — explicitly NOT the working-status `Color::Green`, the retired Magenta accent, or the focused-pane Cyan — carried together with a thick `┃` glyph, `Modifier::BOLD` and a `▸ ` title marker, and with no `Modifier::DIM` (issue #442).
+- **Does not assert:** the status badge (still shows status independent of selection); the absolute-background guard (covered by `theme/guard/001`); the PaneInput emphasis of the same selection (covered by `mode/deck/001`); the all-statuses/both-modes sweep (covered by `theme/palette/006`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### theme/palette/004 — Focused-pane border is the dedicated `focused` accent (Cyan), distinct from every status and from `selected`.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
 - **Agent:** none (one focused `TerminalWidget`).
-- **Asserts:** rendering a focused embedded pane resolves its border to `Color::Cyan`, and that this color is distinct from every status role (green/blue/yellow/red/dark-gray) and from the `selected` accent (magenta) — focus stays Cyan while selection moves to Magenta, so status/selection/focus are provably distinct (PRD #155 success criterion #3). Also asserts the PRECEDENCE invariant: a pane that is focused AND carries a present `Working` status still renders the focused accent (Cyan), never the Working/Green status color — focus OVERRIDES a present status in the unified border precedence (Option A).
+- **Asserts:** rendering a focused embedded pane resolves its border to `Color::Cyan`, and that this color is distinct from every status role (green/blue/yellow/red/dark-gray) and from the retired Magenta accent — focus keeps the only accent HUE while deck selection uses the terminal's own foreground plus thickness, so status/selection/focus stay provably distinct (PRD #155 success criterion #3, issue #442). Also asserts the PRECEDENCE invariant: a pane that is focused AND carries a present `Working` status still renders the focused accent (Cyan), never the Working/Green status color — focus OVERRIDES a present status in the unified border precedence (Option A).
 - **Does not assert:** unfocused-pane status coloring (covered by `theme/palette/002`); pane content rendering; the command-mode half of the focus precedence (covered by `theme/palette/005`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -2870,6 +3184,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (one `TerminalWidget` rendered twice, live vs. command mode).
 - **Asserts:** rendering the SAME focused pane with `input_active=true` (`UiMode::PaneInput`) vs. `input_active=false` (command mode) produces visually distinguishable borders — live resolves to `Color::Cyan` on a thin `│` (`BorderType::Plain`) border, command mode falls through to the agent's status role (`Working`=`Color::Green`) on a thick `┃` (`BorderType::Thick`) border — and that the two colors differ, so colour encodes whether keystrokes reach the pane while thickness still encodes which pane is focused. Also asserts an UNFOCUSED pane keeps the thin border in BOTH modes, so thickness stays exclusive to the focused pane.
 - **Does not assert:** that the inner area / PTY size is unaffected by the border weight (`BorderType` never feeds `Block::inner`, and the PRD #84 invariant-3 contract assert covers a regression there); the bottom-bar and hint-string mode cues (covered by the PRD #241 M4 button-bar specs); the status-less focused pane's dim fallback.
+- **Platform coverage:** mac+linux+windows.
+
+##### theme/palette/006 — A selected deck card is visible at every status: terminal-foreground border, thickened glyph, never dimmed.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, color-aware capture).
+- **Agent:** none (one live session fixture per status, rendered selected and unselected in both modes).
+- **Asserts:** for every agent status and in BOTH `UiMode::Normal` and `UiMode::PaneInput`, a SELECTED card's border resolves to `palette::SELECTED` (`Color::Reset`) and never to that status's role colour, thickens its glyph from `│` to `┃`, and never carries `Modifier::DIM`. The CONTROL in the same loop is that the UNSELECTED card is untouched — still its status role, still `│` — so an idle agent keeps receding. Guards issue #442 in both of its reported forms: selection dimmed into the `palette::STATUS_IDLE` band (the original report), and a selected idle card inheriting DarkGray so that thickening its border changed nothing (the follow-up).
+- **Does not assert:** the `▸ ` title marker (covered by `theme/palette/003` / `theme/guard/001`); the BOLD-vs-plain mode emphasis (covered by `mode/deck/001`); embedded-pane borders (covered by `theme/palette/002`, `004`, `005`).
 - **Platform coverage:** mac+linux+windows.
 
 
@@ -2953,11 +3274,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### mode/deck
 
-##### mode/deck/001 — The selected deck-card accent is full-strength only in command mode.
+##### mode/deck/001 — The selected deck-card emphasis is full-strength only in command mode, and is never dimmed.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, colour-and-modifier-aware card capture through the production renderer).
 - **Agent:** none (one synthetic selected Working session rendered in both modes).
-- **Asserts:** command mode remains byte-identical to the legacy selected-card rendering and carries Magenta+BOLD+`▸ `; PaneInput keeps `▸ ` but has a different, de-emphasised border style where BOLD is absent and/or DIM is present; neither rendering contains `Color::Rgb`; the snapshot pins both styled cards.
-- **Does not assert:** unselected-card styling; focused terminal-pane styling; a single mandated de-emphasis recipe beyond the property that it drops BOLD and/or adds DIM.
+- **Asserts:** command mode remains byte-identical to the legacy selected-card seam and carries `palette::SELECTED` (`Color::Reset`) on a thick `┃` border with BOLD and `▸ `; PaneInput keeps the same colour, the same thick glyph and `▸ ` but drops BOLD; NEITHER mode carries `Modifier::DIM`, since dimming the selection is what made it read as an idle card (issue #442); neither rendering contains `Color::Rgb`; the snapshot pins both styled cards.
+- **Does not assert:** unselected-card styling (covered by `theme/palette/006`); focused terminal-pane styling; statuses other than `Working`.
 - **Platform coverage:** mac+linux+windows.
 
 #### mode/scroll
@@ -3177,7 +3498,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** L2 PTY (the real `dot-agent-deck` binary in an isolated PTY via the `TuiDeck` harness, asserted on the rendered vt100 grid — same harness as `scheduler/dispatch/011`). REAL seams, no stand-ins: REAL `gh` on the normal PATH (no `gh` stub) really enumerates/PR-checks/clones against live GitHub, with `GITHUB_TOKEN` threaded through the scrubbed deck env so the daemon's `gh` inherits auth; the clone's `[[orchestrations]]` resolves to two FULLY INTERACTIVE `claude` role panes pinned to Haiku (`claude-haiku-4-5-20251001`, `--allowedTools Bash`, no `-p`); the freshly-built `dot-agent-deck` binary's dir is prepended to the deck→daemon→agents PATH (`with_env("PATH", …)` wins over the harness scrub) so the orchestrator's `dot-agent-deck delegate --to worker` resolves. The dispatch behavior is ungated, so the env carries no `DOT_AGENT_DECK_EXPERIMENTAL`; the fire is driven by `RunNow` over the attach socket.
 - **Fixture:** the permanent public repo `vfarcic/dot-agent-deck-tests` — a committed `DISPATCH_E2E_SENTINEL.md`, a `.dot-agent-deck.toml` with `[[orchestrations]] name = "issue-work"` (roles `orchestrator` (start) + `worker`, both Haiku `claude`; the orchestrator's `prompt_template` delegates the task to the worker), and a PERMANENT open issue #1 labelled `agent-dispatch-test`. The schedule filters on that label with `max_per_run = 1`, so ONLY issue #1 is enumerated (deterministic). Both role panes share the per-issue worktree cwd (pre-trusted in the per-test HOME so claude's first-run gates clear with no keystroke). Clone + worktree live under a `tempfile::tempdir()` removed on drop.
 - **Agent:** REAL Claude Code (Haiku) ×2 role panes, cheap interactive turns (<$0.05/run). Flaky-tolerant pre-PR tier (real LLM + real network) — run once, not looped (rule 4). Runtime-skipped (Decision 26) when the `claude` CLI/credentials or `GITHUB_TOKEN` are absent.
-- **Asserts:** after the fire the daemon registers the dispatched orchestration's role agents under the schedule name `github-issues` (precondition — proves the live clone + worktree + spawn happened); the dispatched ORCHESTRATION then surfaces LIVE as an orchestration TAB labelled `issue-work` (the fixture's `[[orchestrations]] name`) in the attached TUI's tab strip, with no reconnect/relaunch — RED today, because `spawn::spawn`'s orchestration branch does not call `surface_spawned_pane` and orchestration tabs are rebuilt only at hydration, so the role panes appear only as flat dashboard cards and no `issue-work` tab paints live. Best-effort (once GREEN, logged not gated): switching to the orchestration tab, the worker (delegated to by the orchestrator) lists the cloned repo's files including the committed sentinel `DISPATCH_E2E_SENTINEL.md`; and the fixture repo has no pushed `agent/issue-1` branch afterward (NO REMOTE WRITES).
+- **Asserts:** after the fire the daemon registers BOTH of the dispatched orchestration's role agents, each under its own ROLE NAME — `orchestrator` and `worker` (precondition — proves the live clone + worktree + spawn happened). Until `orchestration/dispatch/002` this looked for the shared schedule name `github-issues` on a role pane, which is what a dispatched role's `display_name` used to be; role panes now carry their role name (matching the interactive `Ctrl+n` path), and requiring both names is strictly stronger — one shared name could be satisfied by a single spawned pane. The dispatched ORCHESTRATION then surfaces LIVE as an orchestration TAB labelled `issue-work` (the fixture's `[[orchestrations]] name`) in the attached TUI's tab strip, with no reconnect/relaunch — RED today, because `spawn::spawn`'s orchestration branch does not call `surface_spawned_pane` and orchestration tabs are rebuilt only at hydration, so the role panes appear only as flat dashboard cards and no `issue-work` tab paints live. Best-effort (once GREEN, logged not gated): switching to the orchestration tab, the worker (delegated to by the orchestrator) lists the cloned repo's files including the committed sentinel `DISPATCH_E2E_SENTINEL.md`; and the fixture repo has no pushed `agent/issue-1` branch afterward (NO REMOTE WRITES).
 - **Does not assert:** the delegation chain / sentinel as a hard gate (logged best-effort — too LLM/timing-dependent); exact agent phrasing; the clone/worktree/branch derivation or skip/dedup/cap/cleanup logic (covered by the headless `scheduler/dispatch/001-009` and the deterministic-stub `scheduler/dispatch/011-012`); the single-agent live-surfacing path (covered by `scheduler/dispatch/011`).
 - **Platform coverage:** mac+linux.
 

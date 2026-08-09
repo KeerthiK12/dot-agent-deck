@@ -118,7 +118,7 @@ pub struct AttachResponse {
 - `dot-agent-deck daemon stop` on a daemon with a live managed agent refuses with a clear message and exits non-zero. `--force` bypasses the guard. Verified by integration test.
 - `probe_remote_protocol` reports a build-version mismatch when the remote's `daemon hello` carries a different `build_version`, and the error points at `remote upgrade`, not `daemon stop`. Verified by a fake-ssh-executor test in the existing `connect.rs` suite.
 - Documentation explains the upgrade flow ("after upgrading, run `daemon stop` if a previous daemon is still running") and the new commands. A user following only the docs can recover from the original bug.
-- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` pass. `cargo test` passes.
+- `cargo fmt --check` and `cargo clippy --all-targets --features e2e -- -D warnings` pass. `cargo test` passes.
 - Manual smoke: upgrade the binary while a daemon is running, launch the TUI, observe the mismatch error; run `daemon stop`; relaunch the TUI; observe normal startup.
 
 ## Milestones

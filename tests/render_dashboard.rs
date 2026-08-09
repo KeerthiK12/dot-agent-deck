@@ -57,9 +57,22 @@ fn pane_004_card_title_row() {
     // doesn't need its own fn — keeping the test body
     // self-contained also reads as cleaner generated `.md` Steps).
     //
-    // Both timestamps use one current instant so the fixture starts with a
+    // Both timestamps derive from one current instant so the fixture keeps a
     // compact `0s` elapsed value; a fixed calendar instant previously drifted
     // into a large hour count as the test aged (M3 fix).
+    //
+    // `last_activity` is nudged 30s into the *future* of that instant rather
+    // than left equal to it (issue #350). The bottom border's `Last:` field is
+    // computed by `format_elapsed` (src/ui.rs) from `Utc::now()` at *render*
+    // time, not at fixture-build time, so `last_activity == now` put the
+    // rendered value exactly on the `0s`/`1s` boundary — any scheduling delay
+    // between building the fixture and rendering (routine under parallel test
+    // load) tipped this snapshot to `Last: 1s`. A *past* offset would only
+    // shrink the margin further; nudging forward instead relies on
+    // `format_elapsed`'s existing clamp of a negative delta to zero
+    // (`delta.num_seconds().max(0)`), so the value holds at `0s` for any
+    // render within 30s. No production change is needed — the clamp already
+    // handles this shape of input, and the committed snapshot is unchanged.
     let now = chrono::Utc::now();
     let session = SessionState {
         session_id: "sess-abc123".to_string(),
@@ -71,7 +84,7 @@ fn pane_004_card_title_row() {
             detail: Some("src/main.rs".to_string()),
         }),
         started_at: now,
-        last_activity: now,
+        last_activity: now + chrono::Duration::seconds(30),
         recent_events: VecDeque::new(),
         tool_count: 7,
         last_user_prompt: Some("fix the login bug".to_string()),
@@ -551,14 +564,13 @@ fn contrast_001_overlays_reference_frame() {
 /// the keyboard drives the deck), then assert two terminal-relative
 /// properties. (a) NO rendered cell across any surface has a `Color::Rgb(..)`
 /// background — backgrounds must be `Color::Reset` so the terminal's own
-/// background shows through. (b) Selection is cued the PRD #155 Option-A way —
-/// a `▸ ` title prefix plus a `Color::Magenta` + `Modifier::BOLD` border — NOT
-/// an absolute background tint, and Magenta is the dedicated `selected` accent
-/// role so it never collides with a status color (green/blue/yellow/red) or the
-/// `focused` cyan: the selected card's border style must differ from the
-/// unselected card's and be magenta-bold. A regression that filled any surface
-/// with an absolute background, or that reverted the selection border to a
-/// status/focus color, would fail one of these assertions.
+/// background shows through. (b) Selection is cued by a `▸ ` title prefix, a
+/// border in the terminal's own foreground (`Color::Reset`), and a THICKER glyph
+/// (`┃` where an unselected card draws `│`) — never an absolute background tint
+/// and never a DIM. A regression that filled any surface with an absolute
+/// background, or that let the selected border fall back to a fixed White/Black
+/// or a low-contrast status colour, would fail one of these assertions (issue
+/// #442).
 #[spec("theme/guard/001")]
 #[test]
 fn guard_001_no_absolute_backgrounds() {
@@ -579,35 +591,41 @@ fn guard_001_no_absolute_backgrounds() {
         );
     }
 
-    // (b) PRD #155 Option A: selection is signalled by a `▸ ` title prefix and a
-    //     Magenta+BOLD border — a terminal-relative cue, NOT an absolute
-    //     background. Read the left-border cell (`│`, at a mid-height row) of
-    //     each card: the selected one must DIFFER from the unselected one and
-    //     be Color::Magenta + Modifier::BOLD. Magenta is the dedicated
-    //     `selected` accent role; it deliberately does not reuse the working
-    //     status green or the focused-pane cyan. (The unselected placeholder
-    //     border is a dimmed terminal foreground.) PRD #341 M4: BOLD is the
-    //     command-mode strength — `mode/deck/001` owns the PaneInput recipe.
-    let border_style = |buf: &ratatui::buffer::Buffer| {
+    // (b) Selection is signalled by a `▸ ` title prefix, the terminal's own
+    //     foreground on the border, and a THICKER glyph — all terminal-relative
+    //     cues, NOT an absolute background fill. Read the left-border cell (at a
+    //     mid-height row) of each card: the selected one must DIFFER from the
+    //     unselected one, must be `Color::Reset` (which contrasts on any theme,
+    //     unlike a fixed White/Black or a low-contrast status colour), must not
+    //     be DIM, and must thicken. Issue #442; `mode/deck/001` owns the
+    //     command-vs-PaneInput emphasis recipe.
+    let border_cell = |buf: &ratatui::buffer::Buffer| {
         let y = buf.area().height / 2;
         let cell = &buf[(0, y)];
-        (cell.fg, cell.modifier)
+        (cell.fg, cell.modifier, cell.symbol().to_string())
     };
-    let (unsel_fg, unsel_mod) = border_style(&unselected);
-    let (sel_fg, sel_mod) = border_style(&selected);
+    let (unsel_fg, unsel_mod, unsel_sym) = border_cell(&unselected);
+    let (sel_fg, sel_mod, sel_sym) = border_cell(&selected);
     assert_ne!(
-        (sel_fg, sel_mod),
-        (unsel_fg, unsel_mod),
+        (sel_fg, sel_mod, sel_sym.clone()),
+        (unsel_fg, unsel_mod, unsel_sym.clone()),
         "selected card border must differ from the unselected card border"
     );
     assert_eq!(
         sel_fg,
-        Color::Magenta,
-        "selected card border must use the `selected` role (Color::Magenta), not a status/focus color (Option-A selection cue)"
+        Color::Reset,
+        "the selected card's border must be the terminal's own foreground, so it \
+         contrasts on light and dark alike — not an absolute tint, not a \
+         low-contrast status colour (issue #442), got {sel_fg:?}"
     );
     assert!(
-        sel_mod.contains(Modifier::BOLD),
-        "selected card border must be BOLD (Option-A selection cue)"
+        !sel_mod.contains(Modifier::DIM),
+        "the selected card's border must not be DIM, got {sel_mod:?}"
+    );
+    assert_eq!(
+        (unsel_sym.as_str(), sel_sym.as_str()),
+        ("│", "┃"),
+        "selection must also thicken the border: unselected `│`, selected `┃`"
     );
 
     // The `▸ ` selection prefix appears only on the selected card's title row.
@@ -728,6 +746,17 @@ fn pane_007_pi_card_shows_pi_identity() {
 #[spec("dashboard/pane/008")]
 #[test]
 fn pane_008_codex_card_shows_colored_identity_badge() {
+    // `last_activity` is nudged 30s into the future of `now` (issue #350). This
+    // fixture feeds *both* snapshots below — the immediate one, and
+    // `pane_008_named_agent_badges` via `session.clone()` in the loop further
+    // down — so by the time the second one renders, real wall-clock time has
+    // already been spent on the first snapshot's assertions and comparisons.
+    // `format_elapsed` (src/ui.rs) reads `Utc::now()` at render time, so
+    // `last_activity == now` raced the `0s`/`1s` boundary, and the widened
+    // window is why the *second* snapshot is the one that flaked first. The
+    // forward nudge relies on `format_elapsed`'s existing clamp of a negative
+    // delta to zero (`delta.num_seconds().max(0)`): both renders stay at `0s`
+    // for 30s. Committed snapshots are unchanged.
     let now = chrono::Utc::now();
     let session = SessionState {
         session_id: "wrapped-01".to_string(),
@@ -736,7 +765,7 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         status: SessionStatus::Thinking,
         active_tool: None,
         started_at: now,
-        last_activity: now,
+        last_activity: now + chrono::Duration::seconds(30),
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: Some("inspect the repository".to_string()),
@@ -1151,15 +1180,16 @@ fn palette_002_pane_border_matches_deck_status_color() {
 }
 
 /// Scenario: Render a SELECTED deck card in **command mode** (`UiMode::Normal`)
-/// and assert its border is the dedicated `selected` accent role —
-/// Color::Magenta + Modifier::BOLD — plus the `▸ ` title marker, and that this
-/// color is NOT a status color (≠ green) and NOT the focused accent (≠ cyan).
-/// This pins the Option-A rule that selection is conveyed by a non-status accent
-/// that never collides with the palette, at the full strength command mode gets
-/// (PRD #341 M4 de-emphasises the same accent in PaneInput — `mode/deck/001`).
+/// for a Working agent and assert its border is the terminal's own foreground
+/// (`Color::Reset`) rather than the working-status Green, carried together with
+/// a thick `┃` glyph, `Modifier::BOLD` and the `▸ ` title marker — three cues,
+/// none of which can be dimmed or camouflaged away. Also assert the border is
+/// neither of the retired accents (Magenta) nor the focused-pane Cyan. This pins
+/// the issue #442 rule that a selected card must be visible whatever its agent
+/// is doing (`mode/deck/001` owns the PaneInput half of the recipe).
 #[spec("theme/palette/003")]
 #[test]
-fn palette_003_selected_card_border_is_magenta_bold_marker() {
+fn palette_003_selected_card_border_is_terminal_fg_thick_marker() {
     let session = palette_session(SessionStatus::Working);
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1178,22 +1208,38 @@ fn palette_003_selected_card_border_is_magenta_bold_marker() {
     let (fg, modifier) = border_style_at_mid(&buffer);
     assert_eq!(
         fg,
-        Color::Magenta,
-        "selected card border must use the `selected` role (Color::Magenta), got {fg:?}"
-    );
-    assert!(
-        modifier.contains(Modifier::BOLD),
-        "selected card border must be BOLD, got {modifier:?}"
+        Color::Reset,
+        "a selected card's border must be the terminal's own foreground, which \
+         contrasts on light and dark alike, got {fg:?}"
     );
     assert_ne!(
         fg,
         Color::Green,
-        "the selected accent must not reuse the working-status green"
+        "a selected card must not rest on its status colour — for idle that would \
+         be DarkGray, invisible on a dark background (issue #442)"
+    );
+    assert!(
+        modifier.contains(Modifier::BOLD),
+        "command-mode selection must be BOLD, got {modifier:?}"
+    );
+    assert!(
+        !modifier.contains(Modifier::DIM),
+        "selection must never DIM a card (issue #442), got {modifier:?}"
+    );
+    assert_eq!(
+        buffer[(0, buffer.area().height / 2)].symbol(),
+        "┃",
+        "selection must also be carried by a thick border glyph"
+    );
+    assert_ne!(
+        fg,
+        Color::Magenta,
+        "selection must no longer spend the retired Magenta accent"
     );
     assert_ne!(
         fg,
         Color::Cyan,
-        "the selected accent must not reuse the focused-pane cyan"
+        "a card border must not reuse the focused-pane cyan"
     );
     assert!(
         buffer_to_text(&buffer).contains('▸'),
@@ -1328,6 +1374,92 @@ fn palette_005_command_mode_focused_pane_drops_cyan_accent() {
             "an unfocused pane must keep the thin border (input_active={input_active}), \
              got {glyph:?}"
         );
+    }
+}
+
+/// Scenario: For every agent status, and in BOTH command and PaneInput mode,
+/// render the same deck card selected and unselected and compare the two
+/// borders. A selected card must be visible whatever its agent is doing: its
+/// border takes the terminal's OWN foreground (`Color::Reset`) — near-white on a
+/// dark theme, near-black on a light one — thickens from `│` to `┃`, and never
+/// carries `Modifier::DIM`. The control in the same loop is that an UNSELECTED
+/// card is untouched and still reports its status role, so an idle agent keeps
+/// receding. Guards issue #442 both ways: the selected card must not fade
+/// (the original DIM-magenta report) and must not inherit the low-contrast
+/// `palette::STATUS_IDLE` (DarkGray), which on a dark background left a selected
+/// idle card as invisible as an unselected one however thick its border was.
+#[spec("theme/palette/006")]
+#[test]
+fn palette_006_selection_is_visible_at_every_status() {
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+
+    for (status, role) in status_role_colors() {
+        for mode in [UiMode::Normal, UiMode::PaneInput] {
+            let session = palette_session(status.clone());
+            let render = |selected: bool| {
+                render_card_for_mode_to_buffer(
+                    &session,
+                    Some("example-agent"),
+                    Some(1),
+                    density,
+                    0,
+                    selected,
+                    mode,
+                    width,
+                    height,
+                )
+            };
+            let unselected = render(false);
+            let selected = render(true);
+            let y = height / 2;
+            let (unsel, sel) = (&unselected[(0, y)], &selected[(0, y)]);
+            let context = format!("{status:?} in {mode:?}");
+
+            // The reported symptom: a selected card whose border colour is the
+            // status colour is only as visible as that status colour, and
+            // `STATUS_IDLE` on a dark ground is barely visible at all. The
+            // terminal's own foreground is the one colour guaranteed to contrast
+            // with the terminal's own background, on either theme.
+            assert_eq!(
+                sel.fg,
+                Color::Reset,
+                "{context}: a selected card's border must use the terminal's own \
+                 foreground so it contrasts on every theme, got {:?}",
+                sel.fg
+            );
+            assert_ne!(
+                sel.fg, role,
+                "{context}: a selected border must not inherit the status colour — \
+                 for idle that is DarkGray, which is invisible on a dark background \
+                 no matter how thick the border is (issue #442)"
+            );
+
+            // CONTROL: selection changed, the resting state did not. An
+            // unselected idle card must still recede exactly as before.
+            assert_eq!(
+                unsel.fg, role,
+                "{context}: an UNSELECTED card must still report its status role"
+            );
+            assert_eq!(
+                unsel.symbol(),
+                "│",
+                "{context}: an unselected card must keep the thin border"
+            );
+
+            assert_eq!(
+                sel.symbol(),
+                "┃",
+                "{context}: selection must also thicken the border glyph"
+            );
+            assert!(
+                !sel.modifier.contains(Modifier::DIM),
+                "{context}: a selected border must never be DIM — that is what made \
+                 it read as an idle card (issue #442), got {:?}",
+                sel.style()
+            );
+        }
     }
 }
 
@@ -1521,6 +1653,15 @@ fn pane_005_highlight_follows_selected_session_id() {
     //
     // All sessions share one current activity time, keeping their compact
     // bottom-border elapsed values identical in the snapshot.
+    //
+    // That time is nudged 30s into the future (issue #350): `format_elapsed`
+    // (src/ui.rs) reads `Utc::now()` at render time, so seeding it to exactly
+    // `now` left every card on the `0s`/`1s` boundary — and this test renders
+    // several cards in sequence, so the later ones sat furthest from the
+    // instant the fixture was built. The forward nudge relies on
+    // `format_elapsed`'s existing clamp of a negative delta to zero
+    // (`delta.num_seconds().max(0)`), holding every card at `0s` for 30s.
+    // Committed snapshot is unchanged.
     let now = chrono::Utc::now();
     let make = |sid: &str, pane: &str, name: &str, cwd: &str| SessionState {
         session_id: sid.to_string(),
@@ -1532,7 +1673,7 @@ fn pane_005_highlight_follows_selected_session_id() {
             detail: Some("src/main.rs".to_string()),
         }),
         started_at: now,
-        last_activity: now,
+        last_activity: now + chrono::Duration::seconds(30),
         recent_events: VecDeque::new(),
         tool_count: 3,
         last_user_prompt: Some("do the thing".to_string()),
@@ -1582,6 +1723,80 @@ fn pane_005_highlight_follows_selected_session_id() {
         80,
     );
     insta::assert_snapshot!(buffer_to_text(&buffer));
+}
+
+/// Scenario: A pane is spawned (tagged placeholder card) and then a legacy hook
+/// reports on it without an `agent_id`. The dashboard must still draw exactly
+/// ONE card for that pane — before issue #398 the untagged event minted a second
+/// session and the deck rendered two cards for the one pane.
+#[spec("dashboard/pane/010")]
+#[test]
+fn pane_010_untagged_event_keeps_one_card_on_the_pane() {
+    // Issue #398. The bug lived in `AppState::apply_event`, but what the user
+    // actually saw was the card grid, so this drives the REAL state transition
+    // and renders whatever it produces — rather than handing the renderer a
+    // card list built by the test, which would assert nothing about the defect.
+    const PANE: &str = "2";
+
+    let mut state = AppState::default();
+    state.register_pane(PANE.to_string());
+    // The pane as it exists right after a daemon spawn: one tagged placeholder.
+    state.insert_placeholder_session(
+        PANE.to_string(),
+        Some("/home/dev/worker".to_string()),
+        Some(AgentType::ClaudeCode),
+        Some("agent-42".to_string()),
+    );
+
+    // A pre-F9 / un-envied hook reports on the same pane, naming no generation.
+    state.apply_event(AgentEvent {
+        session_id: "legacy-hook-session".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::WaitingForInput,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some(PANE.to_string()),
+        agent_id: None,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    });
+
+    // The card list the dashboard would build for this pane.
+    let on_pane: Vec<&SessionState> = state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(PANE))
+        .collect();
+    assert_eq!(
+        on_pane.len(),
+        1,
+        "one pane must yield one card; {} sessions claim pane {PANE}",
+        on_pane.len()
+    );
+
+    // And the surviving card carries the status the hook reported, so the fix
+    // suppressed a duplicate rather than suppressing the update itself.
+    assert_eq!(
+        on_pane[0].status,
+        SessionStatus::WaitingForInput,
+        "the single card must show the status the untagged hook reported"
+    );
+
+    let cards: [(&SessionState, Option<&str>); 1] = [(on_pane[0], Some("worker"))];
+    let buffer = render_dashboard_cards_to_buffer(&cards, Some(0), CardDensityKind::Normal, 0, 80);
+    let rendered = buffer_to_text(&buffer);
+    // The status badge is per-card, so counting it counts cards — and keeps the
+    // assertion readable without committing another snapshot file.
+    assert_eq!(
+        rendered.matches("Needs Input").count(),
+        1,
+        "exactly one card should render for the pane:\n{rendered}"
+    );
 }
 
 /// Build one event-rich session fixture that fills `render_session_card`

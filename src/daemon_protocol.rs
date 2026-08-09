@@ -1488,15 +1488,42 @@ async fn handle_connection(
                     // preserved) and drop the registry entry. The child is already
                     // reaped, so the worktree is no longer a live cwd. No-op for
                     // ordinary agents and for earlier sibling-role closes.
-                    if let Some(worktree) = dispatched_worktree
-                        && !crate::issue_dispatch_run::worktree_still_in_use(
-                            &registry.agent_records(),
-                            &worktree,
-                        )
-                        && let Some(clone) =
-                            crate::issue_dispatch_run::take_worktree(&worktree_registry, &worktree)
-                    {
-                        crate::issue_dispatch_run::remove_worktree(&worktree, &clone).await;
+                    // PRD #220: the removal POLICY travels with the registry
+                    // entry, because this handler serves both producers and sees
+                    // only a path — issue-dispatch needs the force removal its
+                    // slot-reclaim model depends on, while a PRD #220 dispatch
+                    // sibling must keep uncommitted work. See `RemovalPolicy`.
+                    //
+                    // Cleanup runs DETACHED, and the close is answered without
+                    // waiting for it. The agent is already stopped by this point,
+                    // so the client's question ("is this pane closed?") is fully
+                    // answered — while the cleanup is two `git` invocations
+                    // against a worktree an agent has been working in, and
+                    // `git status --porcelain` there is seconds, not milliseconds,
+                    // on a real checkout. Awaiting it held the response past the
+                    // TUI's 5s `CTRL_W_STOP_TIMEOUT`, so the client gave up,
+                    // retained the pane "for retry", and the user saw a card that
+                    // would not go away even though its agent was gone
+                    // (`dispatch/close/001`).
+                    if let Some(worktree) = dispatched_worktree {
+                        let registry = registry.clone();
+                        let worktree_registry = worktree_registry.clone();
+                        tokio::spawn(async move {
+                            if !crate::issue_dispatch_run::worktree_still_in_use(
+                                &registry.agent_records(),
+                                &worktree,
+                            ) && let Some(entry) = crate::issue_dispatch_run::take_worktree(
+                                &worktree_registry,
+                                &worktree,
+                            ) {
+                                crate::issue_dispatch_run::remove_worktree(
+                                    &worktree,
+                                    &entry.clone_dir,
+                                    entry.policy,
+                                )
+                                .await;
+                            }
+                        });
                     }
                     write_resp(&mut stream, &AttachResponse::ok()).await?
                 }

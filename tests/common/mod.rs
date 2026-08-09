@@ -52,6 +52,23 @@ pub const QUIESCENT_IDLE_MS: u64 = 50;
 /// budget — quiescence and string-signal waits are bounded internally.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Max-lifetime cap for tests that spawn `dot-agent-deck wrap` DIRECTLY (rather
+/// than through [`TuiDeck`] / `DaemonProc`, which inject their own cap), so a
+/// wrapper orphaned by a SIGKILLed / timed-out / panicking test self-exits
+/// instead of leaking to PID 1 forever.
+///
+/// This is not hypothetical: three `wrap --agent codex` stubs from this file's
+/// own probes were found alive for **three days**, from a worktree that had
+/// already been deleted — two of them spinning a shell `sleep 0.01` loop at
+/// ~100 wakeups/second, and one holding `trap '' TERM` so no SIGTERM could
+/// reach it. The wrapper honours the cap as of the same change that added this
+/// constant; before that the env var was read only by `daemon serve`.
+///
+/// Deliberately generous (120 s) relative to these sub-10 s probes: it is a
+/// leak backstop, not a test timeout, so it must never be the thing that ends a
+/// legitimately slow run.
+pub const WRAP_TEST_MAX_LIFETIME_SECS: &str = "120";
+
 /// Decision 20: pinned PTY dimensions for the deck. Resize tests
 /// override via `TuiDeck::resize`.
 const DEFAULT_COLS: u16 = 120;
@@ -1047,6 +1064,38 @@ impl TuiDeck {
         }
     }
 
+    /// The retry (not just the wait) lives here, not in the test body. For a
+    /// keystroke gated on a status update delivered over a SEPARATE async
+    /// daemon round-trip (a hook-socket injection broadcast back to this
+    /// attached client) there is no in-process signal a test can await instead
+    /// — unlike an in-process state flip (e.g. toggling the command-entry lock
+    /// via `Ctrl+e`, which is synchronous), the client may not yet have applied
+    /// the broadcast the instant after it was sent. Repeatedly (re-)sends
+    /// `bytes` until `needle` lands on the rendered grid or `timeout` elapses,
+    /// so a keystroke sent slightly too early is simply retried rather than
+    /// lost — the same "wait for the needle, don't just snapshot" principle
+    /// applied to the SEND side rather than the read side.
+    ///
+    /// Safe to retry against a `cat` stub, which just re-echoes; not
+    /// appropriate where a duplicate keystroke would have a side effect.
+    pub fn send_keys_until_grid_string_within(
+        &self,
+        bytes: &[u8],
+        needle: &str,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.send_keys(bytes);
+            if self.wait_for_grid_string_within(needle, Duration::from_millis(300)) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
     /// Like [`wait_for_grid_string_within`](Self::wait_for_grid_string_within)
     /// but for a predicate over the whole rendered grid — for the cases a single
     /// substring cannot express (a spatial relationship between two strings, a
@@ -1305,6 +1354,89 @@ impl TuiDeck {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Debounced cursor read: poll
+    /// [`terminal_cursor_snapshot`](Self::terminal_cursor_snapshot) until
+    /// `STABLE_SAMPLES` consecutive reads — position AND cell styling, both
+    /// fields of `TerminalCursorSnapshot`'s `PartialEq` — come back identical,
+    /// or `timeout` elapses, whichever is first.
+    ///
+    /// On its own this only proves "nothing changed for ~60ms," which a
+    /// snapshot taken the INSTANT a keystroke is sent trivially satisfies — the
+    /// write hasn't even reached the PTY yet, so the first several reads all
+    /// agree on the stale pre-keystroke value and this returns immediately
+    /// without ever observing the keystroke's effect. Calling this directly
+    /// right after `send_bytes`/`send_keys` is that trap; use
+    /// [`wait_for_terminal_cursor_change_then_settle`](Self::wait_for_terminal_cursor_change_then_settle)
+    /// instead whenever a prior snapshot is available to diverge from. This
+    /// primitive is for the complementary case — settling on the FINAL frame
+    /// once some external wait (e.g. `wait_for_grid_string_within`) has already
+    /// established that change is underway or done, where a bare
+    /// `terminal_cursor_snapshot()` could still land one frame early.
+    pub fn wait_for_settled_terminal_cursor(&self, timeout: Duration) -> TerminalCursorSnapshot {
+        const STABLE_SAMPLES: u32 = 3;
+        const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+        let deadline = Instant::now() + timeout;
+        let mut last = self.terminal_cursor_snapshot();
+        let mut stable_count = 1;
+        loop {
+            if stable_count >= STABLE_SAMPLES || Instant::now() >= deadline {
+                return last;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+            let current = self.terminal_cursor_snapshot();
+            if current == last {
+                stable_count += 1;
+            } else {
+                last = current;
+                stable_count = 1;
+            }
+        }
+    }
+
+    /// Two-phase cursor wait for "this keystroke should move the cursor away
+    /// from `from`": first a coarse, cheap `(row, col)` divergence check
+    /// (catches "did anything move at all", bounded by `timeout`), then a
+    /// hand-off to
+    /// [`wait_for_settled_terminal_cursor`](Self::wait_for_settled_terminal_cursor)
+    /// (bounded by whatever of `timeout` remains) so the returned snapshot
+    /// reflects the FINAL frame rather than the first one where the coarse
+    /// check happened to pass.
+    ///
+    /// Collapsing this into a single stability-only wait (poll
+    /// `terminal_cursor_snapshot()` until N consecutive reads agree, with no
+    /// divergence check) is flaky in the OPPOSITE direction on a loaded runner:
+    /// called right after `send_bytes`, before the keystroke has propagated
+    /// through the PTY round trip at all, the first several reads all agree on
+    /// the unchanged pre-keystroke value — which is trivially "stable" — so it
+    /// returns that stale snapshot within one poll interval instead of waiting
+    /// for the real change. Requiring an actual `(row, col)` change from a
+    /// known `from` baseline before settling closes that gap.
+    ///
+    /// If the cursor never diverges from `from` within `timeout`, returns the
+    /// last (still-`from`-equal) snapshot observed — the caller's own assertion
+    /// on the returned value produces the diagnostic, exactly as it would for a
+    /// real product regression.
+    pub fn wait_for_terminal_cursor_change_then_settle(
+        &self,
+        from: TerminalCursorSnapshot,
+        timeout: Duration,
+    ) -> TerminalCursorSnapshot {
+        const POLL_INTERVAL: Duration = Duration::from_millis(20);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let snap = self.terminal_cursor_snapshot();
+            if (snap.row, snap.col) != (from.row, from.col) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                return self.wait_for_settled_terminal_cursor(remaining);
+            }
+            if Instant::now() >= deadline {
+                return snap;
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
     }
 
@@ -4666,6 +4798,48 @@ pub fn wait_for_file_substr_count(
     }
 }
 
+/// A `/bin/sh` line that posts one synthetic Claude-Code hook event from inside
+/// a fixture agent script, through the REAL `dot-agent-deck hook` CLI.
+///
+/// Centralised because six fixture shims across five e2e files hand-rolled this
+/// line, and when the CLI moved the agent from a positional argument to
+/// `--agent` (PRD #30), five of them kept emitting the stale `hook claude-code`
+/// form. `clap` rejected it (exit 2), the `>/dev/null 2>&1` swallowed the error,
+/// and no readiness signal was ever emitted — so the agent-ready gate those
+/// tests exist to exercise silently fell through to the 10-second
+/// `process_pending_seed_prompts` timeout fallback instead (issue #343). They
+/// still passed, just ~10s slower and proving nothing about readiness.
+///
+/// The `|| exit` is what stops that recurring: `handle_hook` returns
+/// `ExitCode::SUCCESS` on EVERY path it reaches — bad JSON, unmapped event, even
+/// a failed socket send — so a nonzero exit can only mean `clap` refused the
+/// argument shape. That makes failing hard here deterministic rather than
+/// load-sensitive: a future CLI change kills the fixture agent loudly instead of
+/// quietly degrading its test into a passing-but-vacuous one.
+///
+/// `bin` is the ABSOLUTE path of the binary under test (`CARGO_BIN_EXE_…`),
+/// single-quoted here so a checkout under a path containing spaces — or a quote
+/// — still resolves the build under test rather than whatever `dot-agent-deck`
+/// a dev machine happens to have on `$PATH`.
+#[allow(dead_code)]
+pub fn claude_hook_line(bin: &str, payload_json: &str) -> String {
+    let quoted_bin = format!("'{}'", bin.replace('\'', r"'\''"));
+    format!(
+        "printf '%s' '{payload_json}' | {quoted_bin} hook --agent claude-code >/dev/null 2>&1 \
+         || {{ echo 'dot-agent-deck hook rejected the fixture payload' >&2; exit 97; }}\n"
+    )
+}
+
+/// [`claude_hook_line`] for the common case: the `SessionStart` event that acts
+/// as the agent-ready signal the spawn-time prompt gate waits on.
+#[allow(dead_code)]
+pub fn claude_session_start_line(bin: &str, session_id: &str) -> String {
+    claude_hook_line(
+        bin,
+        &format!(r#"{{"hook_event_name":"SessionStart","session_id":"{session_id}"}}"#),
+    )
+}
+
 /// The recorder line the deck's own Codex metadata probe produces.
 ///
 /// PRD #20 §4.2.1: the deck records SCOPED, hash-pinned trust for its own Codex
@@ -4928,6 +5102,11 @@ pub struct InProcDaemon {
     pub event_tx: tokio::sync::broadcast::Sender<dot_agent_deck::event::BroadcastMsg>,
     /// Hand this to spawned agents as `DOT_AGENT_DECK_SOCKET`.
     pub hook_path: PathBuf,
+    /// The streaming-attach socket (`AttachRequest`/`AttachResponse`, e.g.
+    /// `ListAgents`). Hand this to a CLI subprocess as
+    /// `DOT_AGENT_DECK_ATTACH_SOCKET` for a real-binary integration test
+    /// against this in-process daemon (this feature's `daemon status`).
+    pub attach_path: PathBuf,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -4991,6 +5170,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
         registry,
         event_tx,
         hook_path,
+        attach_path,
         handle,
     }
 }

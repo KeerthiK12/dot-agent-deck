@@ -95,6 +95,14 @@ To set one up, let an agent generate the config (`Ctrl+d` then `g`), run `dot-ag
 
 For the full configuration reference and more examples, see [Workspace Modes](workspace-modes.md).
 
+## Dispatching Work in the Background
+
+Dispatcher mode lets you start work without stopping what you are doing. Tell a dispatcher pane what you want started — "work on the search bug" — and it sets up a separate, isolated copy of your repository and puts an agent, or a whole team, to work there. Start several and they run in parallel without colliding with each other or with your working tree.
+
+Press `Ctrl+n`, navigate to the project directory, cycle the **Mode** field to **dispatcher**, and press `Enter`. Then just ask.
+
+For the full reference — choosing one agent or a team, watching the units, and cleanup, see [Dispatcher Mode](dispatcher-mode.md).
+
 ## Scheduled Tasks
 
 Scheduled tasks let the daemon spawn an agent (or run a command) on a cron schedule — a nightly review, a recurring digest, a periodic health check — without you being at the keyboard. They are defined globally, so they apply across every project.

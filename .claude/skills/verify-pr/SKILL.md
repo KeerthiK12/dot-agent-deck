@@ -157,6 +157,14 @@ Fails at the merge-base too → not this PR's defect. Say so — but read the ne
 
 **The worktree is not a control.** A baseline worktree holds the *diff* constant; it does not hold the *environment* constant. Both worktrees sit at a long `../dot-agent-deck-pr-<n>` path that the main checkout does not have, and both carry a cold `target/`. Measured on #352: `tabstrip_003` failed in the PR worktree, failed again in a clean-`origin/main` worktree, and was reported as a `main` defect — wrongly. The test was matching its sentinel inside the wrapped command line the pane's shell echoed, and where that line wrapped depended on the length of the checkout's absolute path, so it was deterministically red under `../dot-agent-deck-*` and green in the main checkout. (The genuine bug behind it — `watch` buffering a non-exiting command's output instead of streaming it — was already filed as #367 and fixed independently.) So "fails at the baseline too" rules out the PR; it does not rule out the review harness. Before writing "`main` needs a fix", re-run that one test in the **main checkout**: if it passes there, the trigger is something the worktree introduced — path length, a fixture keyed to `$PWD`, a cold build dir — and the finding belongs to this skill, not to `main`. For the same reason, other sessions' `../dot-agent-deck-*` worktrees failing the same test is not corroboration: they reproduce the artifact, not the defect.
 
+**Merge-base is not `main`.** `--baseline` pins the **merge-base**, which is the right comparison for "did this PR introduce the failure?" It is *not* the right one for "is this already broken on today's `main`?" — on a stale PR those differ by however far `main` has moved, and after a sibling PR merges they can differ by the very change you are attributing. To rebaseline the existing worktree onto current `main`, reset it rather than creating another:
+
+```bash
+git -C ../dot-agent-deck-pr-<n>-base reset --hard origin/main
+```
+
+Do **not** hand-roll a worktree under the scratchpad to get a second baseline. A cargo `target/` is multi-GB and the scratchpad is typically a tmpfs, so the build dies at link time with a misleading `linking with 'cc' failed`, and the space it does consume comes out of the RAM the compile needs (CLAUDE.md rule 14). Every worktree belongs at a disk-backed `../<repo>-<suffix>` sibling.
+
 **Flakes.** The e2e tier is flaky-tolerant by design (rule 5), and timing-sensitive tests here have failed on one platform and passed on two others in the same run. Per rule 6, rerun the single failing test in isolation first:
 
 ```bash

@@ -43,6 +43,143 @@ pub fn idle_shutdown_from_env() -> Option<Duration> {
     }
 }
 
+/// Exit status when a SECOND termination signal cuts a graceful shutdown short.
+/// `128 + SIGTERM(15)`, the shell convention for "died on signal 15", so a
+/// supervisor or script reads it the same way it read the pre-handler behaviour.
+const EXIT_FORCED_BY_SECOND_SIGNAL: i32 = 143;
+
+/// Spawn the production termination-signal watch, routing SIGTERM/SIGINT into
+/// the shared `shutdown` notify so a stop reuses the ONE audited teardown path
+/// (sockets unlinked, `AgentPtyRegistry` dropped, tasks aborted).
+///
+/// Why this exists: `daemon stop` / `daemon restart` terminate the daemon with
+/// SIGTERM (see [`crate::daemon_stop`]), and the build-version handshake
+/// SIGTERMs it silently on the no-agents path. With no handler installed the
+/// default disposition applied — the process died instantly, so its owned
+/// agents died by PTY hangup instead of an orderly registry teardown and,
+/// worst of all, **nothing was logged**. A daemon that vanished mid-session
+/// left no evidence of whether it was stopped, crashed, or was OOM-killed;
+/// reconstructing one real incident took kernel logs and an external watchdog
+/// to establish something the daemon itself should have said in one line.
+///
+/// Logged at `warn!` (not `info!`) for the same reason the give-up warnings in
+/// `embedded_pane` are: losing the daemon terminates every managed agent, so
+/// it is a user-visible outcome that must survive a default log filter.
+fn spawn_termination_signal_watch(
+    shutdown: Arc<Notify>,
+    registry: Arc<AgentPtyRegistry>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // Registering can only fail if the runtime can't install the handler
+        // (no signal driver). That is not fatal — the daemon simply keeps the
+        // pre-existing default disposition — so log and carry on.
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "could not install SIGTERM handler; termination will not be logged");
+                return None;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "could not install SIGINT handler; termination will not be logged");
+                return None;
+            }
+        };
+        Some(tokio::spawn(async move {
+            let sig = tokio::select! {
+                _ = sigterm.recv() => "SIGTERM",
+                _ = sigint.recv() => "SIGINT",
+            };
+            warn!(
+                signal = sig,
+                "daemon received termination signal; initiating graceful shutdown \
+                 (every managed agent will be stopped)"
+            );
+
+            // Drain managed agents with the SAME grace the `KIND_SHUTDOWN`
+            // handler gives them, BEFORE releasing the hook loop. Notifying
+            // `shutdown` alone is not enough: the loop returns, `run_daemon_with`
+            // drops the registry, and `Drop` calls `shutdown_all` — the
+            // SIGKILL-WITHOUT-grace path, which `shutdown_all_graceful`'s own docs
+            // scope to "idle shutdown and test cleanup". Idle shutdown only fires
+            // with no agents left, so force-killing there costs nothing; a signal
+            // is a DELIBERATE stop that routinely lands on live agents, so it
+            // belongs on the graceful path. (Greptile P1 on the first draft, which
+            // notified and returned — agents lost the grace this change promised.)
+            //
+            // `spawn_blocking` mirrors `daemon_protocol`'s KIND_SHUTDOWN arm: the
+            // drain blocks while it polls for each child to exit. Idempotent via
+            // the registry's `shutting_down` latch, whose docs already anticipate
+            // "a SIGTERM landing during shutdown".
+            let draining = registry.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                draining.shutdown_all_graceful(crate::agent_pty::AGENT_TERMINATE_GRACE);
+            })
+            .await;
+            shutdown.notify_one();
+
+            // Escape hatch, and the reason this task keeps waiting instead of
+            // returning here. Installing a handler REPLACES the default
+            // disposition for the life of the process: once the first signal is
+            // consumed, tokio's handler stays installed, so every later SIGTERM
+            // would be quietly swallowed by a stream nobody reads. Before this
+            // change SIGTERM always killed the daemon outright, so a wedged
+            // shutdown could still be ended with `pkill dot-agent-deck` — which
+            // sends SIGTERM by default and is the escape hatch the in-repo audit
+            // notes call the only way to stop a daemon. A second signal
+            // therefore force-exits, preserving that. A second signal arriving
+            // DURING the drain above is buffered by tokio's signal stream and
+            // handled as soon as the drain returns, so the hatch is delayed by at
+            // most `AGENT_TERMINATE_GRACE`, never lost.
+            let again = tokio::select! {
+                _ = sigterm.recv() => "SIGTERM",
+                _ = sigint.recv() => "SIGINT",
+            };
+            warn!(
+                signal = again,
+                "second termination signal while shutting down; exiting immediately \
+                 without finishing teardown"
+            );
+            std::process::exit(EXIT_FORCED_BY_SECOND_SIGNAL);
+        }))
+    }
+    #[cfg(windows)]
+    {
+        Some(tokio::spawn(async move {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                warn!(error = %e, "could not await Ctrl-C; termination will not be logged");
+                return;
+            }
+            warn!(
+                signal = "CTRL_C",
+                "daemon received termination signal; initiating graceful shutdown \
+                 (every managed agent will be stopped)"
+            );
+            // Same graceful drain as the Unix arm above; see its comment.
+            let draining = registry.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                draining.shutdown_all_graceful(crate::agent_pty::AGENT_TERMINATE_GRACE);
+            })
+            .await;
+            shutdown.notify_one();
+
+            // Same second-signal escape hatch as the Unix arm above.
+            if tokio::signal::ctrl_c().await.is_ok() {
+                warn!(
+                    signal = "CTRL_C",
+                    "second termination signal while shutting down; exiting immediately \
+                     without finishing teardown"
+                );
+                std::process::exit(EXIT_FORCED_BY_SECOND_SIGNAL);
+            }
+        }))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test-only self-defense: orphan watchdog + max-lifetime backstop.
 //
@@ -443,6 +580,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // expires, the hook loop's `select!` arm wakes up, and the loop exits.
     let shutdown = Arc::new(Notify::new());
 
+    // Production termination watch: route SIGTERM/SIGINT through the same
+    // `shutdown` notify. Armed unconditionally — unlike the two backstops
+    // below, this is not test-only: `daemon stop` IS a SIGTERM.
+    let signal_handle = spawn_termination_signal_watch(shutdown.clone(), pty_registry.clone());
+
     // Test-only orphan watchdog: when `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED` is
     // truthy, gracefully shut down (via the SAME `shutdown` signal the idle
     // monitor uses — so sockets/agents tear down cleanly) once this daemon is
@@ -587,7 +729,15 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
-    let result = run_hook_loop(listener, state, event_tx, pty_registry.clone(), shutdown).await;
+    let result = run_hook_loop(
+        listener,
+        state,
+        event_tx,
+        pty_registry.clone(),
+        shutdown,
+        worktree_registry.clone(),
+    )
+    .await;
 
     if let Some(h) = attach_handle {
         h.abort();
@@ -601,6 +751,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         h.abort();
     }
     if let Some(h) = max_lifetime_handle {
+        h.abort();
+    }
+    if let Some(h) = signal_handle {
         h.abort();
     }
     drop(pty_registry);
@@ -703,6 +856,12 @@ fn make_schedule_callback(
         working_dir: task.working_dir.clone(),
         command: task.command.clone(),
         prompt: task.prompt.clone(),
+        // `None`: a scheduled task's shape still comes from its working dir's
+        // config. The PRD #220 selector is a `dispatch`-only surface.
+        resolved_target: None,
+        // Unchanged behaviour: the prompt is delivered verbatim. Giving this path
+        // the orchestrator context is #222's work, not this PR's.
+        compose_orchestrator_context: false,
     };
     let new_tab_per_fire = task.new_tab_per_fire;
     Arc::new(move || {
@@ -1112,6 +1271,7 @@ async fn run_hook_loop(
     event_tx: broadcast::Sender<BroadcastMsg>,
     pty_registry: Arc<AgentPtyRegistry>,
     shutdown: Arc<Notify>,
+    worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
 ) -> Result<(), DaemonError> {
     loop {
         tokio::select! {
@@ -1121,7 +1281,12 @@ async fn run_hook_loop(
             // is dropped, which doesn't leak the listener (only the
             // partially-built tokio future).
             _ = shutdown.notified() => {
-                info!("Daemon hook loop exiting on idle shutdown");
+                // Deliberately does NOT name a cause: `shutdown` is notified by
+                // the idle monitor, the termination-signal watch, the orphan
+                // watchdog, and the max-lifetime backstop. Each logs its own
+                // reason before notifying, so naming one here (this used to say
+                // "on idle shutdown") mislabels the other three.
+                info!("Daemon hook loop exiting on shutdown signal");
                 return Ok(());
             }
             accept_res = listener.accept() => match accept_res {
@@ -1129,6 +1294,7 @@ async fn run_hook_loop(
                 let state = state.clone();
                 let event_tx = event_tx.clone();
                 let pty_registry = pty_registry.clone();
+                let worktree_registry = worktree_registry.clone();
                 tokio::spawn(async move {
                     // PRD #201: split so the read-only `get-seed` verb can write
                     // a reply back on the same connection. Every other message
@@ -1167,6 +1333,81 @@ async fn run_hook_loop(
                                         .handle_delegate(signal, &pty_registry, &event_tx)
                                         .await;
                                 }
+                                DaemonMessage::Dispatch(signal) => {
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        name = %signal.name,
+                                        "Received dispatch signal"
+                                    );
+                                    use crate::dispatch::{self, DispatchContext};
+
+                                    use std::path::PathBuf;
+
+                                    // Phase 1: resolve caller cwd from the PTY registry's
+                                    // AgentRecord.cwd, not AppState::pane_cwd_map.
+                                    // pane_cwd_map is only populated for orchestration
+                                    // panes; mode panes (including the dispatcher mode)
+                                    // never get an entry there, which would make every
+                                    // dispatch from a mode pane a silent no-op.
+                                    let cwd = {
+                                        let records = pty_registry.agent_records();
+                                        records
+                                            .iter()
+                                            .find(|r| r.pane_id_env.as_deref() == Some(&signal.pane_id))
+                                            .and_then(|r| r.cwd.clone())
+                                    };
+                                    let cwd = match cwd {
+                                        Some(c) => c,
+                                        None => {
+                                            warn!(pane_id = %signal.pane_id, "dispatch from unknown pane");
+                                            continue;
+                                        }
+                                    };
+
+                                    // Phase 2: do the slow I/O (git worktree + spawn)
+                                    // OUTSIDE any AppState lock so concurrent hook
+                                    // processing is never stalled.
+                                    // The deck's configured default command, so a
+                                    // single-agent dispatch starts an AGENT rather
+                                    // than `$SHELL`. Same resolution as the
+                                    // issue-dispatch arm above; empty → the Claude
+                                    // default inside `handle_dispatch`.
+                                    let default_command = {
+                                        let dc = crate::config::DashboardConfig::load()
+                                            .default_command
+                                            .trim()
+                                            .to_string();
+                                        if dc.is_empty() { None } else { Some(dc) }
+                                    };
+                                    let ctx = DispatchContext {
+                                        working_dir: PathBuf::from(&cwd),
+                                        registry: pty_registry.clone(),
+                                        event_tx: event_tx.clone(),
+                                        worktrees: worktree_registry.clone(),
+                                        default_command,
+                                    };
+                                    let task = signal.task.as_deref().unwrap_or_default();
+                                    let result = dispatch::handle_dispatch(
+                                        &ctx,
+                                        &signal.name,
+                                        task,
+                                        signal.shape.as_ref(),
+                                    )
+                                    .await;
+
+                                    // Deliver result to the caller pane (doesn't need
+                                    // any AppState lock — uses the PTY registry).
+                                    if let Err(e) = pty_registry
+                                        .write_to_pane_and_submit(&signal.pane_id, &result.message)
+                                        .await
+                                    {
+                                        warn!(
+                                            pane_id = %signal.pane_id,
+                                            error = %e,
+                                            "dispatch: failed to write result into caller pane"
+                                        );
+                                    }
+                                }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
                                         pane_id = %signal.pane_id,
@@ -1199,13 +1440,60 @@ async fn run_hook_loop(
                                         let _ = write_half.flush().await;
                                     }
                                 }
+                                DaemonMessage::ListTargets(req) => {
+                                    // PRD #220: the shape menu, computed HERE so it
+                                    // comes from the same cwd and the same config
+                                    // the dispatch will use. Resolving the cwd from
+                                    // `AgentRecord.cwd` — not from the CLI's own
+                                    // `current_dir()` — is the whole point: those
+                                    // two diverge whenever the agent has `cd`'d, and
+                                    // a menu that disagrees with the spawn sends the
+                                    // user to a target that cannot start.
+                                    let cwd = {
+                                        let records = pty_registry.agent_records();
+                                        records
+                                            .iter()
+                                            .find(|r| r.pane_id_env.as_deref() == Some(&req.pane_id))
+                                            .and_then(|r| r.cwd.clone())
+                                    };
+                                    info!(
+                                        pane_id = %req.pane_id,
+                                        resolved_cwd = ?cwd,
+                                        "Received list-targets request"
+                                    );
+                                    let resp = crate::dispatch::list_targets_response(
+                                        cwd.as_deref().map(std::path::Path::new),
+                                    );
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ =
+                                            write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
                             }
                         } else if let Ok(event) = serde_json::from_str::<AgentEvent>(&line) {
+                            // `tool_name`/`tool_detail` are logged so a post-mortem can
+                            // name the command an agent was running, not just that it ran
+                            // one. Four "fleet death" investigations (2026-07-28 23:05,
+                            // 07-29 01:54, 07-29 02:09, 08-08 03:05) stalled on exactly
+                            // this gap: the daemon logged `ToolStart` with a session id
+                            // while the command text lived only in the agent's own
+                            // transcript — and a process killed mid-tool never flushes
+                            // that entry. In the 08-08 case the ToolStart landed 0.838s
+                            // before the daemon took a SIGTERM, so the best-correlated
+                            // command was the one piece of evidence permanently lost.
+                            // `tool_detail` is already first-line-only and truncated to
+                            // 120 chars by `hook::extract_tool_detail`, which bounds the
+                            // added log volume; the untruncated command remains in
+                            // `metadata["bash_command"]` for anyone who needs it.
                             info!(
                                 session_id = %event.session_id,
                                 event_type = ?event.event_type,
                                 pane_id = ?event.pane_id,
                                 agent_type = ?event.agent_type,
+                                tool_name = ?event.tool_name,
+                                tool_detail = ?event.tool_detail,
                                 "Received event"
                             );
                             // Persist the agent type this hook revealed into
@@ -1393,7 +1681,8 @@ mod hook_ingestion_tests {
 
         let handle = tokio::spawn({
             let registry = registry.clone();
-            async move { run_hook_loop(listener, state, event_tx, registry, shutdown).await }
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
         });
 
         // Synthetic SessionStart for the shell pane, carrying the real type.
@@ -1754,7 +2043,8 @@ mod hook_ingestion_tests {
         let shutdown = Arc::new(Notify::new());
         let handle = tokio::spawn({
             let registry = registry.clone();
-            async move { run_hook_loop(listener, state, event_tx, registry, shutdown).await }
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
         });
 
         // Helper: send one get_seed request line and read the single reply line.
