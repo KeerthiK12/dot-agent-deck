@@ -22,6 +22,17 @@
 //!   delete a live temp dir owned by something else entirely.
 //!
 //! Dry-run is the default; `--apply` is required to remove anything.
+//!
+//! # Where it looks
+//!
+//! The **standard** roots only, from [`standard_roots`]: the harness's private
+//! `/var/tmp/dad-e2e-<uid>` parent, and the system temp dir (where the roots
+//! used to live, and still do on the last-resort rung of the harness ladder).
+//!
+//! Placement and deletion are deliberately different trust decisions, so a
+//! `DAD_E2E_TMPDIR` that moved the harness somewhere else does **not** silently
+//! become a directory this command deletes from — it prints a hint naming it,
+//! and `--root <path>` is how you opt in.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -36,6 +47,123 @@ const UNTAGGED_PREFIX: &str = ".tmp";
 
 const DEFAULT_MAX_AGE_HOURS: u64 = 6;
 
+/// The harness's explicit temp-base override. Read here only to *mention* it —
+/// see [`override_hint`].
+const TEMP_BASE_ENV: &str = "DAD_E2E_TMPDIR";
+
+/// The shared directory the harness's private parent lives in.
+#[cfg(unix)]
+const SHARED_VAR_TMP: &str = "/var/tmp";
+
+/// A directory to look in, plus the two facts that differ between them.
+struct ScanRoot {
+    /// Original spelling. Every message uses this, not the canonical form.
+    path: PathBuf,
+    /// Whether `--include-untagged` applies here. Issue #322: `.tmp*` is the
+    /// `tempfile` crate's default prefix, so the flag is confined to the
+    /// historical system temp root (and to roots the user names by hand);
+    /// letting it follow the widened root set would put `cargo`'s own build
+    /// output and other tooling's persistent tempdirs in range.
+    untagged_ok: bool,
+    /// Named with `--root`. An unreadable root the user asked for by hand is an
+    /// error; an absent standard root is normal and silent.
+    required: bool,
+}
+
+/// The private, UID-scoped parent the harness puts its per-process roots in.
+///
+/// Mirrors `private_parent_name()` in `tests/common/mod.rs`, duplicated rather
+/// than shared because an xtask crate cannot depend on an integration-test
+/// module. Unix-only and `cfg`-gated to match the harness exactly: on Windows
+/// `/var/tmp` is a root-relative path on the current drive that the harness
+/// never uses but `--apply` could still delete from.
+#[cfg(unix)]
+fn private_parent() -> PathBuf {
+    // SAFETY: `geteuid` takes no arguments, always succeeds, and touches no
+    // memory this process owns.
+    let uid = unsafe { libc::geteuid() };
+    Path::new(SHARED_VAR_TMP).join(format!("dad-e2e-{uid}"))
+}
+
+/// The roots reaped without being asked for by name.
+///
+/// Both are places the *current* machine's harness puts roots. It cannot infer
+/// another worktree's leftovers, or a `DAD_E2E_TMPDIR` that is no longer
+/// exported — run it where the run that leaked them ran, or name the directory
+/// with `--root`.
+fn standard_roots() -> Vec<ScanRoot> {
+    let mut roots = vec![
+        // The historical root: where every leftover from before issue #322
+        // sits, and where the harness still lands when no private parent is
+        // usable.
+        ScanRoot {
+            path: std::env::temp_dir(),
+            untagged_ok: true,
+            required: false,
+        },
+    ];
+    // Listed first because it is where a current run's roots are; `insert`
+    // rather than building the vec in order so the Windows build is not left
+    // with a one-armed `cfg` around the whole literal.
+    #[cfg(unix)]
+    roots.insert(
+        0,
+        ScanRoot {
+            path: private_parent(),
+            untagged_ok: false,
+            required: false,
+        },
+    );
+    roots
+}
+
+/// Identity of a directory for de-duplication: its canonical path when it
+/// exists, otherwise its own spelling. Never shown to the user.
+fn canonical_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Drop roots that name the same directory twice.
+///
+/// Lexical comparison is not enough: a symlink, a `TMPDIR` spelled with a
+/// trailing `/.`, or an explicit `--root` that happens to alias a standard one
+/// would each be walked twice — doubling the dry-run totals, and under
+/// `--apply` failing the second `remove_dir_all` with `NotFound`, reporting an
+/// otherwise-successful cleanup as a failure. The first spelling wins, so
+/// display keeps whatever the user or the harness actually said.
+fn dedup_roots(roots: Vec<ScanRoot>) -> Vec<ScanRoot> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut out: Vec<ScanRoot> = Vec::new();
+    for root in roots {
+        let key = canonical_key(&root.path);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(root);
+    }
+    out
+}
+
+/// `DAD_E2E_TMPDIR` is a *placement* decision; deleting from it is a separate
+/// one. When it is set but not among the roots being scanned, say so rather
+/// than either scanning it silently or leaving the user to wonder why the
+/// command found nothing.
+fn override_hint(roots: &[ScanRoot]) -> Option<String> {
+    let base = PathBuf::from(std::env::var_os(TEMP_BASE_ENV).filter(|v| !v.is_empty())?);
+    let key = canonical_key(&base);
+    if roots.iter().any(|r| canonical_key(&r.path) == key) {
+        return None;
+    }
+    Some(format!(
+        "note: {TEMP_BASE_ENV}={} is set but is NOT scanned — where the harness \
+         may write and what this command may delete are separate decisions. \
+         Add `--root {}` to reap it too.",
+        base.display(),
+        base.display(),
+    ))
+}
+
 struct Options {
     max_age: Duration,
     apply: bool,
@@ -49,8 +177,8 @@ struct Candidate {
 }
 
 pub fn run(args: &[String]) -> ExitCode {
-    let opts = match parse_args(args) {
-        Ok(Some(opts)) => opts,
+    let (opts, explicit_roots) = match parse_args(args) {
+        Ok(Some(parsed)) => parsed,
         Ok(None) => return ExitCode::SUCCESS, // --help
         Err(msg) => {
             eprintln!("xtask clean-e2e-tmp: {msg}");
@@ -59,22 +187,75 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     };
 
-    let temp_root = std::env::temp_dir();
-    let candidates = match collect(&temp_root, &opts) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "xtask clean-e2e-tmp: cannot read {}: {e}",
-                temp_root.display()
-            );
-            return ExitCode::FAILURE;
+    let temp_roots = dedup_roots(if explicit_roots.is_empty() {
+        standard_roots()
+    } else {
+        explicit_roots
+            .iter()
+            .map(|path| ScanRoot {
+                path: path.clone(),
+                // Naming a directory by hand is the deliberate act the flag's
+                // warning is about, so it is honoured here.
+                untagged_ok: true,
+                required: true,
+            })
+            .collect()
+    });
+    let searched = temp_roots
+        .iter()
+        .map(|r| r.path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(hint) = override_hint(&temp_roots) {
+        println!("{hint}");
+    }
+    let restricted: Vec<String> = temp_roots
+        .iter()
+        .filter(|r| !r.untagged_ok)
+        .map(|r| r.path.display().to_string())
+        .collect();
+    if opts.include_untagged && !restricted.is_empty() {
+        println!(
+            "note: --include-untagged does NOT apply to {} — `{UNTAGGED_PREFIX}*` is \
+             every Rust program's default prefix and those roots hold more than \
+             this suite's leftovers.",
+            restricted.join(", "),
+        );
+    }
+    let mut candidates = Vec::new();
+    for root in &temp_roots {
+        // Per-root view: `collect` reads `include_untagged` straight off
+        // `Options`, and the flag is confined to one root, so it is masked here
+        // rather than inside `collect` — which issue #461 is rewriting and
+        // which this branch leaves byte-for-byte untouched.
+        let scoped = Options {
+            max_age: opts.max_age,
+            apply: opts.apply,
+            include_untagged: opts.include_untagged && root.untagged_ok,
+        };
+        match collect(&root.path, &scoped) {
+            Ok(mut found) => candidates.append(&mut found),
+            // A standard root that is simply absent is normal — a machine that
+            // has never run the suite has no private parent yet. A root the
+            // user named by hand is not: silence there would look like "nothing
+            // to reap".
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !root.required => {}
+            Err(e) => {
+                eprintln!(
+                    "xtask clean-e2e-tmp: cannot read {}: {e}",
+                    root.path.display()
+                );
+                return ExitCode::FAILURE;
+            }
         }
-    };
+    }
+    // `collect` sorts within one root; re-sort so the biggest offender is first
+    // across all of them.
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.bytes));
 
     if candidates.is_empty() {
         println!(
-            "nothing to reap in {} (no owned dirs older than {})",
-            temp_root.display(),
+            "nothing to reap in {searched} (no owned dirs older than {})",
             human_duration(opts.max_age),
         );
         return ExitCode::SUCCESS;
@@ -90,11 +271,10 @@ pub fn run(args: &[String]) -> ExitCode {
         );
     }
     println!(
-        "{} dir(s), {} total, older than {} in {}",
+        "{} dir(s), {} total, older than {} in {searched}",
         candidates.len(),
         human_bytes(total),
         human_duration(opts.max_age),
-        temp_root.display(),
     );
 
     if !opts.apply {
@@ -126,17 +306,31 @@ pub fn run(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
+/// Returns the options plus the `--root` list. The roots ride alongside
+/// `Options` rather than inside it so that `Options` — which `collect` reads and
+/// which issue #461's rewrite of this file owns — stays untouched.
+fn parse_args(args: &[String]) -> Result<Option<(Options, Vec<PathBuf>)>, String> {
     let mut opts = Options {
         max_age: Duration::from_secs(DEFAULT_MAX_AGE_HOURS * 3600),
         apply: false,
         include_untagged: false,
     };
+    let mut roots: Vec<PathBuf> = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--apply" => opts.apply = true,
             "--include-untagged" => opts.include_untagged = true,
+            "--root" => {
+                let raw = it
+                    .next()
+                    .ok_or_else(|| "--root needs a directory".to_string())?;
+                let path = PathBuf::from(raw);
+                if !path.is_absolute() {
+                    return Err(format!("--root needs an absolute path, got {raw:?}"));
+                }
+                roots.push(path);
+            }
             "--older-than" => {
                 let raw = it
                     .next()
@@ -153,23 +347,36 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok(Some(opts))
+    Ok(Some((opts, roots)))
 }
 
 fn usage() {
     println!(
-        "usage: cargo xtask clean-e2e-tmp [--older-than <hours>] [--apply] [--include-untagged]"
+        "usage: cargo xtask clean-e2e-tmp [--older-than <hours>] [--apply] \
+         [--include-untagged] [--root <dir>]..."
     );
     println!();
     println!("Reaps stale e2e harness temp dirs left by SIGKILLed test processes.");
     println!("Dry-run by default; --apply is required to delete.");
     println!();
+    println!("Scans the standard roots — the harness's private /var/tmp/dad-e2e-<uid>");
+    println!("parent and the system temp dir. It cannot infer another worktree's");
+    println!("leftovers, so run it where the run that leaked them ran.");
+    println!();
     println!("  --older-than <hours>  age threshold (default: {DEFAULT_MAX_AGE_HOURS})");
     println!("  --apply               actually remove the directories");
+    println!("  --root <dir>          scan this absolute path INSTEAD of the standard");
+    println!("                        roots. Repeatable. Needed for a base you moved");
+    println!("                        with {TEMP_BASE_ENV}: where the harness may write");
+    println!("                        and what this command may delete are separate");
+    println!("                        decisions, so the override is never scanned");
+    println!("                        automatically.");
     println!("  --include-untagged    ALSO reap `{UNTAGGED_PREFIX}*` dirs. These use the");
     println!("                        tempfile crate's DEFAULT prefix and are shared with");
     println!("                        every Rust program on this machine — only use this");
-    println!("                        when no other Rust build or tool is running.");
+    println!("                        when no other Rust build or tool is running. Applies");
+    println!("                        to the system temp dir and to any --root you name;");
+    println!("                        never to the private parent.");
 }
 
 fn collect(temp_root: &Path, opts: &Options) -> std::io::Result<Vec<Candidate>> {
@@ -332,6 +539,159 @@ mod tests {
         assert!(collect(tmp.path(), &opts).expect("collect").is_empty());
     }
 
+    /// The harness puts its roots in a private `/var/tmp/dad-e2e-<uid>` parent,
+    /// so a reaper that only looked at the system temp dir would report
+    /// "nothing to reap" while GBs sat under `/var/tmp`. The system temp dir
+    /// stays in the set because that is where every pre-#322 leftover is.
+    #[test]
+    fn standard_roots_cover_the_private_parent_and_the_historical_temp_dir() {
+        let roots = standard_roots();
+        let paths: Vec<&Path> = roots.iter().map(|r| r.path.as_path()).collect();
+        #[cfg(unix)]
+        assert!(
+            paths.contains(&private_parent().as_path()),
+            "private parent missing from {paths:?}",
+        );
+        assert!(
+            paths.contains(&std::env::temp_dir().as_path()),
+            "system temp dir missing from {paths:?}",
+        );
+    }
+
+    /// `/var/tmp` is a Unix path. On Windows it is root-relative on the current
+    /// drive and the harness never writes there, so `--apply` must not be able
+    /// to delete from it.
+    #[cfg(not(unix))]
+    #[test]
+    fn the_var_tmp_rung_does_not_exist_off_unix() {
+        assert!(
+            !standard_roots()
+                .iter()
+                .any(|r| r.path.starts_with("/var/tmp")),
+            "/var/tmp must not be scanned on a non-Unix platform",
+        );
+    }
+
+    /// Issue #322: `--include-untagged` reaps by the `tempfile` crate's default
+    /// prefix, so it stays confined to the historical system temp root. Letting
+    /// it follow the widened root set would put unrelated tooling's persistent
+    /// tempdirs in range.
+    #[test]
+    fn include_untagged_is_confined_to_the_historical_temp_dir() {
+        for root in standard_roots() {
+            let is_system_temp = root.path == std::env::temp_dir();
+            assert_eq!(
+                root.untagged_ok,
+                is_system_temp,
+                "{} has the wrong --include-untagged scope",
+                root.path.display(),
+            );
+        }
+    }
+
+    /// Two spellings of ONE directory must be walked once. Lexical de-duping
+    /// misses this: under `--apply` the second `remove_dir_all` returns
+    /// `NotFound` and a successful cleanup gets reported as a failure.
+    #[cfg(unix)]
+    #[test]
+    fn aliased_roots_are_deduplicated_by_the_directory_they_resolve_to() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).expect("create real");
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("create symlink");
+        let deduped = dedup_roots(vec![
+            ScanRoot {
+                path: real.clone(),
+                untagged_ok: false,
+                required: true,
+            },
+            ScanRoot {
+                path: alias,
+                untagged_ok: false,
+                required: true,
+            },
+            ScanRoot {
+                path: real.join("."),
+                untagged_ok: false,
+                required: true,
+            },
+        ]);
+        assert_eq!(
+            deduped.len(),
+            1,
+            "left {:?}",
+            deduped.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
+        );
+        assert_eq!(deduped[0].path, real, "the first spelling must survive");
+    }
+
+    /// Placement and deletion are separate decisions: a `DAD_E2E_TMPDIR` that
+    /// moved the harness is never scanned automatically, and the user is told
+    /// how to opt in rather than left wondering why nothing was found.
+    #[test]
+    fn the_env_override_is_not_scanned_but_is_named() {
+        // SAFETY: nextest runs one test per process, so this process is
+        // single-threaded here; the variable is restored before returning.
+        let prev = std::env::var_os(TEMP_BASE_ENV);
+        unsafe { std::env::set_var(TEMP_BASE_ENV, "/somewhere/else/dad-e2e") };
+        let roots = standard_roots();
+        let scanned_override = roots.iter().any(|r| r.path.ends_with("dad-e2e"));
+        let hint = override_hint(&roots);
+        let hint_when_named = override_hint(&[ScanRoot {
+            path: PathBuf::from("/somewhere/else/dad-e2e"),
+            untagged_ok: true,
+            required: true,
+        }]);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(TEMP_BASE_ENV, v) },
+            None => unsafe { std::env::remove_var(TEMP_BASE_ENV) },
+        }
+        assert!(!scanned_override, "the override must not be scanned");
+        let hint = hint.expect("an unscanned override must be named");
+        assert!(hint.contains("/somewhere/else/dad-e2e"), "{hint}");
+        assert!(hint.contains("--root"), "{hint}");
+        assert!(
+            hint_when_named.is_none(),
+            "no hint once the override is passed as --root: {hint_when_named:?}",
+        );
+    }
+
+    /// `--root` replaces the standard set rather than adding to it, so a
+    /// deliberate scan of one directory cannot quietly also delete from
+    /// `/var/tmp` or the system temp dir.
+    #[test]
+    fn explicit_roots_replace_the_standard_set() {
+        let (_opts, roots) = parse_args(&[
+            "--root".to_string(),
+            "/scratch/one".to_string(),
+            "--root".to_string(),
+            "/scratch/two".to_string(),
+        ])
+        .expect("parse")
+        .expect("options");
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/scratch/one"), PathBuf::from("/scratch/two")],
+        );
+        assert!(
+            parse_args(&[])
+                .expect("parse")
+                .expect("options")
+                .1
+                .is_empty(),
+            "no --root means the standard set",
+        );
+    }
+
+    /// A relative `--root` would resolve against whatever directory the command
+    /// happened to be run from — refused rather than guessed at.
+    #[test]
+    fn a_relative_root_is_refused() {
+        assert!(parse_args(&["--root".to_string(), "scratch".to_string()]).is_err());
+        assert!(parse_args(&["--root".to_string()]).is_err());
+    }
+
     #[test]
     fn stale_owned_dirs_are_collected_with_their_size() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -346,5 +706,39 @@ mod tests {
         let found = collect(tmp.path(), &opts).expect("collect");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].bytes, 2048);
+    }
+
+    /// The residue actually left on disk after a full e2e run is not a harness
+    /// root: the exit sweep removed the real 0o700 one, and an agent process
+    /// that outlived the test re-created the path with `mkdir -p`, landing it
+    /// at the umask default (0o775 under the common `umask 002`). Reaping keys
+    /// on the name and never on the mode — a `0o700`-only filter added here
+    /// would make exactly the residue worth reclaiming unreclaimable.
+    #[cfg(unix)]
+    #[test]
+    fn an_orphan_recreated_root_at_the_umask_default_is_still_reaped() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skeleton = tmp.path().join("dad-tests-99999-Zz0AbC");
+        std::fs::create_dir(&skeleton).expect("create");
+        std::fs::write(skeleton.join("payload"), vec![0u8; 4096]).expect("write");
+        std::fs::set_permissions(&skeleton, std::fs::Permissions::from_mode(0o775))
+            .expect("chmod 0o775");
+        let mode = std::fs::symlink_metadata(&skeleton)
+            .expect("stat skeleton")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o775, "the fixture must reproduce the observed mode");
+
+        let opts = Options {
+            max_age: Duration::ZERO,
+            apply: false,
+            include_untagged: false,
+        };
+        let found = collect(tmp.path(), &opts).expect("collect");
+        assert_eq!(found.len(), 1, "a 0o775 orphan skeleton must still be seen");
+        assert_eq!(found[0].path, skeleton);
+        assert_eq!(found[0].bytes, 4096);
     }
 }
