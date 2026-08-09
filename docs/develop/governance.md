@@ -20,7 +20,7 @@ GitHub counts an approving review only from an account with **write** or **admin
 
 What the pathless rule buys is the one thing the ruleset cannot express: **routing**. GitHub omits the pull request's author when auto-requesting review from code owners, so `* @vfarcic @prageethw` requests the other maintainer on every pull request, with nobody having to remember a flag. That is not a hypothetical convenience — on 2026-08-09, the day approvals were raised to 1, seven open pull requests from the owner had no reviewer requested at all, so the maintainer whose approval they needed had no signal they existed.
 
-It stays a router rather than a second gate: `require_code_owner_review` remains `false`, so any maintainer's approval satisfies the single required review exactly as it did before the file existed. Two mechanics are worth knowing. `CODEOWNERS` is read from the **base** branch, so a pull request that edits it does not benefit from its own change. And a malformed entry disables routing without failing anything — check `gh api repos/vfarcic/dot-agent-deck/codeowners/errors` after editing it.
+It stays a router rather than a second gate: `require_code_owner_review` remains `false`, so any maintainer's approval satisfies the single required review exactly as it did before the file existed. Three mechanics are worth knowing, and they share a failure mode: each one stops the routing without failing anything, so the only symptom is a pull request sitting with no reviewer. `CODEOWNERS` is read from the **base** branch, so a pull request that edits it does not benefit from its own change. A malformed entry disables routing entirely — check `gh api repos/vfarcic/dot-agent-deck/codeowners/errors` after editing it. And a **draft** pull request is not routed to code owners until it is marked ready for review, so `gh pr ready <n>` is what actually triggers the request on anything opened with `--draft`.
 
 A consequence worth accepting deliberately: the approval requirement is not path-scoped, so a documentation typo needs a review round trip exactly like a protocol change does. Rulesets condition on ref names rather than file paths, so there is no clean way to exempt `docs/` without giving up the gate. One review on a typo is the cheaper half of that trade.
 
@@ -33,7 +33,7 @@ gh pr create --reviewer prageethw ...       # at creation
 gh pr edit 464 --add-reviewer prageethw     # afterwards
 ```
 
-With `CODEOWNERS` in place this normally happens on its own. The commands are for what it misses: a draft that records the request but sends no notification until it is marked ready, an extra reviewer beyond the routed one, or a re-request after one was removed. Do **not** assign the other maintainer instead — an assignee is who is responsible for driving the pull request to done, which is normally the author.
+With `CODEOWNERS` in place this normally happens on its own. The commands are for what it misses: a pull request opened before the routing existed, an extra reviewer beyond the routed one, or a re-request after one was removed. They are also the manual route on a draft — a reviewer named with `--reviewer` is recorded on a draft, but code-owner routing does not run until `gh pr ready <n>`. Do **not** assign the other maintainer instead — an assignee is who is responsible for driving the pull request to done, which is normally the author.
 
 Three rules about sequencing, each of which exists because of a specific ruleset setting:
 
