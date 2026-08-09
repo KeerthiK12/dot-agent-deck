@@ -18,5 +18,15 @@ regex = "1"
 syn = { version = "3", features = ["full", "parsing"] }
 xtask-docs = { path = "../docs" }
 
+# Issue #461: `clean-e2e-tmp` decides by owning-PID liveness, which needs
+# `kill(pid, 0)` — the only call that distinguishes "no such process" (ESRCH,
+# dead) from "not yours" (EPERM, alive). `libc` is already a workspace
+# dependency at the same version and gating (the root package declares it under
+# `[target.'cfg(unix)'.dependencies]`), so this pulls no new crate into
+# Cargo.lock. Unix-only: every `libc::` reference is behind `#[cfg(unix)]` and
+# non-Unix targets fall back to the age rule.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

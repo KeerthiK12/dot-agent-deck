@@ -37,7 +37,26 @@ Dry-run is the default and `--apply` is required to delete anything. By default 
 | `dot-agent-deck-test-lock-*` | yes | Pre-fix lock dirs, still present in bulk on older machines. |
 | `.tmp*` | **no** — needs `--include-untagged` | The `tempfile` crate's default prefix, shared with every Rust program on the machine. |
 
-Only pass `--include-untagged` when no other Rust build or tool is running; it can otherwise delete a live temp dir belonging to something else. Directories younger than the age threshold (default 6h) are always left alone so a reap cannot race a running suite, and symlinks are never followed.
+Only pass `--include-untagged` when no other Rust build or tool is running; it can otherwise delete a live temp dir belonging to something else. Symlinks are never followed.
+
+### Ownership decides, age is only the fallback
+
+The `<pid>` in `dad-tests-<pid>-<random>` is the process that created the root, so it answers "is anyone still using this?" directly, where age is only a proxy. Since [issue #461](https://github.com/vfarcic/dot-agent-deck/issues/461) the reaper reads it back:
+
+| The root's PID | Decision |
+|---|---|
+| No live process holds it | **Reap, at any age.** `--older-than` does not hold it back. |
+| Held by a live process | **Keep, at any age.** |
+| Held by a live process that started *after* the root's mtime | The number was recycled and proves nothing — decided by age. |
+| Not readable (untagged `.tmp*`, a lock dir, a malformed name, or a non-Unix host) | Decided by age. |
+
+Liveness is `kill(pid, 0)`, in which `EPERM` counts as **alive** — the process exists, it merely belongs to another user — and only `ESRCH` means dead. Start time comes from the `/proc/<pid>` directory's mtime; where it cannot be read the live process is assumed to be the owner and the root is kept.
+
+Both directions of that change matter. Age alone once refused 280 roots totalling **6.2 GB**, every one with a dead owner, because the oldest was 4h09m and the default threshold is 6h — on a 14 GB tmpfs with 5 MiB of swap left and an e2e compile about to start. It also made the opposite mistake: a suite still running past the threshold was eligible to have its own live root deleted out from under it.
+
+The output attributes each decision — `dead-pid`, `live-pid`, `recycled`, `untagged` — with per-reason counts and sizes, so "nothing to reap" now says which category held the survivors back instead of restating the age threshold. The per-directory list is capped at 20 entries (biggest first) and says how many it dropped; the summary always counts them all.
+
+`--older-than` still applies to the fallback cases only.
 
 ## Pre-flight space check
 

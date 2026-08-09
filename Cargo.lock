@@ -3584,6 +3584,7 @@ dependencies = [
 name = "xtask-linkage-check"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "proc-macro2",
  "regex",
  "syn 3.0.3",
