@@ -47,14 +47,22 @@ The `<pid>` in `dad-tests-<pid>-<random>` is the process that created the root, 
 |---|---|
 | No live process holds it | **Reap, at any age.** `--older-than` does not hold it back. |
 | Held by a live process | **Keep, at any age.** |
-| Held by a live process that started *after* the root's mtime | The number was recycled and proves nothing — decided by age. |
+| Held by a live process *proven* to have started well after the root already existed | The number was recycled and proves nothing — decided by age. |
 | Not readable (untagged `.tmp*`, a lock dir, a malformed name, or a non-Unix host) | Decided by age. |
 
-Liveness is `kill(pid, 0)`, in which `EPERM` counts as **alive** — the process exists, it merely belongs to another user — and only `ESRCH` means dead. Start time comes from the `/proc/<pid>` directory's mtime; where it cannot be read the live process is assumed to be the owner and the root is kept.
+Liveness is `kill(pid, 0)`, in which `EPERM` counts as **alive** — the process exists, it merely belongs to another user — and only `ESRCH` means dead.
+
+Recycling is the only verdict that can delete a directory whose PID *is* alive, so it demands positive proof and gets a deliberately expensive one. The start time is field 22 (`starttime`) of `/proc/<pid>/stat` — clock ticks since boot, which the kernel stamps once at task creation and never rewrites — converted to wall clock with `/proc/stat`'s `btime` and `sysconf(_SC_CLK_TCK)`. That is compared against the root's *creation* time (`statx` btime, falling back to mtime) with **five minutes** of slack, because the two timestamps come from unrelated clocks and are not safely orderable at second resolution across coarse-granularity, network, or clock-skewed filesystems. Field 22 is read by splitting at the **last** `)` in the line: field 2 is `comm`, unescaped, so a process named `foo bar) baz` would shift every index in a naive whitespace split.
+
+Every way that proof can fall short resolves to **keep, forever** — an unreadable or unparseable `stat`, a missing `btime`, a bad `_SC_CLK_TCK`, a filesystem that reports no timestamp for the root, or a non-Linux target. The tradeoff is accepted knowingly: a genuinely recycled PID the tool cannot prove recycled pins its root indefinitely, and leaking a root is strictly better than deleting a live run's working directory.
+
+Do **not** substitute the `/proc/<pid>` directory's mtime for that. It is not a start time. Linux instantiates the per-PID procfs inode lazily — `proc_pid_make_inode()` initialises its timestamps at instantiation and `pid_getattr()` leaves them alone — so the mtime is a proc-dentry *lookup* time and moves forward again whenever the dentry is evicted and re-looked-up, which is likeliest under exactly the memory pressure this tool exists to relieve. The first cut of #461 did use it, and any live root created before its owner's first `/proc/<pid>` lookup was reported `recycled` and deleted under `--apply`.
 
 Both directions of that change matter. Age alone once refused 280 roots totalling **6.2 GB**, every one with a dead owner, because the oldest was 4h09m and the default threshold is 6h — on a 14 GB tmpfs with 5 MiB of swap left and an e2e compile about to start. It also made the opposite mistake: a suite still running past the threshold was eligible to have its own live root deleted out from under it.
 
-The output attributes each decision — `dead-pid`, `live-pid`, `recycled`, `untagged` — with per-reason counts and sizes, so "nothing to reap" now says which category held the survivors back instead of restating the age threshold. The per-directory list is capped at 20 entries (biggest first) and says how many it dropped; the summary always counts them all.
+The output attributes each decision — `dead-pid`, `live-pid`, `recycled`, `untagged` — with per-reason counts and sizes, so "nothing to reap" now says which category held the survivors back instead of restating the age threshold. The per-directory list is capped at 20 entries (biggest first) and says how many it dropped; the summary always counts them all. Directory names are printed escaped rather than raw, because `/tmp` is mode 1777 and the suffix of a `dad-tests-<pid>-*` name is attacker-controlled text that the *default dry run* pipes to a terminal — an OSC 52 sequence in a directory name would otherwise rewrite the reader's clipboard.
+
+Sizes are computed by a walk bounded at 50,000 entries and depth 64 per root, because the walk now runs on kept roots too rather than only on age-eligible ones. Past the budget the walk stops and the size is printed with a `≥` marker and a footnote. Sizing is presentation only and never reaches the classifier, so a truncated size cannot change a reap/keep verdict.
 
 `--older-than` still applies to the fallback cases only.
 
