@@ -6876,6 +6876,95 @@ mod harness_unit_tests {
         );
     }
 
+    /// macOS reaches `/var/tmp` through a symlink — `/var -> private/var` — so
+    /// the harness and `cargo xtask clean-e2e-tmp` end up holding two different
+    /// spellings of one directory. This pins which one the *harness* holds.
+    ///
+    /// [`private_temp_parent_in`] joins the parent's name onto the shared
+    /// directory it was handed and never canonicalises, so what the socket
+    /// budget is charged against, and what a later `bind(2)` actually sees, is
+    /// the short `/var/tmp/dad-e2e-<uid>`. The reaper resolves instead and scans
+    /// `/private/var/tmp/dad-e2e-<uid>`. The only thing that has to be true of
+    /// the pair is that they are one directory, which is asserted by inode
+    /// rather than by string.
+    #[cfg(unix)]
+    #[test]
+    fn the_private_parent_keeps_the_short_spelling_the_socket_budget_charges_for() {
+        use std::os::unix::fs::MetadataExt;
+        let anchor = race_safe_tempdir();
+        let euid = effective_uid();
+        // macOS's own layout in miniature: a real `private/var/tmp`, reached
+        // through a `var` symlink that `lstat` traverses because it is never the
+        // final component.
+        std::fs::create_dir_all(anchor.path().join("private/var/tmp"))
+            .expect("stand-in /private/var/tmp");
+        std::os::unix::fs::symlink("private/var", anchor.path().join("var")).expect("plant /var");
+        let shared = anchor.path().join("var/tmp");
+
+        let by_name = private_temp_parent_in(&shared, euid).expect("a parent below the link");
+        assert_eq!(by_name, shared.join(private_parent_name(euid)));
+
+        let resolved = by_name.canonicalize().expect("resolve the parent");
+        assert_ne!(
+            by_name, resolved,
+            "the fixture must really diverge, as macOS does",
+        );
+        assert!(
+            by_name.as_os_str().len() < resolved.as_os_str().len(),
+            "the harness must hold the shorter spelling: {} vs {}",
+            by_name.display(),
+            resolved.display(),
+        );
+        let named = std::fs::metadata(&by_name).expect("stat by name");
+        let followed = std::fs::metadata(&resolved).expect("stat resolved");
+        assert_eq!(
+            (named.dev(), named.ino()),
+            (followed.dev(), followed.ino()),
+            "the two spellings must be one directory",
+        );
+    }
+
+    /// The socket budget at a macOS UID, in both spellings the two halves use.
+    ///
+    /// [`SUN_PATH_USABLE`] is already macOS's 103, so the only open question is
+    /// whether a `501`-shaped parent composes inside it. Both do, with room:
+    /// `/var/tmp/dad-e2e-501` is 20 bytes and composes to 68;
+    /// `/private/var/tmp/dad-e2e-501` is 28 and composes to 76 — against a
+    /// 55-byte base allowance and a 103-byte socket path. The harness binds
+    /// under the first of those, and the veto is applied to that same value.
+    #[cfg(unix)]
+    #[test]
+    fn a_macos_uid_fits_the_socket_budget_in_both_spellings() {
+        let name = private_parent_name(501);
+        let by_name = PathBuf::from(SHARED_VAR_TMP).join(&name);
+        let resolved = PathBuf::from("/private")
+            .join(SHARED_VAR_TMP.trim_start_matches('/'))
+            .join(&name);
+        assert_eq!(by_name, Path::new("/var/tmp/dad-e2e-501"));
+        assert_eq!(resolved, Path::new("/private/var/tmp/dad-e2e-501"));
+
+        for (base, len) in [(&by_name, 20), (&resolved, 28)] {
+            assert_eq!(base.as_os_str().len(), len, "{}", base.display());
+            assert!(
+                fits_socket_budget(base),
+                "{} ({len} bytes) exceeds the {MAX_TEMP_BASE_LEN}-byte allowance",
+                base.display(),
+            );
+            assert!(
+                len + HARNESS_SOCKET_OVERHEAD <= SUN_PATH_USABLE,
+                "{} composes to {} bytes, past {SUN_PATH_USABLE}",
+                base.display(),
+                len + HARNESS_SOCKET_OVERHEAD,
+            );
+        }
+
+        // And the ladder picks the short one without complaint — the veto sees
+        // exactly the value that reaches `bind(2)`.
+        let choice = choose_temp_base(None, Some(&by_name), Path::new("/tmp"));
+        assert_eq!(choice.path, by_name);
+        assert!(choice.warnings.is_empty(), "{:?}", choice.warnings);
+    }
+
     /// A refused `DAD_E2E_TMPDIR` is fatal too, and for a stronger reason than
     /// the default: the operator stated where the temp dirs must go, so quietly
     /// putting them somewhere else is both wrong and unasked-for.

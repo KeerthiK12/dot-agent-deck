@@ -845,6 +845,183 @@ mod tests {
         tmp
     }
 
+    /// Build macOS's own shape in miniature: a real `private/var/tmp`, reached
+    /// through a `var` symlink, so one directory has two spellings that share no
+    /// lexical prefix past `anchor`. Returns `(through_the_link, real)`.
+    ///
+    /// This is the platform's actual layout, not a contrivance — on macOS `/var`
+    /// is a symlink to `private/var`, so `/var/tmp` and `/private/var/tmp` are
+    /// one directory. Every macOS-shaped test below is built on it. `None` off
+    /// Unix, where there is nothing to build it from.
+    fn macos_var_alias(anchor: &Path) -> Option<(PathBuf, PathBuf)> {
+        #[cfg(unix)]
+        {
+            let real = anchor.join("private/var/tmp");
+            std::fs::create_dir_all(&real).expect("stand-in /private/var/tmp");
+            std::os::unix::fs::symlink("private/var", anchor.join("var")).expect("plant /var");
+            Some((anchor.join("var/tmp"), real))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = anchor;
+            None
+        }
+    }
+
+    /// The reading the whole platform rests on, verified rather than assumed:
+    /// `symlink_metadata` does not follow only the **final** component, so
+    /// `symlink_metadata("/var/tmp")` traverses macOS's `/var -> private/var`
+    /// link and stats the real `/private/var/tmp` — `drwxrwxrwt root:wheel`.
+    ///
+    /// If that reading were wrong the shared-holder check would see a symlink,
+    /// and `cargo xtask clean-e2e-tmp` would print `REFUSED to scan` on every
+    /// Mac and reap nothing. Fail-safe, and useless. The reaper's own tests do
+    /// not run on macOS CI at all (issue #470 — `cargo nextest run` there
+    /// carries no `--workspace`), so the shape is pinned here on Linux.
+    #[cfg(unix)]
+    #[test]
+    fn the_shared_holder_is_judged_through_a_symlinked_ancestor_as_macos_needs() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = scratch_anchor();
+        // SAFETY: `geteuid` takes no arguments and touches no memory we own.
+        let euid = unsafe { libc::geteuid() };
+        let (through_link, real) = macos_var_alias(tmp.path()).expect("unix");
+        // 1777 is the mode macOS ships: world-writable, and sticky, which is
+        // exactly what makes it acceptable.
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o1777)).expect("chmod");
+
+        let meta = std::fs::symlink_metadata(&through_link).expect("lstat through the link");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "lstat must traverse the ancestor link and stat the real directory",
+        );
+        assert!(
+            meta.is_dir(),
+            "{} is not a directory",
+            through_link.display()
+        );
+        let mode = meta.permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o1777, "{} is 0o{mode:o}", through_link.display());
+        assert_eq!(
+            meta.ino(),
+            std::fs::symlink_metadata(&real)
+                .expect("lstat the real directory")
+                .ino(),
+            "the two spellings must be one inode",
+        );
+
+        // So the verdict is handed a real sticky directory, and accepts it.
+        assert_eq!(
+            shared_parent_verdict(&through_link, false, true, meta.uid(), mode, euid),
+            None,
+        );
+        // And with the ownership macOS actually has, which no unprivileged test
+        // can build: root:wheel, at a typical macOS UID.
+        assert_eq!(
+            shared_parent_verdict(Path::new("/private/var/tmp"), false, true, 0, 0o1777, 501),
+            None,
+        );
+    }
+
+    /// The whole macOS path end to end: a private parent below a symlinked
+    /// ancestor is accepted, scanned at the **resolved** spelling, and its
+    /// children are still matched by name.
+    ///
+    /// On macOS the two halves disagree about spelling by construction — the
+    /// harness holds `/var/tmp/dad-e2e-<uid>`, `vet_root` resolves to
+    /// `/private/var/tmp/dad-e2e-<uid>`. What has to hold is that every decision
+    /// is made by directory *identity* and by the **final** component's name,
+    /// neither of which resolution moves.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_parent_below_a_symlinked_ancestor_is_scanned_at_its_resolved_path() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = scratch_anchor();
+        // SAFETY: `geteuid` takes no arguments and touches no memory we own.
+        let euid = unsafe { libc::geteuid() };
+        let (through_link, real) = macos_var_alias(tmp.path()).expect("unix");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o1777)).expect("chmod");
+
+        let parent = through_link.join(format!("dad-e2e-{euid}"));
+        std::fs::create_dir(&parent).expect("create the private parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let child = parent.join("dad-tests-1-macos");
+        std::fs::create_dir(&child).expect("plant a harness root");
+        std::fs::write(child.join("payload"), vec![0u8; 1024]).expect("write");
+
+        let root = ScanRoot {
+            path: parent.clone(),
+            untagged_ok: false,
+            required: false,
+            private: true,
+        };
+        let scan = match vet_root(&root) {
+            RootVerdict::Scan(scan) => scan,
+            RootVerdict::Absent => panic!("{} was reported absent", parent.display()),
+            RootVerdict::Refused(why) => panic!("macOS's own shape was refused: {why}"),
+        };
+        assert_eq!(scan, parent.canonicalize().expect("canonicalize"));
+        assert_ne!(
+            scan, parent,
+            "the fixture must really diverge, as macOS does",
+        );
+        let named = std::fs::metadata(&parent).expect("stat by name");
+        let resolved = std::fs::metadata(&scan).expect("stat resolved");
+        assert_eq!(
+            (named.dev(), named.ino()),
+            (resolved.dev(), resolved.ino()),
+            "the two spellings must be one directory",
+        );
+
+        // Resolution rewrites ancestors, never the final component, so the
+        // owned-prefix match is untouched by it.
+        let opts = Options {
+            max_age: Duration::ZERO,
+            apply: false,
+            include_untagged: false,
+        };
+        let found = collect(&scan, &opts).expect("collect");
+        assert_eq!(
+            found.len(),
+            1,
+            "found {:?}",
+            found.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
+        );
+        assert_eq!(found[0].path, scan.join("dad-tests-1-macos"));
+        assert_eq!(found[0].bytes, 1024);
+    }
+
+    /// De-duplication at the macOS spelling divergence. `/var/tmp/dad-e2e-501`
+    /// and `/private/var/tmp/dad-e2e-501` share no lexical prefix past the
+    /// anchor, so a textual comparison would walk one directory twice — doubling
+    /// the dry-run totals and, under `--apply`, failing the second
+    /// `remove_dir_all` with `NotFound`.
+    #[cfg(unix)]
+    #[test]
+    fn two_spellings_across_a_symlinked_ancestor_dedup_to_one_root() {
+        let tmp = scratch_anchor();
+        let (through_link, real) = macos_var_alias(tmp.path()).expect("unix");
+        let root = |path: PathBuf| ScanRoot {
+            path,
+            untagged_ok: false,
+            required: true,
+            private: false,
+        };
+        let deduped = dedup_roots(vec![root(through_link.clone()), root(real)]);
+        assert_eq!(
+            deduped.len(),
+            1,
+            "left {:?}",
+            deduped.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            deduped[0].path, through_link,
+            "the first spelling must survive",
+        );
+    }
+
     /// The blocker this closes, at the level that decides it: the *harness*
     /// verifies the private parent before writing under it, but this command —
     /// the one that deletes — verified nothing at all, so a `/var/tmp/dad-e2e-
@@ -1096,8 +1273,17 @@ mod tests {
     /// Placement and deletion are separate decisions: a `DAD_E2E_TMPDIR` that
     /// moved the harness is never scanned automatically, and the user is told
     /// how to opt in rather than left wondering why nothing was found.
+    ///
+    /// The last case is macOS's: the variable and the root being scanned name
+    /// one directory in two spellings. The hint compares by the directory, not
+    /// by how it is written, so a Mac is not told to `--root` something already
+    /// in the set. This stays one test rather than two because it is the only
+    /// one that mutates `DAD_E2E_TMPDIR` — a second would race it outside
+    /// nextest's one-process-per-test.
     #[test]
     fn the_env_override_is_not_scanned_but_is_named() {
+        let tmp = scratch_anchor();
+        let alias = macos_var_alias(tmp.path());
         // SAFETY: nextest runs one test per process, so this process is
         // single-threaded here; the variable is restored before returning.
         let prev = std::env::var_os(TEMP_BASE_ENV);
@@ -1111,6 +1297,15 @@ mod tests {
             required: true,
             private: false,
         }]);
+        let hint_when_aliased = alias.as_ref().map(|(through_link, real)| {
+            unsafe { std::env::set_var(TEMP_BASE_ENV, through_link) };
+            override_hint(&[ScanRoot {
+                path: real.clone(),
+                untagged_ok: true,
+                required: true,
+                private: false,
+            }])
+        });
         match prev {
             Some(v) => unsafe { std::env::set_var(TEMP_BASE_ENV, v) },
             None => unsafe { std::env::remove_var(TEMP_BASE_ENV) },
@@ -1123,6 +1318,13 @@ mod tests {
             hint_when_named.is_none(),
             "no hint once the override is passed as --root: {hint_when_named:?}",
         );
+        if let Some(aliased) = hint_when_aliased {
+            assert!(
+                aliased.is_none(),
+                "an override that is another spelling of a scanned root must not \
+                 be hinted at: {aliased:?}",
+            );
+        }
     }
 
     /// `--root` replaces the standard set rather than adding to it, so a
