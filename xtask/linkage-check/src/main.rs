@@ -21,6 +21,9 @@
 //!      The byte-identity diff against the on-disk `.md` is gone:
 //!      `.dot-agent-deck/` is gitignored dev-time state and would
 //!      not exist on a fresh clone.
+//!   8. No bare `tempfile::tempdir()` / `TempDir::new()` in
+//!      `tests/e2e_*.rs` or `tests/common/` — issue #322. See
+//!      [`BARE_TEMPDIR_RULE`].
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
 //!   through the SAME syn walker rule 7 uses
@@ -61,6 +64,38 @@ use regex::Regex;
 const CATALOG_PATH: &str = "tests/CATALOG.md";
 const ALLOWLIST_PATH: &str = "xtask/linkage-check/m2.allowlist";
 const TESTS_DIR: &str = "tests";
+
+/// Check 8 (issue #322): why a bare `tempfile` constructor is forbidden under
+/// `tests/`, spelled out here because the violation is invisible at the call
+/// site.
+///
+/// The harness redirects `tempfile`'s process-global default temp dir at its own
+/// per-process root — but it can only do that from inside
+/// `harness_temp_root()`'s lazy initialisation, i.e. the first time something
+/// asks the harness for a directory. nextest runs one process per test, so a
+/// bare `tempfile::tempdir()` that runs *before* any harness call in that test
+/// is the first allocation of the process and lands in the OS temp dir instead:
+/// commonly the RAM-backed `/tmp` this whole issue is about, at `tempfile`'s
+/// default mode rather than 0o700, outside the free-space pre-flight, and — the
+/// part that bites — left behind on SIGKILL under `.tmp*`, a name the reaper
+/// deliberately will not touch by default because it belongs to every Rust
+/// program on the machine.
+///
+/// This was not theoretical: `e2e_issue_dispatch` cloned whole repositories
+/// through exactly that ordering. Rather than depend on every call site
+/// happening to be preceded by a harness call, the suite calls
+/// `common::harness_tempdir()`, which initialises the root first and then
+/// allocates inside it. This rule is what keeps that true — the ordering
+/// argument is invisible in a diff, so it cannot be left to review.
+///
+/// The escape hatch is [`BARE_TEMPDIR_ALLOW`] on the same line, which the
+/// harness's own defence-in-depth regression test uses.
+const BARE_TEMPDIR_RULE: &str = "bare tempfile constructor — use `common::harness_tempdir()` so the dir \
+     lands under the harness temp root even when it is the process's FIRST \
+     allocation (issue #322)";
+
+/// Opt-out marker for check 8, on the offending line.
+const BARE_TEMPDIR_ALLOW: &str = "linkage-check:allow-bare-tempdir";
 
 fn main() -> ExitCode {
     // PRD #77 M4: route subcommands through this binary so the
@@ -136,6 +171,13 @@ fn main() -> ExitCode {
         Regex::new(r"(std::thread::sleep|tokio::time::sleep)\b").expect("sleep regex compiles");
     let polling_re =
         Regex::new(r"for\s+_\s+in\s+0\.\.\s*\d+\s*\{").expect("polling regex compiles");
+    // Check 8 (issue #322): the two constructors that allocate in the OS temp
+    // dir. `Builder::…::tempdir_in(...)` names its parent explicitly and is
+    // fine; `Builder::…::tempdir()` does not, so it is matched too.
+    let bare_tempdir_re =
+        Regex::new(r"tempfile::tempdir\s*\(|TempDir::new\s*\(|\.tempdir\s*\(\s*\)")
+            .expect("bare tempdir regex compiles");
+    let mut bare_tempdir_violations: Vec<String> = Vec::new();
 
     for file in &test_files {
         let text = match std::fs::read_to_string(file) {
@@ -168,6 +210,31 @@ fn main() -> ExitCode {
                 file: file.clone(),
                 line: line_no,
             });
+        }
+
+        // Check 8 (issue #322): the e2e tier plus the harness itself — the same
+        // scoping rule 5 uses, and for the same reason. That is where the
+        // allocations are whole cloned repositories, where nextest's
+        // `slow-timeout terminate-after` SIGKILLs a process before it can clean
+        // up, and where real agent credentials get seeded. A fast-tier
+        // `TempDir` is small, drops on the normal path, and its file is not
+        // linked against the harness at all, so requiring the wrapper there
+        // would mean pulling the whole PTY harness into another binary to fix
+        // something that is not leaking. Run against the stripped view so a
+        // comment naming the constructor is not a violation, but report the raw
+        // line number.
+        let is_harness = file.starts_with(tests_dir.join("common"));
+        if is_e2e || is_harness {
+            for (idx, raw) in raw_lines.iter().enumerate() {
+                let stripped_line = stripped_lines.get(idx).copied().unwrap_or("");
+                if bare_tempdir_re.is_match(stripped_line) && !raw.contains(BARE_TEMPDIR_ALLOW) {
+                    bare_tempdir_violations.push(format!(
+                        "{}:{}: {BARE_TEMPDIR_RULE}",
+                        file.display(),
+                        idx + 1
+                    ));
+                }
+            }
         }
 
         if is_e2e {
@@ -285,6 +352,11 @@ fn main() -> ExitCode {
 
     failures.extend(e2e_violations);
     failures.extend(ignore_violations);
+    failures.extend(
+        bare_tempdir_violations
+            .into_iter()
+            .map(|v| format!("[8] {v}")),
+    );
 
     // Check 7 (PRD #77 Decision 30 / M4.3): every #[spec] test has
     // a `/// Scenario:` doc comment with a body AND
@@ -300,7 +372,7 @@ fn main() -> ExitCode {
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 7 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 8 rules)",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()

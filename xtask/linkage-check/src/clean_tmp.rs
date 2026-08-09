@@ -33,6 +33,19 @@
 //! `DAD_E2E_TMPDIR` that moved the harness somewhere else does **not** silently
 //! become a directory this command deletes from — it prints a hint naming it,
 //! and `--root <path>` is how you opt in.
+//!
+//! # The boundary this command has to prove for itself
+//!
+//! `/var/tmp/dad-e2e-<uid>` is what makes "everything under here is ours" true,
+//! and the *harness* proving it is not enough: this is the half that **deletes**,
+//! and the name is predictable in a world-writable directory, so another local
+//! user can occupy it before the victim's first run. Every root is therefore
+//! vetted here in its own right ([`vet_root`]) before a single entry is read —
+//! the private parent must be a real directory, owned by this UID, with no
+//! group or other bits, inside a `/var/tmp` that is itself a root-owned sticky
+//! directory. A symlink at that name is **refused, never followed**. Scanning
+//! and removal then run against the path vetting resolved, not the spelling it
+//! was handed, so nothing can be retargeted underneath the walk.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -55,7 +68,7 @@ const TEMP_BASE_ENV: &str = "DAD_E2E_TMPDIR";
 #[cfg(unix)]
 const SHARED_VAR_TMP: &str = "/var/tmp";
 
-/// A directory to look in, plus the two facts that differ between them.
+/// A directory to look in, plus the facts that differ between them.
 struct ScanRoot {
     /// Original spelling. Every message uses this, not the canonical form.
     path: PathBuf,
@@ -68,6 +81,24 @@ struct ScanRoot {
     /// Named with `--root`. An unreadable root the user asked for by hand is an
     /// error; an absent standard root is normal and silent.
     required: bool,
+    /// Whether this is the harness's own private, UID-scoped parent — the one
+    /// the "everything under it is ours by construction" argument rests on, and
+    /// therefore the one that has to be *proved* private before this command
+    /// deletes anything under it. See [`private_root_verdict`].
+    private: bool,
+}
+
+/// A root that passed [`vet_root`]: what to show, and what to actually touch.
+struct VettedRoot {
+    /// Original spelling, for every message.
+    shown: PathBuf,
+    /// The validated, fully-resolved path `read_dir` and `remove_dir_all`
+    /// operate on. Kept separate from `shown` deliberately: resolving only for
+    /// de-duplication while scanning and deleting the *original* spelling is
+    /// what let a retargetable symlink make the object deleted differ from the
+    /// object listed.
+    scan: PathBuf,
+    untagged_ok: bool,
 }
 
 /// The private, UID-scoped parent the harness puts its per-process roots in.
@@ -100,6 +131,7 @@ fn standard_roots() -> Vec<ScanRoot> {
             path: std::env::temp_dir(),
             untagged_ok: true,
             required: false,
+            private: false,
         },
     ];
     // Listed first because it is where a current run's roots are; `insert`
@@ -112,9 +144,200 @@ fn standard_roots() -> Vec<ScanRoot> {
             path: private_parent(),
             untagged_ok: false,
             required: false,
+            private: true,
         },
     );
     roots
+}
+
+/// Why the shared directory the private parent lives in — `/var/tmp` — cannot
+/// be trusted to hold it. Pure, so a foreign owner can be injected.
+///
+/// `/var/tmp` is mode 1777 on every normal system: world-writable, but sticky,
+/// so only an entry's own owner may rename or remove it. That is what makes the
+/// private parent's name un-hijackable once it exists. World-writable *without*
+/// the sticky bit is the shape where any local user could swap our parent for
+/// theirs between this check and the deletion below, so it is refused.
+#[cfg(unix)]
+fn shared_parent_verdict(
+    path: &Path,
+    is_symlink: bool,
+    is_dir: bool,
+    uid: u32,
+    mode: u32,
+    euid: u32,
+) -> Option<String> {
+    let path = path.display();
+    if is_symlink {
+        return Some(format!("{path} is a symlink, not a real directory"));
+    }
+    if !is_dir {
+        return Some(format!("{path} is not a directory"));
+    }
+    if uid != 0 && uid != euid {
+        return Some(format!(
+            "{path} is owned by uid {uid}, neither root nor {euid}"
+        ));
+    }
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Some(format!(
+            "{path} is mode 0o{mode:o} — group/world-writable without the sticky \
+             bit, so any local user could swap the directory below it"
+        ));
+    }
+    None
+}
+
+/// Why the harness's private, UID-scoped parent must not be scanned or deleted
+/// from. Pure, so the foreign-owner case — which needs `chown` to build on disk
+/// — can be driven with injected values.
+///
+/// This is the check the whole design rested on and did not have. The *harness*
+/// verifies this directory before it writes anything under it, and refuses to
+/// start when it is foreign; the reaper, which is the half that **deletes**,
+/// verified nothing at all. `/var/tmp/dad-e2e-<uid>` is a predictable name in a
+/// world-writable directory, so another local user can create it before the
+/// victim's first run — and `--apply` would then have scanned their 0777
+/// directory and removed the `dad-tests-*` children they put in it. A symlink at
+/// the same name was worse: it was resolved for de-duplication and then the
+/// original spelling was scanned and deleted through, redirecting the reaper
+/// wherever the attacker pointed.
+#[cfg(unix)]
+fn private_root_verdict(
+    path: &Path,
+    is_symlink: bool,
+    is_dir: bool,
+    uid: u32,
+    mode: u32,
+    euid: u32,
+) -> Option<String> {
+    let shown = path.display();
+    if is_symlink {
+        // Refused, never followed: the harness would refuse it too, and
+        // following it is exactly how the reaper gets aimed somewhere else.
+        return Some(format!(
+            "{shown} is a symlink — refused rather than followed; the harness's \
+             private parent is always a real directory"
+        ));
+    }
+    if !is_dir {
+        return Some(format!("{shown} is not a directory"));
+    }
+    if uid != euid {
+        return Some(format!(
+            "{shown} is owned by uid {uid}, not {euid} — it is not this user's \
+             harness parent, so nothing under it is this command's to delete"
+        ));
+    }
+    if mode & 0o077 != 0 {
+        return Some(format!(
+            "{shown} is mode 0o{mode:o}, not owner-only — another user can write \
+             into it, so what is under it is not ours by construction"
+        ));
+    }
+    None
+}
+
+/// Filesystem-facing adapter over [`private_root_verdict`], including the
+/// [`shared_parent_verdict`] check on the directory that holds it.
+#[cfg(unix)]
+fn private_root_objection(path: &Path, euid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(parent) = path.parent() {
+        let meta = match std::fs::symlink_metadata(parent) {
+            Ok(meta) => meta,
+            Err(e) => return Some(format!("cannot stat {}: {e}", parent.display())),
+        };
+        if let Some(why) = shared_parent_verdict(
+            parent,
+            meta.file_type().is_symlink(),
+            meta.is_dir(),
+            meta.uid(),
+            meta.permissions().mode() & 0o7777,
+            euid,
+        ) {
+            return Some(why);
+        }
+    }
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        // Nothing there at all: not an objection, just an absence. The caller
+        // distinguishes the two.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("cannot stat {}: {e}", path.display())),
+    };
+    private_root_verdict(
+        path,
+        meta.file_type().is_symlink(),
+        meta.is_dir(),
+        meta.uid(),
+        meta.permissions().mode() & 0o7777,
+        euid,
+    )
+}
+
+/// What one root turned out to be.
+enum RootVerdict {
+    /// Safe to read from and delete under, at this fully-resolved path.
+    Scan(PathBuf),
+    /// Nothing at the path. Normal for a standard root on a machine that has
+    /// never run the suite.
+    Absent,
+    /// Present and not safe. Never scanned, never deleted from.
+    Refused(String),
+}
+
+/// Decide whether a root may be scanned, and at which path.
+///
+/// Two separate jobs. For the private parent, prove the privacy boundary the
+/// deletion rests on ([`private_root_verdict`]) — the check whose absence is the
+/// blocker this closes. For every root, resolve the spelling **once** here and
+/// hand that resolved path to the scan and the deletion, so a symlinked
+/// component cannot be retargeted between listing a directory and removing it.
+///
+/// What this still does not do is hold the root open as a descriptor and
+/// enumerate relative to it: `std` offers no `read_dir`-from-`fd` and no
+/// `remove_dir_all`-from-`fd`, so that would mean an FFI directory walk of its
+/// own. The residual is one lookup wide — between `read_dir` here and
+/// `remove_dir_all` below, an entry could be swapped by whoever can write in the
+/// root. Under the private parent (0o700, proved ours above) nobody can; under a
+/// sticky system temp dir only the entry's own owner can, and our entries are
+/// ours; under a hand-named `--root` it is the operator's directory and their
+/// call.
+fn vet_root(root: &ScanRoot) -> RootVerdict {
+    #[cfg(unix)]
+    if root.private {
+        // SAFETY: `geteuid` takes no arguments, always succeeds, and touches no
+        // memory this process owns.
+        let euid = unsafe { libc::geteuid() };
+        if let Some(why) = private_root_objection(&root.path, euid) {
+            return RootVerdict::Refused(why);
+        }
+    }
+    let meta = match std::fs::symlink_metadata(&root.path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RootVerdict::Absent,
+        Err(e) => {
+            return RootVerdict::Refused(format!("cannot stat {}: {e}", root.path.display()));
+        }
+    };
+    // A FIFO, socket or plain file at a root name is refused everywhere, not
+    // just under the private rule — `read_dir` on one blocks or errors, and
+    // `remove_dir_all` on one is not what anybody asked for. A symlink is not
+    // judged here: the private arm above has already refused it, and for the
+    // system temp dir or a hand-named `--root` following it is the documented
+    // behaviour, resolved exactly once by the `canonicalize` below.
+    if !meta.file_type().is_symlink() && !meta.is_dir() {
+        return RootVerdict::Refused(format!("{} is not a directory", root.path.display()));
+    }
+    match std::fs::canonicalize(&root.path) {
+        Ok(resolved) => RootVerdict::Scan(resolved),
+        // A dangling symlink: `symlink_metadata` found the link, `canonicalize`
+        // cannot find its target.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RootVerdict::Absent,
+        Err(e) => RootVerdict::Refused(format!("cannot resolve {}: {e}", root.path.display())),
+    }
 }
 
 /// Identity of a directory for de-duplication: its canonical path when it
@@ -198,6 +421,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 // warning is about, so it is honoured here.
                 untagged_ok: true,
                 required: true,
+                private: false,
             })
             .collect()
     });
@@ -222,8 +446,44 @@ pub fn run(args: &[String]) -> ExitCode {
             restricted.join(", "),
         );
     }
-    let mut candidates = Vec::new();
+    // Vetted BEFORE anything is read, let alone removed. A standard root that
+    // cannot be proved safe is skipped loudly rather than scanned; one the user
+    // named by hand is a hard error, because silently skipping it would read as
+    // "nothing to reap".
+    let mut vetted: Vec<VettedRoot> = Vec::new();
     for root in &temp_roots {
+        match vet_root(root) {
+            RootVerdict::Scan(scan) => vetted.push(VettedRoot {
+                shown: root.path.clone(),
+                scan,
+                untagged_ok: root.untagged_ok,
+            }),
+            // A standard root that is simply absent is normal — a machine that
+            // has never run the suite has no private parent yet.
+            RootVerdict::Absent if !root.required => {}
+            RootVerdict::Absent => {
+                eprintln!(
+                    "xtask clean-e2e-tmp: {} does not exist",
+                    root.path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+            RootVerdict::Refused(why) => {
+                eprintln!("xtask clean-e2e-tmp: REFUSED to scan {why}.");
+                eprintln!(
+                    "  Nothing under it was read or removed. Look at it — \
+                     `ls -ld {}` — and remove it by hand if it is yours.",
+                    root.path.display(),
+                );
+                if root.required {
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for root in &vetted {
         // Per-root view: `collect` reads `include_untagged` straight off
         // `Options`, and the flag is confined to one root, so it is masked here
         // rather than inside `collect` — which issue #461 is rewriting and
@@ -233,17 +493,17 @@ pub fn run(args: &[String]) -> ExitCode {
             apply: opts.apply,
             include_untagged: opts.include_untagged && root.untagged_ok,
         };
-        match collect(&root.path, &scoped) {
+        // `root.scan`, not `root.shown`: the resolved path vetting produced, so
+        // the tree walked here is the tree vetting judged.
+        match collect(&root.scan, &scoped) {
             Ok(mut found) => candidates.append(&mut found),
-            // A standard root that is simply absent is normal — a machine that
-            // has never run the suite has no private parent yet. A root the
-            // user named by hand is not: silence there would look like "nothing
-            // to reap".
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !root.required => {}
+            // Vetting already stat'ed it, so a `NotFound` here is a race with
+            // something else removing the root — nothing left to reap.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 eprintln!(
                     "xtask clean-e2e-tmp: cannot read {}: {e}",
-                    root.path.display()
+                    root.shown.display()
                 );
                 return ExitCode::FAILURE;
             }
@@ -558,6 +818,202 @@ mod tests {
         );
     }
 
+    /// A scratch directory that can stand in for `/var/tmp`.
+    ///
+    /// Hardened to 0o700 because [`vet_root`] judges the *holder* of a private
+    /// root as well as the root itself, and `tempfile` creates at the umask
+    /// default — 0o775 under the common `umask 002`, which is precisely the
+    /// "another local user could swap the directory below it" shape the rule
+    /// refuses. Without this the fixtures below would be rejected for the wrong
+    /// reason and prove nothing about the shapes they plant.
+    fn scratch_anchor() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("harden the anchor");
+        }
+        tmp
+    }
+
+    /// The blocker this closes, at the level that decides it: the *harness*
+    /// verifies the private parent before writing under it, but this command —
+    /// the one that deletes — verified nothing at all, so a `/var/tmp/dad-e2e-
+    /// <victim-uid>` another local user created first would have been scanned
+    /// and emptied under `--apply`.
+    ///
+    /// The foreign case is driven through the pure verdict because `chown` is
+    /// privileged; every other shape is built on disk below.
+    #[cfg(unix)]
+    #[test]
+    fn a_foreign_or_loose_private_parent_is_never_scanned() {
+        let path = Path::new("/var/tmp/dad-e2e-1000");
+        let why = |v: Option<String>| v.unwrap_or_default();
+
+        // Ours, a real directory, owner-only: the one shape that passes.
+        assert_eq!(
+            private_root_verdict(path, false, true, 1000, 0o700, 1000),
+            None,
+        );
+
+        // Someone else got the predictable name first.
+        let foreign = why(private_root_verdict(path, false, true, 1001, 0o700, 1000));
+        assert!(foreign.contains("owned by uid 1001"), "{foreign}");
+        assert!(foreign.contains("not this user's"), "{foreign}");
+
+        // Ours, but open enough that anything under it could be anyone's.
+        for mode in [0o777, 0o770, 0o707, 0o750] {
+            let loose = why(private_root_verdict(path, false, true, 1000, mode, 1000));
+            assert!(
+                loose.contains("not owner-only"),
+                "0o{mode:o} must be refused: {loose}",
+            );
+        }
+
+        // Redirection: refused, and the message has to say it was not followed.
+        let linked = why(private_root_verdict(path, true, true, 1000, 0o777, 1000));
+        assert!(linked.contains("is a symlink"), "{linked}");
+        assert!(linked.contains("rather than followed"), "{linked}");
+
+        // A FIFO, socket or plain file at the name.
+        let fifo = why(private_root_verdict(path, false, false, 1000, 0o700, 1000));
+        assert!(fifo.contains("is not a directory"), "{fifo}");
+    }
+
+    /// The same rule against real entries on disk, since every shape except the
+    /// foreign owner is buildable unprivileged. `vet_root` must come back
+    /// `Refused` for each — never `Scan`, which is what would let `--apply`
+    /// reach `remove_dir_all`.
+    #[cfg(unix)]
+    #[test]
+    fn vetting_refuses_every_unsafe_private_parent_shape_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = scratch_anchor();
+        // SAFETY: `geteuid` takes no arguments and touches no memory we own.
+        let euid = unsafe { libc::geteuid() };
+        let private = |path: PathBuf| ScanRoot {
+            path,
+            untagged_ok: false,
+            required: false,
+            private: true,
+        };
+        let refusal = |root: &ScanRoot| match vet_root(root) {
+            RootVerdict::Refused(why) => why,
+            RootVerdict::Scan(p) => {
+                panic!("{} was accepted as {}", root.path.display(), p.display())
+            }
+            RootVerdict::Absent => panic!("{} was reported absent", root.path.display()),
+        };
+
+        // A loose 0o777 parent — the shape a foreign one would also have, and
+        // the one that makes "ours by construction" false.
+        let loose = tmp.path().join("loose");
+        std::fs::create_dir(&loose).expect("create loose");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        std::fs::create_dir(loose.join("dad-tests-1-x")).expect("plant a child");
+        let why = refusal(&private(loose.clone()));
+        assert!(why.contains("not owner-only"), "{why}");
+        assert!(
+            loose.join("dad-tests-1-x").is_dir(),
+            "a refused root must be left completely alone",
+        );
+
+        // A symlink at the parent name, pointed at a directory that DOES hold a
+        // matching child — the redirection the finding is about.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("create elsewhere");
+        std::fs::create_dir(elsewhere.join("dad-tests-2-y")).expect("plant a child");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink");
+        let why = refusal(&private(link.clone()));
+        assert!(why.contains("is a symlink"), "{why}");
+        assert!(
+            elsewhere.join("dad-tests-2-y").is_dir(),
+            "the reaper followed the link",
+        );
+
+        // A dangling symlink is still a symlink, not an absence.
+        let dangling = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &dangling).expect("symlink");
+        let why = refusal(&private(dangling));
+        assert!(why.contains("is a symlink"), "{why}");
+
+        // A FIFO at the parent name: `read_dir` on one is not something to try.
+        let fifo = tmp.path().join("fifo");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("cstring");
+        // SAFETY: a NUL-terminated path the call only reads.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+        let why = refusal(&private(fifo));
+        assert!(why.contains("is not a directory"), "{why}");
+
+        // And the control: a real, owner-only directory of ours is accepted, so
+        // the assertions above are refusals of the shape, not of the fixture.
+        let good = tmp.path().join("good");
+        std::fs::create_dir(&good).expect("create good");
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        match vet_root(&private(good.clone())) {
+            RootVerdict::Scan(scan) => assert_eq!(
+                scan,
+                good.canonicalize().expect("canonicalize"),
+                "the scanned path must be the resolved one",
+            ),
+            RootVerdict::Absent => panic!("a real directory reported absent"),
+            RootVerdict::Refused(why) => {
+                panic!("an owner-only dir of uid {euid} was refused: {why}")
+            }
+        }
+    }
+
+    /// A parent that is simply not there is normal — a machine that has never
+    /// run the suite has no private parent yet — and must stay silent rather
+    /// than becoming a refusal.
+    #[test]
+    fn an_absent_standard_root_is_not_a_refusal() {
+        let tmp = scratch_anchor();
+        let root = ScanRoot {
+            path: tmp.path().join("never-created"),
+            untagged_ok: false,
+            required: false,
+            private: true,
+        };
+        assert!(
+            matches!(vet_root(&root), RootVerdict::Absent),
+            "an absent root must be Absent, not Refused",
+        );
+    }
+
+    /// The holder of the private parent has to be trustworthy too: `/var/tmp`
+    /// is world-writable, and only the sticky bit stops another user renaming
+    /// our parent out from under the scan.
+    #[cfg(unix)]
+    #[test]
+    fn the_shared_holder_of_the_private_parent_must_be_sticky_and_root_owned() {
+        let path = Path::new("/var/tmp");
+        let why = |v: Option<String>| v.unwrap_or_default();
+
+        // The real-world shape: root-owned, 1777.
+        assert_eq!(
+            shared_parent_verdict(path, false, true, 0, 0o1777, 1000),
+            None
+        );
+        // Ours is fine too — a scratch stand-in in the tests below is exactly that.
+        assert_eq!(
+            shared_parent_verdict(path, false, true, 1000, 0o700, 1000),
+            None
+        );
+
+        let foreign = why(shared_parent_verdict(path, false, true, 1001, 0o1777, 1000));
+        assert!(foreign.contains("owned by uid 1001"), "{foreign}");
+
+        // 0777 without the sticky bit: any local user can rename our parent.
+        let unsticky = why(shared_parent_verdict(path, false, true, 0, 0o777, 1000));
+        assert!(unsticky.contains("without the sticky bit"), "{unsticky}");
+
+        let linked = why(shared_parent_verdict(path, true, true, 0, 0o1777, 1000));
+        assert!(linked.contains("is a symlink"), "{linked}");
+    }
+
     /// `/var/tmp` is a Unix path. On Windows it is root-relative on the current
     /// drive and the harness never writes there, so `--apply` must not be able
     /// to delete from it.
@@ -605,16 +1061,19 @@ mod tests {
                 path: real.clone(),
                 untagged_ok: false,
                 required: true,
+                private: false,
             },
             ScanRoot {
                 path: alias,
                 untagged_ok: false,
                 required: true,
+                private: false,
             },
             ScanRoot {
                 path: real.join("."),
                 untagged_ok: false,
                 required: true,
+                private: false,
             },
         ]);
         assert_eq!(
@@ -642,6 +1101,7 @@ mod tests {
             path: PathBuf::from("/somewhere/else/dad-e2e"),
             untagged_ok: true,
             required: true,
+            private: false,
         }]);
         match prev {
             Some(v) => unsafe { std::env::set_var(TEMP_BASE_ENV, v) },
