@@ -68,6 +68,19 @@
 //! which is exactly where the wrong answers came from, in exchange for a hint
 //! nobody can act on differently.
 //!
+//! No *behavioural* test can enforce that, and the tests in this file do not
+//! pretend to. Tripping a reinstated comparison needs a root whose timestamp
+//! predates its owner's start by more than the comparison's margin, and a
+//! directory's birth time cannot be backdated by any portable API — a test can
+//! set mtime and nothing else, so the only gap it can manufacture is
+//! milliseconds, far inside the five-minute margin the deleted code used and
+//! inside any plausible replacement. Restore that code verbatim and every
+//! behavioural test here still passes. What guards it instead is a source-level
+//! scan (`source_has_no_pid_recycling_machinery`, which reads this very file),
+//! the shape of [`owner_of`], which takes no timestamp and so cannot express
+//! the comparison, and code review. None of the three is a substitute for
+//! reading the diff.
+//!
 //! # What this will and will not delete
 //!
 //! Deleting by prefix in a shared `/tmp` is only safe for names this repo
@@ -807,9 +820,16 @@ mod tests {
         }
     }
 
-    /// Force a directory's mtime, so a test can put a root's only timestamp
-    /// anywhere on the wall clock — including the future, which no amount of
-    /// waiting can produce.
+    /// Force a directory's **mtime**, and only its mtime, so a test can put
+    /// that one timestamp anywhere on the wall clock — including the future,
+    /// which no amount of waiting can produce.
+    ///
+    /// It is not the root's only timestamp. `FileTimes` reaches mtime and atime;
+    /// nothing portable reaches **birth time**, and on a filesystem that records
+    /// one — the tmpfs this usually runs on does — the directory keeps a
+    /// creation time of "just now" whatever this sets. That is precisely why no
+    /// behavioural test can catch a reinstated start-time comparison, and why
+    /// the guard is `source_has_no_pid_recycling_machinery` instead.
     fn set_mtime(dir: &Path, when: SystemTime) {
         let handle = std::fs::File::open(dir).expect("open dir");
         handle
@@ -995,22 +1015,22 @@ mod tests {
         assert!(dir.exists());
     }
 
-    /// The invariant that replaced the recycling machinery, asserted end to end
-    /// through the real deletion path and the real `kill(pid, 0)` probe: a live
-    /// owner keeps its root **whatever timestamp the root carries**.
+    /// A live owner keeps its root at a zero threshold, through the real
+    /// deletion path and the real `kill(pid, 0)` probe, **whatever mtime the
+    /// root carries** — decades stale or decades in the future. Ancient mtime is
+    /// what a long-running suite looks like once a `--older-than 0` sweep comes
+    /// past; a future mtime is the shape a forward clock step leaves behind.
     ///
-    /// The two extremes are the two ways the old start-time comparison could be
-    /// fooled. A root timestamped in the distant past is what a live long-running
-    /// suite looks like once a `--older-than 0` sweep comes past; a root
-    /// timestamped in the future is what a single forward `settimeofday` step
-    /// makes every *ordinary* root look like relative to a reconstructed start
-    /// time, since `btime` moves and inode timestamps do not. Under the old
-    /// design either could reach `Recycled` and then be deleted; under this one
-    /// no timestamp is read at all outside the age fallback, and the age
-    /// fallback is unreachable for a live PID.
+    /// **This is not a guard against the deleted start-time comparison, and must
+    /// not be read as one.** [`set_mtime`] moves mtime only: both roots keep a
+    /// birth time of "just now", so a restored `meta.created().ok().or(mtime)`
+    /// comparison would find the current process older than both, classify both
+    /// live, and leave this test green. Nothing a test can build changes that —
+    /// see the module docs and `source_has_no_pid_recycling_machinery`, which is
+    /// the guard.
     #[cfg(unix)]
     #[test]
-    fn a_live_pid_is_kept_whatever_timestamp_the_root_carries() {
+    fn a_live_pid_is_kept_whatever_mtime_the_root_carries() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let pid = std::process::id();
         let ancient = tmp.path().join(format!("dad-tests-{pid}-ancient"));
@@ -1019,10 +1039,10 @@ mod tests {
             std::fs::create_dir(dir).expect("create");
             std::fs::write(dir.join("payload"), vec![0u8; 512]).expect("write");
         }
-        // Decades before this process could possibly have started…
+        // An mtime decades before this process could possibly have started…
         set_mtime(&ancient, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
-        // …and decades after it, which is where a forward clock step used to
-        // strand a perfectly ordinary root.
+        // …and one decades after it, the shape a forward clock step leaves on an
+        // otherwise ordinary root. Only mtime moves; both birth times stay put.
         set_mtime(
             &futuristic,
             SystemTime::now() + Duration::from_secs(50 * 365 * 24 * 3600),
@@ -1040,10 +1060,13 @@ mod tests {
         .expect("apply");
 
         assert_eq!(applied.removed, 0, "{}", applied.report);
-        assert!(ancient.exists(), "a live owner's root must survive any age");
+        assert!(
+            ancient.exists(),
+            "a live owner's root must survive an ancient mtime"
+        );
         assert!(
             futuristic.exists(),
-            "a live owner's root must survive a future timestamp too"
+            "a live owner's root must survive a future mtime too"
         );
         assert!(
             !applied.report.contains("reap:"),
@@ -1051,7 +1074,7 @@ mod tests {
             applied.report
         );
         assert!(applied.report.contains("live-pid"), "{}", applied.report);
-        // And the mirror image: the timestamp cannot save a dead owner either.
+        // And the mirror image: an mtime cannot save a dead owner either.
         let dead_tmp = tempfile::tempdir().expect("tempdir");
         let dead = dead_tmp.path().join("dad-tests-4242-futuristic");
         std::fs::create_dir(&dead).expect("create");
@@ -1067,7 +1090,7 @@ mod tests {
                 reap: true,
                 reason: Reason::DeadPid
             },
-            "a dead PID is reaped whatever the root's timestamp"
+            "a dead PID is reaped whatever the root's mtime"
         );
     }
 
@@ -1465,5 +1488,253 @@ mod tests {
         assert!(text.contains("≥ 5.0 MB"), "{text}");
         assert!(text.contains("reap: 1 dir(s), ≥ 5.0 MB"), "{text}");
         assert!(text.contains("lower bounds"), "{text}");
+    }
+
+    /// This module's own source, scanned by the reinstatement guard below.
+    const SRC: &str = include_str!("clean_tmp.rs");
+
+    /// Tokens that only the deleted PID-recycling machinery brings back, matched
+    /// **case-insensitively** (hence the lower-case spellings) against the
+    /// source with comments and literals removed by [`code_only`].
+    ///
+    /// `recycled` covers `Owner::Recycled`, `Reason::RecycledAge`, and any
+    /// freshly invented `recycled_*` binding. The rest name the `/proc` parsing
+    /// surface the two failed implementations were built on.
+    const FORBIDDEN: &[&str] = &[
+        "recycled",
+        ".created(",
+        "sysconf",
+        "_sc_clk_tck",
+        "starttime",
+        "process_start_time",
+        "boot_time",
+    ];
+
+    fn is_ident_char(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '_'
+    }
+
+    /// Whether the character before `i` continues an identifier, so a bare `r`
+    /// is only read as a raw-string sigil where one can legally start. A `b`
+    /// immediately before it is the byte-string prefix, not identifier text.
+    fn prev_is_ident(c: &[char], i: usize) -> bool {
+        match i.checked_sub(1).map(|p| c[p]) {
+            None => false,
+            Some('b') => prev_is_ident(c, i - 1),
+            Some(p) => is_ident_char(p),
+        }
+    }
+
+    /// Index just past a raw string starting at `i` (`r"…"`, `r#"…"#`, …), or
+    /// `None` if `i` does not start one.
+    fn raw_string_end(c: &[char], i: usize) -> Option<usize> {
+        let mut j = i + 1;
+        let mut hashes = 0usize;
+        while c.get(j) == Some(&'#') {
+            hashes += 1;
+            j += 1;
+        }
+        if c.get(j) != Some(&'"') {
+            return None;
+        }
+        j += 1;
+        while j < c.len() {
+            if c[j] == '"' && c[j + 1..].iter().take(hashes).all(|&h| h == '#') {
+                return Some((j + 1 + hashes).min(c.len()));
+            }
+            j += 1;
+        }
+        Some(c.len())
+    }
+
+    /// Index just past a char literal starting at `i`. `None` for a lifetime or
+    /// a loop label — this file has `'walk:`, and swallowing everything up to
+    /// the next apostrophe would blind the scan to the code in between.
+    fn char_literal_end(c: &[char], i: usize) -> Option<usize> {
+        if c.get(i + 1) == Some(&'\\') {
+            // An escape of any length: `'\n'`, `'\''`, `'\u{1b}'`.
+            let mut j = i + 3;
+            while j < c.len() && c[j] != '\'' {
+                j += 1;
+            }
+            return (j < c.len()).then_some(j + 1);
+        }
+        (c.get(i + 2) == Some(&'\'')).then_some(i + 3)
+    }
+
+    /// The source with comments, string literals and char literals blanked out,
+    /// so a token scan sees code and only code.
+    ///
+    /// Both halves are load-bearing. **Comments** have to go because this module
+    /// documents the deleted branch at length — the words the scan forbids are
+    /// all over its own explanation of why the code is gone, and a naive
+    /// substring scan would fail on that explanation, which would be its own
+    /// kind of dishonesty. **Literals** have to go because [`FORBIDDEN`] is
+    /// itself a list of string literals living in the file being scanned.
+    ///
+    /// This is not a duplicate of the crate's `strip_rust_comments`, which does
+    /// only the first half by design: its callers index the stripped text back
+    /// against raw line numbers, so it preserves literals verbatim and walks
+    /// bytes rather than chars (which mangles this file's `≥` and `…` into
+    /// mojibake — harmless there, wrong here). This walks chars and removes
+    /// literals; neither contract can serve the other.
+    fn code_only(src: &str) -> String {
+        let c: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < c.len() {
+            let ch = c[i];
+            if ch == '/' && c.get(i + 1) == Some(&'/') {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+            } else if ch == '/' && c.get(i + 1) == Some(&'*') {
+                // Rust block comments nest, so depth is tracked rather than
+                // stopping at the first `*/`.
+                let mut depth = 1usize;
+                i += 2;
+                while i < c.len() && depth > 0 {
+                    if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                out.push(' ');
+            } else if ch == 'r' && !prev_is_ident(&c, i) {
+                match raw_string_end(&c, i) {
+                    Some(end) => {
+                        i = end;
+                        out.push(' ');
+                    }
+                    // A plain identifier that happens to start with `r`.
+                    None => {
+                        out.push(ch);
+                        i += 1;
+                    }
+                }
+            } else if ch == '"' {
+                i += 1;
+                while i < c.len() && c[i] != '"' {
+                    i += if c[i] == '\\' { 2 } else { 1 };
+                }
+                i += 1;
+                out.push(' ');
+            } else if ch == '\'' {
+                match char_literal_end(&c, i) {
+                    Some(end) => {
+                        i = end;
+                        out.push(' ');
+                    }
+                    None => {
+                        out.push(ch);
+                        i += 1;
+                    }
+                }
+            } else {
+                out.push(ch);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The scanner sees code and nothing else: comments of all three kinds go,
+    /// literals go, and — the case this file actually contains — a loop label is
+    /// not mistaken for a char literal, which would have swallowed every line
+    /// between two apostrophes.
+    #[test]
+    fn the_source_scan_strips_comments_and_literals_but_not_labels() {
+        let sample = concat!(
+            "// line boot_time\n",
+            "/// doc recycled\n",
+            "//! inner sysconf\n",
+            "/* block /* nested starttime */ still_comment */\n",
+            "let s = \"string sysconf // not a comment\";\n",
+            "let r = r#\"raw _SC_CLK_TCK\"#;\n",
+            "let dash = '-'; let esc = '\\u{1b}'; let quote = '\\'';\n",
+            "'walk: loop { keep_me(); break 'walk; }\n",
+        );
+        let code = code_only(sample);
+        for gone in [
+            "boot_time",
+            "recycled",
+            "sysconf",
+            "starttime",
+            "still_comment",
+            "_SC_CLK_TCK",
+            "not a comment",
+        ] {
+            assert!(!code.contains(gone), "{gone:?} survived:\n{code}");
+        }
+        assert!(code.contains("let s ="), "code was eaten:\n{code}");
+        assert!(
+            code.contains("keep_me()"),
+            "the loop label was read as a char literal, swallowing the code \
+             between the two apostrophes:\n{code}"
+        );
+        assert!(code.contains("'walk: loop"), "{code}");
+    }
+
+    /// **The** guard against the recycled-PID branch coming back (issue #461),
+    /// and the only mechanism that can be one.
+    ///
+    /// No behavioural test can do this job. Tripping a reinstated comparison
+    /// needs a root whose timestamp predates its owner's start by more than the
+    /// margin, and a directory's birth time cannot be backdated by any portable
+    /// API — a test reaches mtime and nothing else, so the gap it can build is
+    /// milliseconds, far inside the five-minute margin the deleted code used and
+    /// inside any plausible replacement. Restore that code verbatim and every
+    /// other test in this file still passes. So the protection is this scan, the
+    /// signature check below, and code review.
+    #[test]
+    fn source_has_no_pid_recycling_machinery() {
+        let code = code_only(SRC).to_lowercase();
+        for token in FORBIDDEN {
+            assert!(
+                !code.contains(token),
+                "`{token}` is back in clean_tmp.rs.\n\
+                 The recycled-PID branch was deleted deliberately (issue #461), not lost: \
+                 ordering a process start against a directory timestamp has to bridge the \
+                 wall clock, and a forward clock step biases a LIVE root towards looking \
+                 recycled — the deletion-unsafe direction. Two implementations were built \
+                 and both deleted live e2e roots.\n\
+                 Read the `Why there is no recycled-PID branch` section at the top of this \
+                 file and docs/develop/e2e-temp-dirs.md before touching this test. Do not \
+                 reinstate the branch in any form, including a report-only annotation."
+            );
+        }
+
+        // Proof the stripping is load-bearing rather than decorative: the module
+        // explains the deleted branch at length, so the RAW source is full of
+        // the very tokens the scan forbids. A naive substring scan would fail on
+        // the documentation of why the code is gone — which is why the tokens
+        // are not simply dropped from the list instead.
+        let raw = SRC.to_lowercase();
+        assert!(
+            raw.matches("recycled").count() >= 5 && raw.contains(".created("),
+            "the module no longer explains why the branch is gone, so this test \
+             no longer demonstrates that it strips comments before scanning"
+        );
+    }
+
+    /// The cheap complement to the source scan, and deliberately **not**
+    /// redundant with it: this one is enforced by the compiler rather than at
+    /// runtime. `owner_of` takes a name and a probe and no timestamp, which is
+    /// the shape that makes a start-time comparison impossible to express;
+    /// reinstating one means widening the signature, and widening the signature
+    /// stops this line from compiling. Do not tidy it away as a test that
+    /// asserts nothing — the assertion is the type.
+    #[test]
+    fn owner_of_takes_a_name_and_a_probe_and_no_timestamp() {
+        let shape: fn(&str, &dyn ProcessProbe) -> Owner = owner_of;
+        assert_eq!(
+            shape("dad-tests-4242-AbCdEf", &FakeProbe::live()),
+            Owner::Live
+        );
     }
 }
