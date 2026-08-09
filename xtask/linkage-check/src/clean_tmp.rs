@@ -19,14 +19,11 @@
 //! past the threshold was *eligible* to have its own live root deleted out from
 //! under it.
 //!
-//! So the PID decides wherever it can, and `--older-than` only filters the cases
-//! it cannot settle:
+//! So the PID decides wherever it can, and `--older-than` only filters the one
+//! case it cannot settle. The decision is exactly three branches:
 //!
 //! - **dead PID** → reap, at any age. `--older-than` does not suppress it.
-//! - **live PID** → keep, at any age.
-//! - **live PID provably started after the root existed** → the number was
-//!   recycled and says nothing about this root, so the age rule decides.
-//!   Without this branch a recycled PID would pin a dead root forever.
+//! - **live PID** → keep, at any age, unconditionally.
 //! - **no usable PID** — an untagged `.tmp*` dir, a pre-fix lock dir, a
 //!   malformed name, or a platform with no `kill(2)` — the age rule decides.
 //!
@@ -34,15 +31,42 @@
 //! exists, it merely is not ours, and reading that as dead would delete a live
 //! run's root.
 //!
-//! Recycling has to be *proven*, and the proof is deliberately expensive to
-//! obtain: field 22 of `/proc/<pid>/stat` converted to wall clock (see
-//! [`process_start_time`]), compared against the root's own creation time with a
-//! [`RECYCLE_MARGIN`] of slack. Every way that proof can fail — no `/proc`, an
-//! unparseable field, no `btime`, a bad `_SC_CLK_TCK`, a filesystem that reports
-//! no timestamp, a non-Linux target — resolves to **keep**, not to the age rule.
-//! The tradeoff is accepted knowingly: a genuinely recycled PID we cannot prove
-//! recycled pins its root forever, and leaking a root is strictly better than
-//! deleting a live run's working directory.
+//! # Why there is no recycled-PID branch
+//!
+//! Issue #461 originally called for a fourth branch: a live PID *proven* to have
+//! started after the root already existed is not the root's owner, so let age
+//! decide. Two successive attempts to build that proof were wrong in the same
+//! direction — deleting a live run's working directory — and the branch is
+//! deliberately gone rather than patched a third time.
+//!
+//! The comparison is unsound in principle, not merely mis-implemented. Ordering
+//! a process start against a directory timestamp has to bridge through the wall
+//! clock: the directory side is only ever a stored `CLOCK_REALTIME` value, and
+//! the process side has to be reconstructed as boot time plus a tick counter.
+//! Linux's `getboottime64()` contract says outright that `settimeofday` shifts
+//! the boot time behind `/proc/stat`'s `btime`, while inode timestamps are never
+//! retroactively adjusted. So a forward clock step — admin action, a VM clock
+//! correction, a time-sync daemon, suspend/resume — moves a *live* process's
+//! reconstructed start forward while its root's timestamp stays put, and a
+//! one-hour correction is enough to push a process that started a second before
+//! creating its root an hour "after" it. The bias lands squarely on the
+//! deletion-unsafe side, and no input available here turns it back into positive
+//! proof. (The attempt before that read the `/proc/<pid>` directory's mtime,
+//! which is a dentry *lookup* time — Linux instantiates that inode lazily — and
+//! deleted live roots for a different reason with the same shape.)
+//!
+//! Dropping the branch costs almost nothing, because a PID collision is
+//! **transient**. When a dead test's PID gets reused by an unrelated live
+//! process, that root is kept for as long as the collision lasts — but the
+//! colliding process eventually exits, and the next run classifies the root
+//! `dead-pid` and reaps it. Nothing leaks permanently; reaping is merely
+//! deferred. Trading a real risk of deleting a live e2e run against a deferral
+//! is not a close call.
+//!
+//! Do not reinstate it, in any form — including a report-only "possibly
+//! recycled" annotation. That would keep the whole `/proc` parsing surface,
+//! which is exactly where the wrong answers came from, in exchange for a hint
+//! nobody can act on differently.
 //!
 //! # What this will and will not delete
 //!
@@ -77,20 +101,6 @@ const UNTAGGED_PREFIX: &str = ".tmp";
 
 const DEFAULT_MAX_AGE_HOURS: u64 = 6;
 
-/// How much later than a root's own timestamp a process must have started
-/// before we are willing to call its PID recycled.
-///
-/// The two timestamps come from unrelated clocks: the process start time is
-/// derived from the kernel's boot time plus a tick counter, while the root's is
-/// whatever `$TMPDIR`'s filesystem recorded — which on a coarse-granularity, a
-/// network, or a clock-skewed filesystem is not safely orderable against the
-/// first at second resolution. Five minutes is far longer than any such skew and
-/// far shorter than the gap in a real recycling (a PID space wraps after tens of
-/// thousands of spawns), so the margin costs nothing in detection and removes a
-/// whole class of false positives — each of which would delete a live run's
-/// scratch space.
-const RECYCLE_MARGIN: Duration = Duration::from_secs(5 * 60);
-
 /// Per-directory lines printed before the per-reason summary. A machine that
 /// has been leaking for a few hours accumulates hundreds of roots, and 280
 /// lines of path bury the one number the user needs; the summary below the list
@@ -120,12 +130,10 @@ struct Options {
 enum Owner {
     /// A PID no live process holds: the root is definitively abandoned.
     Dead,
-    /// A live PID that could have created this root — including every case
-    /// where we cannot *prove* it could not.
+    /// A live PID. The root is kept, full stop — no timestamp of any kind is
+    /// consulted, and there is deliberately no "but it might be recycled"
+    /// escape hatch (see the module docs).
     Live,
-    /// A live PID whose process is proven to have started well after the root
-    /// already existed, so it cannot be the creator: the number was recycled.
-    Recycled,
     /// No PID to go on: an untagged or malformed name, or a platform on which
     /// liveness cannot be determined.
     Unknown,
@@ -139,43 +147,34 @@ enum Reason {
     DeadPid,
     /// Owning process is still running — kept whatever its age.
     LivePid,
-    /// The PID was recycled, so the age rule decided.
-    RecycledAge,
     /// There was no usable PID, so the age rule decided.
     UntaggedAge,
 }
 
 impl Reason {
     /// Fixed order, so the summary reads the same way on every run.
-    const ALL: [Reason; 4] = [
-        Reason::DeadPid,
-        Reason::LivePid,
-        Reason::RecycledAge,
-        Reason::UntaggedAge,
-    ];
+    const ALL: [Reason; 3] = [Reason::DeadPid, Reason::LivePid, Reason::UntaggedAge];
 
     fn label(self) -> &'static str {
         match self {
             Reason::DeadPid => "dead-pid",
             Reason::LivePid => "live-pid",
-            Reason::RecycledAge => "recycled",
             Reason::UntaggedAge => "untagged",
         }
     }
 
-    /// One-line justification for the summary. The age-based reasons need the
+    /// One-line justification for the summary. The age-based reason needs the
     /// threshold and which side of it the dirs fell on; the PID-based ones are
     /// unconditional and say so.
     fn note(self, reap: bool, max_age: Duration) -> String {
-        let age = human_duration(max_age);
-        let side = if reap { "older" } else { "younger" };
         match self {
             Reason::DeadPid => "owning process is gone — reaped at any age".to_string(),
             Reason::LivePid => "owning process is still running — never reaped".to_string(),
-            Reason::RecycledAge => {
-                format!("PID reused by a newer process; {side} than {age}")
+            Reason::UntaggedAge => {
+                let age = human_duration(max_age);
+                let side = if reap { "older" } else { "younger" };
+                format!("no owning PID in the name; {side} than {age}")
             }
-            Reason::UntaggedAge => format!("no owning PID in the name; {side} than {age}"),
         }
     }
 }
@@ -195,34 +194,26 @@ struct Candidate {
     verdict: Verdict,
 }
 
-/// The two process facts the ownership decision needs, behind a trait so the
+/// The one process fact the ownership decision needs, behind a trait so the
 /// classification matrix can be driven from a table rather than from real PIDs.
 ///
 /// The dead-PID test used to spawn a child, `wait()` it, and then probe the
 /// number — but the kernel may reassign a PID the moment it is reaped, so under
 /// PID churn that test observed an unrelated live process (issue #461 review).
-/// Injecting the probes removes the race and, more importantly, makes every
-/// branch of [`owner_of`] reachable without arranging a real process to match.
+/// Injecting the probe removes the race and makes every branch of [`owner_of`]
+/// reachable without arranging a real process to match.
 trait ProcessProbe {
     /// `Some(true)` alive, `Some(false)` dead, `None` where this platform
     /// cannot tell.
     fn is_alive(&self, pid: i32) -> Option<bool>;
-
-    /// When the process holding `pid` started, or `None` when that cannot be
-    /// established — which always resolves to keeping the root.
-    fn start_time(&self, pid: i32) -> Option<SystemTime>;
 }
 
-/// The real probes: `kill(pid, 0)` for liveness, `/proc/<pid>/stat` for start.
+/// The real probe: `kill(pid, 0)`.
 struct SystemProbe;
 
 impl ProcessProbe for SystemProbe {
     fn is_alive(&self, pid: i32) -> Option<bool> {
         pid_is_alive(pid)
-    }
-
-    fn start_time(&self, pid: i32) -> Option<SystemTime> {
-        process_start_time(pid)
     }
 }
 
@@ -285,7 +276,11 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 let hours: u64 = raw
                     .parse()
                     .map_err(|_| format!("--older-than expects whole hours, got {raw:?}"))?;
-                opts.max_age = Duration::from_secs(hours * 3600);
+                // `saturating_mul`: the value is user input, and an hour count
+                // near `u64::MAX` would otherwise panic the whole command in a
+                // debug build before it can clean anything. Saturating gives an
+                // absurdly distant threshold, which is what such input means.
+                opts.max_age = Duration::from_secs(hours.saturating_mul(3600));
             }
             "-h" | "--help" => {
                 usage();
@@ -308,9 +303,9 @@ fn usage() {
     println!("A `{PID_TAGGED_PREFIX}<pid>-*` root is decided by whether that PID is still");
     println!("alive: dead means reaped at any age, alive means never reaped. The age");
     println!("threshold only decides roots with no usable PID — untagged or malformed");
-    println!("names, and PIDs proven to have been recycled by a newer process.");
+    println!("names, and hosts with no way to ask whether a PID is alive.");
     println!();
-    println!("  --older-than <hours>  age threshold for the fallback cases only");
+    println!("  --older-than <hours>  age threshold for the fallback case only");
     println!(
         "                        (default: {DEFAULT_MAX_AGE_HOURS}). It does NOT hold back a dead PID."
     );
@@ -357,7 +352,11 @@ fn sweep(temp_root: &Path, opts: &Options, probe: &dyn ProcessProbe) -> std::io:
                 match std::fs::remove_dir_all(&c.path) {
                     Ok(()) => {
                         removed += 1;
-                        freed += c.bytes;
+                        // Saturating, like every other size accumulation here:
+                        // apparent sizes are attacker-influenced (sparse files
+                        // cost no blocks), and a panicking total would abort a
+                        // sweep that has already deleted part of its work list.
+                        freed = freed.saturating_add(c.bytes);
                         freed_truncated |= c.size_truncated;
                     }
                     // `{:?}` not `.display()`: see `report`.
@@ -407,21 +406,18 @@ fn collect(
         if !is_owned(name, opts.include_untagged) {
             continue;
         }
-        let mtime = meta.modified().ok();
-        let age = mtime
+        // mtime is the only timestamp this tool reads, and it feeds the age
+        // fallback alone. Ownership is decided from the PID with no timestamp
+        // involved at all.
+        let age = meta
+            .modified()
+            .ok()
             .and_then(|m| now.duration_since(m).ok())
             .unwrap_or_default();
-        // Creation time (`statx` btime on Linux) is the timestamp the recycling
-        // test actually wants: "did this root already exist when that process
-        // started?". mtime is the fallback where the filesystem reports no
-        // btime, and the fallback direction is safe — mtime is never earlier
-        // than creation, so it makes `start > dir_time` harder to satisfy and
-        // biases towards keeping the root.
-        let dir_time = meta.created().ok().or(mtime);
         // Every owned dir is collected, kept ones included: the report has to
         // be able to say WHY a root survived, which it cannot do for entries
         // that were filtered away before they were ever seen.
-        let verdict = classify(owner_of(name, dir_time, probe), age, opts.max_age);
+        let verdict = classify(owner_of(name, probe), age, opts.max_age);
         let size = dir_size(&path);
         out.push(Candidate {
             bytes: size.bytes,
@@ -456,15 +452,12 @@ fn classify(owner: Owner, age: Duration, max_age: Duration) -> Verdict {
             reap: true,
             reason: Reason::DeadPid,
         },
-        // Strictly safer than the age rule it replaces, which made a suite
-        // running past the threshold eligible for its own root.
+        // Unconditional, and the reason there is no timestamp in this function
+        // beyond the age fallback: every attempt to qualify this branch with
+        // "…unless the PID looks recycled" ended up deleting live roots.
         Owner::Live => Verdict {
             reap: false,
             reason: Reason::LivePid,
-        },
-        Owner::Recycled => Verdict {
-            reap: age >= max_age,
-            reason: Reason::RecycledAge,
         },
         Owner::Unknown => Verdict {
             reap: age >= max_age,
@@ -473,36 +466,21 @@ fn classify(owner: Owner, age: Duration, max_age: Duration) -> Verdict {
     }
 }
 
-/// Classify a root from its name plus the best timestamp the filesystem has for
-/// it (creation time where available, mtime otherwise).
+/// Classify a root from the PID in its name and nothing else.
 ///
-/// The asymmetry is the point: `Owner::Recycled` is the only verdict that can
-/// lead to deleting a directory whose PID *is* alive, so it is the only one that
-/// demands positive proof. These all resolve to `Owner::Live`, i.e. keep
-/// forever:
-///
-/// - the process start time is unavailable — no `/proc`, an unreadable or
-///   unparseable `stat`, no `btime` in `/proc/stat`, a bad `_SC_CLK_TCK`, or a
-///   non-Linux target;
-/// - the root carries no usable timestamp;
-/// - the process started before the root's timestamp, or after it by less than
-///   [`RECYCLE_MARGIN`].
-fn owner_of(name: &str, dir_time: Option<SystemTime>, probe: &dyn ProcessProbe) -> Owner {
+/// No filesystem timestamp reaches this function. A live PID means keep, at any
+/// age and whatever the root's timestamps say; see the module docs for why the
+/// recycled-PID branch was removed rather than repaired.
+fn owner_of(name: &str, probe: &dyn ProcessProbe) -> Owner {
     let Some(pid) = parse_pid(name) else {
         return Owner::Unknown;
     };
     match probe.is_alive(pid) {
         Some(false) => Owner::Dead,
+        Some(true) => Owner::Live,
         // The platform cannot answer, so fall back to age exactly as an
         // untagged name would.
         None => Owner::Unknown,
-        Some(true) => {
-            let cutoff = dir_time.and_then(|d| d.checked_add(RECYCLE_MARGIN));
-            match (probe.start_time(pid), cutoff) {
-                (Some(started), Some(cutoff)) if started > cutoff => Owner::Recycled,
-                _ => Owner::Live,
-            }
-        }
     }
 }
 
@@ -527,6 +505,10 @@ fn parse_pid(name: &str) -> Option<i32> {
 /// `ESRCH` is the ONLY answer that means dead: `EPERM` means the process exists
 /// and simply is not ours, and reading that as dead would delete a live run's
 /// root. Anything else unexpected is treated as alive for the same reason.
+///
+/// This is available on every Unix, not just Linux. Only a genuinely non-Unix
+/// host — where there is no `kill(2)` to ask — returns `None` and falls back to
+/// the age rule.
 #[cfg(unix)]
 fn pid_is_alive(pid: i32) -> Option<bool> {
     // SAFETY: `kill` with signal 0 sends nothing and touches no memory; `pid`
@@ -539,81 +521,6 @@ fn pid_is_alive(pid: i32) -> Option<bool> {
 
 #[cfg(not(unix))]
 fn pid_is_alive(_pid: i32) -> Option<bool> {
-    None
-}
-
-/// When the process holding `pid` started, as an absolute wall-clock instant.
-///
-/// Field 22 (`starttime`) of `/proc/<pid>/stat` is the authoritative answer: the
-/// kernel stamps it once, when the task is created, and never rewrites it. It
-/// counts clock ticks since boot, so it is converted with `/proc/stat`'s `btime`
-/// (the boot instant, in wall-clock seconds) and `sysconf(_SC_CLK_TCK)` for the
-/// tick rate — never a hardcoded 100, which is only the usual `CONFIG_HZ`.
-///
-/// `/proc/uptime` would serve equally well, but `btime` is preferred because it
-/// is already an absolute instant: the conversion needs no second "now" reading,
-/// so there is no window between the two clock reads for either to drift.
-///
-/// This replaces the `/proc/<pid>` **directory mtime**, which is emphatically
-/// NOT a start time. Linux instantiates the per-PID procfs inode lazily —
-/// `proc_pid_make_inode()` initialises its timestamps at instantiation and
-/// `pid_getattr()` leaves them alone rather than substituting the task's start
-/// time — so that mtime is a proc-dentry *lookup* time and moves forward again
-/// whenever the dentry is evicted and re-looked-up, which is most likely under
-/// exactly the memory pressure this tool exists to relieve. A live owner whose
-/// root predated the first `/proc/<pid>` lookup was therefore reported
-/// "recycled", and under `--apply` its live working directory was deleted
-/// (issue #461 review).
-///
-/// Every failure path returns `None`, which [`owner_of`] reads as "keep".
-#[cfg(target_os = "linux")]
-fn process_start_time(pid: i32) -> Option<SystemTime> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let ticks = starttime_ticks(&stat)?;
-    let hz = clock_ticks_per_second()?;
-    let nanos = u64::try_from(u128::from(ticks) * 1_000_000_000 / u128::from(hz)).ok()?;
-    boot_time()?.checked_add(Duration::from_nanos(nanos))
-}
-
-/// Field 22 out of one `/proc/<pid>/stat` line, in clock ticks since boot.
-///
-/// Field 2 is `comm`, wrapped in parentheses and **not** escaped: a process
-/// named `foo bar) baz` puts both spaces and a `)` inside it, so a
-/// `split_whitespace()` over the whole line silently reads some other number.
-/// `comm` is the only parenthesised field and every field after it is numeric,
-/// so splitting at the **last** `)` is unambiguous. Counting resumes there:
-/// field 3 is index 0 of the remainder, so field 22 is index 19.
-#[cfg(target_os = "linux")]
-fn starttime_ticks(stat: &str) -> Option<u64> {
-    let after_comm = stat.get(stat.rfind(')')? + 1..)?;
-    after_comm.split_whitespace().nth(19)?.parse().ok()
-}
-
-/// `sysconf(_SC_CLK_TCK)`, the unit field 22 is counted in.
-#[cfg(target_os = "linux")]
-fn clock_ticks_per_second() -> Option<u64> {
-    // SAFETY: `sysconf` reads a static system parameter, takes no pointer and
-    // writes no memory we own. It returns -1 for an unsupported name, which the
-    // `try_from` + `> 0` filter rejects into `None` (keep the root).
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    u64::try_from(hz).ok().filter(|hz| *hz > 0)
-}
-
-/// The wall-clock instant the machine booted, from `/proc/stat`'s `btime` line.
-#[cfg(target_os = "linux")]
-fn boot_time() -> Option<SystemTime> {
-    let stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let secs: u64 = stat
-        .lines()
-        .find_map(|line| line.strip_prefix("btime "))?
-        .trim()
-        .parse()
-        .ok()?;
-    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn process_start_time(_pid: i32) -> Option<SystemTime> {
     None
 }
 
@@ -695,7 +602,7 @@ fn write_breakdown(out: &mut String, cands: &[Candidate], reap: bool, max_age: D
         if matching.is_empty() {
             continue;
         }
-        let bytes = matching.iter().map(|c| c.bytes).sum();
+        let bytes = sum_bytes(matching.iter().map(|c| c.bytes));
         let truncated = matching.iter().any(|c| c.size_truncated);
         let _ = writeln!(
             out,
@@ -712,9 +619,25 @@ fn write_breakdown(out: &mut String, cands: &[Candidate], reap: bool, max_age: D
 /// was truncated.
 fn total_size(cands: &[Candidate]) -> String {
     human_size(
-        cands.iter().map(|c| c.bytes).sum(),
+        sum_bytes(cands.iter().map(|c| c.bytes)),
         cands.iter().any(|c| c.size_truncated),
     )
+}
+
+/// Every size total in this file goes through here, and it saturates rather
+/// than wrapping.
+///
+/// `Iterator::sum` panics on overflow in a debug build and wraps silently in a
+/// release one, and these are *apparent* sizes: a sparse file costs no blocks,
+/// so any local user can park three 8-exabyte files in a world-writable `/tmp`
+/// under a `dad-tests-*` name and overflow a `u64`. The auditor did exactly
+/// that and aborted the plain `cargo xtask clean-e2e-tmp` with `attempt to add
+/// with overflow` before it could clean anything — which defeats the whole
+/// point of a tool you reach for when the machine is already in trouble.
+/// Saturating prints an implausible number; panicking or wrapping prints a
+/// wrong one or nothing at all.
+fn sum_bytes(sizes: impl Iterator<Item = u64>) -> u64 {
+    sizes.fold(0u64, |acc, b| acc.saturating_add(b))
 }
 
 /// Apparent size of one tree, plus whether the walk gave up before finishing.
@@ -724,8 +647,31 @@ struct DirSize {
 }
 
 /// Recursive apparent size, bounded by [`MAX_SIZE_WALK_ENTRIES`] and
-/// [`MAX_SIZE_WALK_DEPTH`]. Never follows symlinks, so a link out of the tree
-/// contributes its own size and nothing more.
+/// [`MAX_SIZE_WALK_DEPTH`].
+///
+/// # What the symlink handling does and does not guarantee
+///
+/// Every entry is stat'd with `symlink_metadata`, so **a symlink is never
+/// descended as observed**: it contributes its own length and nothing more, and
+/// a symlink loop cannot spin the walk. That is a statement about what the walk
+/// *sees*, not a race-free guarantee, and the earlier flat claim that it "never
+/// follows symlinks" was too absolute.
+///
+/// `read_dir` resolves by path. Between the moment a child is observed to be a
+/// directory and the moment it is opened, a local user with write access inside
+/// the tree can replace that path with a symlink, and the open follows the
+/// replacement — so the *sizing* walk can be steered outside the candidate. The
+/// `symlink_metadata` re-check below catches a swap that is still in place when
+/// the directory is opened; a swap undone again inside that window is not
+/// detected.
+///
+/// The residual consequence is bounded and presentation-only: at worst some
+/// other tree's entries are counted into a size, capped by the entry and depth
+/// budgets. No name and no content from outside the candidate is ever printed,
+/// sizing never reaches [`classify`], so it cannot move a reap/keep verdict, and
+/// it is not a deletion escape — `--apply` calls `remove_dir_all` on the
+/// candidate path itself, which [`collect`] established was a directory and not
+/// a symlink.
 fn dir_size(path: &Path) -> DirSize {
     dir_size_bounded(path, MAX_SIZE_WALK_ENTRIES, MAX_SIZE_WALK_DEPTH)
 }
@@ -739,6 +685,13 @@ fn dir_size_bounded(path: &Path, max_entries: usize, max_depth: usize) -> DirSiz
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
+        // The path was a real directory when it was queued, but `read_dir`
+        // re-resolved it by name and would have followed a symlink swapped in
+        // since. Re-stat before spending any of the budget here: it costs one
+        // `lstat` per directory and rejects a swap that is still in place.
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
         for entry in rd.flatten() {
             seen += 1;
             if seen > max_entries {
@@ -755,7 +708,9 @@ fn dir_size_bounded(path: &Path, max_entries: usize, max_depth: usize) -> DirSiz
                 }
                 stack.push((entry.path(), depth + 1));
             } else {
-                bytes += meta.len();
+                // Saturating: see `sum_bytes`. `meta.len()` is the apparent
+                // size, so three sparse files are enough to overflow a `u64`.
+                bytes = bytes.saturating_add(meta.len());
             }
         }
     }
@@ -821,46 +776,24 @@ mod tests {
 
     /// One scripted answer for every PID (issue #461 review, item 3). Real PIDs
     /// cannot express "dead" without a race — the kernel may hand a reaped
-    /// number to someone else before the probe runs — nor "started three hours
-    /// after that directory" at all.
-    struct FakeProbe {
-        alive: Option<bool>,
-        start: Option<SystemTime>,
-    }
+    /// number to someone else before the probe runs.
+    struct FakeProbe(Option<bool>);
 
     impl FakeProbe {
         fn dead() -> Self {
-            Self {
-                alive: Some(false),
-                start: None,
-            }
+            Self(Some(false))
         }
-        fn live_started(start: SystemTime) -> Self {
-            Self {
-                alive: Some(true),
-                start: Some(start),
-            }
-        }
-        fn live_with_unknown_start() -> Self {
-            Self {
-                alive: Some(true),
-                start: None,
-            }
+        fn live() -> Self {
+            Self(Some(true))
         }
         fn unanswerable() -> Self {
-            Self {
-                alive: None,
-                start: None,
-            }
+            Self(None)
         }
     }
 
     impl ProcessProbe for FakeProbe {
         fn is_alive(&self, _pid: i32) -> Option<bool> {
-            self.alive
-        }
-        fn start_time(&self, _pid: i32) -> Option<SystemTime> {
-            self.start
+            self.0
         }
     }
 
@@ -872,9 +805,26 @@ mod tests {
         fn is_alive(&self, pid: i32) -> Option<bool> {
             Some(!self.0.contains(&pid))
         }
-        fn start_time(&self, _pid: i32) -> Option<SystemTime> {
-            None // unknown start ⇒ a live PID owns its root
-        }
+    }
+
+    /// Force a directory's mtime, so a test can put a root's only timestamp
+    /// anywhere on the wall clock — including the future, which no amount of
+    /// waiting can produce.
+    fn set_mtime(dir: &Path, when: SystemTime) {
+        let handle = std::fs::File::open(dir).expect("open dir");
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("set mtime");
+    }
+
+    /// A file of `len` apparent bytes that occupies (almost) no blocks, so a
+    /// test can build an exabyte-scale tree in milliseconds — the same trick
+    /// available to any local user with write access to `/tmp`.
+    fn sparse_file(path: &Path, len: u64) {
+        std::fs::File::create(path)
+            .expect("create sparse file")
+            .set_len(len)
+            .expect("set_len");
     }
 
     #[test]
@@ -939,9 +889,9 @@ mod tests {
         }
     }
 
-    /// The four branches of the decision, with no filesystem in the way. The
-    /// two PID-driven ones ignore the age threshold entirely; the two fallback
-    /// ones are decided by it.
+    /// The three branches of the decision, with no filesystem in the way. The
+    /// two PID-driven ones ignore the age threshold entirely; only the fallback
+    /// is decided by it.
     #[test]
     fn ownership_decides_first_and_age_only_where_it_cannot() {
         let max_age = HOUR * 6;
@@ -967,22 +917,33 @@ mod tests {
             );
         }
 
-        for (owner, reason) in [
-            (Owner::Recycled, Reason::RecycledAge),
-            (Owner::Unknown, Reason::UntaggedAge),
-        ] {
-            assert_eq!(
-                classify(owner, stale, max_age),
-                Verdict { reap: true, reason }
-            );
-            assert_eq!(
-                classify(owner, fresh, max_age),
-                Verdict {
-                    reap: false,
-                    reason
-                }
-            );
-        }
+        assert_eq!(
+            classify(Owner::Unknown, stale, max_age),
+            Verdict {
+                reap: true,
+                reason: Reason::UntaggedAge
+            }
+        );
+        assert_eq!(
+            classify(Owner::Unknown, fresh, max_age),
+            Verdict {
+                reap: false,
+                reason: Reason::UntaggedAge
+            }
+        );
+    }
+
+    /// Ownership comes from the PID and from nothing else — there is no
+    /// recycled branch to reach, so a live PID has exactly one outcome. A
+    /// platform that cannot answer liveness is *not* a keep: it falls back to
+    /// the age rule exactly as an untagged name does.
+    #[test]
+    fn a_live_pid_has_exactly_one_outcome_and_an_unanswerable_one_falls_back() {
+        let name = "dad-tests-4242-AbCdEf";
+        assert_eq!(owner_of(name, &FakeProbe::live()), Owner::Live);
+        assert_eq!(owner_of(name, &FakeProbe::dead()), Owner::Dead);
+        assert_eq!(owner_of(name, &FakeProbe::unanswerable()), Owner::Unknown);
+        assert_eq!(owner_of(".tmpAbCdEf", &FakeProbe::live()), Owner::Unknown);
     }
 
     /// Issue #461's headline case: 280 roots whose owners were provably gone
@@ -1008,12 +969,9 @@ mod tests {
         assert!(!found[0].size_truncated);
     }
 
-    /// The other half of the fix, driven by the REAL probes: a suite still
+    /// The other half of the fix, driven by the REAL probe: a suite still
     /// running past the threshold used to be eligible to have its own scratch
-    /// space deleted out from under it. This is the reviewer's repro of the
-    /// procfs-mtime blocker in test form — this process is genuinely alive and
-    /// genuinely started before the directory, so nothing but `Live` is correct
-    /// no matter when `/proc/<pid>` was first looked up.
+    /// space deleted out from under it.
     #[cfg(unix)]
     #[test]
     fn a_live_pid_is_kept_even_when_older_than_the_threshold() {
@@ -1035,6 +993,82 @@ mod tests {
             }
         );
         assert!(dir.exists());
+    }
+
+    /// The invariant that replaced the recycling machinery, asserted end to end
+    /// through the real deletion path and the real `kill(pid, 0)` probe: a live
+    /// owner keeps its root **whatever timestamp the root carries**.
+    ///
+    /// The two extremes are the two ways the old start-time comparison could be
+    /// fooled. A root timestamped in the distant past is what a live long-running
+    /// suite looks like once a `--older-than 0` sweep comes past; a root
+    /// timestamped in the future is what a single forward `settimeofday` step
+    /// makes every *ordinary* root look like relative to a reconstructed start
+    /// time, since `btime` moves and inode timestamps do not. Under the old
+    /// design either could reach `Recycled` and then be deleted; under this one
+    /// no timestamp is read at all outside the age fallback, and the age
+    /// fallback is unreachable for a live PID.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_pid_is_kept_whatever_timestamp_the_root_carries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pid = std::process::id();
+        let ancient = tmp.path().join(format!("dad-tests-{pid}-ancient"));
+        let futuristic = tmp.path().join(format!("dad-tests-{pid}-futuristic"));
+        for dir in [&ancient, &futuristic] {
+            std::fs::create_dir(dir).expect("create");
+            std::fs::write(dir.join("payload"), vec![0u8; 512]).expect("write");
+        }
+        // Decades before this process could possibly have started…
+        set_mtime(&ancient, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        // …and decades after it, which is where a forward clock step used to
+        // strand a perfectly ordinary root.
+        set_mtime(
+            &futuristic,
+            SystemTime::now() + Duration::from_secs(50 * 365 * 24 * 3600),
+        );
+
+        let applied = sweep(
+            tmp.path(),
+            &Options {
+                max_age: Duration::ZERO,
+                apply: true,
+                include_untagged: false,
+            },
+            &SystemProbe,
+        )
+        .expect("apply");
+
+        assert_eq!(applied.removed, 0, "{}", applied.report);
+        assert!(ancient.exists(), "a live owner's root must survive any age");
+        assert!(
+            futuristic.exists(),
+            "a live owner's root must survive a future timestamp too"
+        );
+        assert!(
+            !applied.report.contains("reap:"),
+            "nothing may be listed for reaping:\n{}",
+            applied.report
+        );
+        assert!(applied.report.contains("live-pid"), "{}", applied.report);
+        // And the mirror image: the timestamp cannot save a dead owner either.
+        let dead_tmp = tempfile::tempdir().expect("tempdir");
+        let dead = dead_tmp.path().join("dad-tests-4242-futuristic");
+        std::fs::create_dir(&dead).expect("create");
+        set_mtime(
+            &dead,
+            SystemTime::now() + Duration::from_secs(365 * 24 * 3600),
+        );
+        let found =
+            collect(dead_tmp.path(), &opts(HOUR * 24), &FakeProbe::dead()).expect("collect");
+        assert_eq!(
+            found[0].verdict,
+            Verdict {
+                reap: true,
+                reason: Reason::DeadPid
+            },
+            "a dead PID is reaped whatever the root's timestamp"
+        );
     }
 
     /// Names carrying no usable PID — the pre-fix lock dirs, untagged `.tmp*`
@@ -1069,152 +1103,6 @@ mod tests {
                     reason: Reason::UntaggedAge
                 },
                 "{name} under the threshold"
-            );
-        }
-    }
-
-    /// The full ownership matrix, driven through injected probes so every
-    /// branch is reachable without arranging a real process to match.
-    ///
-    /// The middle two rows are the blocker from the #461 review: the root
-    /// predates the process by *less* than the margin (clock/filesystem skew,
-    /// not recycling) and must be kept, while a process that started hours
-    /// later is genuinely a different one.
-    #[test]
-    fn recycling_is_only_claimed_when_the_start_time_proves_it() {
-        let name = "dad-tests-4242-AbCdEf";
-        let dir_time = SystemTime::UNIX_EPOCH + HOUR * 1_000;
-
-        assert_eq!(
-            owner_of(
-                name,
-                Some(dir_time),
-                &FakeProbe::live_started(dir_time - HOUR)
-            ),
-            Owner::Live,
-            "a process older than the root is its owner"
-        );
-        assert_eq!(
-            owner_of(
-                name,
-                Some(dir_time),
-                &FakeProbe::live_started(dir_time + RECYCLE_MARGIN - Duration::from_secs(1)),
-            ),
-            Owner::Live,
-            "inside the margin is skew, not recycling"
-        );
-        assert_eq!(
-            owner_of(
-                name,
-                Some(dir_time),
-                &FakeProbe::live_started(dir_time + RECYCLE_MARGIN + Duration::from_secs(1)),
-            ),
-            Owner::Recycled,
-            "past the margin the process cannot have created the root"
-        );
-        assert_eq!(
-            owner_of(
-                name,
-                Some(dir_time),
-                &FakeProbe::live_started(dir_time + HOUR * 3)
-            ),
-            Owner::Recycled,
-        );
-        assert_eq!(
-            owner_of(name, Some(dir_time), &FakeProbe::dead()),
-            Owner::Dead,
-        );
-
-        // The recycled verdict is the only one that can delete a live PID's
-        // root, and even then only the age rule actually pulls the trigger.
-        let max_age = HOUR * 6;
-        assert!(classify(Owner::Recycled, HOUR * 9, max_age).reap);
-        assert!(!classify(Owner::Recycled, HOUR, max_age).reap);
-    }
-
-    /// Every way the recycling proof can come up short resolves to `Live`, i.e.
-    /// keep forever. Leaking a root beats deleting a live run's working
-    /// directory, so this list is the whole safety argument for the feature.
-    #[test]
-    fn every_uncertain_probe_result_keeps_the_root() {
-        let name = "dad-tests-4242-AbCdEf";
-        let dir_time = SystemTime::UNIX_EPOCH + HOUR * 1_000;
-
-        // No start time at all: unreadable or unparseable `/proc/<pid>/stat`,
-        // a missing `btime`, a bad `_SC_CLK_TCK`, or a non-Linux target.
-        assert_eq!(
-            owner_of(name, Some(dir_time), &FakeProbe::live_with_unknown_start()),
-            Owner::Live,
-        );
-        // The filesystem reported no timestamp for the root.
-        assert_eq!(
-            owner_of(name, None, &FakeProbe::live_started(dir_time + HOUR * 3)),
-            Owner::Live,
-        );
-        assert_eq!(
-            owner_of(name, None, &FakeProbe::live_with_unknown_start()),
-            Owner::Live,
-        );
-        // A platform that cannot answer liveness at all is not a keep — it is
-        // the pre-#461 age rule, exactly as an untagged name would be.
-        assert_eq!(
-            owner_of(name, Some(dir_time), &FakeProbe::unanswerable()),
-            Owner::Unknown,
-        );
-    }
-
-    /// The start time must be the kernel's own record, not a procfs lookup
-    /// timestamp. `init` booted before this test binary was ever spawned, and
-    /// no amount of dentry churn can change that — but the `/proc/<pid>` mtime
-    /// this replaced could report either order depending on which entry was
-    /// looked up last.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_start_time_is_the_kernels_record_not_a_procfs_lookup_time() {
-        let boot = boot_time().expect("btime in /proc/stat");
-        let init = process_start_time(1).expect("start time of pid 1");
-        let me = process_start_time(i32::try_from(std::process::id()).expect("pid fits"))
-            .expect("start time of this process");
-
-        assert!(init >= boot, "init cannot predate the boot instant");
-        assert!(init <= me, "init started before this test process");
-        assert!(me <= SystemTime::now(), "this process has already started");
-        // A lookup time would be seconds old at most; a start time carries the
-        // real distance back to boot.
-        assert!(
-            init.duration_since(boot).expect("init after boot") < HOUR,
-            "pid 1 starts within an hour of boot"
-        );
-    }
-
-    /// Field 22 is counted from after `comm`, which is unescaped and may hold
-    /// both spaces and parentheses — the case a `split_whitespace()` over the
-    /// whole line gets silently wrong.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn field_22_is_parsed_from_after_the_last_closing_paren() {
-        let tail = "0 -1 4194304 147 0 0 0 0 0 0 0 20 0 1 0 107253507 10383360 723";
-        assert_eq!(
-            starttime_ticks(&format!("4177459 (head) R 4177425 4177459 4177425 {tail}")),
-            Some(107253507),
-        );
-        assert_eq!(
-            starttime_ticks(&format!(
-                "4177459 (evil ) name) R 4177425 4177459 4177425 {tail}"
-            )),
-            Some(107253507),
-            "a comm holding a space and a paren must not shift the field index"
-        );
-        for malformed in [
-            "",
-            "4177459 (head",
-            "4177459 (head) R 1 2 3",
-            "4177459 (head) R 4177425 4177459 4177425 0 -1 x 147 0 0 0 0 0 0 0 20 0 1 0 nope 1 2",
-        ] {
-            assert_eq!(
-                starttime_ticks(malformed),
-                None,
-                "{malformed:?} must not yield a start time"
             );
         }
     }
@@ -1299,12 +1187,12 @@ mod tests {
                 },
             ),
             candidate(
-                "dad-tests-303-AbCdEf",
+                "dot-agent-deck-test-lock-GhIjKl",
                 512,
                 1,
                 Verdict {
                     reap: false,
-                    reason: Reason::RecycledAge,
+                    reason: Reason::UntaggedAge,
                 },
             ),
         ];
@@ -1314,7 +1202,6 @@ mod tests {
             "dead-pid",
             "untagged",
             "live-pid",
-            "recycled",
             "owning process is gone",
             "owning process is still running",
         ] {
@@ -1323,6 +1210,10 @@ mod tests {
         assert!(text.contains("reap: 2 dir(s)"), "{text}");
         assert!(text.contains("keep: 2 dir(s)"), "{text}");
         assert!(!text.contains('≥'), "nothing was truncated:\n{text}");
+        assert!(
+            !text.contains("recycled"),
+            "the recycled reason is gone:\n{text}"
+        );
     }
 
     /// Nothing eligible is no longer reported as an age fact: the summary says
@@ -1429,10 +1320,130 @@ mod tests {
         assert_eq!(shallow.bytes, 600, "nothing below the depth cap is counted");
 
         // Presentation only: the same tree gets the same verdict either way.
-        let name = "dad-tests-4242-AbCdEf";
         assert_eq!(
-            owner_of(name, Some(SystemTime::now()), &FakeProbe::dead()),
+            owner_of("dad-tests-4242-AbCdEf", &FakeProbe::dead()),
             Owner::Dead
+        );
+    }
+
+    /// Sparse files make apparent size attacker-controlled at zero cost, and
+    /// `u64` addition panics on overflow in a debug build — which is how a
+    /// plain `cargo xtask clean-e2e-tmp` was aborted with `attempt to add with
+    /// overflow` by three planted files, before it could clean anything.
+    ///
+    /// Every accumulation on the path from one file's length to the printed
+    /// total must saturate instead: the per-tree walk, the per-reason group
+    /// total, the reap/keep totals, and the `freed` counter after `--apply`.
+    #[test]
+    fn exabyte_sparse_files_saturate_instead_of_aborting_the_sweep() {
+        const HUGE: u64 = 8_000_000_000_000_000_000; // 3 of these overflow u64
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The auditor's exact shape: a readable, dead-owner root full of sparse
+        // files, reachable by the default dry run.
+        for root in ["dad-tests-2147483647-AbCdEf", "dad-tests-2147483646-GhIjKl"] {
+            let dir = tmp.path().join(root);
+            std::fs::create_dir(&dir).expect("create");
+            for i in 0..3 {
+                sparse_file(&dir.join(format!("sparse{i}")), HUGE);
+            }
+        }
+
+        // One tree on its own already overflows.
+        let one = dir_size_bounded(&tmp.path().join("dad-tests-2147483647-AbCdEf"), 100, 8);
+        assert_eq!(one.bytes, u64::MAX, "the walk must saturate, not wrap");
+        assert!(!one.truncated, "three entries are well inside the budget");
+
+        // And so do the group totals and the freed counter across two trees.
+        let applied = sweep(
+            tmp.path(),
+            &Options {
+                max_age: Duration::ZERO,
+                apply: true,
+                include_untagged: false,
+            },
+            &FakeProbe::dead(),
+        )
+        .expect("apply");
+        assert_eq!(applied.removed, 2, "{}", applied.report);
+        assert_eq!(applied.freed, u64::MAX);
+        assert!(applied.failures.is_empty(), "{:?}", applied.failures);
+        assert!(applied.report.contains("dead-pid"), "{}", applied.report);
+    }
+
+    /// The same overflow reached through the pure reporting path, where the
+    /// group and grand totals are summed independently of the walk.
+    #[test]
+    fn group_and_grand_totals_saturate() {
+        let reap = vec![
+            candidate(
+                "dad-tests-101-AbCdEf",
+                u64::MAX,
+                1,
+                Verdict {
+                    reap: true,
+                    reason: Reason::DeadPid,
+                },
+            ),
+            candidate(
+                "dad-tests-102-GhIjKl",
+                u64::MAX,
+                1,
+                Verdict {
+                    reap: true,
+                    reason: Reason::DeadPid,
+                },
+            ),
+        ];
+        let text = report(Path::new("/tmp"), &reap, &[], HOUR * 6);
+        assert!(text.contains("reap: 2 dir(s)"), "{text}");
+        assert!(text.contains("dead-pid"), "{text}");
+    }
+
+    /// `--older-than` takes hours from the command line and multiplies by 3600.
+    /// A value near `u64::MAX` used to panic the command outright in a debug
+    /// build rather than parse into an absurdly distant threshold.
+    #[test]
+    fn an_enormous_older_than_saturates_rather_than_panicking() {
+        let args = vec!["--older-than".to_string(), u64::MAX.to_string()];
+        let parsed = parse_args(&args).expect("parse").expect("options");
+        assert_eq!(parsed.max_age, Duration::from_secs(u64::MAX));
+    }
+
+    /// The sizing walk resolves every queued directory by path, so a symlink
+    /// swapped into that path after it was observed to be a directory would be
+    /// followed by `read_dir`. This drives that state directly — the walk is
+    /// handed a path that is a symlink by the time it opens it — and the
+    /// re-check must refuse to descend, leaving the size at zero rather than
+    /// counting a tree outside the candidate.
+    ///
+    /// It is a narrowing, not a fix: a swap undone again inside the window
+    /// still slips through, which is why the guarantee is documented as bounded
+    /// rather than absolute.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_replaced_by_a_symlink_is_not_descended() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).expect("create outside");
+        std::fs::write(outside.join("payload"), vec![0u8; 4096]).expect("write");
+
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).expect("create root");
+        std::fs::write(root.join("own"), vec![0u8; 100]).expect("write");
+        assert_eq!(dir_size_bounded(&root, 100, 8).bytes, 100);
+
+        std::fs::remove_dir_all(&root).expect("remove root");
+        std::os::unix::fs::symlink(&outside, &root).expect("symlink");
+        let size = dir_size_bounded(&root, 100, 8);
+        assert_eq!(
+            size.bytes, 0,
+            "the walk descended a path that had become a symlink"
+        );
+        assert!(!size.truncated);
+        assert!(
+            outside.join("payload").exists(),
+            "nothing outside is touched"
         );
     }
 

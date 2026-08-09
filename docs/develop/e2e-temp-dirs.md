@@ -37,34 +37,45 @@ Dry-run is the default and `--apply` is required to delete anything. By default 
 | `dot-agent-deck-test-lock-*` | yes | Pre-fix lock dirs, still present in bulk on older machines. |
 | `.tmp*` | **no** — needs `--include-untagged` | The `tempfile` crate's default prefix, shared with every Rust program on the machine. |
 
-Only pass `--include-untagged` when no other Rust build or tool is running; it can otherwise delete a live temp dir belonging to something else. Symlinks are never followed.
+Only pass `--include-untagged` when no other Rust build or tool is running; it can otherwise delete a live temp dir belonging to something else.
 
 ### Ownership decides, age is only the fallback
 
-The `<pid>` in `dad-tests-<pid>-<random>` is the process that created the root, so it answers "is anyone still using this?" directly, where age is only a proxy. Since [issue #461](https://github.com/vfarcic/dot-agent-deck/issues/461) the reaper reads it back:
+The `<pid>` in `dad-tests-<pid>-<random>` is the process that created the root, so it answers "is anyone still using this?" directly, where age is only a proxy. Since [issue #461](https://github.com/vfarcic/dot-agent-deck/issues/461) the reaper reads it back, and the decision is exactly three branches:
 
 | The root's PID | Decision |
 |---|---|
 | No live process holds it | **Reap, at any age.** `--older-than` does not hold it back. |
-| Held by a live process | **Keep, at any age.** |
-| Held by a live process *proven* to have started well after the root already existed | The number was recycled and proves nothing — decided by age. |
-| Not readable (untagged `.tmp*`, a lock dir, a malformed name, or a non-Unix host) | Decided by age. |
+| Held by a live process | **Keep, at any age.** No timestamp of any kind is consulted. |
+| No usable PID — an untagged `.tmp*` dir, a lock dir, a malformed name, or a host with no `kill(2)` at all | Decided by age. |
 
-Liveness is `kill(pid, 0)`, in which `EPERM` counts as **alive** — the process exists, it merely belongs to another user — and only `ESRCH` means dead.
+Liveness is `kill(pid, 0)`, in which `EPERM` counts as **alive** — the process exists, it merely belongs to another user — and only `ESRCH` means dead. That call exists on every Unix, so the third row's "no `kill(2)`" case means a genuinely non-Unix host, not merely a non-Linux one; macOS and the BSDs establish liveness exactly as Linux does.
 
-Recycling is the only verdict that can delete a directory whose PID *is* alive, so it demands positive proof and gets a deliberately expensive one. The start time is field 22 (`starttime`) of `/proc/<pid>/stat` — clock ticks since boot, which the kernel stamps once at task creation and never rewrites — converted to wall clock with `/proc/stat`'s `btime` and `sysconf(_SC_CLK_TCK)`. That is compared against the root's *creation* time (`statx` btime, falling back to mtime) with **five minutes** of slack, because the two timestamps come from unrelated clocks and are not safely orderable at second resolution across coarse-granularity, network, or clock-skewed filesystems. Field 22 is read by splitting at the **last** `)` in the line: field 2 is `comm`, unescaped, so a process named `foo bar) baz` would shift every index in a naive whitespace split.
+Age alone once refused 280 roots totalling **6.2 GB**, every one with a dead owner, because the oldest was 4h09m and the default threshold is 6h — on a 14 GB tmpfs with 5 MiB of swap left and an e2e compile about to start. It also made the opposite mistake: a suite still running past the threshold was eligible to have its own live root deleted out from under it. Both directions matter, and the second is why the middle row is unconditional.
 
-Every way that proof can fall short resolves to **keep, forever** — an unreadable or unparseable `stat`, a missing `btime`, a bad `_SC_CLK_TCK`, a filesystem that reports no timestamp for the root, or a non-Linux target. The tradeoff is accepted knowingly: a genuinely recycled PID the tool cannot prove recycled pins its root indefinitely, and leaking a root is strictly better than deleting a live run's working directory.
+### Why there is no recycled-PID branch
 
-Do **not** substitute the `/proc/<pid>` directory's mtime for that. It is not a start time. Linux instantiates the per-PID procfs inode lazily — `proc_pid_make_inode()` initialises its timestamps at instantiation and `pid_getattr()` leaves them alone — so the mtime is a proc-dentry *lookup* time and moves forward again whenever the dentry is evicted and re-looked-up, which is likeliest under exactly the memory pressure this tool exists to relieve. The first cut of #461 did use it, and any live root created before its owner's first `/proc/<pid>` lookup was reported `recycled` and deleted under `--apply`.
+Issue #461 as filed called for a fourth branch: a live PID *proven* to have started after the root already existed cannot be its creator, so the number was recycled and age should decide. That branch was built twice and removed. It is a deliberate, documented deviation from the issue — do not reinstate it.
 
-Both directions of that change matter. Age alone once refused 280 roots totalling **6.2 GB**, every one with a dead owner, because the oldest was 4h09m and the default threshold is 6h — on a 14 GB tmpfs with 5 MiB of swap left and an e2e compile about to start. It also made the opposite mistake: a suite still running past the threshold was eligible to have its own live root deleted out from under it.
+Both attempts failed in the same direction: deleting a live run's working directory. The first read the `/proc/<pid>` directory's mtime as a start time. It is not one — Linux instantiates the per-PID procfs inode lazily, `proc_pid_make_inode()` stamps its timestamps at instantiation and `pid_getattr()` leaves them alone, so that mtime is a proc-dentry *lookup* time that moves forward again whenever the dentry is evicted and re-looked-up, which is likeliest under exactly the memory pressure this tool exists to relieve. Any live root created before its owner's first `/proc/<pid>` lookup was classified recycled and deleted under `--apply`. The second reconstructed a real start time from field 22 of `/proc/<pid>/stat` plus `/proc/stat`'s `btime`, which is the kernel's authoritative record — and still could not be trusted, for a reason no parsing fix reaches.
 
-The output attributes each decision — `dead-pid`, `live-pid`, `recycled`, `untagged` — with per-reason counts and sizes, so "nothing to reap" now says which category held the survivors back instead of restating the age threshold. The per-directory list is capped at 20 entries (biggest first) and says how many it dropped; the summary always counts them all. Directory names are printed escaped rather than raw, because `/tmp` is mode 1777 and the suffix of a `dad-tests-<pid>-*` name is attacker-controlled text that the *default dry run* pipes to a terminal — an OSC 52 sequence in a directory name would otherwise rewrite the reader's clipboard.
+The comparison is unsound in principle. Ordering a process start against a directory timestamp has to bridge through the wall clock: the directory side is only ever a stored `CLOCK_REALTIME` value, while the process side has to be reconstructed as boot time plus a tick counter. Linux's `getboottime64()` contract states outright that `settimeofday` shifts the boot time behind `btime`, and inode timestamps are never retroactively adjusted to match. So any forward clock step since a root was created — admin action, a VM clock correction, a time-sync daemon, suspend/resume — moves a *live* process's reconstructed start forward while its root's timestamp stays put. A one-hour correction is enough to make a process that started one second before creating its root look like it started 59m59s after, straight past any plausible margin. The bias lands squarely on the deletion-unsafe side, and there is no further input available here that turns it back into positive proof.
+
+Deleting the branch costs almost nothing, because a PID collision is **transient**. When a dead test's PID gets reused by an unrelated live process, that root is kept for as long as the collision lasts — but the colliding process eventually exits, and the next run classifies the root `dead-pid` and reaps it at any age. Nothing leaks permanently; reaping is merely deferred. That is the whole trade: a deferral, against a real risk of deleting a live e2e run.
+
+For the same reason there is no report-only "possibly recycled" annotation either. It would keep the entire `/proc` parsing surface — which is where the wrong answers came from — in exchange for a hint nobody can act on differently.
+
+### Output, sizes, and what the size walk guarantees
+
+The output attributes each decision — `dead-pid`, `live-pid`, `untagged` — with per-reason counts and sizes, so "nothing to reap" says which category held the survivors back instead of restating the age threshold. The per-directory list is capped at 20 entries (biggest first) and says how many it dropped; the summary always counts them all. Directory names are printed escaped rather than raw, because `/tmp` is mode 1777 and the suffix of a `dad-tests-<pid>-*` name is attacker-controlled text that the *default dry run* pipes to a terminal — an OSC 52 sequence in a directory name would otherwise rewrite the reader's clipboard.
 
 Sizes are computed by a walk bounded at 50,000 entries and depth 64 per root, because the walk now runs on kept roots too rather than only on age-eligible ones. Past the budget the walk stops and the size is printed with a `≥` marker and a footnote. Sizing is presentation only and never reaches the classifier, so a truncated size cannot change a reap/keep verdict.
 
-`--older-than` still applies to the fallback cases only.
+Every size total saturates rather than wrapping, and this is not theoretical: `meta.len()` is the *apparent* size, a sparse file costs no blocks, and three 8-exabyte sparse files planted under a `dad-tests-*` name in a world-writable `/tmp` overflow a `u64`. That aborted the plain debug `cargo xtask clean-e2e-tmp` with `attempt to add with overflow` before it could clean anything, and a release build wrapped silently and printed a false size. `--older-than` saturates its hours-to-seconds multiplication for the same reason.
+
+The walk stats every entry with `symlink_metadata`, so **a symlink is never descended as observed**: it contributes its own length and nothing more, and a symlink loop cannot spin the walk. That is a statement about what the walk sees, not a race-free guarantee — the older flat claim that it "never follows symlinks" was too absolute. `read_dir` resolves by path, so a local user with write access inside the tree can replace an already-observed directory with a symlink before it is opened, and the open follows the replacement; the walk re-stats each directory after opening it, which rejects a swap still in place but not one undone again inside the window. The residual consequence is bounded and presentation-only: at worst some other tree's entries are counted into a size, capped by the entry and depth budgets. Nothing from outside the candidate is ever printed, no reap/keep verdict can move, and it is not a deletion escape — `--apply` calls `remove_dir_all` on the candidate path itself, which the collector established was a directory and not a symlink.
+
+`--older-than` still applies to the fallback case only.
 
 ## Pre-flight space check
 
