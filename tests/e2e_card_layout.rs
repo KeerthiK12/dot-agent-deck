@@ -23,9 +23,36 @@ const RECORDING_ROWS: u16 = 16;
 const CONTROL_COLS: u16 = 120;
 const CONTROL_ROWS: u16 = 40;
 
+#[derive(Clone, Copy, Debug)]
+struct CardBorder {
+    top_left: char,
+    top_right: char,
+    vertical: char,
+    bottom_left: char,
+    bottom_right: char,
+}
+
+const CARD_BORDERS: [CardBorder; 2] = [
+    CardBorder {
+        top_left: '┌',
+        top_right: '┐',
+        vertical: '│',
+        bottom_left: '└',
+        bottom_right: '┘',
+    },
+    CardBorder {
+        top_left: '┏',
+        top_right: '┓',
+        vertical: '┃',
+        bottom_left: '┗',
+        bottom_right: '┛',
+    },
+];
+
 #[derive(Debug)]
 struct CardSnapshot {
     rows: Vec<String>,
+    border: CardBorder,
 }
 
 impl CardSnapshot {
@@ -45,6 +72,16 @@ impl CardSnapshot {
         self.rows[0].chars().count().saturating_sub(2)
     }
 
+    fn bottom_corners_are_intact(&self) -> bool {
+        self.bottom().starts_with(self.border.bottom_left)
+            && self.bottom().ends_with(self.border.bottom_right)
+    }
+
+    fn bottom_label_is_right_aligned(&self, label: &str) -> bool {
+        self.bottom()
+            .ends_with(&format!("{label} {}", self.border.bottom_right))
+    }
+
     fn row_of(&self, needle: &str) -> usize {
         self.rows
             .iter()
@@ -53,38 +90,98 @@ impl CardSnapshot {
     }
 }
 
-fn corner_segment(row: &str, left: char, right: char) -> Option<String> {
-    let start = row.chars().position(|ch| ch == left)?;
-    let after_start = row.chars().skip(start + 1).position(|ch| ch == right)?;
-    Some(row.chars().skip(start).take(after_start + 2).collect())
+#[derive(Debug)]
+struct BorderSegment {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+fn border_segments(row: &str, left: char, right: char) -> Vec<BorderSegment> {
+    let chars: Vec<char> = row.chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .filter(|(_, ch)| **ch == left)
+        .filter_map(|(start, _)| {
+            let end = chars
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find_map(|(index, ch)| (*ch == right).then_some(index))?;
+            Some(BorderSegment {
+                start,
+                end,
+                text: chars[start..=end].iter().collect(),
+            })
+        })
+        .collect()
+}
+
+fn border_segment_at(
+    row: &str,
+    left: char,
+    right: char,
+    start: usize,
+    end: usize,
+) -> Option<String> {
+    border_segments(row, left, right)
+        .into_iter()
+        .find(|segment| segment.start == start && segment.end == end)
+        .map(|segment| segment.text)
 }
 
 fn try_first_card(grid: &str) -> Option<CardSnapshot> {
     let lines: Vec<&str> = grid.lines().collect();
-    let top = lines
-        .iter()
-        .position(|line| corner_segment(line, '┌', '┐').is_some())?;
-    let bottom = lines
-        .iter()
-        .enumerate()
-        .skip(top + 1)
-        .find_map(|(index, line)| corner_segment(line, '└', '┘').map(|_| index))?;
+    let mut leftmost: Option<(usize, usize, CardSnapshot)> = None;
+    for (top, line) in lines.iter().enumerate() {
+        for border in CARD_BORDERS {
+            for top_segment in border_segments(line, border.top_left, border.top_right) {
+                for (bottom, bottom_line) in lines.iter().enumerate().skip(top + 1) {
+                    let Some(bottom_segment) = border_segment_at(
+                        bottom_line,
+                        border.bottom_left,
+                        border.bottom_right,
+                        top_segment.start,
+                        top_segment.end,
+                    ) else {
+                        continue;
+                    };
+                    let mut rows = Vec::with_capacity(bottom - top + 1);
+                    rows.push(top_segment.text.clone());
+                    let middle = lines[top + 1..bottom]
+                        .iter()
+                        .map(|line| {
+                            border_segment_at(
+                                line,
+                                border.vertical,
+                                border.vertical,
+                                top_segment.start,
+                                top_segment.end,
+                            )
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    let Some(middle) = middle else {
+                        continue;
+                    };
+                    rows.extend(middle);
+                    rows.push(bottom_segment);
 
-    let rows = lines[top..=bottom]
-        .iter()
-        .enumerate()
-        .map(|(offset, line)| {
-            if offset == 0 {
-                corner_segment(line, '┌', '┐')
-            } else if top + offset == bottom {
-                corner_segment(line, '└', '┘')
-            } else {
-                corner_segment(line, '│', '│')
+                    let candidate = CardSnapshot { rows, border };
+                    let candidate_key = (top_segment.start, top);
+                    if leftmost
+                        .as_ref()
+                        .is_none_or(|(start, row, _)| candidate_key < (*start, *row))
+                    {
+                        leftmost = Some((top_segment.start, top, candidate));
+                    }
+                    break;
+                }
             }
-        })
-        .collect::<Option<Vec<_>>>()?;
+        }
+    }
 
-    Some(CardSnapshot { rows })
+    leftmost.map(|(_, _, card)| card)
 }
 
 fn first_card(grid: &str) -> CardSnapshot {
@@ -247,12 +344,12 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
     let tool_count = tools_from_full_label(wide.bottom());
     assert!(tool_count > 0, "wide card must retain the real tool count");
     assert!(
-        wide.bottom().starts_with('└') && wide.bottom().ends_with('┘'),
+        wide.bottom_corners_are_intact(),
         "wide card must retain both bottom corners:\n{}",
         wide.rows.join("\n")
     );
     assert!(
-        wide.bottom().ends_with(&format!(" Tools: {tool_count} ┘")),
+        wide.bottom_label_is_right_aligned(&format!(" Tools: {tool_count}")),
         "the full stats label must be right-aligned against the wide card's bottom-right corner:\n{}",
         wide.rows.join("\n")
     );
@@ -294,14 +391,12 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
         .into_inner()
         .expect("the successful narrowed-card predicate stores its complete snapshot");
     assert!(
-        narrow.bottom().starts_with('└') && narrow.bottom().ends_with('┘'),
+        narrow.bottom_corners_are_intact(),
         "narrow stats must preserve both bottom corners:\n{}",
         narrow.rows.join("\n")
     );
     assert!(
-        narrow
-            .bottom()
-            .ends_with(&format!(" · {tool_count} tools ┘")),
+        narrow.bottom_label_is_right_aligned(&format!(" · {tool_count} tools")),
         "narrow card must right-align the shorter stats rung and retain the same tool count:\n{}",
         narrow.rows.join("\n")
     );

@@ -732,8 +732,9 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     // could be satisfied by the agent's own output echoing the text back. A card
     // title is the only row that carries the label AND the card's top-left corner.
     let card_titled = |grid: &str, role: &str| {
-        grid.lines()
-            .any(|line| line.contains('┌') && line.contains(&card_label(role)))
+        grid.lines().any(|line| {
+            line.chars().any(|ch| matches!(ch, '┌' | '┏')) && line.contains(&card_label(role))
+        })
     };
     assert!(
         common::wait_until(CARD_WAIT, || {

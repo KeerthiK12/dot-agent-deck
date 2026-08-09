@@ -42,7 +42,31 @@ fn idle_role_label(role: &str) -> String {
     format!("[UNTRUSTED-ROLE-LABEL: {role} :END-UNTRUSTED-ROLE-LABEL]")
 }
 
-/// Drop every whitespace run and the vt100 box-drawing verticals from `text`.
+/// Keep only the orchestration pane column from a rendered terminal grid.
+///
+/// The focused orchestrator's expanded box starts at this column. Cropping
+/// every row there prevents role-card text in the sidebar from being spliced
+/// between adjacent wrapped pane rows when the grid is joined vertically.
+fn orchestration_pane_column(grid: &str) -> Option<String> {
+    let left_edge = grid.lines().find_map(|line| {
+        ["┌orchestrator", "┏orchestrator", "╔orchestrator"]
+            .iter()
+            .filter_map(|header| {
+                line.find(header)
+                    .map(|byte_index| line[..byte_index].chars().count())
+            })
+            .min()
+    })?;
+
+    Some(
+        grid.lines()
+            .map(|line| line.chars().skip(left_edge).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Drop every whitespace run and vt100 box-drawing vertical from `text`.
 ///
 /// The idle prompt is one long line, so on a rendered grid it is broken across
 /// rows at whatever column the pane happens to be — and a needle straddling
@@ -54,14 +78,17 @@ fn idle_role_label(role: &str) -> String {
 /// re-flowed at a word boundary or hard-broke mid-token).
 fn squeeze(text: &str) -> String {
     text.chars()
-        .filter(|c| !c.is_whitespace() && *c != '│')
+        .filter(|c| !c.is_whitespace() && !matches!(*c, '│' | '┃' | '║'))
         .collect()
 }
 
 /// Wrap-tolerant [`TuiDeck::wait_for_grid_string_within`].
 fn wait_for_wrapped_grid_string(deck: &TuiDeck, needle: &str, timeout: Duration) -> bool {
     let needle = squeeze(needle);
-    common::wait_until(timeout, || squeeze(&deck.snapshot_grid()).contains(&needle))
+    common::wait_until(timeout, || {
+        orchestration_pane_column(&deck.snapshot_grid())
+            .is_some_and(|pane| squeeze(&pane).contains(&needle))
+    })
 }
 
 fn path_with_binary_dir() -> String {
