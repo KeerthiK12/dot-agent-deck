@@ -23,8 +23,8 @@
 //!      not exist on a fresh clone.
 //!   8. No bare `tempfile` constructor — directory (`tempdir()`,
 //!      `TempDir::new()`) *or* file (`NamedTempFile::new()`,
-//!      `tempfile()`) — in `tests/e2e_*.rs`, `tests/common/`, or
-//!      the files on [`EXTRA_TEMP_COVERED`]. Issue #322. See
+//!      `tempfile()`) — anywhere under `tests/`, or in the files on
+//!      [`EXTRA_TEMP_COVERED`]. Issue #322. See
 //!      [`BARE_TEMPDIR_RULE`].
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
@@ -100,34 +100,44 @@ const TESTS_DIR: &str = "tests";
 /// forms (`tempdir_in`, `tempfile_in`, `new_in`) name their parent explicitly
 /// and are therefore fine; the no-argument forms are not.
 ///
-/// **Scope.** `tests/e2e_*.rs` and `tests/common/` — where the allocations are
-/// whole cloned repositories and seeded credentials — plus two files outside
-/// the e2e tier that were measured allocating anyway and now have a wrapper:
-/// [`EXTRA_TEMP_COVERED`].
+/// **Scope: all of `tests/`**, plus [`EXTRA_TEMP_COVERED`] for the lib target.
+///
+/// It used to be an enumerated list — `tests/e2e_*.rs`, `tests/common/`, and
+/// two named files — because covering the rest of the fast tier was priced at
+/// pulling `tests/common/mod.rs` into six more binaries and duplicating its
+/// ~530 executions to contain small L1 `TempDir`s. That price was real when it
+/// was measured, and it is no longer what the choice costs: `src/test_temp.rs`
+/// is deliberately self-contained, so a fast-tier crate `#[path]`-includes it
+/// for **two** extra executions. Six crates, twelve executions, measured — so
+/// the enumeration outlived the measurement that justified it. A whole-
+/// directory rule is also the only version a *new* file under `tests/` inherits
+/// automatically; an enumerated one silently does not cover it.
 ///
 /// The escape hatch is [`BARE_TEMPDIR_ALLOW`] on the same line, which the
-/// harness's own defence-in-depth regression test uses.
+/// harness's own defence-in-depth regression test uses — the one test whose
+/// subject *is* the bare constructor.
 const BARE_TEMPDIR_RULE: &str = "bare tempfile constructor — use `common::harness_tempdir()` / \
      `harness_tempfile()` (or `test_temp::tempdir()` outside the harness) so it \
      lands under the harness temp root even when it is the process's FIRST \
      allocation (issue #322)";
 
-/// Files outside `tests/e2e_*.rs` and `tests/common/` that check 8 also covers.
+/// Files outside `tests/` that check 8 also covers.
 ///
-/// Both were measured allocating in the OS temp dir during a recorded
-/// `cargo test-e2e` and both now route through a wrapper, so the rule is what
-/// stops a bare constructor coming back:
+/// `src/dispatch.rs` — lib-target unit tests that build real git repos and
+/// worktrees. They do not link `tests/common/` at all and use
+/// `crate::test_temp::tempdir()`; one of them was measured holding a live
+/// 184 KiB `/tmp/.tmpYN3lNF` with a cloned repo in it during a recorded
+/// `cargo test-e2e`, so the rule is what stops a bare constructor coming back.
 ///
-/// - `src/dispatch.rs` — lib-target unit tests that build real git repos and
-///   worktrees; they do not link `tests/common/` at all, and use
-///   `crate::test_temp::tempdir()`.
-/// - `tests/daemon_protocol.rs` — a fast-tier crate that binds Unix domain
-///   sockets and is included in `cargo test-e2e`; it `#[path]`-includes the
-///   same `test_temp` module rather than the whole PTY harness.
+/// The **rest** of `src/`'s unit tests are deliberately not here — ~82 call
+/// sites across 22 files, a large mechanical diff that would move fast-tier
+/// churn onto `/var/tmp` for no measured benefit. That is the one remaining
+/// documented gap in `docs/develop/e2e-temp-dirs.md`; everything under
+/// `tests/` is covered by the directory rule above.
 ///
 /// Paths are repo-relative and compared with the platform separator
 /// normalised, so this works on Windows too.
-const EXTRA_TEMP_COVERED: &[&str] = &["src/dispatch.rs", "tests/daemon_protocol.rs"];
+const EXTRA_TEMP_COVERED: &[&str] = &["src/dispatch.rs"];
 
 /// Opt-out marker for check 8, on the offending line.
 const BARE_TEMPDIR_ALLOW: &str = "linkage-check:allow-bare-tempdir";
@@ -151,11 +161,12 @@ fn bare_temp_ctor_re() -> Regex {
 
 /// Whether check 8 applies to `file`.
 ///
-/// `tests/e2e_*.rs` plus everything under `tests/common/`, plus the explicit
-/// [`EXTRA_TEMP_COVERED`] list. `is_e2e` is passed in because the caller has
-/// already derived it from the file name.
-fn temp_ctor_rule_covers(file: &Path, root: &Path, tests_dir: &Path, is_e2e: bool) -> bool {
-    if is_e2e || file.starts_with(tests_dir.join("common")) {
+/// Everything under `tests/`, plus the explicit [`EXTRA_TEMP_COVERED`] list for
+/// the lib target. `is_e2e` is no longer consulted — an `e2e_` file is under
+/// `tests/` by construction — but stays in the signature because the caller has
+/// it and because dropping it would make the two scoping rules look unrelated.
+fn temp_ctor_rule_covers(file: &Path, root: &Path, tests_dir: &Path, _is_e2e: bool) -> bool {
+    if file.starts_with(tests_dir) {
         return true;
     }
     EXTRA_TEMP_COVERED
@@ -273,18 +284,16 @@ fn main() -> ExitCode {
             });
         }
 
-        // Check 8 (issue #322): the e2e tier plus the harness itself — the same
-        // scoping rule 5 uses, and for the same reason. That is where the
-        // allocations are whole cloned repositories, where nextest's
-        // `slow-timeout terminate-after` SIGKILLs a process before it can clean
-        // up, and where real agent credentials get seeded. A fast-tier
-        // `TempDir` is small, drops on the normal path, and its file is not
-        // linked against the harness at all, so requiring the wrapper there
-        // would mean pulling the whole PTY harness into another binary to fix
-        // something that is not leaking. The two exceptions on
-        // `EXTRA_TEMP_COVERED` are files that were measured allocating in `/tmp`
-        // during a recorded e2e run and that got a wrapper cheaper than the
-        // harness. Run against the stripped view so a comment naming the
+        // Check 8 (issue #322): all of `tests/`, plus `EXTRA_TEMP_COVERED` for
+        // the lib target. The e2e tier is where the allocations are whole cloned
+        // repositories, where nextest's `slow-timeout terminate-after` SIGKILLs
+        // a process before it can clean up, and where real agent credentials
+        // get seeded — but the fast tier is no longer excluded, because the
+        // exclusion was priced at pulling the PTY harness into six more
+        // binaries and the `#[path]`-included `src/test_temp.rs` costs two test
+        // executions per crate instead. Its files bind Unix domain sockets and,
+        // on SIGKILL, survive as untagged `.tmp*` the reaper will not remove by
+        // default. Run against the stripped view so a comment naming the
         // constructor is not a violation, but report the raw line number.
         if temp_ctor_rule_covers(file, &root, &tests_dir, is_e2e) {
             for (idx, raw) in raw_lines.iter().enumerate() {
@@ -980,9 +989,9 @@ mod tests {
         }
     }
 
-    /// Scope: the e2e tier, the harness, and the two explicitly-listed files
-    /// that were measured allocating anyway — but not the rest of the fast
-    /// tier, which stays excluded on the measured grounds documented in
+    /// Scope: **all** of `tests/` — the e2e tier, the harness, and the fast-tier
+    /// crates that used to be excluded — plus `src/dispatch.rs`. The rest of
+    /// `src/` stays out; that is the one remaining documented gap in
     /// `docs/develop/e2e-temp-dirs.md`.
     #[test]
     fn temp_ctor_rule_covers_the_documented_scope() {
@@ -997,10 +1006,20 @@ mod tests {
         assert!(covers("tests/daemon_protocol.rs", false));
         assert!(covers("src/dispatch.rs", false));
 
-        assert!(!covers("tests/rehydration.rs", false));
-        assert!(!covers("tests/pane_close.rs", false));
-        assert!(!covers("tests/codex_hooks_safety.rs", false));
+        // The six converted in the same commit that widened this rule, and a
+        // name that does not exist yet — the whole point of a directory rule is
+        // that a new file under `tests/` inherits it without being listed.
+        assert!(covers("tests/rehydration.rs", false));
+        assert!(covers("tests/pane_close.rs", false));
+        assert!(covers("tests/codex_hooks_safety.rs", false));
+        assert!(covers("tests/features.rs", false));
+        assert!(covers("tests/devin_hook_ingestion.rs", false));
+        assert!(covers("tests/codex_hook_ingestion.rs", false));
+        assert!(covers("tests/some_future_suite.rs", false));
+
+        // Still outside: everything in `src/` except the one listed file.
         assert!(!covers("src/config.rs", false));
+        assert!(!covers("src/test_temp.rs", false));
     }
 
     #[test]

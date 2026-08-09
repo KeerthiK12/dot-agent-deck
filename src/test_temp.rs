@@ -113,10 +113,15 @@ fn private_base() -> Option<PathBuf> {
     None
 }
 
-// These two run once more in every crate that `#[path]`-includes this file
-// (`tests/daemon_protocol.rs`). That is the whole cost of sharing the module
-// this way — two extra fast-tier executions per crate, against the ~530 that
-// pulling `tests/common/mod.rs` in would have duplicated.
+// These two run once more in every crate that `#[path]`-includes this file:
+// `tests/daemon_protocol.rs`, `tests/rehydration.rs`, `tests/pane_close.rs`,
+// `tests/codex_hooks_safety.rs`, `tests/features.rs`,
+// `tests/devin_hook_ingestion.rs` and `tests/codex_hook_ingestion.rs`. That is
+// the whole cost of sharing the module this way — two extra fast-tier
+// executions per crate, against the ~530 that pulling `tests/common/mod.rs` in
+// would have duplicated. Measured across the six added at once: 2,315 → 2,327.
+// Keeping it self-contained is what makes that price available, so a `crate::`
+// reference added here would silently take it away.
 #[cfg(test)]
 mod tests {
     /// A scratch dir comes back, and it really is a directory on disk —
