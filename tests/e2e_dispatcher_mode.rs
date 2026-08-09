@@ -727,13 +727,32 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     deck.send_keys(b"\x1b[6;5~"); // Ctrl+PageDown → the dispatched orchestration tab
     const CARD_WAIT: Duration = Duration::from_secs(60);
     let card_label = |role: &str| format!("ClaudeCode · {role}");
-    // Matched on the CARD TITLE ROW, not anywhere on the grid: the tab's right
-    // half renders the focused role's live terminal, so a bare `grid.contains`
-    // could be satisfied by the agent's own output echoing the text back. A card
-    // title is the only row that carries the label AND the card's top-left corner.
+    // Match only within one same-weight top-border span. The focused role's live
+    // terminal occupies these same rows to the right, so cropping at the card's
+    // own right corner prevents aligned agent output from supplying the label.
     let card_titled = |grid: &str, role: &str| {
+        let label = card_label(role);
         grid.lines().any(|line| {
-            line.chars().any(|ch| matches!(ch, '┌' | '┏')) && line.contains(&card_label(role))
+            let chars: Vec<char> = line.chars().collect();
+            chars.iter().enumerate().any(|(start, left)| {
+                let right = match *left {
+                    '┌' => '┐',
+                    '┏' => '┓',
+                    _ => return false,
+                };
+                let Some(end) = chars
+                    .iter()
+                    .enumerate()
+                    .skip(start + 1)
+                    .find_map(|(index, ch)| (*ch == right).then_some(index))
+                else {
+                    return false;
+                };
+                chars[start..=end]
+                    .iter()
+                    .collect::<String>()
+                    .contains(&label)
+            })
         })
     };
     assert!(

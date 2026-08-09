@@ -152,22 +152,7 @@ fn inject_role_status(
     );
 }
 
-/// Scenario: The full lock-governed focus contract in one real Orchestration
-/// tab, as a user experiences it, asserted purely on the rendered grid. (1) A
-/// freshly opened tab (LOCKED, the default) shows the orchestrator role's
-/// expanded pane box. (2) Injecting `WaitingForInput` for the non-orchestrator
-/// `alpha` role visibly steers focus onto ITS expanded box. (3) Injecting
-/// `Thinking` for `alpha` (status clears) visibly returns focus to the
-/// orchestrator's expanded box — the all-clear edge. (4) `Ctrl+d` then `Ctrl+e`
-/// unlocks, surfacing the `Pane entry: unlocked` status message. (5) With the
-/// deck now unlocked, manually focusing the OTHER non-orchestrator role
-/// (`beta`, not `alpha` — so the fresh waiting episode below is a genuine
-/// steer-attempt rather than a same-pane no-op) and then injecting a fresh
-/// `WaitingForInput`/`Thinking` pair for `alpha` moves focus nowhere: `beta`'s
-/// expanded box, and a sentinel typed into it, survive both the waiting pane
-/// appearing and its all-clear — because while unlocked the per-frame call site
-/// never even calls `observe_waiting_panes`, so there is no auto-focus branch
-/// left to fight the human's manual choice.
+/// Scenario: Launch a real Orchestration tab with the experimental command-entry-lock surface enabled, so LOCKED is that enabled surface's initial state, and verify waiting `alpha` visibly takes focus before all-clear returns it to `orchestrator`. Unlock through `Ctrl+d` then `Ctrl+e`, manually focus `beta`, and inject a fresh `alpha` waiting/all-clear pair; `beta`'s expanded pane and typed sentinel remain visible because unlocked mode preserves manual focus.
 #[spec("orchestration/focus/007")]
 #[test]
 fn focus_007_lock_governed_focus_contract_on_real_binary() {

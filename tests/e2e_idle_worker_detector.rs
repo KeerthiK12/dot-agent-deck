@@ -48,6 +48,8 @@ fn idle_role_label(role: &str) -> String {
 /// every row there prevents role-card text in the sidebar from being spliced
 /// between adjacent wrapped pane rows when the grid is joined vertically.
 fn orchestration_pane_column(grid: &str) -> Option<String> {
+    // This scalar-based crop matches terminal columns only while fixtures keep
+    // every cell left of the pane boundary width-1.
     let left_edge = grid.lines().find_map(|line| {
         ["┌orchestrator", "┏orchestrator", "╔orchestrator"]
             .iter()

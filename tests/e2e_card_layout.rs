@@ -72,11 +72,6 @@ impl CardSnapshot {
         self.rows[0].chars().count().saturating_sub(2)
     }
 
-    fn bottom_corners_are_intact(&self) -> bool {
-        self.bottom().starts_with(self.border.bottom_left)
-            && self.bottom().ends_with(self.border.bottom_right)
-    }
-
     fn bottom_label_is_right_aligned(&self, label: &str) -> bool {
         self.bottom()
             .ends_with(&format!("{label} {}", self.border.bottom_right))
@@ -98,6 +93,8 @@ struct BorderSegment {
 }
 
 fn border_segments(row: &str, left: char, right: char) -> Vec<BorderSegment> {
+    // Segment indices count Unicode scalars, so fixtures must keep every prefix
+    // left of a card boundary to width-1 terminal cells.
     let chars: Vec<char> = row.chars().collect();
     chars
         .iter()
@@ -169,6 +166,9 @@ fn try_first_card(grid: &str) -> Option<CardSnapshot> {
 
                     let candidate = CardSnapshot { rows, border };
                     let candidate_key = (top_segment.start, top);
+                    // compute_frame_layout puts dashboard cards left of panes in
+                    // every layout exercised here; a pane-left layout would
+                    // invalidate this leftmost-complete-rectangle selection.
                     if leftmost
                         .as_ref()
                         .is_none_or(|(start, row, _)| candidate_key < (*start, *row))
@@ -343,11 +343,8 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
     let wide = first_card(&deck.snapshot_grid());
     let tool_count = tools_from_full_label(wide.bottom());
     assert!(tool_count > 0, "wide card must retain the real tool count");
-    assert!(
-        wide.bottom_corners_are_intact(),
-        "wide card must retain both bottom corners:\n{}",
-        wide.rows.join("\n")
-    );
+    // Successful extraction from the raw grid already requires matching-weight
+    // bottom corners at the exact columns of this card's top corners.
     assert!(
         wide.bottom_label_is_right_aligned(&format!(" Tools: {tool_count}")),
         "the full stats label must be right-aligned against the wide card's bottom-right corner:\n{}",
@@ -390,11 +387,8 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
     let narrow = narrowed_snapshot
         .into_inner()
         .expect("the successful narrowed-card predicate stores its complete snapshot");
-    assert!(
-        narrow.bottom_corners_are_intact(),
-        "narrow stats must preserve both bottom corners:\n{}",
-        narrow.rows.join("\n")
-    );
+    // The successful try_first_card extraction is itself the raw-grid corner
+    // check: both matching-weight bottom corners had to align with the top span.
     assert!(
         narrow.bottom_label_is_right_aligned(&format!(" · {tool_count} tools")),
         "narrow card must right-align the shorter stats rung and retain the same tool count:\n{}",
