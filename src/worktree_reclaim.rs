@@ -143,10 +143,21 @@ pub fn decide(pr_state: &PrState, clean: &Cleanliness, ownership: Ownership) -> 
     }
 }
 
+/// Serialize a `PathBuf` as its lossy string rendering, so a worktree path
+/// containing non-UTF-8 bytes still produces valid JSON instead of failing
+/// the whole document — `PathBuf`'s stock `Serialize` errors on those bytes.
+fn serialize_path_lossy<S: serde::Serializer>(
+    path: &Path,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&path.to_string_lossy())
+}
+
 /// One examined worktree, ready to render as a human row or a JSON entry.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorktreeReport {
-    pub path: String,
+    #[serde(serialize_with = "serialize_path_lossy")]
+    pub path: PathBuf,
     pub branch: Option<String>,
     pub clean: bool,
     pub owned: bool,
@@ -177,18 +188,29 @@ struct RawWorktree {
     branch: Option<String>,
 }
 
-/// Build a `PathBuf` from one raw `-z` path field without a lossy UTF-8
-/// round-trip. On Unix a path is an arbitrary byte sequence, so this goes
-/// straight through `OsStr`; elsewhere (Windows paths are UTF-16, and `git`
-/// there emits UTF-8 on the wire) a lossy fallback is the best available.
+/// Build a `PathBuf` from raw bytes read from `git`'s output (a `-z` path
+/// field, or a `rev-parse --git-dir` line) without a lossy UTF-8 round-trip.
+/// On Unix a path is an arbitrary byte sequence, so this goes straight
+/// through `OsStr`; elsewhere (Windows paths are UTF-16, and `git` there
+/// emits UTF-8 on the wire) a lossy fallback is the best available.
 #[cfg(unix)]
-fn path_from_porcelain_field(field: &[u8]) -> PathBuf {
+fn path_from_bytes(field: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
     PathBuf::from(std::ffi::OsStr::from_bytes(field))
 }
 
+/// Strip a single trailing `\n` (or `\r\n`) from a `git` command's raw
+/// stdout, at the byte level — no UTF-8 round-trip, so the bytes that
+/// precede the line ending survive untouched regardless of what they are.
+fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
+    bytes
+        .strip_suffix(b"\n")
+        .map(|b| b.strip_suffix(b"\r").unwrap_or(b))
+        .unwrap_or(bytes)
+}
+
 #[cfg(not(unix))]
-fn path_from_porcelain_field(field: &[u8]) -> PathBuf {
+fn path_from_bytes(field: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(field).into_owned())
 }
 
@@ -225,7 +247,7 @@ fn parse_worktree_porcelain(bytes: &[u8]) -> Vec<RawWorktree> {
                     branch: cur_branch.take(),
                 });
             }
-            cur_path = Some(path_from_porcelain_field(rest));
+            cur_path = Some(path_from_bytes(rest));
         } else if let Some(rest) = field.strip_prefix(b"branch ") {
             let rest = String::from_utf8_lossy(rest);
             cur_branch = Some(
@@ -314,11 +336,11 @@ fn ownership_of(worktree_path: &Path) -> Ownership {
         Ok(o) if o.status.success() => o,
         _ => return Ownership::Foreign,
     };
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let raw = trim_trailing_newline(&out.stdout);
     if raw.is_empty() {
         return Ownership::Foreign;
     }
-    let git_dir = PathBuf::from(&raw);
+    let git_dir = path_from_bytes(raw);
     let git_dir = if git_dir.is_absolute() {
         git_dir
     } else {
@@ -479,7 +501,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
         };
         let verdict = decide(&pr_state, &cleanliness, ownership);
         reports.push(WorktreeReport {
-            path: wt.path.to_string_lossy().to_string(),
+            path: wt.path,
             branch: wt.branch,
             clean,
             owned,
@@ -506,9 +528,10 @@ pub fn format_list_human(reports: &[WorktreeReport]) -> String {
     let mut out = String::new();
     out.push_str("PATH\tBRANCH\tPR\tCLEAN\tOWNED\tVERDICT\tREASON\n");
     for r in reports {
+        let path = r.path.to_string_lossy();
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            r.path,
+            path,
             cell(&r.branch),
             r.pr_state,
             if r.clean { "yes" } else { "no" },
@@ -525,10 +548,11 @@ pub fn format_list_human(reports: &[WorktreeReport]) -> String {
 /// `--force`, since [`examine_worktrees`] already gated on cleanliness; git's
 /// own refusal on an unexpectedly dirty tree is a second line of defense
 /// rather than something to override.
-fn remove_worktree_dir(repo_dir: &Path, worktree_path: &str) -> Result<(), String> {
+fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path) -> Result<(), String> {
     let out = Command::new("git")
         .current_dir(repo_dir)
-        .args(["worktree", "remove", worktree_path])
+        .args(["worktree", "remove"])
+        .arg(worktree_path)
         .output()
         .map_err(|e| format!("failed to spawn `git worktree remove`: {e}"))?;
     if out.status.success() {
@@ -602,7 +626,7 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
             outcome.pending.len()
         ));
         for r in &outcome.pending {
-            out.push_str(&format!("  - {}\n", r.path));
+            out.push_str(&format!("  - {}\n", r.path.to_string_lossy()));
         }
         out.push_str("Run `dot-agent-deck worktree reclaim --yes` to remove them.\n\n");
     }
@@ -610,7 +634,7 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
     if !outcome.removed.is_empty() {
         out.push_str("Removed:\n");
         for r in &outcome.removed {
-            out.push_str(&format!("  - {}\n", r.path));
+            out.push_str(&format!("  - {}\n", r.path.to_string_lossy()));
         }
     } else {
         out.push_str("Removed: none\n");
@@ -621,7 +645,7 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
         for r in &outcome.kept {
             out.push_str(&format!(
                 "  - {} ({})\n",
-                r.path,
+                r.path.to_string_lossy(),
                 r.reason.as_deref().unwrap_or("no reason recorded")
             ));
         }
@@ -734,7 +758,7 @@ mod tests {
     #[test]
     fn json_document_carries_schema_version() {
         let reports = vec![WorktreeReport {
-            path: "/repo/wt-a".to_string(),
+            path: PathBuf::from("/repo/wt-a"),
             branch: Some("feat/a".to_string()),
             clean: true,
             owned: true,
