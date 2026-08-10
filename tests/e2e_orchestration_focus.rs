@@ -152,7 +152,7 @@ fn inject_role_status(
     );
 }
 
-/// Scenario: Launch a real Orchestration tab with the experimental command-entry-lock surface enabled, so LOCKED is that enabled surface's initial state, and verify waiting `alpha` visibly takes focus before all-clear returns it to `orchestrator`. Unlock through `Ctrl+d` then `Ctrl+e`, manually focus `beta`, and inject a fresh `alpha` waiting/all-clear pair; `beta`'s expanded pane and typed sentinel remain visible because unlocked mode preserves manual focus.
+/// Scenario: Launch a real Orchestration tab with the experimental command-entry-lock surface enabled, so LOCKED is that enabled surface's initial state, and verify waiting `alpha` visibly takes focus before all-clear returns it to `orchestrator`. Unlock through `Ctrl+d` then `Ctrl+e`, manually focus `beta`, and inject a fresh `alpha` waiting/all-clear pair; `beta`'s expanded pane and typed sentinel both remain visible because while unlocked the per-frame call site never even calls `observe_waiting_panes`, so no auto-focus branch is left to fight the human's manual choice.
 #[spec("orchestration/focus/007")]
 #[test]
 fn focus_007_lock_governed_focus_contract_on_real_binary() {

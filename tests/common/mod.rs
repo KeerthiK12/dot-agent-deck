@@ -1910,6 +1910,179 @@ pub fn joined_rows(buffer: &ratatui::buffer::Buffer) -> String {
         .join("\n")
 }
 
+// ---------------------------------------------------------------------------
+// Box-drawing grid helpers
+// ---------------------------------------------------------------------------
+//
+// Shared by every suite that reads a RENDERED grid (a vt100 PTY snapshot or a
+// `joined_rows` buffer) and has to find, crop or bound a drawn box. Kept here
+// as ONE copy because the alternative was measured and cost us: `a861c8d`
+// promoted the selected deck card from a plain to a thick border and `eff6256`
+// did the same to the focused pane, and each presentation change red-lined a
+// different test file that had hardcoded the old glyph — issue #460. Two files
+// had already grown near-identical copies of the pane-column scan below, which
+// would have made the next such change a two-site edit where only one site got
+// edited (review of #465, S1/S2).
+
+/// One border weight's corner and vertical glyphs — everything needed to find
+/// a box's span on a row and to recognise its verticals.
+#[derive(Clone, Copy, Debug)]
+pub struct BorderWeight {
+    pub top_left: char,
+    pub top_right: char,
+    pub vertical: char,
+    pub bottom_left: char,
+    pub bottom_right: char,
+}
+
+/// Every border weight a rendered box may use, in ratatui `BorderType` order.
+///
+/// The product paints only `Plain` and `Thick` today — `card_border_glyph`
+/// (`src/ui.rs`) and `TerminalWidget::render` (`src/terminal_widget.rs`) both
+/// return exactly those two, and `BorderType::Double` appears nowhere in
+/// `src/`. `Double` is listed ANYWAY, deliberately, because every consumer of
+/// this table is either a LOCATOR (find the box's column) or a
+/// weight-AGNOSTIC extractor (require the same weight top and bottom), and for
+/// both of those a weight they fail to recognise is a silent false negative,
+/// not a caught defect. That is not hypothetical: the pane-column scan below
+/// once pinned a single corner glyph and failed a mode switch that was working
+/// correctly. Listing an unreachable weight costs one table row and never
+/// weakens a same-weight coherence check — a card with a plain top and a thick
+/// bottom is still rejected.
+pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
+    BorderWeight {
+        top_left: '┌',
+        top_right: '┐',
+        vertical: '│',
+        bottom_left: '└',
+        bottom_right: '┘',
+    },
+    BorderWeight {
+        top_left: '┏',
+        top_right: '┓',
+        vertical: '┃',
+        bottom_left: '┗',
+        bottom_right: '┛',
+    },
+    BorderWeight {
+        top_left: '╔',
+        top_right: '╗',
+        vertical: '║',
+        bottom_left: '╚',
+        bottom_right: '╝',
+    },
+];
+
+/// Whether `ch` is any border weight's vertical glyph — the characters a
+/// wrap-tolerant grid search has to drop, since a box's own left/right edges
+/// are interposed into every row of text it contains.
+pub fn is_box_vertical(ch: char) -> bool {
+    BORDER_WEIGHTS.iter().any(|weight| weight.vertical == ch)
+}
+
+/// Drop every whitespace run and box-drawing vertical from `text`, so a needle
+/// that WRAPPED across rows still matches once the rows are joined.
+///
+/// A long line rendered into a box breaks at whatever column the box happens to
+/// sit at, and each continuation row re-enters through the box's own left edge. A
+/// needle straddling that wrap column is therefore absent from the row-joined
+/// snapshot even though every character of it is on screen. Squeezing BOTH
+/// haystack and needle makes the match independent of where the wrap fell, and of
+/// whether the renderer re-flowed at a word boundary or hard-broke mid-token.
+///
+/// Squeezing alone is NOT sufficient on a split layout — see
+/// [`orchestration_pane_column`] for the sidebar-splicing trap it leaves open.
+pub fn squeeze_wrapped_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace() && !is_box_vertical(*ch))
+        .collect()
+}
+
+/// Whether `label` appears inside ONE box's top-border span on some row.
+///
+/// Stronger than `grid.lines().any(|l| l.contains('┌') && l.contains(label))`:
+/// on an Orchestration tab the sidebar's cards and the focused role's live
+/// terminal share rows, so a label printed by the AGENT, to the right of a
+/// card's own right corner, satisfied the loose form. Cropping to the span
+/// between one weight's matching corners is what makes this specific to a card
+/// TITLE. `tests/grid_box_helpers.rs` guards that in the fast tier.
+pub fn label_in_box_top_border(grid: &str, label: &str) -> bool {
+    grid.lines().any(|line| {
+        let chars: Vec<char> = line.chars().collect();
+        BORDER_WEIGHTS.iter().any(|weight| {
+            chars
+                .iter()
+                .enumerate()
+                .filter(|(_, ch)| **ch == weight.top_left)
+                .any(|(start, _)| {
+                    let Some(end) = chars
+                        .iter()
+                        .enumerate()
+                        .skip(start + 1)
+                        .find_map(|(index, ch)| (*ch == weight.top_right).then_some(index))
+                    else {
+                        return false;
+                    };
+                    chars[start..=end]
+                        .iter()
+                        .collect::<String>()
+                        .contains(label)
+                })
+        })
+    })
+}
+
+/// Column of the orchestration tab's pane-column LEFT edge, in Unicode
+/// scalars, or `None` when no expanded orchestrator box is drawn.
+///
+/// The role-pane box drawn for the fixture's `start = true` role fuses its
+/// title into the top border as `┌orchestrator───…`, so that corner's column
+/// is exactly `panes_area.x` — the sidebar/pane boundary that
+/// `orchestration_split_percents` controls. The sidebar's own truncated
+/// `orchestrat…` card label carries no corner, so there is no collision.
+///
+/// Two preconditions, both of which return `None` rather than a wrong column,
+/// and which callers must therefore report on separately (see the `Result`
+/// returned by `e2e_idle_worker_detector.rs`'s wait helper — review S4):
+///
+/// 1. The fixture's start role must be named literally `orchestrator`.
+/// 2. Its pane must render EXPANDED. A collapsed `Stacked` pane draws a
+///    `Block` with `Borders::TOP` and a padded title — no corner glyph at all
+///    (see `tests/e2e_orchestration_pane_column.rs`) — so there is no anchor.
+///
+/// The returned index counts scalars, which equals the terminal column only
+/// while every cell left of the boundary is width-1. Fixtures keep it so.
+pub fn orchestration_pane_left_edge(grid: &str) -> Option<usize> {
+    grid.lines().find_map(|line| {
+        BORDER_WEIGHTS
+            .iter()
+            .filter_map(|weight| {
+                let header = format!("{}orchestrator", weight.top_left);
+                line.find(&header)
+                    .map(|byte_index| line[..byte_index].chars().count())
+            })
+            .min()
+    })
+}
+
+/// Crop every row of `grid` to the orchestration pane column, dropping the
+/// sidebar to its left.
+///
+/// Needed because a needle that wraps across pane rows is only contiguous once
+/// the rows are joined, and joining the FULL grid splices the sidebar's
+/// role-card text between them: `card1·pane1·card2·pane2…` breaks a needle
+/// spanning `pane1`+`pane2`. Returns `None` on the same two preconditions as
+/// [`orchestration_pane_left_edge`].
+pub fn orchestration_pane_column(grid: &str) -> Option<String> {
+    let left_edge = orchestration_pane_left_edge(grid)?;
+    Some(
+        grid.lines()
+            .map(|line| line.chars().skip(left_edge).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 /// Poll `path` until its contents contain `needle`, or panic after the
 /// harness wait ceiling ([`WAIT_TIMEOUT`]). Lives in the harness (not an
 /// `e2e_*` test file) because it sleeps between reads — Decision 21 forbids

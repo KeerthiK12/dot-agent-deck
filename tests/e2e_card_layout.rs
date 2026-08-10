@@ -23,36 +23,10 @@ const RECORDING_ROWS: u16 = 16;
 const CONTROL_COLS: u16 = 120;
 const CONTROL_ROWS: u16 = 40;
 
-#[derive(Clone, Copy, Debug)]
-struct CardBorder {
-    top_left: char,
-    top_right: char,
-    vertical: char,
-    bottom_left: char,
-    bottom_right: char,
-}
-
-const CARD_BORDERS: [CardBorder; 2] = [
-    CardBorder {
-        top_left: '┌',
-        top_right: '┐',
-        vertical: '│',
-        bottom_left: '└',
-        bottom_right: '┘',
-    },
-    CardBorder {
-        top_left: '┏',
-        top_right: '┓',
-        vertical: '┃',
-        bottom_left: '┗',
-        bottom_right: '┛',
-    },
-];
-
 #[derive(Debug)]
 struct CardSnapshot {
     rows: Vec<String>,
-    border: CardBorder,
+    border: common::BorderWeight,
 }
 
 impl CardSnapshot {
@@ -115,6 +89,19 @@ fn border_segments(row: &str, left: char, right: char) -> Vec<BorderSegment> {
         .collect()
 }
 
+/// The substring of `row` spanning exactly `start..=end`, provided the glyphs
+/// AT those two columns are `left` and `right`.
+///
+/// Indexes the two columns directly rather than searching [`border_segments`]
+/// for a matching pair. That matters when `left == right`, as it is for a card's
+/// verticals: pairing each `left` with the NEXT `right` yields only CONSECUTIVE
+/// pairs `(p0,p1), (p1,p2), …` and never `(p0,p2)`, so a content row carrying a
+/// stray `│` between the card's own edges would fail to extract — and fail in
+/// `first_card`'s panic, whose message points nowhere near the cause. Direct
+/// indexing removes that class. It gives up only the incidental "no other
+/// `right` in between" property, which no caller relied on, and keeps the
+/// same-weight same-column coherence that is the actual contract (review of
+/// #465, N4).
 fn border_segment_at(
     row: &str,
     left: char,
@@ -122,17 +109,25 @@ fn border_segment_at(
     start: usize,
     end: usize,
 ) -> Option<String> {
-    border_segments(row, left, right)
-        .into_iter()
-        .find(|segment| segment.start == start && segment.end == end)
-        .map(|segment| segment.text)
+    let chars: Vec<char> = row.chars().collect();
+    (start < end && *chars.get(start)? == left && *chars.get(end)? == right)
+        .then(|| chars[start..=end].iter().collect())
 }
 
+/// The leftmost, topmost complete same-weight card rectangle on `grid`.
+///
+/// Weight-agnostic by way of [`common::BORDER_WEIGHTS`] because `a861c8d`
+/// promoted the SELECTED card from a plain border to a thick one and this
+/// parser, pinned to `┌`/`┘`, went red on a product change that was correct —
+/// issue #460. Being weight-agnostic costs nothing here: a card still has to
+/// present one weight's corners at identical columns on its top row, EVERY
+/// middle row and its bottom row, so a plain top with a thick bottom is still
+/// rejected.
 fn try_first_card(grid: &str) -> Option<CardSnapshot> {
     let lines: Vec<&str> = grid.lines().collect();
     let mut leftmost: Option<(usize, usize, CardSnapshot)> = None;
     for (top, line) in lines.iter().enumerate() {
-        for border in CARD_BORDERS {
+        for border in common::BORDER_WEIGHTS {
             for top_segment in border_segments(line, border.top_left, border.top_right) {
                 for (bottom, bottom_line) in lines.iter().enumerate().skip(top + 1) {
                     let Some(bottom_segment) = border_segment_at(
@@ -167,8 +162,14 @@ fn try_first_card(grid: &str) -> Option<CardSnapshot> {
                     let candidate = CardSnapshot { rows, border };
                     let candidate_key = (top_segment.start, top);
                     // compute_frame_layout puts dashboard cards left of panes in
-                    // every layout exercised here; a pane-left layout would
-                    // invalidate this leftmost-complete-rectangle selection.
+                    // every layout exercised here — `ActiveTabView::Dashboard`
+                    // and `Orchestration` both route through `split_cards_area`,
+                    // which returns `(dashboard_area, panes_area)` in that
+                    // order. `ActiveTabView::Mode` is the concrete
+                    // counterexample (`src/ui.rs`: "50/50 horizontal split:
+                    // agent pane left, side panes right"), so pointing this test
+                    // at a Mode tab would invalidate the leftmost-complete-
+                    // rectangle selection below (review of #465, N2).
                     if leftmost
                         .as_ref()
                         .is_none_or(|(start, row, _)| candidate_key < (*start, *row))

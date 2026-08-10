@@ -567,63 +567,14 @@ fn card_label(role: &str) -> String {
 
 /// Match a role label only within one same-weight card top-border span.
 ///
-/// The focused role's live terminal occupies these same rows to the right, so
-/// cropping at the card's own right corner prevents aligned agent output from
-/// supplying the label.
+/// Matched on the CARD TITLE ROW, not anywhere on the grid: the tab's right half
+/// renders the focused role's live terminal, so a bare `grid.contains` could be
+/// satisfied by the agent's own output echoing the text back. Cropping to the
+/// span between one weight's matching corners is what makes this specific to a
+/// card title — the predicate itself lives in the harness so the fast tier can
+/// guard it (`tests/grid_box_helpers.rs`; review of #465, S2/S5).
 fn card_titled(grid: &str, role: &str) -> bool {
-    let label = card_label(role);
-    grid.lines().any(|line| {
-        let chars: Vec<char> = line.chars().collect();
-        chars.iter().enumerate().any(|(start, left)| {
-            let right = match *left {
-                '┌' => '┐',
-                '┏' => '┓',
-                _ => return false,
-            };
-            let Some(end) = chars
-                .iter()
-                .enumerate()
-                .skip(start + 1)
-                .find_map(|(index, ch)| (*ch == right).then_some(index))
-            else {
-                return false;
-            };
-            chars[start..=end]
-                .iter()
-                .collect::<String>()
-                .contains(&label)
-        })
-    })
-}
-
-#[test]
-fn card_titled_rejects_labels_outside_card_span() {
-    // This models the historical false pass: UUID-titled sidebar cards have a
-    // top-left corner on rows where the adjacent live pane prints every role.
-    // The role text is present on each row, but outside both cards' right edge.
-    const FALSE_PASS_GRID: &str = "\
-┌─ ClaudeCode · 6134822e-f2 ─┐  ┃ ClaudeCode · orchestrator ClaudeCode · coder ClaudeCode · reviewer
-│ waiting                    │  ┃
-└────────────────────────────┘  ┃
-┏━ ClaudeCode · c15a2be1-77 ━┓  ┃ ClaudeCode · orchestrator ClaudeCode · coder ClaudeCode · reviewer
-┃ working                    ┃  ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  ┃";
-    assert!(
-        !card_titled(FALSE_PASS_GRID, "coder"),
-        "a role label in the agent pane must not make a UUID-titled sidebar card match\n\
-         Adversarial grid:\n{FALSE_PASS_GRID}"
-    );
-
-    const PLAIN_CARD_GRID: &str = "\
-┌─ ClaudeCode · coder ──────┐  ┃ live agent output
-│                              │  ┃
-└──────────────────────────────┘  ┃";
-    const THICK_CARD_GRID: &str = "\
-┏━ ClaudeCode · coder ━━━━━━┓  ┃ live agent output
-┃                              ┃  ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  ┃";
-    assert!(card_titled(PLAIN_CARD_GRID, "coder"));
-    assert!(card_titled(THICK_CARD_GRID, "coder"));
+    common::label_in_box_top_border(grid, &card_label(role))
 }
 
 /// Scenario: Launch the deck on the `dispatch-orch-real` fixture, whose `real-team`
