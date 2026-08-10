@@ -570,6 +570,94 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** actual pane delivery or rendered feedback (covered by `prompt/pane-input/004`).
 - **Platform coverage:** mac+linux+windows.
 
+#### daemon/status
+
+##### daemon/status/001 — `dot-agent-deck daemon status` names a managed agent and visibly reflects a driven live status, not a placeholder identical to an agent with no session.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status` CLI as a subprocess + an in-process daemon attach socket, `common::spawn_inprocess_daemon`, + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — two `cat`-stub worker panes registered as managed; one is driven to `Thinking` over the daemon's hook socket exactly as `agent-event --type running` would, the other never receives an event, as a same-daemon control).
+- **Asserts:** the subprocess exits successfully; its stdout names both the driven and the control agent by pane id; and, after normalizing BOTH the pane id and the registry agent id out of each agent's own output lines (the latter differs per spawn regardless of live status), the driven agent's text differs from the control agent's — proving the command actually surfaces the live status rather than an identical placeholder or one that differs only by identity fields. Deliberately does not pin column layout, exact status wording, or row ordering.
+- **Does not assert:** `--json` output shape (`daemon/status/002`); the no-daemon path (`daemon/status/003`); prompt/task redaction (`daemon/status/004`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/status/002 — `dot-agent-deck daemon status --json` emits a machine-readable document carrying `schema_version` with an entry for the managed agent.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status --json` CLI as a subprocess + an in-process daemon attach socket + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a `cat`-stub worker pane driven to `Thinking` over the daemon's hook socket).
+- **Asserts:** the subprocess exits successfully; its stdout parses as a JSON object; the parsed document carries a `schema_version` key; and the raw JSON text names the managed agent by its pane id. Deliberately does not pin any field name beyond `schema_version`, since the rest of the document shape is the coder's to choose (the design rationale).
+- **Does not assert:** the human-readable table (`daemon/status/001`); full field-by-field JSON shape.
+- **Platform coverage:** mac+linux.
+
+##### daemon/status/003 — `dot-agent-deck daemon status` against an unreachable daemon fails distinguishably from a crash and from clap's own unrecognized-subcommand error, and never brings a daemon into existence at the socket it queried.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status` CLI as a subprocess against a scratch attach-socket path with nothing listening; no in-process daemon, no PTY, no LLM, no `e2e` feature gate).
+- **Agent:** none.
+- **Asserts:** the subprocess does not report success; its stderr carries no Rust panic; its exit code is not clap's own generic usage/parse-error code (`2`) and its stderr carries no clap `Usage:` banner — ruling out "this build's CLI does not understand the `status` subcommand" as the reason for the failure, so it stays distinguishable from a genuinely-handled "no daemon reachable" outcome; and the queried socket path still does not exist on disk afterward, proving the diagnostic never spawned a daemon. Deliberately does not pin the exact exit code value or message wording (the design rationale).
+- **Does not assert:** the live-agent path (`daemon/status/001`/`002`); prompt redaction (`daemon/status/004`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/status/004 — `dot-agent-deck daemon status` never prints prompt text into its output.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status` CLI as a subprocess + an in-process daemon attach socket + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a `cat`-stub worker pane driven to `Thinking` over the daemon's hook socket with a distinctive sentinel seeded into `user_prompt`, landing in `SessionState::last_user_prompt`/`first_prompts`).
+- **Asserts:** the subprocess exits successfully and the seeded sentinel never appears anywhere in its combined stdout/stderr.
+- **Does not assert:** `--json` output (the design doc scopes the no-prompt-text requirement to the human view); task-file/delegate text (out of scope for `ListAgents`-derived data).
+- **Platform coverage:** mac+linux.
+
+#### worktree/reclaim
+
+##### worktree/reclaim/001 — `dot-agent-deck worktree list` succeeds in a git repo and names the worktree it examined.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL CLI as a subprocess against real `git` repos in a tempdir, with a synthetic `gh` on `PATH`; no PTY, no daemon, no LLM, no `e2e` feature gate).
+- **Agent:** none.
+- **Asserts:** the command exits successfully and its output names the examined worktree. Deliberately does not pin the verdict wording or column layout, which are the implementation's to choose.
+- **Does not assert:** the removal path (`worktree/reclaim/002`); JSON shape (`006`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/002 — A deck-owned, MERGED, clean worktree is reclaimed even though its commits are NOT in `main`'s ancestry (the squash-merge case), and its branch survives.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a real worktree on a branch carrying its own commit, with the stub `gh` reporting `MERGED` — the exact shape a squash-merged branch has locally).
+- **Asserts:** first, a **fixture precondition** that `git branch --merged main` does NOT list the branch, so the test provably exercises the ancestry-vs-PR-state divergence rather than passing for the wrong reason; then that the worktree directory is gone after `reclaim --yes`, and that `git branch --list` still shows the branch — committed work stays recoverable.
+- **Does not assert:** remote branch state; the ownership-marker file format (only that marking a tree makes it reclaimable).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/003 — A dirty worktree is never removed, even with a MERGED PR and `--yes`, and the report says why it was kept.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (an untracked file placed in an otherwise-reclaimable worktree).
+- **Asserts:** first, that the exit code is not clap's own generic `2` and stderr carries no clap `Usage:` banner — ruling out "this build's CLI does not understand `worktree reclaim`" as the reason the worktree survives, so the domain assertion below is not vacuously true; then that the worktree still exists after `reclaim --yes`, and the output names dirtiness/uncommitted/untracked as the reason. The untracked file was never part of the PR, so it is genuinely absent from `main` — the case the "the code is already merged" argument does not cover.
+- **Does not assert:** the exact wording of the reason; behaviour for tracked-but-modified files (the same gate, one representative case tested).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/004 — A worktree whose branch IS an ancestor of `main` but has NO pull request is never removed.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a branch created at `main`'s tip with no canned PR fixture, so the stub `gh` returns `[]`).
+- **Asserts:** a **fixture precondition** that `git branch --merged main` DOES list the branch — so the ancestry check's false-positive is genuinely present — then, as in `003`, that the exit code and stderr rule out clap's own unrecognized-subcommand error (without this, "the worktree still exists" would hold vacuously today, since clap never touches the filesystem either) — and finally that the worktree still exists after `reclaim --yes`. This is the destructive direction of the naive check: the same shape as a live scratch worktree that a "git says merged, delete it" rule would destroy.
+- **Does not assert:** the reason wording; closed-unmerged or open-PR states (same gate, distinct fixtures).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/005 — A foreign (unmarked) merged clean worktree is asked about, not removed, and the ask names the exact path and the command that would proceed.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a reclaimable worktree deliberately left without an ownership marker).
+- **Asserts:** as in `003`/`004`, first that the exit code/stderr rule out clap's own unrecognized-subcommand error; then that the worktree still exists after a bare `reclaim`; the output contains the worktree's exact path (not a count or a category); and it contains `--yes`, the specific command that would proceed. Pins the "when it asks, it asks specifically" requirement.
+- **Does not assert:** interactive confirmation (this is the non-interactive path); the ordering of ask-versus-detail in the output, which is not mechanically checkable here.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/006 — `dot-agent-deck worktree list --json` emits a document carrying `schema_version` and the examined worktree.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none.
+- **Asserts:** stdout parses as JSON, carries a `schema_version` key, and includes the examined worktree. Deliberately does not pin field names beyond `schema_version`.
+- **Does not assert:** the full document shape; per-verdict field naming.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/007 — PR state is resolved against a worktree's OWN `origin` remote, not the caller's cwd — regression coverage for the `resolve_pr_state(repo_dir, ...)` → `resolve_pr_state(&wt.path, ...)` fix.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (the main checkout's `origin` is removed entirely, then a worktree is given its own `origin` via `extensions.worktreeConfig` naming a repo whose branch has a MERGED PR fixture; `remote.<name>.url` is a list-accumulating git config variable — verified directly against git 2.55.0 — so a per-worktree override only actually takes effect when the common config defines no `origin` at all, which is why the main checkout's is removed rather than merely overridden).
+- **Asserts:** `worktree list`'s row for the worktree carries PR column `merged`, verdict `remove`, and reason `-` (none) — reachable only by resolving PR state from the worktree's own remote, since the main checkout has no `origin` and resolving against its path (the pre-fix behaviour) can never derive a `--repo`, always failing closed to `keep`/`unresolvable` regardless of the worktree's actual PR.
+- **Does not assert:** the `reclaim` (removal) path for this fixture, or JSON output — same gate, already covered elsewhere (`002`, `006`); the "unrelated repo's coincidental MERGED PR" framing from the fix's own doc comment, which this suite could not reproduce (see the test's doc comment and `set_worktree_origin`) because it requires the common config to ALSO carry a resolvable `origin`, which the list-accumulation behavior above rules out.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/008 — A reclaimable worktree whose DIRECTORY NAME contains a non-UTF-8 byte is still removed by `reclaim --yes`.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a worktree directory built from raw bytes via `OsStr::from_bytes`/`Command::arg`, never through a `&str`/`to_string_lossy` conversion that would corrupt the byte before git ever saw it).
+- **Asserts:** first, a **fixture precondition** that the scratch dir genuinely contains an entry whose raw bytes exactly match the intended non-UTF-8 name — ruling out "the filesystem silently normalised or rejected it" as the reason later assertions pass; then, as in `003`/`004`/`005`, that the exit code/stderr rule out clap's own unrecognized-subcommand error; then that the human report actually carries a non-empty `Removed:` section (not `Removed: none`) — ruling out "the directory was simply never created" as the reason it's absent; and finally that the worktree directory is gone. Pins Greptile P1 (upstream PR #427, `src/worktree_reclaim.rs:482`): `examine_worktrees` lossy-converts the parsed `PathBuf` into a `String`, and `run_reclaim` feeds that mangled string to `git worktree remove`, so a worktree whose path contains non-UTF-8 bytes is never reclaimed even though it is otherwise fully eligible.
+- **Does not assert:** behaviour on non-Linux filesystems (APFS/HFS+ reject non-UTF-8 filenames outright, so this scenario cannot exist there); which specific byte is preserved, only that the exact bytes round-trip.
+- **Platform coverage:** linux.
+
 ### Prompts
 
 #### prompt/permission
@@ -1947,6 +2035,34 @@ without depending on the config struct API.
 - **Asserts:** the dashboard appears on second launch; the socket is now a live daemon's.
 - **Does not assert:** the time spent in the recovery path.
 - **Platform coverage:** mac+linux.
+
+##### error/socket/003 — `request_from_socket` returns `None` within a bounded wait against a daemon that reads the request and then never replies and never closes, instead of hanging forever.
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; a synthetic stub daemon over a real temp Unix socket, no PTY, no daemon binary, no real agent).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, then sleeps well past the bound without replying or closing).
+- **Asserts:** `request_from_socket`, driven on a worker thread and awaited via `mpsc::recv_timeout` at 15s (comfortably above the production 5s bound the fix adds), returns before the 15s bound and the returned value is exactly `None` — a timed-out/unbounded daemon must fold into the same "no seed" bucket as a daemon that closes without replying, not a distinct outcome. A `RecvTimeoutError::Timeout` is treated as the RED failure (`request_from_socket` is unbounded) and fails the test with an explicit panic message rather than hanging until nextest's own timeout.
+- **Does not assert:** the exact timeout duration chosen by the fix (only that it is comfortably under 15s); `SocketReply`'s three-way outcome (only `request_from_socket`'s two-way `None` collapse is exercised here — the richer outcome exists for a not-yet-submitted caller); real daemon behavior; Windows named-pipe timeout semantics.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### error/socket/004 — `request_from_socket` still returns the reply from a daemon that is merely slow, not absent — a bound that fires too eagerly must not be mistaken for "no seed".
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, sleeps 300ms — comfortably inside the production 5s bound — then writes one JSON reply line).
+- **Asserts:** `request_from_socket` returns `Some("{\"seed\":\"abc123\"}")` — the exact reply line, unmodified — proving the timeout bound added for `error/socket/003` does not fire against a daemon that is merely slow. Passes both before and after the fix; it is a correctness control, not a timing measurement, and the delay is deliberately far from the 5s bound to avoid flaking under scheduler jitter.
+- **Does not assert:** the timeout duration itself (`error/socket/003` pins the unbounded-hang failure mode; this test never reaches the bound); daemon behavior beyond a single reply line; real daemon timing.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### error/socket/005 — `request_from_socket` still hangs against a peer that dribbles one non-newline byte just before each per-read timeout, because every byte resets it.
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`/`004`).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, then writes a single non-newline byte every 200ms for 20s without ever sending a newline).
+- **Asserts:** `request_from_socket`, driven on a worker thread and awaited via `mpsc::recv_timeout` at a 15s ceiling — comfortably above whatever operation-level deadline the fix adds, and comfortably inside the 20s the drip keeps running — returns before the ceiling. A `RecvTimeoutError::Timeout` is the RED failure (the per-read timeout keeps getting reset and never fires) and fails the test with an explicit panic rather than hanging until nextest's own timeout. Deliberately does not pin the exact deadline value so it keeps passing once any sane operation-level bound exists.
+- **Does not assert:** the exact operation-level deadline chosen by the fix; the reply-length cap (a separate, deliberately out-of-scope follow-up); any other caller of the shared, vulnerable `request_from_socket_inner` code path with a different timeout value — this test exercises the choke point itself, so any future caller inherits the same coverage.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### error/socket/006 — A daemon that closes without writing any bytes back folds into `SocketReply::NoReply`, not `SocketReply::Line("")`.
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`/`004`/`005`).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, then closes without writing a single byte).
+- **Asserts:** `request_from_socket_at` returns `SocketReply::NoReply`. Before the fix, an EOF with an empty in-progress buffer returned `Some(String::new())` (`SocketReply::Line("")`), contradicting `SocketReply::NoReply`'s own doc comment, which already names "the daemon closed without answering" as a `NoReply` case.
+- **Does not assert:** the *partial*-line-then-EOF case (some bytes written, then closed before the newline) — that is deliberately left returning `Line(partial)`, unchanged by this fix; `SocketReply::Unreachable`; timing.
+- **Platform coverage:** mac+linux (Unix-domain socket).
 
 #### error/config
 
