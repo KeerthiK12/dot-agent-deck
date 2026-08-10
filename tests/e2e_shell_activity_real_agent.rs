@@ -66,7 +66,18 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
     let deck = TuiDeck::builder()
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    // `wait_for_string`'s shared 10s bound is tight on a loaded machine (this
+    // one routinely runs at load average 20+) and this startup race is
+    // unrelated to anything this test asserts, so it gets a local, more
+    // generous bound here rather than widening the shared constant every
+    // other harness test relies on.
+    assert!(
+        deck.wait_for_grid_string_within("No active sessions", Duration::from_secs(30)),
+        "startup race: the deck never rendered \"No active sessions\" within 30s — this is the \
+         known loaded-machine startup flake (harness-side), not a badge or shell-activity \
+         assertion:\n{}",
+        deck.snapshot_grid()
+    );
 
     std::fs::write(deck.workdir().join(SENTINEL), SENTINEL_CONTENT)
         .expect("write shell-activity-005 sentinel fixture");
@@ -445,7 +456,18 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     let deck = TuiDeck::builder()
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    // `wait_for_string`'s shared 10s bound is tight on a loaded machine (this
+    // one routinely runs at load average 20+) and this startup race is
+    // unrelated to anything this test asserts, so it gets a local, more
+    // generous bound here rather than widening the shared constant every
+    // other harness test relies on.
+    assert!(
+        deck.wait_for_grid_string_within("No active sessions", Duration::from_secs(30)),
+        "startup race: the deck never rendered \"No active sessions\" within 30s — this is the \
+         known loaded-machine startup flake (harness-side), not a badge or shell-activity \
+         assertion:\n{}",
+        deck.snapshot_grid()
+    );
 
     let cwd = deck.workdir().to_path_buf();
     let mut trust_paths = vec![cwd.to_string_lossy().into_owned()];

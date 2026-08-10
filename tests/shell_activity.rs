@@ -503,23 +503,40 @@ impl Drop for KillOnDrop {
 fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child() {
     const PANE_ID: &str = "shell-activity-004-pane";
     let marker = format!("shell-activity-004-target-{}", std::process::id());
-    // `sleep 0.3` guarantees an observable idle window before the detached
-    // child appears; the python3 one-liner setsid()'s itself (detaching from
-    // the pane's controlling terminal and becoming its own session leader,
-    // exactly as Claude Code's Bash-tool child does) and execv's into
-    // `/bin/sleep 30` with an argv crafted to carry the measured Bash-tool
-    // shape (`shell-snapshots/snapshot-` and `&& eval `) so the argv
-    // cross-check is exercised against a real process, not just a fixture
-    // string. 30s is a generous backstop bound in case the test panics
-    // before the explicit kill below runs; `KillOnDrop` and the explicit
-    // kill both aim to end it long before that. The trailing `sleep 5` keeps
-    // the pane's own shell alive (and so its registry entry) past the
-    // detached child's death — without it the shell has nothing left to run
-    // and exits the instant the killed child is reaped, so the pane
-    // disappears from the snapshot instead of reading idle.
+    // A fixed `sleep 0.3` before the detached child launched used to give the
+    // pre-edge assertion below an "observable idle window" to sample inside
+    // — but that window is a race, not a guarantee: once `spawn_agent` +
+    // registry setup is delayed past ~300ms by machine load, the first
+    // successful sample already sees the detached child, and the pre-edge
+    // assertion fails even though the production code is correct (confirmed
+    // by the maintainer's PR #390 review: 5/5 passes in isolation, fails only
+    // under full-tier contention). Gate the child behind a ready-marker file
+    // this process controls instead: the script busy-waits on the marker's
+    // existence, so the detached child structurally cannot exist until this
+    // test has already sampled and asserted the idle state below — the
+    // pre-edge read no longer depends on winning a timing race at all. The
+    // python3 one-liner setsid()'s itself (detaching from the pane's
+    // controlling terminal and becoming its own session leader, exactly as
+    // Claude Code's Bash-tool child does) and execv's into `/bin/sleep 30`
+    // with an argv crafted to carry the measured Bash-tool shape
+    // (`shell-snapshots/snapshot-` and `&& eval `) so the argv cross-check is
+    // exercised against a real process, not just a fixture string. 30s is a
+    // generous backstop bound in case the test panics before the explicit
+    // kill below runs; `KillOnDrop` and the explicit kill both aim to end it
+    // long before that. The trailing `sleep 5` keeps the pane's own shell
+    // alive (and so its registry entry) past the detached child's death —
+    // without it the shell has nothing left to run and exits the instant the
+    // killed child is reaped, so the pane disappears from the snapshot
+    // instead of reading idle.
+    let ready_marker =
+        std::env::temp_dir().join(format!("shell-activity-004-ready-{}", std::process::id()));
+    // Best-effort: a stale file from a prior crashed run under the same pid
+    // (pids do wrap) would otherwise let the gated shell run immediately.
+    let _ = std::fs::remove_file(&ready_marker);
     let command = format!(
-        "sleep 0.3; python3 -c \"import os; os.setsid(); os.execv('/bin/sleep', \
-         ['shell-snapshots/snapshot- && eval {marker}', '30'])\"; sleep 5"
+        "while [ ! -e \"{ready}\" ]; do sleep 0.05; done; python3 -c \"import os; os.setsid(); \
+         os.execv('/bin/sleep', ['shell-snapshots/snapshot- && eval {marker}', '30'])\"; sleep 5",
+        ready = ready_marker.display(),
     );
 
     let registry = AgentPtyRegistry::new();
@@ -560,8 +577,11 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
             .map(|(_, busy)| busy)
     };
 
-    // Falling edge before the rising edge: the script hasn't launched the
-    // detached child yet, so the pane must read idle.
+    // Falling edge before the rising edge: the script is blocked on the
+    // ready marker and structurally cannot have launched the detached child
+    // yet, so the pane must read idle. No longer a race against a fixed
+    // sleep — the only thing this loop can observe before the marker is
+    // written below is `None` (pane not registered yet) or `Some(false)`.
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut state = busy_for_pane(&registry);
     while state != Some(false) && Instant::now() < deadline {
@@ -573,6 +593,11 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
         Some(false),
         "an idle shell with no detached descendant yet must not read busy"
     );
+
+    // Release the gated shell now that the idle read above is confirmed —
+    // only past this point can the detached child come into existence.
+    std::fs::write(&ready_marker, b"go")
+        .expect("write ready marker to release the gated shell script");
 
     // Rising edge: the detached, setsid()'d, Bash-tool-shaped child appears.
     let deadline = Instant::now() + Duration::from_secs(4);
@@ -645,6 +670,7 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     );
 
     registry.close_agent(&id).unwrap();
+    let _ = std::fs::remove_file(&ready_marker);
 }
 
 // ---------------------------------------------------------------------------
