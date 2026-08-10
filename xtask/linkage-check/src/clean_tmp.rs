@@ -10,26 +10,47 @@
 //!
 //! # Ownership decides, age is only the fallback (issue #461)
 //!
-//! The `<pid>` in the name is the process that created the root, so it answers
-//! "is anyone still using this?" directly. Age is a proxy for the same question
-//! and a bad one in both directions. Measured: 280 roots totalling 6.2 GB, every
-//! one with a dead owning PID, were refused because the oldest was 4h09m and the
-//! default threshold is 6h — on a 14 GB tmpfs with 5 MiB of swap left and an e2e
-//! compile about to start. In the other direction, a genuine suite still running
-//! past the threshold was *eligible* to have its own live root deleted out from
-//! under it.
+//! The `<pid>` in the name is the process that **created** the root, so it
+//! answers "is the creator still running?". That is a far better proxy for "is
+//! anyone still using this?" than age is — but it is **not the same question**,
+//! and the gap is deliberate in this codebase: the deck's lazily-spawned daemon
+//! `setsid`s out of the test's process group and can outlive it, as can a
+//! wrapped agent two `setsid` levels down. A dead owner therefore does *not*
+//! prove the tree is unreferenced, which is why the dead branch carries
+//! [`DEAD_PID_MIN_AGE`]. Do not remove that floor on the strength of "the PID
+//! answers it directly", because it does not.
 //!
-//! So the PID decides wherever it can, and `--older-than` only filters the one
-//! case it cannot settle. The decision is exactly three branches:
+//! Age alone was a bad proxy in both directions. Measured: 280 roots totalling
+//! 6.2 GB, every one with a dead owning PID, were refused because the oldest was
+//! 4h09m and the default threshold is 6h — on a 14 GB tmpfs with 5 MiB of swap
+//! left and an e2e compile about to start. In the other direction, a genuine
+//! suite still running past the threshold was *eligible* to have its own live
+//! root deleted out from under it.
 //!
-//! - **dead PID** → reap, at any age. `--older-than` does not suppress it.
+//! So the PID decides wherever it can, and `--older-than` only filters the cases
+//! it cannot settle. The decision is four branches:
+//!
+//! - **dead PID** → reap, once the root is at least [`DEAD_PID_MIN_AGE`] old.
+//!   `--older-than` does not suppress it; the floor is separate and much
+//!   shorter, and exists for the orphan window described above.
 //! - **live PID** → keep, at any age, unconditionally.
+//! - **live PID with `--ignore-liveness`** → the age rule decides. The operator
+//!   asserts that liveness is untrustworthy here, which is the reboot case: a
+//!   leftover root's PID can be reissued to an unrelated long-lived process,
+//!   and nothing this program can measure distinguishes that from a running
+//!   suite. Never inferred — see "Why there is no recycled-PID branch" below.
 //! - **no usable PID** — an untagged `.tmp*` dir, a pre-fix lock dir, a
 //!   malformed name, or a platform with no `kill(2)` — the age rule decides.
 //!
 //! Liveness is `kill(pid, 0)`, in which `EPERM` counts as **alive**: the process
 //! exists, it merely is not ours, and reading that as dead would delete a live
 //! run's root.
+//!
+//! One thing `kill(2)` cannot tell us: it answers about the **caller's** PID
+//! namespace. A container that bind-mounts `/tmp` from the host would have a
+//! host-side reaper probe host PIDs against in-container names. No workflow here
+//! does that — the tooling is `devbox`, same namespace — but the answer is
+//! "about a different namespace", not "unavailable", so no fallback triggers.
 //!
 //! # Why there is no recycled-PID branch
 //!
@@ -55,13 +76,22 @@
 //! which is a dentry *lookup* time — Linux instantiates that inode lazily — and
 //! deleted live roots for a different reason with the same shape.)
 //!
-//! Dropping the branch costs almost nothing, because a PID collision is
-//! **transient**. When a dead test's PID gets reused by an unrelated live
-//! process, that root is kept for as long as the collision lasts — but the
-//! colliding process eventually exits, and the next run classifies the root
-//! `dead-pid` and reaps it. Nothing leaks permanently; reaping is merely
-//! deferred. Trading a real risk of deleting a live e2e run against a deferral
-//! is not a close call.
+//! Dropping the branch is still the right trade, but the cost is **not** simply
+//! "a deferral", and an earlier version of this comment claiming a PID collision
+//! is always *transient* was wrong. Within one boot it is: the colliding process
+//! exits, and the next run classifies the root `dead-pid` and reaps it. **Across
+//! a reboot it is not.** A leftover root outlives the boot, low PIDs are handed
+//! to long-lived system units early in the next one, and the root is then pinned
+//! `live-pid` for the whole life of that boot — possibly re-colliding after the
+//! next reboot. That matters most on a filesystem not cleared at boot, which is
+//! where the harness roots are heading (`/var/tmp`, issue #322), and those roots
+//! hold real agent credentials.
+//!
+//! `--ignore-liveness` is the answer, and its shape is deliberate: the operator
+//! supplies the one fact the program cannot measure — that the machine rebooted,
+//! so liveness here is meaningless — and the roots then fall back to the age
+//! rule rather than being reaped outright. That keeps the judgement out of the
+//! code, which is the whole point of deleting the inferred branch.
 //!
 //! Do not reinstate it, in any form — including a report-only "possibly
 //! recycled" annotation. That would keep the whole `/proc` parsing surface,
@@ -80,6 +110,16 @@
 //! the shape of [`owner_of`], which takes no timestamp and so cannot express
 //! the comparison, and code review. None of the three is a substitute for
 //! reading the diff.
+//!
+//! Two limits on that scan, stated so nobody mistakes it for a fence. It reads
+//! **this file only**, so the same inference reintroduced in a new module and
+//! called from `SystemProbe::is_alive` would pass every guard here untouched —
+//! that impl is the seam to watch. And the scan runs in no CI gate today: the
+//! workspace has no `default-members`, so `cargo nextest run` selects the root
+//! package alone and never builds this crate's tests. `cargo clippy --workspace
+//! --all-targets` does compile them, which is what still enforces
+//! `owner_of`'s signature; the runtime scan needs `cargo nextest run
+//! --workspace` to actually execute.
 //!
 //! # What this will and will not delete
 //!
@@ -114,6 +154,33 @@ const UNTAGGED_PREFIX: &str = ".tmp";
 
 const DEFAULT_MAX_AGE_HOURS: u64 = 6;
 
+/// Minimum age before a **dead-owner** root is reaped, because owner death is
+/// not the same thing as the tree being unreferenced.
+///
+/// The name carries the *test process's* PID, but the processes that test
+/// spawned do not die with it. `tests/common/mod.rs` says so at the group-kill
+/// site: "The deck's own lazy-spawned daemon setsid's into a separate session
+/// and escapes this group — its `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` cap is
+/// the net for that." `src/daemon_attach.rs` runs `setsid(2)` in `pre_exec` so
+/// the daemon outlives its parent, and a *wrapped* agent sits two `setsid`
+/// levels down, in a group the deck cannot signal at all.
+///
+/// So after nextest SIGKILLs a test, an orphan can keep writing under the dead
+/// test's root for up to that cap (300s). Reaping a dead owner instantly would
+/// hand `remove_dir_all` the working directory of a live process — and the
+/// moment a developer is most likely to run `--apply` is right after a run
+/// died, which is exactly when orphans are still alive.
+///
+/// The old age-only rule never had this problem: its 6h floor was 72× the
+/// orphan cap. This floor restores that protection at 2× the cap instead of
+/// 72×, which is ample, and costs #461 nothing — the case it was filed for was
+/// 280 roots whose youngest was 4h09m.
+///
+/// Note this is a timestamp on the **keep** side. That is the safe bias, and
+/// the exact inverse of the deleted PID-recycling comparison, which biased
+/// toward deletion (see the module docs).
+const DEAD_PID_MIN_AGE: Duration = Duration::from_secs(600);
+
 /// Per-directory lines printed before the per-reason summary. A machine that
 /// has been leaking for a few hours accumulates hundreds of roots, and 280
 /// lines of path bury the one number the user needs; the summary below the list
@@ -136,6 +203,10 @@ struct Options {
     max_age: Duration,
     apply: bool,
     include_untagged: bool,
+    /// Fall a **live**-PID root back to the age rule instead of keeping it
+    /// unconditionally. The escape hatch for a PID that was reused across a
+    /// reboot; see [`Reason::LivenessIgnored`].
+    ignore_liveness: bool,
 }
 
 /// What the PID embedded in a root's name says about who owns the root.
@@ -143,9 +214,10 @@ struct Options {
 enum Owner {
     /// A PID no live process holds: the root is definitively abandoned.
     Dead,
-    /// A live PID. The root is kept, full stop — no timestamp of any kind is
-    /// consulted, and there is deliberately no "but it might be recycled"
-    /// escape hatch (see the module docs).
+    /// A live PID. The root is kept and no timestamp is consulted, unless the
+    /// operator passes `--ignore-liveness`. There is deliberately no *inferred*
+    /// "but the PID might have been reused" escape hatch — the only escape is
+    /// the explicit flag (see the module docs).
     Live,
     /// No PID to go on: an untagged or malformed name, or a platform on which
     /// liveness cannot be determined.
@@ -156,33 +228,64 @@ enum Owner {
 /// instead of restating an age fact (issue #461).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reason {
-    /// Owning process is gone — reaped whatever its age.
+    /// Owning process is gone. Reaped once past [`DEAD_PID_MIN_AGE`], kept
+    /// below it so a `setsid`'d orphan still writing under the root is not
+    /// deleted out from under itself.
     DeadPid,
     /// Owning process is still running — kept whatever its age.
     LivePid,
+    /// A live PID that `--ignore-liveness` demoted to the age rule, for the
+    /// reboot case where the number was reused by an unrelated process.
+    LivenessIgnored,
     /// There was no usable PID, so the age rule decided.
     UntaggedAge,
 }
 
 impl Reason {
     /// Fixed order, so the summary reads the same way on every run.
-    const ALL: [Reason; 3] = [Reason::DeadPid, Reason::LivePid, Reason::UntaggedAge];
+    const ALL: [Reason; 4] = [
+        Reason::DeadPid,
+        Reason::LivePid,
+        Reason::LivenessIgnored,
+        Reason::UntaggedAge,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Reason::DeadPid => "dead-pid",
             Reason::LivePid => "live-pid",
+            Reason::LivenessIgnored => "live-aged",
             Reason::UntaggedAge => "untagged",
         }
     }
 
-    /// One-line justification for the summary. The age-based reason needs the
-    /// threshold and which side of it the dirs fell on; the PID-based ones are
-    /// unconditional and say so.
+    /// One-line justification for the summary. Every age-sensitive reason names
+    /// the threshold it was judged against and which side of it the dirs fell
+    /// on; only [`Reason::LivePid`] is unconditional.
     fn note(self, reap: bool, max_age: Duration) -> String {
         match self {
-            Reason::DeadPid => "owning process is gone — reaped at any age".to_string(),
-            Reason::LivePid => "owning process is still running — never reaped".to_string(),
+            Reason::DeadPid => {
+                if reap {
+                    format!(
+                        "owning process is gone; older than {}",
+                        human_duration(DEAD_PID_MIN_AGE)
+                    )
+                } else {
+                    format!(
+                        "owning process is gone, but younger than {} — a spawned daemon may still be writing here",
+                        human_duration(DEAD_PID_MIN_AGE)
+                    )
+                }
+            }
+            Reason::LivePid => {
+                "owning process is still running — never reaped (--ignore-liveness overrides)"
+                    .to_string()
+            }
+            Reason::LivenessIgnored => {
+                let age = human_duration(max_age);
+                let side = if reap { "older" } else { "younger" };
+                format!("--ignore-liveness: liveness not trusted; {side} than {age}")
+            }
             Reason::UntaggedAge => {
                 let age = human_duration(max_age);
                 let side = if reap { "older" } else { "younger" };
@@ -276,12 +379,14 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         max_age: Duration::from_secs(DEFAULT_MAX_AGE_HOURS * 3600),
         apply: false,
         include_untagged: false,
+        ignore_liveness: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--apply" => opts.apply = true,
             "--include-untagged" => opts.include_untagged = true,
+            "--ignore-liveness" => opts.ignore_liveness = true,
             "--older-than" => {
                 let raw = it
                     .next()
@@ -309,20 +414,31 @@ fn usage() {
     println!(
         "usage: cargo xtask clean-e2e-tmp [--older-than <hours>] [--apply] [--include-untagged]"
     );
+    println!("                                 [--ignore-liveness]");
     println!();
     println!("Reaps stale e2e harness temp dirs left by SIGKILLed test processes.");
     println!("Dry-run by default; --apply is required to delete.");
     println!();
     println!("A `{PID_TAGGED_PREFIX}<pid>-*` root is decided by whether that PID is still");
-    println!("alive: dead means reaped at any age, alive means never reaped. The age");
-    println!("threshold only decides roots with no usable PID — untagged or malformed");
-    println!("names, and hosts with no way to ask whether a PID is alive.");
+    println!("alive. A dead owner is reaped once the root is at least");
+    println!(
+        "{}, a short floor that exists because a daemon the",
+        human_duration(DEAD_PID_MIN_AGE)
+    );
+    println!("test spawned can outlive it and keep writing there. A live owner is");
+    println!("never reaped. The --older-than threshold decides roots with no usable");
+    println!("PID — untagged or malformed names, and hosts with no way to ask.");
     println!();
-    println!("  --older-than <hours>  age threshold for the fallback case only");
+    println!("  --older-than <hours>  age threshold for the fallback cases only");
     println!(
         "                        (default: {DEFAULT_MAX_AGE_HOURS}). It does NOT hold back a dead PID."
     );
     println!("  --apply               actually remove the directories");
+    println!("  --ignore-liveness     do NOT trust `live-pid`: judge those roots by age");
+    println!("                        too. For when the machine has REBOOTED and a stale");
+    println!("                        root's PID has been reused by an unrelated process,");
+    println!("                        which otherwise pins it for the life of that boot.");
+    println!("                        Never reap a live root while a suite is running.");
     println!("  --include-untagged    ALSO reap `{UNTAGGED_PREFIX}*` dirs. These use the");
     println!("                        tempfile crate's DEFAULT prefix and are shared with");
     println!("                        every Rust program on this machine — only use this");
@@ -430,7 +546,12 @@ fn collect(
         // Every owned dir is collected, kept ones included: the report has to
         // be able to say WHY a root survived, which it cannot do for entries
         // that were filtered away before they were ever seen.
-        let verdict = classify(owner_of(name, probe), age, opts.max_age);
+        let verdict = classify(
+            owner_of(name, probe),
+            age,
+            opts.max_age,
+            opts.ignore_liveness,
+        );
         let size = dir_size(&path);
         out.push(Candidate {
             bytes: size.bytes,
@@ -456,22 +577,36 @@ fn is_owned(name: &str, include_untagged: bool) -> bool {
 
 /// The whole reap/keep decision, kept free of the filesystem so it can be
 /// exercised directly for every combination of ownership and age.
-fn classify(owner: Owner, age: Duration, max_age: Duration) -> Verdict {
+fn classify(owner: Owner, age: Duration, max_age: Duration, ignore_liveness: bool) -> Verdict {
     match owner {
-        // Definitive, and deliberately not subject to `--older-than`: this is
-        // the case issue #461 was filed for, where 6.2 GB of provably-dead
-        // roots were refused for being four hours old.
+        // Not subject to `--older-than` — that is the case issue #461 was filed
+        // for, where 6.2 GB of provably-dead roots were refused for being four
+        // hours old. But it IS subject to a short floor of its own: the owning
+        // PID is the test process, and a daemon it spawned can outlive it by up
+        // to 300s while still writing here. See `DEAD_PID_MIN_AGE`.
         Owner::Dead => Verdict {
-            reap: true,
+            reap: age >= DEAD_PID_MIN_AGE,
             reason: Reason::DeadPid,
         },
-        // Unconditional, and the reason there is no timestamp in this function
-        // beyond the age fallback: every attempt to qualify this branch with
-        // "…unless the PID looks recycled" ended up deleting live roots.
-        Owner::Live => Verdict {
-            reap: false,
-            reason: Reason::LivePid,
-        },
+        // Unconditional by default, and the reason no *process* timestamp
+        // appears in this function: every attempt to qualify this branch by
+        // guessing whether the PID had been reused ended up deleting live
+        // roots. `--ignore-liveness` is the operator-driven form of the same
+        // escape — it demotes the root to the age rule rather than reaping it
+        // outright, and it is never inferred.
+        Owner::Live => {
+            if ignore_liveness {
+                Verdict {
+                    reap: age >= max_age,
+                    reason: Reason::LivenessIgnored,
+                }
+            } else {
+                Verdict {
+                    reap: false,
+                    reason: Reason::LivePid,
+                }
+            }
+        }
         Owner::Unknown => Verdict {
             reap: age >= max_age,
             reason: Reason::UntaggedAge,
@@ -544,10 +679,11 @@ fn pid_is_alive(_pid: i32) -> Option<bool> {
 /// Candidate paths are rendered with `{:?}`, never `.display()`. `/tmp` is mode
 /// 1777, so any local user can create a `dad-tests-<dead-pid>-<suffix>` whose
 /// suffix carries a newline, a CSI sequence, or an OSC one the terminal may act
-/// on (OSC 52 writes the clipboard) — and since the age floor no longer holds
-/// anything back, such a name is reportable immediately, in the **default dry
-/// run**. `Path`'s `Debug` escapes control characters; `Display` passes them
-/// through verbatim.
+/// on (OSC 52 writes the clipboard). Such a name reaches the report in the
+/// **default dry run**, and needs only to clear the ten-minute floor rather than
+/// the old six-hour threshold — and a *kept* root is listed now too, so an
+/// attacker does not even need the name to be reapable. `Path`'s `Debug` escapes
+/// control characters; `Display` passes them through verbatim.
 fn report(temp_root: &Path, reap: &[Candidate], keep: &[Candidate], max_age: Duration) -> String {
     let mut out = String::new();
     if reap.is_empty() && keep.is_empty() {
@@ -559,23 +695,7 @@ fn report(temp_root: &Path, reap: &[Candidate], keep: &[Candidate], max_age: Dur
         return out;
     }
 
-    for c in reap.iter().take(MAX_LISTED) {
-        let _ = writeln!(
-            out,
-            "  {:>9}  {:<9} {:>4} old  {:?}",
-            human_size(c.bytes, c.size_truncated),
-            c.verdict.reason.label(),
-            human_duration(c.age),
-            c.path,
-        );
-    }
-    if reap.len() > MAX_LISTED {
-        let _ = writeln!(
-            out,
-            "  … and {} more (all counted in the summary below)",
-            reap.len() - MAX_LISTED
-        );
-    }
+    write_listing(&mut out, reap);
 
     if reap.is_empty() {
         let _ = writeln!(out, "nothing to reap in {}", temp_root.display());
@@ -591,6 +711,13 @@ fn report(temp_root: &Path, reap: &[Candidate], keep: &[Candidate], max_age: Dur
     }
 
     if !keep.is_empty() {
+        // Survivors are listed, not merely counted. A `live-pid` root that is
+        // really a PID collision across a reboot is indistinguishable from a
+        // running suite's root in a bare count, and it is the one class the
+        // reaper will not settle on its own — so the operator needs to see its
+        // size and age to decide whether `--ignore-liveness` is warranted.
+        let _ = writeln!(out, "kept:");
+        write_listing(&mut out, keep);
         let _ = writeln!(out, "keep: {} dir(s), {}", keep.len(), total_size(keep));
         write_breakdown(&mut out, keep, false, max_age);
     }
@@ -602,6 +729,29 @@ fn report(temp_root: &Path, reap: &[Candidate], keep: &[Candidate], max_age: Dur
         );
     }
     out
+}
+
+/// The per-directory lines for one group, capped at [`MAX_LISTED`] with the
+/// truncation announcing itself. Shared by the reap and keep groups so a
+/// survivor is described exactly as precisely as a casualty.
+fn write_listing(out: &mut String, cands: &[Candidate]) {
+    for c in cands.iter().take(MAX_LISTED) {
+        let _ = writeln!(
+            out,
+            "  {:>9}  {:<9} {:>5} old  {:?}",
+            human_size(c.bytes, c.size_truncated),
+            c.verdict.reason.label(),
+            human_duration(c.age),
+            c.path,
+        );
+    }
+    if cands.len() > MAX_LISTED {
+        let _ = writeln!(
+            out,
+            "  … and {} more (all counted in the summary below)",
+            cands.len() - MAX_LISTED
+        );
+    }
 }
 
 /// Counts and sizes per reason — the part that stays readable when there are
@@ -681,10 +831,17 @@ struct DirSize {
 /// The residual consequence is bounded and presentation-only: at worst some
 /// other tree's entries are counted into a size, capped by the entry and depth
 /// budgets. No name and no content from outside the candidate is ever printed,
-/// sizing never reaches [`classify`], so it cannot move a reap/keep verdict, and
-/// it is not a deletion escape — `--apply` calls `remove_dir_all` on the
-/// candidate path itself, which [`collect`] established was a directory and not
-/// a symlink.
+/// and sizing never reaches [`classify`], so it cannot move a reap/keep verdict.
+///
+/// It is not a deletion escape either — but **not** because [`collect`] `lstat`ed
+/// the path. That check and the removal are separated by the whole classify and
+/// size-walk pass, and in a mode-1777 `/tmp` a user can `rename(2)` their own
+/// entry into a symlink inside that window (the sticky bit does not help: they
+/// are modifying an entry they own). The removal is safe because
+/// `std::fs::remove_dir_all` does not follow a symlink at the path it is given
+/// and has been `openat`-based since the CVE-2022-21658 fix. Attributing the
+/// safety to the earlier `lstat` would license replacing it with a hand-rolled
+/// recursive delete, which is precisely where this bug class gets introduced.
 fn dir_size(path: &Path) -> DirSize {
     dir_size_bounded(path, MAX_SIZE_WALK_ENTRIES, MAX_SIZE_WALK_DEPTH)
 }
@@ -754,9 +911,19 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Minutes below an hour, hours below two days, then days.
+///
+/// The sub-hour case is not cosmetic. Now that a dead owner is reaped from
+/// [`DEAD_PID_MIN_AGE`] rather than from six hours, most rows on a freshly-dead
+/// machine are minutes old, and truncating to whole hours printed every one of
+/// them as `0h` — including the `DEAD_PID_MIN_AGE` threshold itself, which made
+/// the floor's own message read "older than 0h".
 fn human_duration(d: Duration) -> String {
-    let hours = d.as_secs() / 3600;
-    if hours < 48 {
+    let secs = d.as_secs();
+    let hours = secs / 3600;
+    if hours == 0 {
+        format!("{}m", secs / 60)
+    } else if hours < 48 {
         format!("{hours}h")
     } else {
         format!("{}d", hours / 24)
@@ -772,6 +939,7 @@ mod tests {
             max_age,
             apply: false,
             include_untagged: false,
+            ignore_liveness: false,
         }
     }
 
@@ -909,9 +1077,9 @@ mod tests {
         }
     }
 
-    /// The three branches of the decision, with no filesystem in the way. The
-    /// two PID-driven ones ignore the age threshold entirely; only the fallback
-    /// is decided by it.
+    /// The branches of the decision, with no filesystem in the way. A dead owner
+    /// ignores `--older-than` but not its own short floor; a live owner ignores
+    /// age entirely; only the fallbacks are decided by `--older-than`.
     #[test]
     fn ownership_decides_first_and_age_only_where_it_cannot() {
         let max_age = HOUR * 6;
@@ -920,15 +1088,15 @@ mod tests {
 
         for age in [fresh, stale] {
             assert_eq!(
-                classify(Owner::Dead, age, max_age),
+                classify(Owner::Dead, age, max_age, false),
                 Verdict {
                     reap: true,
                     reason: Reason::DeadPid
                 },
-                "a dead owner is reaped at any age"
+                "a dead owner past the floor is reaped however `--older-than` is set"
             );
             assert_eq!(
-                classify(Owner::Live, age, max_age),
+                classify(Owner::Live, age, max_age, false),
                 Verdict {
                     reap: false,
                     reason: Reason::LivePid
@@ -938,19 +1106,113 @@ mod tests {
         }
 
         assert_eq!(
-            classify(Owner::Unknown, stale, max_age),
+            classify(Owner::Unknown, stale, max_age, false),
             Verdict {
                 reap: true,
                 reason: Reason::UntaggedAge
             }
         );
         assert_eq!(
-            classify(Owner::Unknown, fresh, max_age),
+            classify(Owner::Unknown, fresh, max_age, false),
             Verdict {
                 reap: false,
                 reason: Reason::UntaggedAge
             }
         );
+    }
+
+    /// The orphan window. The owning PID names the *test* process, but a daemon
+    /// it spawned `setsid`s out of the group and can outlive it by up to 300s
+    /// while still writing under that root — so a dead owner is NOT reaped
+    /// instantly. Below the floor the root is kept and the reason says why;
+    /// above it, reaping resumes and `--older-than` still cannot hold it back.
+    #[test]
+    fn a_dead_owner_is_not_reaped_inside_the_orphan_window() {
+        let generous = HOUR * 24;
+
+        for age in [
+            Duration::ZERO,
+            Duration::from_secs(1),
+            DEAD_PID_MIN_AGE - Duration::from_secs(1),
+        ] {
+            assert_eq!(
+                classify(Owner::Dead, age, generous, false),
+                Verdict {
+                    reap: false,
+                    reason: Reason::DeadPid
+                },
+                "a dead owner younger than the floor must be kept ({age:?})"
+            );
+        }
+
+        for age in [DEAD_PID_MIN_AGE, DEAD_PID_MIN_AGE + Duration::from_secs(1)] {
+            assert_eq!(
+                classify(Owner::Dead, age, generous, false),
+                Verdict {
+                    reap: true,
+                    reason: Reason::DeadPid
+                },
+                "at or past the floor a dead owner is reaped despite --older-than 24h ({age:?})"
+            );
+        }
+
+        // The floor must stay far above the orphan cap it exists for, and far
+        // below the age threshold it is not a substitute for.
+        assert!(DEAD_PID_MIN_AGE >= Duration::from_secs(600));
+        assert!(DEAD_PID_MIN_AGE < Duration::from_secs(DEFAULT_MAX_AGE_HOURS * 3600));
+
+        // Both keep-side notes name the floor, not `--older-than`, so the report
+        // cannot blame the wrong threshold.
+        let note = Reason::DeadPid.note(false, generous);
+        assert!(note.contains(&human_duration(DEAD_PID_MIN_AGE)), "{note}");
+        assert!(!note.contains("24h"), "{note}");
+    }
+
+    /// `--ignore-liveness` is the operator's answer to a PID reused across a
+    /// reboot: it demotes a live-PID root to the age rule rather than reaping it
+    /// outright, and it is never inferred. Default off.
+    #[test]
+    fn ignore_liveness_demotes_a_live_pid_to_the_age_rule() {
+        let max_age = HOUR * 6;
+
+        assert_eq!(
+            classify(Owner::Live, HOUR * 9, max_age, true),
+            Verdict {
+                reap: true,
+                reason: Reason::LivenessIgnored
+            },
+            "past the threshold, an untrusted live PID is reapable"
+        );
+        assert_eq!(
+            classify(Owner::Live, HOUR, max_age, true),
+            Verdict {
+                reap: false,
+                reason: Reason::LivenessIgnored
+            },
+            "the flag demotes to the age rule — it does not reap unconditionally"
+        );
+        // Off by default, and it is a keep at any age without it.
+        assert!(
+            !parse_args(&[])
+                .expect("parse")
+                .expect("opts")
+                .ignore_liveness
+        );
+        assert_eq!(
+            classify(Owner::Live, HOUR * 9, max_age, false),
+            Verdict {
+                reap: false,
+                reason: Reason::LivePid
+            }
+        );
+        assert!(
+            parse_args(&["--ignore-liveness".to_string()])
+                .expect("parse")
+                .expect("opts")
+                .ignore_liveness
+        );
+        // A dead owner's floor is unaffected by the flag.
+        assert!(!classify(Owner::Dead, Duration::ZERO, max_age, true).reap);
     }
 
     /// Ownership comes from the PID and from nothing else — there is no
@@ -968,13 +1230,19 @@ mod tests {
 
     /// Issue #461's headline case: 280 roots whose owners were provably gone
     /// were refused because the oldest was under the six-hour default. A dead
-    /// PID must now outvote any threshold, however generous.
+    /// PID must outvote any `--older-than`, however generous — the only thing
+    /// that holds it back is its own short orphan-window floor, so the root here
+    /// is aged past that and nothing else changes.
+    #[cfg(unix)]
     #[test]
     fn a_dead_pid_is_reaped_even_when_younger_than_the_threshold() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("dad-tests-4242-AbCdEf");
         std::fs::create_dir(&dir).expect("create");
         std::fs::write(dir.join("payload"), vec![0u8; 2048]).expect("write");
+        // Past the orphan floor, but still far under the 24h threshold below —
+        // which is the whole point of the assertion.
+        set_mtime(&dir, SystemTime::now() - DEAD_PID_MIN_AGE * 2);
 
         let found = collect(tmp.path(), &opts(HOUR * 24), &FakeProbe::dead()).expect("collect");
         assert_eq!(found.len(), 1);
@@ -985,8 +1253,51 @@ mod tests {
                 reason: Reason::DeadPid
             }
         );
+        assert!(found[0].age < HOUR * 24, "must be under the threshold");
         assert_eq!(found[0].bytes, 2048);
         assert!(!found[0].size_truncated);
+    }
+
+    /// The floor, driven through the real filesystem: a root whose owner just
+    /// died is kept, because a `setsid`'d daemon may still be writing under it.
+    /// This is the case the old six-hour rule protected by accident and an
+    /// unconditional dead-PID reap would have regressed.
+    #[test]
+    fn a_freshly_dead_root_is_kept_through_collect() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("dad-tests-4242-JustDied");
+        std::fs::create_dir(&dir).expect("create");
+
+        // Zero threshold: only the orphan floor can be keeping this.
+        let found =
+            collect(tmp.path(), &opts(Duration::ZERO), &FakeProbe::dead()).expect("collect");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].verdict,
+            Verdict {
+                reap: false,
+                reason: Reason::DeadPid
+            }
+        );
+
+        let applied = sweep(
+            tmp.path(),
+            &Options {
+                max_age: Duration::ZERO,
+                apply: true,
+                include_untagged: false,
+                ignore_liveness: false,
+            },
+            &FakeProbe::dead(),
+        )
+        .expect("apply");
+        assert_eq!(applied.removed, 0, "{}", applied.report);
+        assert!(dir.exists(), "a just-died root must survive --apply");
+        assert!(
+            applied.report.contains("may still be writing"),
+            "the report must explain the orphan window:\n{}",
+            applied.report
+        );
     }
 
     /// The other half of the fix, driven by the REAL probe: a suite still
@@ -1054,6 +1365,7 @@ mod tests {
                 max_age: Duration::ZERO,
                 apply: true,
                 include_untagged: false,
+                ignore_liveness: false,
             },
             &SystemProbe,
         )
@@ -1074,14 +1386,17 @@ mod tests {
             applied.report
         );
         assert!(applied.report.contains("live-pid"), "{}", applied.report);
-        // And the mirror image: an mtime cannot save a dead owner either.
+
+        // The mirror image, with one honest asymmetry. An *ancient* mtime cannot
+        // save a dead owner — `--older-than 24h` does not hold it back. But a
+        // *future* mtime yields an age of zero (`duration_since` fails, so the
+        // age saturates at nothing), which lands under the orphan floor and is
+        // therefore KEPT. That is the fail-safe direction, and it is the reason
+        // this uses a past mtime where it once used a future one.
         let dead_tmp = tempfile::tempdir().expect("tempdir");
-        let dead = dead_tmp.path().join("dad-tests-4242-futuristic");
+        let dead = dead_tmp.path().join("dad-tests-4242-ancient");
         std::fs::create_dir(&dead).expect("create");
-        set_mtime(
-            &dead,
-            SystemTime::now() + Duration::from_secs(365 * 24 * 3600),
-        );
+        set_mtime(&dead, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
         let found =
             collect(dead_tmp.path(), &opts(HOUR * 24), &FakeProbe::dead()).expect("collect");
         assert_eq!(
@@ -1090,7 +1405,29 @@ mod tests {
                 reap: true,
                 reason: Reason::DeadPid
             },
-            "a dead PID is reaped whatever the root's mtime"
+            "an ancient mtime cannot save a dead owner from --older-than 24h"
+        );
+
+        // And the future-mtime case, spelled out rather than left implicit.
+        let future = dead_tmp.path().join("dad-tests-4243-futuristic");
+        std::fs::create_dir(&future).expect("create");
+        set_mtime(
+            &future,
+            SystemTime::now() + Duration::from_secs(365 * 24 * 3600),
+        );
+        let found =
+            collect(dead_tmp.path(), &opts(Duration::ZERO), &FakeProbe::dead()).expect("collect");
+        let fut = found
+            .iter()
+            .find(|c| c.path == future)
+            .expect("future root collected");
+        assert_eq!(
+            fut.verdict,
+            Verdict {
+                reap: false,
+                reason: Reason::DeadPid
+            },
+            "a future mtime reads as age zero, which the orphan floor keeps — the safe direction"
         );
     }
 
@@ -1134,6 +1471,7 @@ mod tests {
     /// candidates too: only the `reap` half is ever handed to `remove_dir_all`.
     /// A test that stops at `collect` cannot see this — it has to drive the
     /// real apply path.
+    #[cfg(unix)]
     #[test]
     fn apply_removes_only_the_reap_slice() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1142,6 +1480,9 @@ mod tests {
         for dir in [&doomed, &spared] {
             std::fs::create_dir(dir).expect("create");
             std::fs::write(dir.join("payload"), vec![0u8; 1024]).expect("write");
+            // Past the orphan floor, so the dead-owner root is genuinely
+            // reapable and this test is about the reap/keep SPLIT, not the floor.
+            set_mtime(dir, SystemTime::now() - DEAD_PID_MIN_AGE * 2);
         }
         let probe = DeadPids(vec![111]);
 
@@ -1156,6 +1497,7 @@ mod tests {
                 max_age: Duration::ZERO,
                 apply: true,
                 include_untagged: false,
+                ignore_liveness: false,
             },
             &probe,
         )
@@ -1258,6 +1600,85 @@ mod tests {
         assert!(!text.contains("older than 6h"), "{text}");
     }
 
+    /// Survivors are **listed**, not merely counted. A `live-pid` root that is
+    /// really a PID reused across a reboot looks identical to a running suite's
+    /// root in a bare count, and it is the one class the reaper will not settle
+    /// on its own — so its path, size and age have to be on screen for the
+    /// operator to judge whether `--ignore-liveness` is warranted.
+    #[test]
+    fn kept_roots_are_listed_individually_with_size_and_age() {
+        let keep = vec![
+            candidate(
+                "dad-tests-202-Survivor",
+                4096,
+                12,
+                Verdict {
+                    reap: false,
+                    reason: Reason::LivePid,
+                },
+            ),
+            candidate(
+                "dad-tests-303-JustDied",
+                512,
+                0,
+                Verdict {
+                    reap: false,
+                    reason: Reason::DeadPid,
+                },
+            ),
+        ];
+        let text = report(Path::new("/tmp"), &[], &keep, HOUR * 6);
+
+        assert!(
+            text.contains("kept:"),
+            "no survivor listing header:\n{text}"
+        );
+        // Each survivor gets its own line, with its own path and size.
+        for (name, size) in [
+            ("dad-tests-202-Survivor", "4.0 KB"),
+            ("dad-tests-303-JustDied", "512 B"),
+        ] {
+            let line = text
+                .lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("{name} was not listed:\n{text}"));
+            assert!(line.contains(size), "{name} line lacks its size: {line:?}");
+        }
+        // The reboot-collision hint and the orphan-window explanation both land.
+        assert!(text.contains("--ignore-liveness overrides"), "{text}");
+        assert!(text.contains("may still be writing"), "{text}");
+        assert!(text.contains("keep: 2 dir(s)"), "{text}");
+    }
+
+    /// The survivor listing is capped exactly like the reap listing, so a
+    /// machine holding hundreds of live roots cannot bury the summary.
+    #[test]
+    fn a_long_keep_list_is_truncated_but_fully_counted() {
+        let keep: Vec<Candidate> = (0..MAX_LISTED + 3)
+            .map(|i| {
+                candidate(
+                    &format!("dad-tests-{i}-Survivor"),
+                    1024,
+                    12,
+                    Verdict {
+                        reap: false,
+                        reason: Reason::LivePid,
+                    },
+                )
+            })
+            .collect();
+        let text = report(Path::new("/tmp"), &[], &keep, HOUR * 6);
+        assert_eq!(
+            text.lines().filter(|l| l.contains("-Survivor")).count(),
+            MAX_LISTED
+        );
+        assert!(text.contains("… and 3 more"), "{text}");
+        assert!(
+            text.contains(&format!("keep: {} dir(s)", MAX_LISTED + 3)),
+            "the summary must count every survivor:\n{text}"
+        );
+    }
+
     /// A leaking machine accumulates hundreds of roots; the per-directory list
     /// is capped so the summary stays visible, and the cap announces itself
     /// rather than silently truncating.
@@ -1357,6 +1778,10 @@ mod tests {
     /// Every accumulation on the path from one file's length to the printed
     /// total must saturate instead: the per-tree walk, the per-reason group
     /// total, the reap/keep totals, and the `freed` counter after `--apply`.
+    ///
+    /// Unix-gated only because it ages the roots past the orphan floor with
+    /// [`set_mtime`], which opens the directory itself.
+    #[cfg(unix)]
     #[test]
     fn exabyte_sparse_files_saturate_instead_of_aborting_the_sweep() {
         const HUGE: u64 = 8_000_000_000_000_000_000; // 3 of these overflow u64
@@ -1370,6 +1795,10 @@ mod tests {
             for i in 0..3 {
                 sparse_file(&dir.join(format!("sparse{i}")), HUGE);
             }
+            // Aged past the orphan floor so both roots actually reach the
+            // deletion path — this test is about arithmetic, not the floor.
+            // (Written after the files, which bump the directory's mtime.)
+            set_mtime(&dir, SystemTime::now() - DEAD_PID_MIN_AGE * 2);
         }
 
         // One tree on its own already overflows.
@@ -1384,6 +1813,7 @@ mod tests {
                 max_age: Duration::ZERO,
                 apply: true,
                 include_untagged: false,
+                ignore_liveness: false,
             },
             &FakeProbe::dead(),
         )
