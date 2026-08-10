@@ -20976,6 +20976,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -23469,6 +23470,7 @@ mod tests {
             pane_id: Some(pane.to_string()),
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -24389,6 +24391,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         }
     }
 
@@ -24609,6 +24612,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
 
         // Spacious: get all 3
@@ -24643,6 +24647,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -24668,6 +24673,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
