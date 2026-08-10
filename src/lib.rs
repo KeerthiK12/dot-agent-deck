@@ -54,4 +54,5 @@ mod test_temp;
 pub mod ui;
 pub mod version;
 pub mod watch;
+pub mod worktree_reclaim;
 pub mod wrap;
