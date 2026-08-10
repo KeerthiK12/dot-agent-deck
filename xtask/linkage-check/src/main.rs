@@ -144,17 +144,31 @@ const BARE_TEMPDIR_ALLOW: &str = "linkage-check:allow-bare-tempdir";
 
 /// The `tempfile` constructors that allocate in the **default** temp dir.
 ///
-/// Directories: `tempfile::tempdir()`, `TempDir::new()`, and the builder's
-/// `.tempdir()`. Files: `NamedTempFile::new()`, `tempfile::tempfile()`, and the
-/// builder's `.tempfile()`. Every `…_in(parent)` / `…_new_in(parent)` form
-/// names its destination and is deliberately NOT matched — that is what the
-/// wrappers themselves call.
+/// Directories: `tempfile::tempdir()`, `TempDir::new()`, `TempDir::with_prefix()`,
+/// `TempDir::with_suffix()`, and the builder's `.tempdir()`. Files:
+/// `NamedTempFile::new()`, `NamedTempFile::with_prefix()`,
+/// `NamedTempFile::with_suffix()`, `tempfile::tempfile()`,
+/// `spooled_tempfile()`, and the builder's `.tempfile()`. Every `…_in(parent)` /
+/// `…_new_in(parent)` form names its destination and is deliberately NOT matched
+/// — that is what the wrappers themselves call, and `…_in` sits between the name
+/// and the `(` so none of the patterns here can reach it.
 ///
 /// Factored out of `main` so it can be unit-tested; the file half of it was
 /// missing for a while and nothing caught that.
+///
+/// **The `with_prefix` / `with_suffix` / `spooled` family was missing too**, and
+/// the same argument applies: they are ordinary safe-looking constructors that
+/// allocate in `std::env::temp_dir()`, verified present in the pinned
+/// `tempfile 3.27.0` (`src/dir/mod.rs:269`/`:294`, `src/file/mod.rs:630`/`:657`),
+/// and each has an `…_in` counterpart, so the rule is satisfiable. There was no
+/// live call site when this was added — the value is that the guard now matches
+/// the claim it makes in the module header ("no bare `tempfile` constructor …
+/// anywhere under `tests/`") instead of enumerating a subset of it. A rule that
+/// covers most of its stated territory is the shape that let
+/// `NamedTempFile::new()` sit inside its own scope undetected.
 fn bare_temp_ctor_re() -> Regex {
     Regex::new(
-        r"tempfile::tempdir\s*\(|TempDir::new\s*\(|\.tempdir\s*\(\s*\)|NamedTempFile::new\s*\(|tempfile::tempfile\s*\(|\.tempfile\s*\(\s*\)",
+        r"tempfile::tempdir\s*\(|TempDir::new\s*\(|TempDir::with_prefix\s*\(|TempDir::with_suffix\s*\(|\.tempdir\s*\(\s*\)|NamedTempFile::new\s*\(|NamedTempFile::with_prefix\s*\(|NamedTempFile::with_suffix\s*\(|tempfile::tempfile\s*\(|spooled_tempfile\s*\(|\.tempfile\s*\(\s*\)",
     )
     .expect("bare temp constructor regex compiles")
 }
@@ -984,8 +998,34 @@ mod tests {
             "    NamedTempFile::new_in(parent)?",
             "    TempDir::new_in(parent)?",
             "    tempfile::tempfile_in(parent)?",
+            // The widened family's own `…_in` counterparts. `_in` sits between
+            // the name and the `(`, which is what keeps these out.
+            "    TempDir::with_prefix_in(\"codex-home-\", parent)?",
+            "    TempDir::with_suffix_in(\".git\", parent)?",
+            "    NamedTempFile::with_prefix_in(\"auth-\", parent)?",
+            "    NamedTempFile::with_suffix_in(\".json\", parent)?",
+            "    tempfile::spooled_tempfile_in(4096, parent)?",
         ] {
             assert!(!re.is_match(line), "should NOT be a violation: {line}");
+        }
+    }
+
+    /// The `with_prefix` / `with_suffix` / `spooled` family allocates in
+    /// `std::env::temp_dir()` exactly like `new()` does, and the rule claims to
+    /// cover every bare constructor under `tests/`. These had no live call site
+    /// when this test was written; it exists so the claim and the guard cannot
+    /// drift apart again, which is how `NamedTempFile::new()` went unmatched.
+    #[test]
+    fn bare_temp_ctor_re_matches_the_prefix_suffix_and_spooled_family() {
+        let re = bare_temp_ctor_re();
+        for line in [
+            "    let d = TempDir::with_prefix(\"codex-home-\").unwrap();",
+            "    let d = tempfile::TempDir::with_suffix(\"-repo\").unwrap();",
+            "    let f = NamedTempFile::with_prefix(\"auth-\").unwrap();",
+            "    let f = tempfile::NamedTempFile::with_suffix(\".json\").unwrap();",
+            "    let f = tempfile::spooled_tempfile(4096);",
+        ] {
+            assert!(re.is_match(line), "should be a violation: {line}");
         }
     }
 
