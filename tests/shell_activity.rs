@@ -554,6 +554,7 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     let busy_for_pane = |registry: &AgentPtyRegistry| -> Option<bool> {
         registry
             .shell_foreground_busy_snapshot(&[CLAUDE_BASH_TOOL_SHAPE])
+            .unwrap_or_default()
             .into_iter()
             .find(|(pane_id, _)| pane_id == PANE_ID)
             .map(|(_, busy)| busy)

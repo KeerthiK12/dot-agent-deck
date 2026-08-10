@@ -4101,30 +4101,38 @@ impl AgentPtyRegistry {
     /// The process table is sampled **once**, before the registry lock is taken
     /// — one `ps -A` per tick reused for every pane (PRD #386 Route A), and no
     /// fork/exec while holding a lock the TUI-facing paths also take.
+    ///
+    /// Returns `None` when the `ps` sample itself failed
+    /// ([`crate::platform::proc::process_table`] returned `None`) — distinct
+    /// from `Some(vec![])`, which means the sample succeeded and there are
+    /// genuinely no live panes to report on. A caller that collapsed the two
+    /// would treat a failed sample as "no panes", clearing whatever busy/idle
+    /// state it tracks and re-emitting a spurious edge for every pane on the
+    /// next good sample.
     pub fn shell_foreground_busy_snapshot(
         &self,
         shapes: &[crate::platform::proc::ShellToolShape],
-    ) -> Vec<(String, bool)> {
-        let Some(table) = crate::platform::proc::process_table() else {
-            return Vec::new();
-        };
+    ) -> Option<Vec<(String, bool)>> {
+        let table = crate::platform::proc::process_table()?;
         let inner = self.inner.lock().unwrap();
-        inner
-            .agents
-            .values()
-            .filter(|agent| !agent.exited.load(Ordering::SeqCst))
-            .filter_map(|agent| {
-                let pane_id = agent.pane_id_env.clone()?;
-                let key = shell_tool_shape_key(agent.agent_type.as_ref());
-                let for_pane: Vec<crate::platform::proc::ShellToolShape> = shapes
-                    .iter()
-                    .copied()
-                    .filter(|shape| Some(shape.agent) == key)
-                    .collect();
-                let busy = agent.shell_activity_in(&table, &for_pane)?;
-                Some((pane_id, busy))
-            })
-            .collect()
+        Some(
+            inner
+                .agents
+                .values()
+                .filter(|agent| !agent.exited.load(Ordering::SeqCst))
+                .filter_map(|agent| {
+                    let pane_id = agent.pane_id_env.clone()?;
+                    let key = shell_tool_shape_key(agent.agent_type.as_ref());
+                    let for_pane: Vec<crate::platform::proc::ShellToolShape> = shapes
+                        .iter()
+                        .copied()
+                        .filter(|shape| Some(shape.agent) == key)
+                        .collect();
+                    let busy = agent.shell_activity_in(&table, &for_pane)?;
+                    Some((pane_id, busy))
+                })
+                .collect(),
+        )
     }
 
     /// PRD #370 M2 test-only seam: `inner` is private (by design — every

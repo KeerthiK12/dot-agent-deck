@@ -1093,8 +1093,18 @@ async fn run_shell_activity_monitor(
         // Claude's fingerprint to a Codex/OpenCode/Pi pane would veto a
         // genuinely detached descendant and leave the pane silently reading
         // `Idle`.
-        let snapshot = pty_registry
-            .shell_foreground_busy_snapshot(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES);
+        // A failed `ps` sample (`None`) is distinct from a succeeding sample
+        // that legitimately found no panes (`Some(vec![])`) — see
+        // `shell_foreground_busy_snapshot`'s doc comment. Collapsing the two
+        // would `retain` every entry out of `last_known` below, then make
+        // every pane look new on the next good sample and re-emit a spurious
+        // ShellBusy/ShellIdle edge for each one. So on a failed sample, skip
+        // the whole tick: leave `last_known` untouched and emit nothing.
+        let Some(snapshot) = pty_registry
+            .shell_foreground_busy_snapshot(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES)
+        else {
+            continue;
+        };
         let seen: std::collections::HashSet<&str> = snapshot
             .iter()
             .map(|(pane_id, _)| pane_id.as_str())
@@ -1496,6 +1506,26 @@ async fn run_hook_loop(
                                 tool_detail = ?event.tool_detail,
                                 "Received event"
                             );
+                            // The `#[serde(other)]` catch-all on `EventType`
+                            // (PRD #386, precedent PRD #201's `AgentType`
+                            // retrofit) is a deliberate forward-compat win —
+                            // an unrecognized `event_type` no longer fails the
+                            // whole decode the way it did before. That also
+                            // means a genuine typo in a hand-written hook now
+                            // silently decodes to `Unknown` and changes
+                            // nothing visible, where it used to be reported as
+                            // a malformed event. Restore that diagnostic here,
+                            // at the one place the daemon still has the raw
+                            // line the unrecognized value came from.
+                            if event.event_type == crate::event::EventType::Unknown {
+                                warn!(
+                                    session_id = %event.session_id,
+                                    pane_id = ?event.pane_id,
+                                    raw_line = %line,
+                                    "Event carries an unrecognized event_type — decoded as \
+                                     Unknown and otherwise ignored; check the hook for a typo"
+                                );
+                            }
                             // Persist the agent type this hook revealed into
                             // the PTY registry (keyed by pane id), so a later
                             // `list_agents` — e.g. a fresh `dot-agent-deck
