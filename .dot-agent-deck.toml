@@ -78,8 +78,11 @@ watch = false
 # Local control-deck workflow: all roles run Claude Code on the Max subscription
 # (codex is not installed on this machine — a codex command here kills every
 # delegation respawn). Coordinator on Opus; coder/tester on Sonnet with
-# acceptEdits; reviewer (Sonnet) and auditor (Opus) in plan mode so they can
-# read but never edit. NOTE: delegation respawns use THESE commands, not the
+# acceptEdits; reviewer (Sonnet) and auditor (Opus) read-only BY PROMPT, not by
+# plan mode: plan mode ends the turn awaiting human approval, so the worker can
+# never run `dot-agent-deck work-done` and the orchestrator waits forever on a
+# pane that looks finished (measured 2026-08-09: reviewer respawned at 20:08:46
+# and was still silent 18 minutes later). NOTE: delegation respawns use THESE commands, not the
 # GUI profile fields — keep them in sync with the profiles you configure.
 [[orchestrations]]
 name = "dot-agent-deck"
@@ -170,13 +173,13 @@ prompt_template = "Implement the requested change. If the task references a PRD 
 
 [[orchestrations.roles]]
 name = "reviewer"
-command = "claude --model sonnet --effort high --permission-mode plan"
+command = "claude --model sonnet --effort high --permission-mode default"
 description = "Reviews code changes for correctness, style, and edge cases"
 prompt_template = "Review the change. Report findings only — do not modify code. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If the task references a PRD path, verify the implementation matches it. If critical context is missing (e.g. the diff or PRD path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you."
 
 [[orchestrations.roles]]
 name = "auditor"
-command = "claude --model opus --effort high --permission-mode plan"
+command = "claude --model opus --effort high --permission-mode default"
 description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = "Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you."
 
