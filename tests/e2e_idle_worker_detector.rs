@@ -42,14 +42,14 @@ fn idle_role_label(role: &str) -> String {
     format!("[UNTRUSTED-ROLE-LABEL: {role} :END-UNTRUSTED-ROLE-LABEL]")
 }
 
-/// Why every needle here goes through [`common::squeeze_wrapped_text`]: the idle
-/// prompt is ONE long line, so the pane wraps it at whatever column the pane
-/// happens to be, and a needle straddling that column is absent from the
-/// row-joined snapshot even though every character of it is on screen. Only
+/// Wrap-tolerant wait for `needle` inside the orchestration PANE COLUMN.
+///
+/// Every needle goes through [`common::squeeze_wrapped_text`] because the idle
+/// prompt is ONE long line: the pane wraps it at whatever column the pane happens
+/// to sit at, and a needle straddling that column is absent from the row-joined
+/// snapshot even though every character of it is on screen. Only
 /// [`IDLE_DAEMON_CLAUSE`] *opens* the line and would be safe to match raw; the
 /// untrusted-role label sits deep in the text and can land anywhere.
-///
-/// Wrap-tolerant wait for `needle` inside the orchestration PANE COLUMN.
 ///
 /// NOT a wrap-tolerant whole-grid search: this crops to the pane column via
 /// [`common::orchestration_pane_column`] and so inherits both of that
