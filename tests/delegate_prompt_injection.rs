@@ -1618,6 +1618,7 @@ fn delegate_work_done_cancels_only_matching_silence_watch() {
                             timestamp: chrono::Utc::now(),
                         },
                         &harness.registry,
+                        &harness.event_tx,
                     )
                     .await;
                 tokio::time::sleep(Duration::from_millis(900)).await;
@@ -1643,6 +1644,7 @@ fn delegate_work_done_cancels_only_matching_silence_watch() {
                         timestamp: chrono::Utc::now(),
                     },
                     &harness.registry,
+                    &harness.event_tx,
                 )
                 .await;
             let notice = wait_for_silence_notice(

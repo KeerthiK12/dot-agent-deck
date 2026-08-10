@@ -192,7 +192,14 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// enforces the identity/idempotency guards. Documented as a semantic
 /// cross-version consideration in `changelog.d/20.breaking.md`; a
 /// previous-release-daemon manual test is required at release.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// v7 (local handoff-visibility PRD): [`crate::event::EventType`] gained the
+/// handoff-lifecycle variants (`delegation_dispatched` / `delegation_delivered`
+/// / `delegation_failed` / `worker_respawned` / `work_done_received`) that ride
+/// `KIND_EVENT` broadcasts. An older peer's `EventType` has no catch-all, so an
+/// unknown variant fails that record's decode — a vocabulary change, hence a
+/// hard bump per the same reasoning as v6.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.

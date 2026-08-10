@@ -139,7 +139,28 @@ export interface DeckSnapshot {
   stages: WorkflowStage[];
   agents: AgentSession[];
   evidence: EvidenceItem[];
+  /** Live delegation edges (handoff-visibility PRD D2), newest first. */
+  handoffs: HandoffEdge[];
   profiles: AgentProfile[];
+}
+
+/** One delegation's lifecycle, driven by the daemon's handoff events. */
+export interface HandoffEdge {
+  /** The daemon's delegation id (`dlg-<millis>-<seq>`). */
+  id: string;
+  toRole: string;
+  orchestration?: string;
+  taskPreview?: string;
+  /**
+   * dispatched → delivered → done is the healthy path; failed is terminal and
+   * carries `reason`. `respawned` marks that the worker was restarted for this
+   * delegation (expected for clear=true roles).
+   */
+  status: "dispatched" | "delivered" | "failed" | "done";
+  respawned: boolean;
+  reason?: string;
+  /** Wall-clock of the newest event applied to this edge (HH:MM:SS). */
+  at: string;
 }
 
 export type DeckAction =

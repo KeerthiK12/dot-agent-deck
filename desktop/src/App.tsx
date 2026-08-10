@@ -33,6 +33,7 @@ import {
   Zap,
 } from "lucide-react";
 import { AgentTile } from "./components/AgentTile";
+import { HandoffRail } from "./components/HandoffRail";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
@@ -370,6 +371,8 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
           </div>
         </section>
 
+        <HandoffRail handoffs={snapshot.handoffs} />
+
         <section className="workspace-section" aria-label="Agent terminals">
           <header className="workspace-header">
             <div><span className="section-kicker">AGENT DECK</span><h2>Live work surfaces</h2></div>
@@ -457,7 +460,7 @@ function EvidenceDrawer({ evidence, selected, onSelect, onClose }: { evidence: E
             <div><strong>{item.title}</strong><small>{item.to ? <>{item.from} <ArrowRight size={10} /> {item.to}</> : item.from}</small></div>
             <time>{item.at}</time>
           </button>
-        )) : <div className="evidence-empty"><History size={20} /><strong>No events yet</strong><span>Live hook events appear here as agents work. Delegate and work-done handoff edges are still pending daemon support (PRD #176 M3.1).</span></div>}
+        )) : <div className="evidence-empty"><History size={20} /><strong>No events yet</strong><span>Live hook and handoff events appear here as agents work — delegations, deliveries, failures, and work-done reports included.</span></div>}
       </div>
       {selected && (
         <div className="evidence-detail">

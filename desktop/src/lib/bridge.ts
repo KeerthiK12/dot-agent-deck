@@ -1,6 +1,6 @@
 import { createFixtureSnapshot, DEFAULT_PROFILES } from "../data/fixture";
-import { mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
-import type {
+import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
+import type { HandoffEdge,
   AgentSession,
   AgentStatus,
   DeckAction,
@@ -165,7 +165,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number): AgentSession {
   };
 }
 
-export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[]): DeckSnapshot {
+export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[], handoffs?: HandoffEdge[]): DeckSnapshot {
   const agents = dto.agents.map(agentFromDto);
   const cwd = agents.find((agent) => agent.cwd !== "Unavailable")?.cwd
     ?? dto.projectCwd
@@ -206,6 +206,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       return old ? { ...agent, transcript: old.transcript } : agent;
     }),
     evidence: evidence ?? previous?.evidence ?? [],
+    handoffs: handoffs ?? previous?.handoffs ?? [],
     profiles: previous?.profiles ?? DEFAULT_PROFILES.map((profile) => ({ ...profile })),
   };
 }
@@ -307,6 +308,7 @@ export class TauriDeckBridge implements DeckBridge {
   private lifecycle = 0;
   /** Newest-first ring of mapped hook events, capped at MAX_LIVE_EVIDENCE. */
   private evidence: EvidenceItem[] = [];
+  private handoffs: HandoffEdge[] = [];
   private evidenceSequence = 0;
   private agentIndex: AgentSession[] = [];
 
@@ -321,8 +323,11 @@ export class TauriDeckBridge implements DeckBridge {
   };
 
   private recordDaemonEvent(payload: unknown): boolean {
+    const edges = applyHandoffEvent(this.handoffs, payload);
+    const edgesChanged = edges !== this.handoffs;
+    this.handoffs = edges;
     const item = mapDaemonEvent(payload, this.evidenceSequence, this.resolveAgent);
-    if (!item) return false;
+    if (!item) return edgesChanged;
     this.evidenceSequence += 1;
     this.evidence = [item, ...this.evidence].slice(0, MAX_LIVE_EVIDENCE);
     return true;
@@ -455,7 +460,7 @@ export class TauriDeckBridge implements DeckBridge {
     const invoke = await this.getInvoke();
     const dto = await invoke<DesktopSnapshotDto>("desktop_bootstrap", { options: { startIfMissing: false } });
     await this.attachAgents(dto.agents, lifecycle);
-    const snapshot = mapDesktopSnapshot(dto, undefined, this.evidence);
+    const snapshot = mapDesktopSnapshot(dto, undefined, this.evidence, this.handoffs);
     this.agentIndex = snapshot.agents;
     return snapshot;
   }
@@ -467,7 +472,7 @@ export class TauriDeckBridge implements DeckBridge {
     this.pendingTerminal.clear();
     let latest: DeckSnapshot | undefined;
     const emit = (dto: DesktopSnapshotDto) => {
-      latest = mapDesktopSnapshot(dto, latest, this.evidence);
+      latest = mapDesktopSnapshot(dto, latest, this.evidence, this.handoffs);
       this.agentIndex = latest.agents;
       onSnapshot(latest);
     };
@@ -480,7 +485,7 @@ export class TauriDeckBridge implements DeckBridge {
     // mapped snapshot keeps the drawer current without waiting for the next.
     const stopDaemonEvent = await listen<unknown>("desktop://daemon-event", (event) => {
       if (!this.recordDaemonEvent(event.payload) || !latest) return;
-      latest = { ...latest, evidence: this.evidence };
+      latest = { ...latest, evidence: this.evidence, handoffs: this.handoffs };
       onSnapshot(latest);
     });
     const stopTerminalState = await listen<DesktopTerminalStateDto>("desktop://terminal-state", (event) => {

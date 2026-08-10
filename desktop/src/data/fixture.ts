@@ -282,6 +282,11 @@ export function createFixtureSnapshot(state: "connected" | "disconnected" | "err
     paused: false,
     stages: state === "empty" ? [] : stages.map((stage) => ({ ...stage })),
     agents: state === "empty" ? [] : agents.map((agent) => ({ ...agent })),
+    handoffs: [
+      { id: "dlg-demo-3", toRole: "Reviewer", orchestration: "dot-agent-deck", taskPreview: "Review the terminal lifecycle change; report findings only.", status: "dispatched", respawned: true, at: "14:41:22" },
+      { id: "dlg-demo-2", toRole: "Builder", orchestration: "dot-agent-deck", taskPreview: "Implement the Tauri client as a second daemon surface.", status: "done", respawned: true, at: "14:40:58" },
+      { id: "dlg-demo-1", toRole: "Tester", orchestration: "dot-agent-deck", taskPreview: "Write the failing bridge test for listener disposal.", status: "failed", respawned: false, reason: "worker respawn failed: command not found", at: "14:33:07" },
+    ],
     evidence: state === "empty" ? [] : evidence.map((item) => ({ ...item })),
     profiles: DEFAULT_PROFILES.map((profile) => ({ ...profile })),
   };
