@@ -145,7 +145,7 @@ Dry-run is the default and `--apply` is required to delete anything. By default 
 | `dot-agent-deck-test-lock-*` | yes | Pre-fix lock dirs, still present in bulk on older machines. |
 | `.tmp*` | **no** — needs `--include-untagged` | The `tempfile` crate's default prefix, shared with every Rust program on the machine. |
 
-Only pass `--include-untagged` when no other Rust build or tool is running; it can otherwise delete a live temp dir belonging to something else. Because of that it is **restricted to the system temp dir** (the historical location the advice was written for) and to any directory you name with `--root`. It never applies to the private `/var/tmp` parent. Directories younger than the age threshold (default 6h) are always left alone so a reap cannot race a running suite, and symlinks are never followed.
+Only pass `--include-untagged` when no other Rust build or tool is running; it can otherwise delete a live temp dir belonging to something else. Because of that it is **restricted to the system temp dir** (the historical location the advice was written for) and to any *other* directory you name with `--root`. It never applies to the private `/var/tmp` parent — including when you name that parent with `--root` yourself, because a root's treatment is decided by the directory it resolves to and not by how it was spelled. Directories younger than the age threshold (default 6h) are always left alone so a reap cannot race a running suite, and symlinks are never followed.
 
 ### Which directories it looks in
 
@@ -157,7 +157,7 @@ What that still does not do is hold each root open as a descriptor and enumerate
 
 That is *this* machine's, *this* checkout's picture. It cannot infer another worktree's leftovers, or a `DAD_E2E_TMPDIR` that is no longer exported — **run it in the worktree the leaking run ran in**, or name the directory with `--root`.
 
-`--root` is also how you reap a base you moved with `DAD_E2E_TMPDIR`, which is deliberately *not* scanned automatically: where the harness may write and what a delete command may remove are different trust decisions, and one should not silently grant the other. When the variable is set but not passed, the reaper prints a note naming it and showing the `--root` invocation. Passing `--root` **replaces** the standard set rather than adding to it, so a deliberate scan of one directory cannot quietly also delete from `/var/tmp` or `/tmp`.
+`--root` is also how you reap a base you moved with `DAD_E2E_TMPDIR`, which is deliberately *not* scanned automatically: where the harness may write and what a delete command may remove are different trust decisions, and one should not silently grant the other. When the variable is set but not passed, the reaper prints a note naming it and showing the `--root` invocation. Passing `--root` **replaces** the standard set rather than adding to it, so a deliberate scan of one directory cannot quietly also delete from `/var/tmp` or `/tmp`. Naming the private parent itself is the one case that is *not* treated as a hand-named directory: it is recognised by resolved path and keeps the strict vetting above, so pasting the pre-flight's own `--root` line cannot buy that directory a weaker check than discovering it as a standard root would.
 
 ## Pre-flight space check
 

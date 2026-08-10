@@ -350,6 +350,60 @@ fn canonical_key(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// The roots a `--root` list turns into.
+///
+/// A `--root` that names the harness's OWN private parent gets the private
+/// treatment, not the hand-named one. Without this, spelling one directory two
+/// ways gave it two different security postures: the standard-root path proves
+/// ownership, mode `0o700` and a sticky root-owned holder, and refuses a symlink
+/// outright ([`private_root_verdict`]), while `--root` skipped all of it and
+/// `canonicalize`d the name instead — so a symlink another local user planted at
+/// the predictable `/var/tmp/dad-e2e-<uid>` before the victim's first run was
+/// **followed** rather than refused. It also flipped `untagged_ok` on at the one
+/// location [`usage`] promises `--include-untagged` never applies to.
+///
+/// Matched by resolved directory rather than by spelling, so macOS's
+/// `/var` → `private/var` alias cannot route around it.
+///
+/// Pure apart from the `canonicalize` in [`canonical_key`], so the posture can
+/// be asserted without building a `/var/tmp` fixture.
+fn explicit_scan_roots(paths: &[PathBuf]) -> Vec<ScanRoot> {
+    let private_key = private_parent_key();
+    paths
+        .iter()
+        .map(|path| {
+            let is_private = private_key
+                .as_ref()
+                .is_some_and(|private| &canonical_key(path) == private);
+            ScanRoot {
+                path: path.clone(),
+                // Naming a directory by hand is the deliberate act the flag's
+                // warning is about, so it is honoured here — except for the
+                // private parent, which is never in range.
+                untagged_ok: !is_private,
+                required: true,
+                private: is_private,
+            }
+        })
+        .collect()
+}
+
+/// Resolved identity of the harness's private parent, so a hand-named `--root`
+/// can be recognised as that same directory however it was spelled.
+///
+/// `None` off Unix, where there is no `/var/tmp` rung to recognise and every
+/// `--root` is therefore an ordinary hand-named directory.
+fn private_parent_key() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        Some(canonical_key(&private_parent()))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// Drop roots that name the same directory twice.
 ///
 /// Lexical comparison is not enough: a symlink, a `TMPDIR` spelled with a
@@ -417,17 +471,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let temp_roots = dedup_roots(if explicit_roots.is_empty() {
         standard_roots()
     } else {
-        explicit_roots
-            .iter()
-            .map(|path| ScanRoot {
-                path: path.clone(),
-                // Naming a directory by hand is the deliberate act the flag's
-                // warning is about, so it is honoured here.
-                untagged_ok: true,
-                required: true,
-                private: false,
-            })
-            .collect()
+        explicit_scan_roots(&explicit_roots)
     });
     let searched = temp_roots
         .iter()
@@ -639,8 +683,9 @@ fn usage() {
     println!("                        tempfile crate's DEFAULT prefix and are shared with");
     println!("                        every Rust program on this machine — only use this");
     println!("                        when no other Rust build or tool is running. Applies");
-    println!("                        to the system temp dir and to any --root you name;");
-    println!("                        never to the private parent.");
+    println!("                        to the system temp dir and to any OTHER --root you");
+    println!("                        name; never to the private parent, even when you");
+    println!("                        name that parent with --root yourself.");
 }
 
 fn collect(temp_root: &Path, opts: &Options) -> std::io::Result<Vec<Candidate>> {
@@ -1352,6 +1397,39 @@ mod tests {
                 .is_empty(),
             "no --root means the standard set",
         );
+    }
+
+    /// Naming the private parent with `--root` must not buy weaker treatment
+    /// than letting it be discovered as a standard root.
+    ///
+    /// The two spellings are one directory, so they must get one security
+    /// posture. Before this, `--root` set `private: false` — which skipped the
+    /// ownership, `mode & 0o077` and sticky-holder checks entirely and let
+    /// `canonicalize` **follow** a symlink the private arm refuses outright —
+    /// and flipped `untagged_ok` on at the one location `usage()` says
+    /// `--include-untagged` must never reach.
+    #[cfg(unix)]
+    #[test]
+    fn naming_the_private_parent_with_root_keeps_its_private_treatment() {
+        let private = private_parent();
+        let roots = explicit_scan_roots(std::slice::from_ref(&private));
+        assert_eq!(roots.len(), 1);
+        assert!(
+            roots[0].private,
+            "{} named by hand must still be judged as the private parent",
+            private.display(),
+        );
+        assert!(
+            !roots[0].untagged_ok,
+            "--include-untagged must never reach the private parent, however it \
+             was spelled",
+        );
+
+        // An unrelated hand-named directory is untouched by this: it stays an
+        // ordinary explicit root, or the flag would become unusable.
+        let other = explicit_scan_roots(&[PathBuf::from("/scratch/elsewhere")]);
+        assert!(!other[0].private);
+        assert!(other[0].untagged_ok);
     }
 
     /// A relative `--root` would resolve against whatever directory the command
