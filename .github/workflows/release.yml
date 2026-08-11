@@ -24,18 +24,32 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       changelog: ${{ steps.changelog.outputs.changelog }}
     steps:
+      # Fail here, not 20 steps later at the push. This job commits the
+      # changelog straight to `main`, which only an admin identity may do:
+      # `main` is ruleset-protected and `github-actions[bot]` is deliberately
+      # NOT a bypass actor (GITHUB_TOKEN cannot be one on a user-owned repo).
+      # RELEASE_TOKEN is the admin PAT that bypasses it.
+      #
+      # This step replaces a `|| github.token` fallback that was correct when
+      # written and is now a trap. Its stated purpose was to keep the workflow
+      # "behaving exactly as it does today while the secret is unset, so this
+      # change is safe to merge before `main` is protected" — both conditions
+      # have since flipped (`main` protected 2026-08-08, secret set the same
+      # day). All the fallback can do now is turn a missing secret into a
+      # silent downgrade to an identity that cannot push, surfacing as the
+      # v0.35.6 `GH006` failure after the release is already half-done.
+      - name: Verify RELEASE_TOKEN is present
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [ -z "${RELEASE_TOKEN}" ]; then
+            echo "::error::RELEASE_TOKEN is unset or empty. This job pushes the changelog commit to the protected \`main\` branch and needs the admin PAT to bypass the ruleset; GITHUB_TOKEN cannot. Set the RELEASE_TOKEN secret and re-run. See CLAUDE.md rule 8."
+            exit 1
+          fi
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          # This job pushes the changelog commit straight to `main` (see the
-          # "Commit changelog updates" step). Once `main` is protected, the
-          # default GITHUB_TOKEN is rejected with `GH006: Protected branch
-          # update failed` and the tag dies here — the v0.35.6 failure mode
-          # recorded in CLAUDE.md rule 8. RELEASE_TOKEN is an admin PAT that
-          # bypasses the ruleset. The `|| github.token` fallback keeps this
-          # workflow behaving exactly as it does today while the secret is
-          # unset, so this change is safe to merge before `main` is protected.
-          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+          token: ${{ secrets.RELEASE_TOKEN }}
       - name: Extract version
         id: version
         # Every GitHub-context value a `run:` script in this workflow consumes
