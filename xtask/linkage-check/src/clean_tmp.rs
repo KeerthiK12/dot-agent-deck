@@ -1559,6 +1559,44 @@ mod tests {
             .expect("set_len");
     }
 
+    /// A temp dir on a filesystem that will actually accept a `len`-byte sparse
+    /// file, or `None` if no candidate will.
+    ///
+    /// `set_len` is bounded by the filesystem's **maximum file size**, not by
+    /// free space, and the two candidates differ by five orders of magnitude:
+    /// ext4 stops at 16 TiB and answers `EFBIG`, while tmpfs and APFS go to
+    /// ~8 EiB. So the exabyte fixture below is not portable to a `/tmp` that
+    /// sits on ext4 — which is exactly CI's Linux runner, while a dev box with a
+    /// RAM-backed `/tmp` (CLAUDE.md rule 14) hosts it happily.
+    ///
+    /// That split stayed invisible until issue #489 put the workspace's tests in
+    /// a gate: the test passed on every machine that ran it and had never once
+    /// run in CI. `/dev/shm` is tried first because it is a tmpfs on every
+    /// normal Linux regardless of what `/tmp` is mounted on; the default temp
+    /// dir covers macOS, where APFS is already large enough.
+    fn sparse_capable_tempdir(len: u64) -> Option<tempfile::TempDir> {
+        let mut bases: Vec<PathBuf> = Vec::new();
+        let shm = PathBuf::from("/dev/shm");
+        if shm.is_dir() {
+            bases.push(shm);
+        }
+        bases.push(std::env::temp_dir());
+        for base in bases {
+            let Ok(dir) = tempfile::tempdir_in(&base) else {
+                continue;
+            };
+            let probe = dir.path().join(".sparse-probe");
+            let accepted = std::fs::File::create(&probe)
+                .and_then(|f| f.set_len(len))
+                .is_ok();
+            let _ = std::fs::remove_file(&probe);
+            if accepted {
+                return Some(dir);
+            }
+        }
+        None
+    }
+
     #[test]
     fn owned_prefixes_are_reaped_by_default() {
         assert!(is_owned("dad-tests-1234-AbCdEf", false));
@@ -2341,12 +2379,31 @@ mod tests {
     ///
     /// Unix-gated only because it ages the roots past the orphan floor with
     /// [`set_mtime`], which opens the directory itself.
+    ///
+    /// The fixture needs a filesystem whose maximum file size can hold it — see
+    /// [`sparse_capable_tempdir`], which is why this does not simply call
+    /// `tempfile::tempdir()`.
     #[cfg(unix)]
     #[test]
     fn exabyte_sparse_files_saturate_instead_of_aborting_the_sweep() {
         const HUGE: u64 = 8_000_000_000_000_000_000; // 3 of these overflow u64
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let Some(tmp) = sparse_capable_tempdir(HUGE) else {
+            // Loud rather than silent. This is the only test that drives
+            // `dir_size_bounded`'s own saturating accumulator with a real
+            // overflow, so a vacuous pass would retire that coverage quietly.
+            // Observed on macOS, whose runners have no `/dev/shm` and whose
+            // temp dir refuses the length; Linux CI reaches it through
+            // `/dev/shm` and still covers it. The group, grand and `freed`
+            // totals are covered on every platform by
+            // `group_and_grand_totals_saturate`, which needs no filesystem.
+            println!(
+                "SKIP: no filesystem here accepts a {HUGE}-byte sparse file \
+                 (tried /dev/shm and the default temp dir), so the size walk's \
+                 own saturation is unverified on this host"
+            );
+            return;
+        };
         // The auditor's exact shape: a readable, dead-owner root full of sparse
         // files, reachable by the default dry run.
         for root in ["dad-tests-2147483647-AbCdEf", "dad-tests-2147483646-GhIjKl"] {
@@ -3246,6 +3303,18 @@ mod tests {
         }
     }
 
+    /// Two absolute paths, spelled the way *this* platform means it.
+    ///
+    /// `/scratch/one` is **not** absolute on Windows — it is root-relative, with
+    /// no drive letter — so `parse_args` rightly refused it and the test below
+    /// panicked in its own setup instead of exercising the replacement rule.
+    /// Like the sparse-file fixture above, that only became visible when issue
+    /// #489 put the workspace's tests in a gate on all three platforms.
+    #[cfg(not(windows))]
+    const SCRATCH_ROOTS: [&str; 2] = ["/scratch/one", "/scratch/two"];
+    #[cfg(windows)]
+    const SCRATCH_ROOTS: [&str; 2] = [r"C:\scratch\one", r"C:\scratch\two"];
+
     /// `--root` replaces the standard set rather than adding to it, so a
     /// deliberate scan of one directory cannot quietly also delete from
     /// `/var/tmp` or the system temp dir.
@@ -3253,15 +3322,18 @@ mod tests {
     fn explicit_roots_replace_the_standard_set() {
         let (_opts, roots) = parse_args(&[
             "--root".to_string(),
-            "/scratch/one".to_string(),
+            SCRATCH_ROOTS[0].to_string(),
             "--root".to_string(),
-            "/scratch/two".to_string(),
+            SCRATCH_ROOTS[1].to_string(),
         ])
         .expect("parse")
         .expect("options");
         assert_eq!(
             roots,
-            vec![PathBuf::from("/scratch/one"), PathBuf::from("/scratch/two")],
+            vec![
+                PathBuf::from(SCRATCH_ROOTS[0]),
+                PathBuf::from(SCRATCH_ROOTS[1])
+            ],
         );
         assert!(
             parse_args(&[])
