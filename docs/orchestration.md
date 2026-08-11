@@ -455,7 +455,17 @@ The role name in `--to` must match the `name` field in the config exactly (case-
 
 ### Orchestrator receives no work-done feedback
 
-The daemon writes feedback to the orchestrator pane via the PTY. If the orchestrator's pane is closed, the feedback write fails silently. The `.dot-agent-deck/work-done-<role>.md` file is still written and can be read manually.
+The daemon writes feedback to the orchestrator pane via the PTY. If the orchestrator's pane is closed, the feedback write fails silently. The `.dot-agent-deck/work-done-<role>.md` file is written first, so for a delegated task it can still be read manually — unless the daemon could not write it, in which case the daemon log carries a `failed to write work-done summary` warning and the file at that path (if any) belongs to an **earlier** delegation.
+
+### Orchestrator is told a completion was "unsolicited"
+
+The daemon records every delegation it dispatches, and a `work-done` that answers none of them is reported to the orchestrator with an explicit label saying so, followed by the worker's report inline. The commonest cause is a worker being tasked **directly by a person**: the `## When done` instruction survives in that worker's context from an earlier delegation, so it signals completion again for work the orchestrator never asked for. Without the label the orchestrator reads that as a delegated task coming back and re-plans on it.
+
+Nothing is dropped — the report still arrives, framed as information rather than as delivered work — and `.dot-agent-deck/work-done-<role>.md` is deliberately left untouched, so an uncommissioned report cannot overwrite the last one the orchestrator did commission. If you want a completion to be reported as delegated work, delegate it: task the worker through the orchestrator rather than typing into its pane.
+
+### The summary file could not be written
+
+When the daemon cannot write `.dot-agent-deck/work-done-<role>.md` — no working directory recorded for the pane, the `.dot-agent-deck` directory cannot be created, or the write itself fails — it does **not** tell the orchestrator to read that path. It says the file is unavailable and inlines the worker's report into the feedback instead. That matters because the path is keyed by role name and reused for every delegation to that role: pointing at it after a failed write hands the orchestrator the previous delegation's report, which is well-formed, from the right role, and for the wrong task. An inlined report loses its Markdown formatting (the feedback is collapsed to a single line) and is truncated past 4000 characters; the worker still holds the full text.
 
 ### Prompt template is not being applied
 

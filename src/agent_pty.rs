@@ -1952,6 +1952,20 @@ struct DelegationTracker {
     /// once the task pointer has actually been written — but the same three
     /// cancellation events resolve both.
     silence_watches: HashMap<String, SilenceWatchRecord>,
+    /// Issue #448: the COMMISSION ledger — how many delegations the orchestrator
+    /// has issued to each worker pane that no `work-done` has been credited to
+    /// yet. Keyed by the *worker's* `pane_id_env`.
+    ///
+    /// A third map rather than a field on `records` because it must answer a
+    /// question neither watch can: *did the orchestrator ask for this at all?*
+    /// Both of those maps are populated only when their detector is switched on
+    /// and their panes are healthy, so an ABSENT record there means "no
+    /// delegation, or a delegation whose detector is off, or one armed while a
+    /// pane was closing" — three states that must be told apart, because in the
+    /// disabled-detector one the completion is entirely genuine. This ledger is
+    /// armed for every delegate the daemon dispatches regardless of either
+    /// timeout, so `Unsolicited` here means what it says.
+    commissions: HashMap<String, DelegationCommission>,
     /// Panes between [`AgentPtyRegistry::begin_pane_close`] and
     /// [`AgentPtyRegistry::finish_pane_close`]. Arming is refused for a pane in
     /// this set (as worker *or* as orchestrator), which is what closes the
@@ -2004,6 +2018,55 @@ struct SilenceWatchRecord {
     /// watch's own conditional take). Mirrors
     /// [`OutstandingDelegation::_watch_cancel`].
     _cancel: oneshot::Sender<()>,
+}
+
+/// Issue #448: the commission ledger's per-worker-pane entry — how many
+/// delegations that pane still owes a `work-done` for.
+///
+/// A count, not a per-delegation record, because the only question it answers is
+/// whether the orchestrator commissioned *anything* that is still unanswered.
+/// `WorkDoneSignal` carries no delegation generation (see
+/// [`AgentPtyRegistry::retire_outstanding_delegation`]), so a completion cannot
+/// be matched to a specific delegation anyway — and the two maps that do carry
+/// generations already own every accounting decision that depends on knowing
+/// *which* one.
+struct DelegationCommission {
+    /// Delegations dispatched to this worker pane that no completion has been
+    /// credited to yet. Saturating, like [`OutstandingDelegation::superseded`].
+    outstanding: u32,
+    /// Pane of the orchestrator that issued them, so closing the ORCHESTRATOR
+    /// clears the ledger as well as the two watches — a commission is owed to a
+    /// specific orchestrator, and a pane id freed by a close can be inherited by
+    /// an unrelated agent that commissioned nothing.
+    orchestrator_pane_id: String,
+}
+
+/// Issue #448: did the orchestrator actually commission the work a `work-done`
+/// reports? See [`AgentPtyRegistry::retire_delegation_commission`].
+///
+/// This is deliberately NOT derived from [`DelegationRetirement`]. Its `Nothing`
+/// arm is not a reliable proxy for "never delegated": the idle detector arms no
+/// record when `worker_response_timeout_minutes = 0`, when the orchestrator pane
+/// has no live registry agent, or when either pane is mid-close — and in the
+/// first of those the completion is genuine and must still be reported as such.
+/// Reading `Nothing` as "unsolicited" would silently mislabel every completion
+/// in every project that has turned the detector off.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkDoneProvenance {
+    /// The orchestrator had at least one unanswered delegation to this worker
+    /// pane; one is now credited to this completion.
+    Solicited {
+        /// Commissions still unanswered after this one — non-zero only when the
+        /// orchestrator re-delegated before the worker reported, which its
+        /// protocol forbids.
+        remaining: u32,
+    },
+    /// Nothing was outstanding: the orchestrator commissioned no work this
+    /// completion could be answering. The commonest cause is a human tasking the
+    /// worker directly — the `work-done` instruction survives in the worker's
+    /// context from an earlier delegation (`work_done_footer`), so it runs again
+    /// for work the orchestrator never asked for.
+    Unsolicited,
 }
 
 /// PRD #249 M3 review (finding B4/S4): handed back by
@@ -2306,6 +2369,93 @@ impl AgentPtyRegistry {
         })
     }
 
+    /// Issue #448: record that the orchestrator has commissioned work from
+    /// `worker_pane_id` and owes itself a `work-done` for it. Returns whether the
+    /// commission was recorded.
+    ///
+    /// Armed for EVERY delegate the daemon dispatches, deliberately independent
+    /// of both `worker_response_timeout_minutes` (PRD #126) and
+    /// `delegate_no_event_window` (PRD #249). That independence is the whole
+    /// point: those two knobs govern whether the daemon *watches* for an answer,
+    /// while this ledger records that an answer is owed. Deriving "was this
+    /// solicited?" from either watch made a project with the idle detector turned
+    /// off indistinguishable from a worker nobody delegated to.
+    ///
+    /// Returns `false` — nothing recorded — when either pane is mid-close
+    /// ([`Self::begin_pane_close`]), the same arm-after-cancel guard as
+    /// [`Self::arm_outstanding_delegation`] and [`Self::arm_silence_watch`]: the
+    /// close sweep has already passed, so an entry armed now would never be
+    /// swept, and a phantom commission makes a later unsolicited completion read
+    /// as solicited. Failing to record fails safe in the other direction (a
+    /// genuine completion is *labelled* unsolicited rather than dropped), which
+    /// is why this is a refusal and not a queue.
+    ///
+    /// Unlike the two watches, arming does not REPLACE a previous entry — it
+    /// increments it. Two unanswered delegations to one worker are two
+    /// commissions, so two completions are credited before a third is called
+    /// unsolicited.
+    pub fn arm_delegation_commission(
+        &self,
+        worker_pane_id: &str,
+        orchestrator_pane_id: &str,
+    ) -> bool {
+        let mut tracker = self.delegations.lock().unwrap();
+        if tracker.closing_panes.contains(worker_pane_id)
+            || tracker.closing_panes.contains(orchestrator_pane_id)
+        {
+            return false;
+        }
+        let entry = tracker
+            .commissions
+            .entry(worker_pane_id.to_string())
+            .or_insert_with(|| DelegationCommission {
+                outstanding: 0,
+                orchestrator_pane_id: orchestrator_pane_id.to_string(),
+            });
+        entry.outstanding = entry.outstanding.saturating_add(1);
+        // Last delegate wins: a pane id that has changed hands (orchestrator
+        // closed, successor spawned onto the same id) must not leave the ledger
+        // pointing its close sweep at the dead pane.
+        entry.orchestrator_pane_id = orchestrator_pane_id.to_string();
+        true
+    }
+
+    /// Issue #448: credit a `work-done` from `worker_pane_id` against the
+    /// commission ledger, and report whether the orchestrator had actually asked
+    /// for anything — see [`WorkDoneProvenance`].
+    ///
+    /// The last commission for a pane removes its entry rather than leaving a
+    /// zero behind, so the map tracks live debt instead of every worker pane that
+    /// has ever been delegated to.
+    pub fn retire_delegation_commission(&self, worker_pane_id: &str) -> WorkDoneProvenance {
+        let mut tracker = self.delegations.lock().unwrap();
+        let Some(outstanding) = tracker
+            .commissions
+            .get(worker_pane_id)
+            .map(|entry| entry.outstanding)
+        else {
+            return WorkDoneProvenance::Unsolicited;
+        };
+        if outstanding <= 1 {
+            tracker.commissions.remove(worker_pane_id);
+            // A `0` entry cannot normally exist — this branch removes an entry as
+            // it reaches zero — so the `Unsolicited` half is defense in depth
+            // against a future arming path that leaves one behind.
+            return if outstanding == 0 {
+                WorkDoneProvenance::Unsolicited
+            } else {
+                WorkDoneProvenance::Solicited { remaining: 0 }
+            };
+        }
+        let remaining = outstanding - 1;
+        tracker
+            .commissions
+            .get_mut(worker_pane_id)
+            .expect("entry present under the same lock")
+            .outstanding = remaining;
+        WorkDoneProvenance::Solicited { remaining }
+    }
+
     /// PRD #249 M3 review (finding B4): a `work-done` arrived from
     /// `worker_pane_id`, so ONE silent-worker watch is resolved — a completion is
     /// positive proof the pointer landed, and `work-done` is a CLI signal rather
@@ -2485,6 +2635,14 @@ impl AgentPtyRegistry {
                 "pane close: cancelled silent-worker watches touching this pane"
             );
         }
+        let dropped_commissions = Self::drain_commissions_touching(&mut tracker, pane_id);
+        if dropped_commissions > 0 {
+            tracing::debug!(
+                pane_id = %pane_id,
+                dropped_commissions,
+                "pane close: dropped delegation commissions touching this pane"
+            );
+        }
         Self::drain_delegations_touching(&mut tracker, pane_id)
     }
 
@@ -2502,6 +2660,7 @@ impl AgentPtyRegistry {
         let mut tracker = self.delegations.lock().unwrap();
         drop(tracker.close_waiters.remove(pane_id));
         Self::drain_silence_watches_touching(&mut tracker, pane_id);
+        Self::drain_commissions_touching(&mut tracker, pane_id);
         let swept = Self::drain_delegations_touching(&mut tracker, pane_id);
         if !closed {
             tracing::debug!(
@@ -2593,6 +2752,31 @@ impl AgentPtyRegistry {
             .collect();
         keys.iter()
             .filter(|key| tracker.silence_watches.remove(*key).is_some())
+            .count()
+    }
+
+    /// Issue #448: the [`Self::drain_delegations_touching`] counterpart for the
+    /// commission ledger — forget every commission that names `pane_id` as its
+    /// worker key or as its orchestrator. Returns how many entries were dropped,
+    /// for logging. Caller holds the tracker lock.
+    ///
+    /// Swept by BOTH roles for the same reason as the watches: a closed worker
+    /// owes nothing, and a commission owed to a closed orchestrator must not
+    /// survive to be credited to whichever agent inherits its pane id. A
+    /// deliberate close therefore also ends the "was this solicited?" question,
+    /// which is the fail-safe direction — a stale commission would launder a
+    /// genuinely unsolicited later completion into a solicited one.
+    fn drain_commissions_touching(tracker: &mut DelegationTracker, pane_id: &str) -> usize {
+        let keys: Vec<String> = tracker
+            .commissions
+            .iter()
+            .filter(|(worker_pane, commission)| {
+                worker_pane.as_str() == pane_id || commission.orchestrator_pane_id == pane_id
+            })
+            .map(|(worker_pane, _)| worker_pane.clone())
+            .collect();
+        keys.iter()
+            .filter(|key| tracker.commissions.remove(*key).is_some())
             .count()
     }
 
@@ -7382,6 +7566,83 @@ mod spawn_tests {
             reg.retire_silence_watch("worker"),
             SilenceWatchRetirement::Nothing
         ));
+    }
+
+    /// Issue #448: the commission ledger answers "did the orchestrator ask for
+    /// this?" on its own, so it counts delegations rather than tracking the newest
+    /// — two unanswered delegations are two commissions, and only a completion
+    /// beyond them is unsolicited.
+    #[test]
+    fn commission_ledger_credits_one_completion_per_delegation() {
+        let reg = AgentPtyRegistry::new();
+        assert_eq!(
+            reg.retire_delegation_commission("worker"),
+            WorkDoneProvenance::Unsolicited,
+            "a worker nobody delegated to owes nothing"
+        );
+
+        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert_eq!(
+            reg.retire_delegation_commission("worker"),
+            WorkDoneProvenance::Solicited { remaining: 1 },
+            "the first completion answers one of two outstanding commissions"
+        );
+        assert_eq!(
+            reg.retire_delegation_commission("worker"),
+            WorkDoneProvenance::Solicited { remaining: 0 },
+            "the second answers the last one"
+        );
+        assert_eq!(
+            reg.retire_delegation_commission("worker"),
+            WorkDoneProvenance::Unsolicited,
+            "a third completion is answering nothing — the defect in #448"
+        );
+    }
+
+    /// Issue #448: the ledger is armed for a delegate whatever the two detectors
+    /// are set to, which is the property that makes `Unsolicited` mean what it
+    /// says. It is swept by the same two pane roles as the watches, and refused
+    /// mid-close for the same arm-after-cancel reason.
+    #[test]
+    fn commission_ledger_is_swept_by_either_panes_close_and_refuses_mid_close() {
+        let reg = AgentPtyRegistry::new();
+        assert!(reg.arm_delegation_commission("worker-a", "orch-1"));
+        assert!(reg.arm_delegation_commission("worker-b", "orch-2"));
+
+        // Closing the ORCHESTRATOR clears what was owed to it; an unrelated
+        // orchestration's commission survives.
+        drop(reg.begin_pane_close("orch-1"));
+        assert_eq!(
+            reg.retire_delegation_commission("worker-a"),
+            WorkDoneProvenance::Unsolicited,
+            "a commission owed to a closed orchestrator must not survive it"
+        );
+        assert_eq!(
+            reg.retire_delegation_commission("worker-b"),
+            WorkDoneProvenance::Solicited { remaining: 0 },
+            "another orchestration's commission must be untouched by the close"
+        );
+
+        // Arming is refused while either pane is mid-close, as worker or as
+        // orchestrator: a phantom commission would launder a later unsolicited
+        // completion into a solicited one.
+        assert!(reg.is_pane_closing("orch-1"));
+        assert!(
+            !reg.arm_delegation_commission("worker-a", "orch-1"),
+            "a closing orchestrator must not accept new commissions"
+        );
+        assert!(reg.arm_delegation_commission("worker-a", "orch-live"));
+        drop(reg.begin_pane_close("worker-a"));
+        assert!(
+            !reg.arm_delegation_commission("worker-a", "orch-live"),
+            "a closing worker must not accept new commissions"
+        );
+        assert_eq!(
+            reg.retire_delegation_commission("worker-a"),
+            WorkDoneProvenance::Unsolicited,
+            "the worker's own close swept its ledger entry too"
+        );
     }
 
     /// PRD #249 round-6 review (Greptile): the M1 readiness buffer must be able
