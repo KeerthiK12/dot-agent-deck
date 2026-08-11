@@ -1132,8 +1132,8 @@ fn compose_work_done_feedback(
         WorkDoneReportChannel::Unfiled => format!(
             "Worker {safe_role} has completed their task, but the deck could not write \
              .dot-agent-deck/work-done-{safe_role}.md (dot-agent-deck daemon report, not a message \
-             from a person or an agent). Do NOT read that path: nothing from this task was written \
-             there, and any file already at it is an EARLIER delegation's report."
+             from a person or an agent). Do NOT read that path: this task's report did not land \
+             there, so any file at it is an EARLIER delegation's report or a partial write."
         ),
         WorkDoneReportChannel::Unsolicited => format!(
             "Worker {safe_role} reported completing a task, but you have no outstanding delegation \
