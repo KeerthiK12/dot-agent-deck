@@ -2456,6 +2456,38 @@ impl AgentPtyRegistry {
         WorkDoneProvenance::Solicited { remaining }
     }
 
+    /// Issue #448 review (finding 1): release ONE commission armed for
+    /// `worker_pane_id` because the delegate that armed it never reached the
+    /// worker. Returns whether an entry was found to release.
+    ///
+    /// The ledger's counterpart to [`Self::cancel_silence_watch_if`], and it
+    /// exists for the same reason: the commission is armed in the synchronous
+    /// fan-out, BEFORE the guarded send that may then refuse. Without it, a
+    /// delegate that was never delivered leaves a debt standing forever — a
+    /// worker owing a completion for work it was never given — and a later,
+    /// genuinely uncommissioned `work-done` spends that phantom entry and is
+    /// reported as `Solicited`. That is #448 and its summary-file clobber,
+    /// reproduced through the very ledger added to prevent them.
+    ///
+    /// DECREMENTS rather than removing the entry: two delegations may be
+    /// outstanding to one worker and only one of them failed, so dropping the
+    /// whole entry would discard a sibling delegation's genuine commission and
+    /// mislabel ITS completion as unsolicited. Saturating for the same
+    /// defense-in-depth reason as [`Self::retire_delegation_commission`], and
+    /// the entry is removed as it reaches zero so the map keeps tracking live
+    /// debt rather than every pane ever delegated to.
+    pub fn release_delegation_commission(&self, worker_pane_id: &str) -> bool {
+        let mut tracker = self.delegations.lock().unwrap();
+        let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
+            return false;
+        };
+        entry.outstanding = entry.outstanding.saturating_sub(1);
+        if entry.outstanding == 0 {
+            tracker.commissions.remove(worker_pane_id);
+        }
+        true
+    }
+
     /// PRD #249 M3 review (finding B4): a `work-done` arrived from
     /// `worker_pane_id`, so ONE silent-worker watch is resolved — a completion is
     /// positive proof the pointer landed, and `work-done` is a CLI signal rather
@@ -7597,6 +7629,46 @@ mod spawn_tests {
             reg.retire_delegation_commission("worker"),
             WorkDoneProvenance::Unsolicited,
             "a third completion is answering nothing — the defect in #448"
+        );
+    }
+
+    /// Issue #448 review (finding 1): a delegate whose task pointer never
+    /// reached the worker owes nothing, so its commission is released rather
+    /// than left standing for a later uncommissioned completion to spend. It
+    /// releases exactly ONE, so a sibling delegation that DID land still gets
+    /// its completion credited.
+    #[test]
+    fn commission_ledger_releases_an_undelivered_delegations_commission() {
+        let reg = AgentPtyRegistry::new();
+        assert!(
+            !reg.release_delegation_commission("worker"),
+            "there is nothing to release for a worker nobody delegated to"
+        );
+
+        // One delegate, undelivered: the ledger must not keep the debt.
+        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.release_delegation_commission("worker"));
+        assert_eq!(
+            reg.retire_delegation_commission("worker"),
+            WorkDoneProvenance::Unsolicited,
+            "a failed delegate must not leave a phantom commission for a later \
+             uncommissioned work-done to spend — that is #448 through its own fix"
+        );
+
+        // Two delegates, only the second undelivered: the first is still owed.
+        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.release_delegation_commission("worker"));
+        assert_eq!(
+            reg.retire_delegation_commission("worker"),
+            WorkDoneProvenance::Solicited { remaining: 0 },
+            "releasing one failed delegate must not discard a sibling delegation's \
+             genuine commission"
+        );
+        assert_eq!(
+            reg.retire_delegation_commission("worker"),
+            WorkDoneProvenance::Unsolicited,
+            "and only the one that landed is credited"
         );
     }
 

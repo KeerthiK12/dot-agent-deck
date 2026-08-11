@@ -2648,6 +2648,28 @@ async fn dispatch_one_owned(
             false
         }
     };
+    // Issue #448 review (finding 1): the delegate never reached the worker, so
+    // the orchestrator is owed no completion from it. Release the commission
+    // armed for this target in the synchronous fan-out, or it outlives the
+    // failed delegate and a later, genuinely uncommissioned `work-done` spends
+    // it — arriving as `Solicited` and clobbering the summary file, which is
+    // exactly the pair of defects the ledger was added to prevent.
+    //
+    // Released HERE, above the `silence` destructuring, and deliberately not
+    // beside the `cancel_silence_watch_if` below it: `silence` is `None`
+    // whenever `delegate_no_event_window` is off (or `arm_silence_watch`
+    // refused mid-close), so the early return above would skip the release on
+    // precisely the projects that disabled that watch. Making the ledger's
+    // correctness depend on a switchable detector is the shape of the original
+    // #448 defect; the commission is armed independently of both watches and
+    // must be released independently of them too.
+    if !delivered && registry.release_delegation_commission(&pane_id) {
+        tracing::debug!(
+            pane_id = %pane_id,
+            role = %target_role,
+            "delegate: released the commission for an undelivered task pointer"
+        );
+    }
     let Some((watch, armed, rx)) = silence else {
         return;
     };
