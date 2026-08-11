@@ -1134,12 +1134,33 @@ async fn run_shell_activity_monitor_with<S, F>(
     // So the timeout bounds the WAIT, not the child: on expiry the in-flight
     // future is retained here and re-awaited on the next tick, which keeps the
     // hard invariant that **at most one `ps` child exists at a time**. A sample
-    // that eventually answers is classified against the tick that receives it
-    // (candidates are re-resolved every tick, so they are current; the table may
-    // be as old as the sample, which is the correct trade — a late answer about
-    // a live pane still beats no answer). A sample that answers `None` is
-    // dropped, so the next tick starts fresh.
-    let mut inflight: Option<std::pin::Pin<Box<F>>> = None;
+    // that answers `None` is dropped, so the next tick starts fresh.
+    //
+    // Retention is unconditional — including on a tick with no candidates, which
+    // does not poll it. Dropping it there would look tidier but reopens the
+    // accumulation path above through pane churn (close to zero, reopen, and a
+    // second `ps` joins the first undead one), and #493 already guarantees a
+    // paneless daemon starts no sample at all. The residual is one retained
+    // child, which is the same child we would be waiting on anyway.
+    //
+    // The `Instant` is the sample's START, and it is what makes retention safe
+    // (#500 review, round 2). A retained sample's table describes the machine as
+    // it was when `ps` began, so a sample that finally answers after an arbitrary
+    // gap — a wedge that outlasts every pane, then a new pane opening — would
+    // classify TODAY's pids against a table from before they existed. Almost
+    // always that is harmless (`descendant_shell_activity` returns `None` for a
+    // pid the table lacks, so the pane is skipped), but under pid reuse a new
+    // pane inherits a dead process's descendants and, because `last_known` has no
+    // entry for it yet, that wrong reading emits immediately. So a table older
+    // than `MAX_TABLE_AGE` is discarded rather than trusted.
+    let mut inflight: Option<(tokio::time::Instant, std::pin::Pin<Box<F>>)> = None;
+    // How old a sample's table may be and still be worth classifying against.
+    // A healthy sample answers in ~49ms and a heavily loaded one in a few
+    // hundred, so this never trips in normal operation; it exists purely to stop
+    // a long-overrunning sample's answer from being applied to a machine that has
+    // moved on. Discarding an ANSWERED sample is free — that child is already
+    // finished, so unlike abandoning an un-answered one it cannot accumulate.
+    const MAX_TABLE_AGE: Duration = Duration::from_secs(3);
     // Whether the in-flight sample has already been reported as overrunning, so
     // a permanently-wedged `ps` logs once rather than every 2.5s forever.
     let mut inflight_reported = false;
@@ -1179,15 +1200,32 @@ async fn run_shell_activity_monitor_with<S, F>(
             // Resume the sample already in flight, or start the tick's own. Only
             // ever one of the two, which is what bounds the `ps` children to one
             // — see `inflight`'s declaration.
-            let mut pending = match inflight.take() {
-                Some(pending) => pending,
+            let (started, mut pending) = match inflight.take() {
+                Some(resumed) => resumed,
                 None => {
                     inflight_reported = false;
-                    Box::pin(sample())
+                    (tokio::time::Instant::now(), Box::pin(sample()))
                 }
             };
             match tokio::time::timeout(SAMPLE_TIMEOUT, pending.as_mut()).await {
-                Ok(Some(table)) => AgentPtyRegistry::classify_shell_activity(&candidates, &table),
+                Ok(Some(table)) => {
+                    // See `MAX_TABLE_AGE`: a sample that answered this late
+                    // describes a machine that has since moved on, and under pid
+                    // reuse would attribute a dead process's descendants to a
+                    // pane that did not exist when it was taken. No opinion.
+                    let age = started.elapsed();
+                    if age > MAX_TABLE_AGE {
+                        warn!(
+                            age_ms = age.as_millis(),
+                            max_age_ms = MAX_TABLE_AGE.as_millis(),
+                            "shell-activity: discarding a process-table sample that answered too \
+                             late to trust; leaving every pane's status alone (classifying current \
+                             pids against a stale table can misattribute a reused pid)"
+                        );
+                        continue;
+                    }
+                    AgentPtyRegistry::classify_shell_activity(&candidates, &table)
+                }
                 // ── The load-bearing decision of issue #429 ──
                 //
                 // BOTH arms below mean "no opinion", and neither may become
@@ -1228,7 +1266,7 @@ async fn run_shell_activity_monitor_with<S, F>(
                              would only pile up unkillable children)"
                         );
                     }
-                    inflight = Some(pending);
+                    inflight = Some((started, pending));
                     continue;
                 }
             }
@@ -2332,6 +2370,122 @@ mod hook_ingestion_tests {
             1,
             "an overrunning sample must be re-awaited, not abandoned and replaced — \
              starting a fresh `ps` per tick piles up unkillable D-state children"
+        );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PR #500 review, round 2. Because an overrunning sample is
+    /// retained rather than abandoned, it can answer arbitrarily late — after a
+    /// wedge that outlasted every pane, with a new pane since opened. Its table
+    /// then describes a machine that no longer exists, and under pid reuse a new
+    /// pane would inherit a dead process's descendants; since `last_known` has no
+    /// entry for a new pane, that wrong reading emits immediately.
+    ///
+    /// So: spawn a real `/bin/sh` pane whose session reads `Idle`, and hand the
+    /// monitor a sampler that answers only after 4s (past `MAX_TABLE_AGE`) with a
+    /// table that says this very pane is busy. The stale answer must be discarded
+    /// — the session stays `Idle` and nothing is broadcast. A monitor that trusted
+    /// it would promote the pane to `Working` off a table it should not believe.
+    #[tokio::test]
+    async fn shell_activity_monitor_discards_a_sample_that_answers_too_late_to_trust() {
+        const PANE: &str = "pane-500-stale";
+        const SESSION: &str = "sess-500-stale";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+        let shell_pid = registry
+            .child_pid(&agent_id)
+            .expect("spawned agent must expose a pid") as i32;
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        state.write().await.apply_event(AgentEvent {
+            session_id: SESSION.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: crate::event::EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(PANE.to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        assert_eq!(
+            state.read().await.sessions[SESSION].status,
+            crate::state::SessionStatus::Idle,
+            "precondition: the pane starts Idle, so a wrongly-trusted busy table would show"
+        );
+
+        // A table that WOULD classify this pane as busy: the pane's own shell as
+        // session leader, plus a descendant in a session of its own. The pane
+        // carries no agent kind, so no argv shape applies and the structural test
+        // stands alone — this is unambiguously `Some(true)`.
+        let busy_table = vec![
+            crate::platform::proc::ProcessInfo {
+                pid: shell_pid,
+                ppid: 1,
+                session_id: shell_pid,
+                has_controlling_tty: true,
+                session_leader: true,
+                argv: "/bin/sh".to_string(),
+            },
+            crate::platform::proc::ProcessInfo {
+                pid: shell_pid + 1,
+                ppid: shell_pid,
+                session_id: shell_pid + 1,
+                has_controlling_tty: false,
+                session_leader: true,
+                argv: "detached-thing".to_string(),
+            },
+        ];
+
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            async move {
+                run_shell_activity_monitor_with(registry, state, event_tx, move || {
+                    let busy_table = busy_table.clone();
+                    async move {
+                        // Answers eventually, but far past MAX_TABLE_AGE — the
+                        // late-wedge-recovery shape, compressed.
+                        tokio::time::sleep(Duration::from_secs(4)).await;
+                        Some(busy_table)
+                    }
+                })
+                .await
+            }
+        });
+
+        // Past the 500ms interval + the sampler's 4s, with margin, so the stale
+        // answer has definitely been received and judged.
+        tokio::time::sleep(Duration::from_millis(5_200)).await;
+
+        assert_eq!(
+            state.read().await.sessions[SESSION].status,
+            crate::state::SessionStatus::Idle,
+            "a sample that answered past MAX_TABLE_AGE describes a machine that has \
+             moved on and must be discarded, not applied — trusting it attributes a \
+             stale table's descendants to today's pids"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "and nothing may be broadcast off a table that was not trusted"
         );
 
         monitor_handle.abort();
