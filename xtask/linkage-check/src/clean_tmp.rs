@@ -1372,6 +1372,21 @@ mod tests {
         }
     }
 
+    /// Two absolute paths that satisfy [`parse_args`]'s `is_absolute()` check on
+    /// the host platform. `is_absolute()` is platform-specific — a leading `/`
+    /// is absolute on Unix but NOT on Windows, which requires a drive prefix —
+    /// so a Unix-only literal here fails the very validation the test is
+    /// exercising, on Windows only (issue #511). Nothing touches the
+    /// filesystem; these directories need not exist.
+    #[cfg(windows)]
+    const SCRATCH_ONE: &str = r"C:\scratch\one";
+    #[cfg(windows)]
+    const SCRATCH_TWO: &str = r"C:\scratch\two";
+    #[cfg(not(windows))]
+    const SCRATCH_ONE: &str = "/scratch/one";
+    #[cfg(not(windows))]
+    const SCRATCH_TWO: &str = "/scratch/two";
+
     /// `--root` replaces the standard set rather than adding to it, so a
     /// deliberate scan of one directory cannot quietly also delete from
     /// `/var/tmp` or the system temp dir.
@@ -1379,15 +1394,15 @@ mod tests {
     fn explicit_roots_replace_the_standard_set() {
         let (_opts, roots) = parse_args(&[
             "--root".to_string(),
-            "/scratch/one".to_string(),
+            SCRATCH_ONE.to_string(),
             "--root".to_string(),
-            "/scratch/two".to_string(),
+            SCRATCH_TWO.to_string(),
         ])
         .expect("parse")
         .expect("options");
         assert_eq!(
             roots,
-            vec![PathBuf::from("/scratch/one"), PathBuf::from("/scratch/two")],
+            vec![PathBuf::from(SCRATCH_ONE), PathBuf::from(SCRATCH_TWO)],
         );
         assert!(
             parse_args(&[])
