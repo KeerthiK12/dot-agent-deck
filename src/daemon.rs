@@ -1073,37 +1073,119 @@ async fn run_shell_activity_monitor(
     state: SharedState,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) {
+    run_shell_activity_monitor_with(pty_registry, state, event_tx, || {
+        crate::platform::proc::process_table_async()
+    })
+    .await
+}
+
+/// [`run_shell_activity_monitor`] with the process-table sample injected, so the
+/// two decisions that are *about* sampling can be tested without a wedged
+/// filesystem or an empty machine (issues #493 and #429): that no sample is
+/// taken at all when there is no live pane, and that a sample which blows its
+/// deadline leaves every pane's status alone.
+///
+/// `sample` is deliberately **not** given the timeout — the deadline is applied
+/// here, around whatever the sampler returns, so a test sampler that never
+/// completes exercises the real timeout path rather than a stubbed one.
+async fn run_shell_activity_monitor_with<S, F>(
+    pty_registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    sample: S,
+) where
+    S: Fn() -> F,
+    F: std::future::Future<Output = Option<Vec<crate::platform::proc::ProcessInfo>>>,
+{
     // PRD #370 Open Question (poll cadence): 500ms is a first-cut balance
     // between feeling responsive and negligible overhead (one registry lock
     // + one `ps -A` sample per tick, reused across every live pane, plus a
     // `getsid` per row). PRD #386 M5 is where that cost gets measured and the
     // cadence confirmed or revised; left unchanged here deliberately, so M5
     // measures the shape that actually shipped.
+    //
+    // Issue #493 measured the sample it pays for: ~49ms of wall time per `ps -A`
+    // on an idle 16-core Linux box with ~620 processes (release build), i.e.
+    // ~10% of one core at 2Hz — of which only ~1.4ms is this process's own CPU
+    // (the `getsid` loop plus parsing); the rest is the `ps` child and waiting
+    // on it. That is the number M5 wants for the Route A vs. Route B (native
+    // enumeration) question, and it is why skipping the sample when no pane
+    // needs it is worth the guard below rather than merely tidy.
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
+    // Issue #429: an upper bound on ONE sample. Generous next to the ~49ms a
+    // healthy `ps -A` takes, so ordinary load never trips it, while still
+    // bounding the tick — the loop awaits the sample, so this also
+    // self-throttles the cadence to at worst POLL_INTERVAL + this rather than
+    // letting samples pile up.
+    const SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
     let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
         // PRD #386 M3: the CATALOG of measured shapes, not a set applied to
-        // every pane — `shell_foreground_busy_snapshot` selects from it per
-        // pane by agent kind, so a Claude pane gets the one shape measured
-        // against Claude Code and an agent whose shell-tool shape has never
-        // been measured gets none (structural session-id test alone). Passing
+        // every pane — `shell_activity_candidates` selects from it per pane by
+        // agent kind, so a Claude pane gets the one shape measured against
+        // Claude Code and an agent whose shell-tool shape has never been
+        // measured gets none (structural session-id test alone). Passing
         // Claude's fingerprint to a Codex/OpenCode/Pi pane would veto a
         // genuinely detached descendant and leave the pane silently reading
         // `Idle`.
-        // A failed `ps` sample (`None`) is distinct from a succeeding sample
-        // that legitimately found no panes (`Some(vec![])`) — see
-        // `shell_foreground_busy_snapshot`'s doc comment. Collapsing the two
-        // would `retain` every entry out of `last_known` below, then make
-        // every pane look new on the next good sample and re-emit a spurious
-        // ShellBusy/ShellIdle edge for each one. So on a failed sample, skip
-        // the whole tick: leave `last_known` untouched and emit nothing.
-        let Some(snapshot) = pty_registry
-            .shell_foreground_busy_snapshot(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES)
-        else {
-            continue;
+        //
+        // Issue #493: resolve WHO there is to classify before sampling the
+        // machine. This lock-only pass is what makes the `ps` fork conditional
+        // — it used to be unconditional and first, so a daemon with zero panes
+        // forked `ps -A` twice a second to classify nobody, and the daemon's
+        // idle shutdown does not bound that (it needs no clients AND no agents,
+        // so a TUI attached with no panes polled forever). The candidates are
+        // owned, so the registry lock is already released here and the sample
+        // below still never runs under it.
+        let candidates = pty_registry
+            .shell_activity_candidates(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES);
+
+        let snapshot = if candidates.is_empty() {
+            // No pane, so no sample — and an empty reading rather than a
+            // skipped tick, because "there are no panes" is a fact we just
+            // established under the lock, not a failure to observe. Falling
+            // through with an empty snapshot lets the `retain` below clear
+            // `last_known`, which is what makes a later reuse of the same pane
+            // id start edge-detection from a clean slate.
+            Vec::new()
+        } else {
+            match tokio::time::timeout(SAMPLE_TIMEOUT, sample()).await {
+                Ok(Some(table)) => AgentPtyRegistry::classify_shell_activity(&candidates, &table),
+                // ── The load-bearing decision of issue #429 ──
+                //
+                // BOTH arms below mean "no opinion", and neither may become
+                // `Some(false)`.
+                //
+                // `descendant_shell_activity` draws that distinction on purpose
+                // and callers are documented to treat `None` as "leave the
+                // pane's status alone". A timed-out sample is a statement about
+                // `ps`, not about the pane: if a `ps` wedges in D-state on a
+                // stuck filesystem, every pane is still exactly as busy as it
+                // was a moment ago. Collapsing the timeout to "not busy" would
+                // synthesize a `ShellIdle` for every pane the deck is running
+                // and silently flip them all to `Idle` — which is precisely the
+                // stale-`Idle` bug PRD #386 exists to fix, reintroduced with a
+                // new trigger and no log line to find it by.
+                //
+                // So skip the whole tick: `last_known` is left untouched (a
+                // `retain` against an empty snapshot would make every pane look
+                // new next tick and re-emit a spurious edge for each one) and
+                // nothing is emitted. The reading simply resumes on the next
+                // sample that answers.
+                Ok(None) => continue,
+                Err(_elapsed) => {
+                    warn!(
+                        timeout_ms = SAMPLE_TIMEOUT.as_millis(),
+                        panes = candidates.len(),
+                        "shell-activity: process-table sample timed out; leaving every pane's \
+                         status alone this tick (a wedged `ps` says nothing about the panes)"
+                    );
+                    continue;
+                }
+            }
         };
         let seen: std::collections::HashSet<&str> = snapshot
             .iter()
@@ -2030,6 +2112,164 @@ mod hook_ingestion_tests {
         assert!(
             saw_busy,
             "the monitor must broadcast a ShellBusy while the detached child runs"
+        );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: issue #493. Run the real shell-activity monitor against an
+    /// EMPTY registry — no panes at all, the state a daemon sits in whenever a
+    /// TUI is attached with nothing open — with the process-table sample
+    /// replaced by a counting stub, and let it tick several times. The sampler
+    /// must never be called: with nobody to classify there is nothing a process
+    /// table could say, so the `ps -A` fork (plus its `getsid` per row) must not
+    /// happen at all. Before the fix `process_table()` was the FIRST statement
+    /// of the snapshot, so this same run forked `ps` twice a second forever —
+    /// the daemon's idle shutdown does not bound it, since that requires no
+    /// clients *and* no agents.
+    #[tokio::test]
+    async fn shell_activity_monitor_never_samples_the_process_table_with_no_live_panes() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "precondition: the registry must be empty, so there is no candidate pane"
+        );
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        let samples = Arc::new(AtomicUsize::new(0));
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let samples = samples.clone();
+            async move {
+                run_shell_activity_monitor_with(registry, state, event_tx, move || {
+                    let samples = samples.clone();
+                    async move {
+                        samples.fetch_add(1, AtomicOrdering::SeqCst);
+                        None
+                    }
+                })
+                .await
+            }
+        });
+
+        // Comfortably more than four 500ms poll intervals, so a monitor that
+        // samples unconditionally would have done so several times over.
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+        assert_eq!(
+            samples.load(AtomicOrdering::SeqCst),
+            0,
+            "the monitor must not sample the process table when no live pane exists — \
+             every sample here is a `ps -A` fork spent classifying nobody"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "and with no panes there is nothing to emit either"
+        );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+    }
+
+    /// Scenario: issue #429's load-bearing decision. Spawn a real `/bin/sh`
+    /// pane, seed it a hook session and drive that session to `Working`, then
+    /// run the real shell-activity monitor with a process-table sample that
+    /// NEVER completes — a `ps` wedged in D-state on a stuck filesystem. The
+    /// monitor's own timeout must fire and be treated as "no opinion": the
+    /// session stays `Working` and no event is broadcast at all. A timeout
+    /// collapsed to `Some(false)` would instead synthesize a `ShellIdle` for
+    /// every pane the deck is running and silently flip them all to `Idle` —
+    /// the exact stale-`Idle` bug PRD #386 exists to fix.
+    #[tokio::test]
+    async fn shell_activity_monitor_leaves_statuses_alone_when_the_sample_times_out() {
+        const PANE: &str = "pane-429";
+        const SESSION: &str = "sess-429";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        let event = |event_type: crate::event::EventType| AgentEvent {
+            session_id: SESSION.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(PANE.to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+        // `SessionStart` creates the card (and the `pane_hook_session_id`
+        // correlation the monitor needs); `ShellBusy` promotes it to `Working`,
+        // which is the status a wrongly-collapsed timeout would knock down.
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::SessionStart));
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::ShellBusy));
+        assert_eq!(
+            state.read().await.sessions[SESSION].status,
+            crate::state::SessionStatus::Working,
+            "precondition: the pane must start out reading Working, so a spurious \
+             ShellIdle would be visible"
+        );
+
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            async move {
+                run_shell_activity_monitor_with(registry, state, event_tx, || {
+                    // The wedged `ps`: a sample that never answers. The
+                    // monitor's SAMPLE_TIMEOUT is what has to end this tick.
+                    std::future::pending::<Option<Vec<crate::platform::proc::ProcessInfo>>>()
+                })
+                .await
+            }
+        });
+
+        // One 500ms poll interval plus the monitor's 2s sample deadline, with
+        // margin — long enough for the timeout to fire at least once.
+        tokio::time::sleep(Duration::from_millis(3_200)).await;
+
+        assert_eq!(
+            state.read().await.sessions[SESSION].status,
+            crate::state::SessionStatus::Working,
+            "a timed-out process-table sample says nothing about the pane, so the \
+             status must be left exactly as it was — collapsing the timeout to \
+             \"not busy\" is what silently flips every busy pane to Idle"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "and no ShellIdle (or any other event) may be synthesized from a sample \
+             that never answered"
         );
 
         monitor_handle.abort();
