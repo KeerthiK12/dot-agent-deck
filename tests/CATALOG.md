@@ -2274,6 +2274,13 @@ without depending on the config struct API.
 - **Does not assert:** the no-cwd and mkdir-only variants of the same failure (unit-tested on `write_work_done_summary`); the stale-file READ itself (the pointer's absence is what makes it unreachable); recovery of the file on a later delegation.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
+##### orchestration/work-done/004 — On the REAL binary, an unsolicited `work-done` renders its label and the worker's framed report in the attached TUI's orchestration surface, with no pointer to a file that was never written (issues #448 + #433).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, with its lazy daemon; the completion is issued by running the REAL `dot-agent-deck work-done` CLI against the deck's own hook socket, so the spawned-binary → hook-socket → daemon → rendered-pane boundary is covered end to end). Synthetic (`cat` roles, no LLM), so deliberately NOT demo-reel-marked.
+- **Agent:** none (the `orch-deck` fixture's two `cat` roles: `orchestrator` start + `worker`). Both delegation watches are switched off via the millisecond seams so no detector competes for the surface under assertion.
+- **Asserts:** with the orchestration opened through the production new-pane flow and NOTHING delegated, the real `work-done` CLI exits 0 and the rendered orchestration surface visibly carries the daemon's unsolicited label (`you have no outstanding delegation to that worker`) plus its provenance clause, and the worker's own report inside `[UNTRUSTED-WORKER-REPORT: … ]` (sentinel `e2e-unsolicited-report-4b7d`); the happy-path pointer (`Read .dot-agent-deck/work-done-worker.md …`) is ABSENT; and no `work-done-worker.md` exists on disk. Needles are matched with whitespace squeezed out of both sides, because a long daemon-injected line wraps at whatever column a role pane happens to be — the failure mode `scheduler/idle-worker/011` demonstrates.
+- **Does not assert:** the failed-summary-write branch (deterministic only by sabotaging the coordination path, so it stays fast-tier as `orchestration/work-done/003`); the commission ledger's arithmetic (unit-tested); a real agent reading and acting on the label (an LLM decision, not a rendering fact).
+- **Platform coverage:** mac+linux (unix-only PTY/UDS).
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
