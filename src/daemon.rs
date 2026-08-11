@@ -1153,7 +1153,16 @@ async fn run_shell_activity_monitor_with<S, F>(
     // pane inherits a dead process's descendants and, because `last_known` has no
     // entry for it yet, that wrong reading emits immediately. So a table older
     // than `MAX_TABLE_AGE` is discarded rather than trusted.
-    let mut inflight: Option<(tokio::time::Instant, std::pin::Pin<Box<F>>)> = None;
+    // Carries the candidate set as it was when the sample STARTED alongside it,
+    // so a late answer can be checked against the panes it could actually have
+    // observed rather than against whatever is open when it lands — see the
+    // `was_resumed` branch below.
+    #[allow(clippy::type_complexity)]
+    let mut inflight: Option<(
+        tokio::time::Instant,
+        Vec<crate::agent_pty::ShellActivityCandidate>,
+        std::pin::Pin<Box<F>>,
+    )> = None;
     // How old a sample's table may be and still be worth classifying against.
     // A healthy sample answers in ~49ms and a heavily loaded one in a few
     // hundred, so this never trips in normal operation; it exists purely to stop
@@ -1200,19 +1209,23 @@ async fn run_shell_activity_monitor_with<S, F>(
             // Resume the sample already in flight, or start the tick's own. Only
             // ever one of the two, which is what bounds the `ps` children to one
             // — see `inflight`'s declaration.
-            let (started, mut pending) = match inflight.take() {
+            let resumed = inflight.take();
+            let was_resumed = resumed.is_some();
+            let (started, at_start, mut pending) = match resumed {
                 Some(resumed) => resumed,
                 None => {
                     inflight_reported = false;
-                    (tokio::time::Instant::now(), Box::pin(sample()))
+                    (
+                        tokio::time::Instant::now(),
+                        candidates.clone(),
+                        Box::pin(sample()),
+                    )
                 }
             };
             match tokio::time::timeout(SAMPLE_TIMEOUT, pending.as_mut()).await {
                 Ok(Some(table)) => {
                     // See `MAX_TABLE_AGE`: a sample that answered this late
-                    // describes a machine that has since moved on, and under pid
-                    // reuse would attribute a dead process's descendants to a
-                    // pane that did not exist when it was taken. No opinion.
+                    // describes a machine that has since moved on. No opinion.
                     let age = started.elapsed();
                     if age > MAX_TABLE_AGE {
                         warn!(
@@ -1224,7 +1237,43 @@ async fn run_shell_activity_monitor_with<S, F>(
                         );
                         continue;
                     }
-                    AgentPtyRegistry::classify_shell_activity(&candidates, &table)
+                    if was_resumed {
+                        // A retained sample's table was taken when `at_start`
+                        // was the truth, so a pid in it means what it meant
+                        // THEN. `MAX_TABLE_AGE` bounds how far back that is, but
+                        // a bound is not an identity check: a pane can be
+                        // replaced inside the window, and if its shell's pid is
+                        // reused the replacement would be classified by numeric
+                        // pid alone against the departed pane's descendants —
+                        // and since `last_known` has no entry for it, that wrong
+                        // reading emits at once (#500 review, round 3).
+                        //
+                        // So classify only panes whose IDENTITY is unchanged
+                        // since the sample began — same pane id AND same shell
+                        // pid. A respawn in the same slot keeps the pane id but
+                        // takes a new pid; a fresh pane brings a new pane id.
+                        // Either way the pair differs and the pane is left to
+                        // the next sample, which is the honest answer: this
+                        // table predates it and cannot describe it.
+                        //
+                        // Only on the resumed path. A sample started this tick
+                        // has `at_start == candidates` by construction, so the
+                        // filter would be a no-op — the common case pays
+                        // nothing.
+                        let unchanged: Vec<crate::agent_pty::ShellActivityCandidate> = candidates
+                            .iter()
+                            .filter(|current| {
+                                at_start.iter().any(|then| {
+                                    then.pane_id == current.pane_id
+                                        && then.shell_pid == current.shell_pid
+                                })
+                            })
+                            .cloned()
+                            .collect();
+                        AgentPtyRegistry::classify_shell_activity(&unchanged, &table)
+                    } else {
+                        AgentPtyRegistry::classify_shell_activity(&candidates, &table)
+                    }
                 }
                 // ── The load-bearing decision of issue #429 ──
                 //
@@ -1266,7 +1315,7 @@ async fn run_shell_activity_monitor_with<S, F>(
                              would only pile up unkillable children)"
                         );
                     }
-                    inflight = Some((started, pending));
+                    inflight = Some((started, at_start, pending));
                     continue;
                 }
             }
@@ -2491,6 +2540,195 @@ mod hook_ingestion_tests {
         monitor_handle.abort();
         let _ = monitor_handle.await;
         registry.shutdown_all();
+    }
+
+    /// Scenario: PR #500 review, round 3 — the residual inside `MAX_TABLE_AGE`.
+    /// A freshness bound is not an identity check: a pane can be replaced while a
+    /// retained sample is still in flight, and if the replacement's shell pid is a
+    /// reused one the table would classify it by numeric pid alone against the
+    /// DEPARTED pane's descendants.
+    ///
+    /// Real pid reuse cannot be forced in a test, so the same shape is built
+    /// directly: pane A is open when the sample starts, the sample overruns, and
+    /// pane B is spawned while it is still in flight. The table the sample
+    /// finally returns names **both** pids as busy — B's row standing in for what
+    /// a reused pid would look like. A (unchanged since the sample began) must be
+    /// promoted to `Working`; B (which did not exist then) must stay `Idle`.
+    ///
+    /// Asserting on A is what makes this test honest rather than merely green.
+    /// The sample lands ~2.5s old, inside `MAX_TABLE_AGE` — but if anything
+    /// slowed the run enough to push it past that bound, the freshness guard
+    /// would swallow the whole answer and B would stay `Idle` for a reason having
+    /// nothing to do with identity matching. A reaching `Working` proves the
+    /// answer was accepted, so B staying `Idle` can only be the identity filter.
+    /// (Measured while writing this: an earlier version closed pane A here, and
+    /// `close_agent`'s SIGTERM grace window — `/bin/sh` ignores SIGTERM — blocked
+    /// the current-thread runtime long enough that the sample landed at 3.4s and
+    /// the test passed entirely via the freshness guard.)
+    #[tokio::test]
+    async fn shell_activity_monitor_ignores_a_pane_that_appeared_after_the_sample_started() {
+        const PANE_A: &str = "pane-500-a";
+        const PANE_B: &str = "pane-500-b";
+        const SESSION_A: &str = "sess-500-a";
+        const SESSION_B: &str = "sess-500-b";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_a = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_A.to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn pane A");
+        let pid_a = registry
+            .child_pid(&agent_a)
+            .expect("pane A must expose a pid") as i32;
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        let session_start = |session_id: &str, pane_id: &str| AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: crate::event::EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+        state
+            .write()
+            .await
+            .apply_event(session_start(SESSION_A, PANE_A));
+
+        // The table the sample will eventually return, filled in only once pane B
+        // exists — so it can name B's real pid, which is what a reused pid would
+        // look like to the classifier.
+        let late_table: Arc<std::sync::Mutex<Vec<crate::platform::proc::ProcessInfo>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let late_table = late_table.clone();
+            async move {
+                run_shell_activity_monitor_with(registry, state, event_tx, move || {
+                    let late_table = late_table.clone();
+                    async move {
+                        // Longer than SAMPLE_TIMEOUT (2s) so the sample is
+                        // RETAINED rather than answered on its first tick, and
+                        // ready by the resumed tick — which lands it ~2.5s old,
+                        // inside MAX_TABLE_AGE (3s). That is the window where the
+                        // freshness bound alone would let it through, so it is
+                        // the window the identity filter has to cover.
+                        tokio::time::sleep(Duration::from_millis(2_100)).await;
+                        Some(late_table.lock().unwrap().clone())
+                    }
+                })
+                .await
+            }
+        });
+
+        // Let the first tick resolve candidates (pane A only) and start the
+        // sample, then add pane B while that sample is still in flight.
+        // Deliberately no `close_agent` — see this test's doc comment.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let agent_b = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_B.to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn pane B");
+        let pid_b = registry
+            .child_pid(&agent_b)
+            .expect("pane B must expose a pid") as i32;
+        state
+            .write()
+            .await
+            .apply_event(session_start(SESSION_B, PANE_B));
+
+        // Both panes read busy in the table: a shell as session leader plus a
+        // descendant in a session of its own. Neither pane carries an agent kind,
+        // so no argv shape applies and the structural test stands alone.
+        let busy_pair = |pid: i32| {
+            [
+                crate::platform::proc::ProcessInfo {
+                    pid,
+                    ppid: 1,
+                    session_id: pid,
+                    has_controlling_tty: true,
+                    session_leader: true,
+                    argv: "/bin/sh".to_string(),
+                },
+                crate::platform::proc::ProcessInfo {
+                    pid: pid + 100_000,
+                    ppid: pid,
+                    session_id: pid + 100_000,
+                    has_controlling_tty: false,
+                    session_leader: true,
+                    argv: "detached-thing".to_string(),
+                },
+            ]
+        };
+        *late_table.lock().unwrap() = busy_pair(pid_a)
+            .into_iter()
+            .chain(busy_pair(pid_b))
+            .collect();
+
+        {
+            let guard = state.read().await;
+            assert_eq!(
+                guard.sessions[SESSION_A].status,
+                crate::state::SessionStatus::Idle,
+                "precondition: both panes start Idle"
+            );
+            assert_eq!(
+                guard.sessions[SESSION_B].status,
+                crate::state::SessionStatus::Idle,
+                "precondition: both panes start Idle"
+            );
+        }
+
+        // Past the resumed tick that receives the late answer.
+        tokio::time::sleep(Duration::from_millis(2_800)).await;
+
+        let (status_a, status_b) = {
+            let guard = state.read().await;
+            (
+                guard.sessions[SESSION_A].status.clone(),
+                guard.sessions[SESSION_B].status.clone(),
+            )
+        };
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        registry.shutdown_all();
+
+        assert_eq!(
+            status_a,
+            crate::state::SessionStatus::Working,
+            "pane A was already open when the sample started, so the sample's verdict \
+             about it is trustworthy and must be applied — this also proves the answer \
+             was ACCEPTED rather than swallowed by the freshness guard, without which \
+             pane B's assertion below would pass for the wrong reason"
+        );
+        assert_eq!(
+            status_b,
+            crate::state::SessionStatus::Idle,
+            "pane B did not exist when the sample started, so the pid naming it in that \
+             table cannot be known to be B's — which under pid reuse is exactly how a \
+             replacement pane inherits a departed one's descendants"
+        );
     }
 
     /// Scenario: PRD #201 native prompt delivery over the hook socket. Spawn a
