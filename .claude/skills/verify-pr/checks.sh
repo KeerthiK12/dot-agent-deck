@@ -177,7 +177,10 @@ if wanted test-fast; then
   elif [ "$have_nextest" != true ]; then
     record test-fast BLOCKED 0 - "cargo-nextest missing: enter 'devbox shell' or 'cargo install cargo-nextest --locked'"
   else
-    run_step test-fast "cargo nextest run${test_filter}" "rule 5 fast tier" || true
+    # `--workspace` (issue #489) mirrors the `test-fast` alias and CI. Without
+    # it cargo selects the root package alone and the `xtask/*` members' tests
+    # never run, so a reviewer's gate would be narrower than the author's.
+    run_step test-fast "cargo nextest run --workspace${test_filter}" "rule 5 fast tier" || true
   fi
 else
   skip test-fast "not in --only"
@@ -237,7 +240,9 @@ else
   # NORMALLY, so nextest counts them as PASSED. Without this flag nextest
   # suppresses passing tests' output and those skips are invisible — a green
   # e2e run that proved nothing. See `REQUIRE_REAL_E2E_ENV` in tests/common/mod.rs.
-  run_step e2e "cargo nextest run --features e2e --success-output=final${test_filter}" "rule 5 e2e tier" || true
+  # `--workspace` (issue #489): same reason as the test-fast step above — keep
+  # this in lockstep with the `test-e2e` alias in .cargo/config.toml.
+  run_step e2e "cargo nextest run --workspace --features e2e --success-output=final${test_filter}" "rule 5 e2e tier" || true
 
   e2e_log="${logs}/e2e.log"
   if [ -f "$e2e_log" ]; then
