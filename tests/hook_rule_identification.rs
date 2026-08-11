@@ -1,8 +1,12 @@
-//! Fork issue #229 — Claude Code hook rules are identified by an
+//! Claude Code hook rules used to be identified by an
 //! `.contains("dot-agent-deck")` substring check
 //! ([`dot_agent_deck::hooks_manage`]), so a deck binary installed under any
-//! other filename cannot see the rule it just wrote. Repeated auto-installs
-//! then accumulate one rule per startup instead of replacing the prior one.
+//! other filename could not see the rule it had just written. Repeated
+//! auto-installs then accumulated one rule per startup instead of replacing
+//! the prior one. Rules are now identified by their command shape (the
+//! `--agent claude-code` suffix) rather than by the binary's name, and a
+//! specific binary is matched against an existing rule by its resolved
+//! (canonicalized) on-disk identity, not a literal string comparison.
 //!
 //! These tests exercise `install_to` / `uninstall_from` — the same
 //! explicit-settings-path seam `codex_hooks_safety.rs` uses for the sibling
@@ -224,12 +228,11 @@ fn hook_rule_identification_005_unrelated_command_ending_in_hook_is_never_delete
 /// binary name (`dot-agent-deck`, pre-fix bare `<path> hook` form) must still be
 /// recognised and replaced by a fresh install — even when the fresh install's own
 /// binary name looks nothing like a deck binary at all. Recognition is keyed off
-/// the LEGACY RULE's own executable name, never off the installer's name: round 1
-/// required the installer to itself "look deck-ish" (contain a name fragment) to
-/// trigger migration, which is exactly what made it impossible to satisfy
-/// alongside `_003` (a genuinely different binary must NOT be swept up) — the two
-/// cases differed only by a coincidence of which fragment a test's binary path
-/// happened to contain, not by anything causal.
+/// the LEGACY RULE's own executable name, never off the installer's name — a
+/// predicate keyed off the installer's name instead cannot be satisfied alongside
+/// `_003` (a genuinely different binary must NOT be swept up): the two cases would
+/// differ only by a coincidence of which fragment a test's binary path happened to
+/// contain, not by anything causal.
 #[test]
 fn hook_rule_identification_006_legacy_rule_is_recognised_and_replaced() {
     let (_dir, path) = settings_path();
@@ -357,8 +360,8 @@ fn hook_rule_identification_009_historical_unquoted_spaced_rule_is_still_recogni
 }
 
 /// Scenario: `~/.local/bin/dot-agent-deck` symlinked to a real, differently-named
-/// `~/.local/bin/worker-agent-deck` binary — the exact real-machine case fork
-/// #229 exists for. Installing via each path in turn must resolve to the SAME
+/// `~/.local/bin/worker-agent-deck` binary — the exact real-machine case a renamed
+/// deck binary produces. Installing via each path in turn must resolve to the SAME
 /// deployment and leave exactly one rule. Every fixture elsewhere in this file
 /// is a fictional path, so `canonicalize` never succeeds against it and this
 /// symlink-resolution branch has never actually executed under this suite
@@ -430,12 +433,11 @@ fn hook_rule_identification_011_distinct_builds_sharing_basename_do_not_collapse
 /// Scenario: A user's own tool whose basename merely CONTAINS the substring
 /// "deck" (looser than the exact historical binary name `dot-agent-deck`)
 /// writes its own legacy-shaped `<path> hook` rule. Neither install nor
-/// uninstall may ever treat it as deck-owned. This is a mutation guard: fork
-/// #229's review found a fragment-based predicate (matching any basename
-/// containing `"deck"`, or containing `"agent-deck"`) passes every other test in
-/// this file, so this case exists specifically to fail if identification is
-/// ever loosened to a substring/fragment match instead of the exact compiled
-/// binary name.
+/// uninstall may ever treat it as deck-owned. This is a mutation guard: a
+/// fragment-based predicate (matching any basename containing `"deck"`, or
+/// containing `"agent-deck"`) passes every other test in this file, so this
+/// case exists specifically to fail if identification is ever loosened to a
+/// substring/fragment match instead of the exact compiled binary name.
 #[test]
 fn hook_rule_identification_012_fragment_match_mutation_guard() {
     let (_dir, path) = settings_path();
@@ -562,11 +564,11 @@ fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
 /// Scenario: A binary path containing `%` or `!` — both `cmd.exe`-special for
 /// variable expansion — must be double-quoted on Windows even though neither
 /// character trips the POSIX safe-set check and `~` (also present here, but
-/// NOT `cmd.exe`-special) does not force quoting on its own. Closes the gap
-/// fork issue #238 recorded: nothing exercised this arm of
-/// `shell_quote_if_needed`'s Windows safe set before now, and `cargo clippy`
-/// on a Unix box cannot even compile the `#[cfg(windows)]` arm — CI's
-/// `build-windows` job is the only thing that sees it.
+/// NOT `cmd.exe`-special) does not force quoting on its own. Closes a gap:
+/// nothing exercised this arm of `shell_quote_if_needed`'s Windows safe set
+/// before now, and `cargo clippy` on a Unix box cannot even compile the
+/// `#[cfg(windows)]` arm — CI's `build-windows` job is the only thing that
+/// sees it.
 #[cfg(windows)]
 #[test]
 fn hook_rule_identification_015_windows_percent_and_bang_are_quoted() {
@@ -596,15 +598,16 @@ fn hook_rule_identification_015_windows_percent_and_bang_are_quoted() {
 /// A hook rule written by a pre-fix Windows install, in the bare `<path> hook`
 /// legacy shape carrying the platform's real `.exe` suffix
 /// (`C:\Program Files\deck\dot-agent-deck.exe hook`), must still be recognised
-/// as a legacy deck rule on Windows. Review finding H2: `is_legacy_deck_rule`
-/// (`src/hooks_manage.rs:397`) compares a rule's basename against the literal
-/// `DEFAULT_BINARY_NAME` (`"dot-agent-deck"`, no `.exe`), which never matches
-/// a Windows basename — which always carries the extension. Today that means
-/// a fresh install appends a second rule beside the unrecognised legacy one
-/// instead of replacing it (the hook fires twice), and uninstall can never
-/// remove either. This is #229's own duplicate-rule / unremovable-rule
-/// symptom, reintroduced specifically on the platform the fix was meant to
-/// make safe.
+/// as a legacy deck rule on Windows. `is_legacy_deck_rule`
+/// (`src/hooks_manage.rs:417`) has to compare a rule's basename against the
+/// literal `DEFAULT_BINARY_NAME` (`"dot-agent-deck"`, no `.exe`) in an
+/// extension-aware way, since a Windows basename always carries the
+/// extension and would otherwise never match. Without that, a fresh install
+/// would append a second rule beside the unrecognised legacy one instead of
+/// replacing it (the hook firing twice), and uninstall would never be able
+/// to remove either — the same duplicate-rule / unremovable-rule symptom
+/// this fix addresses generally, reintroduced specifically on the platform
+/// it was meant to make safe.
 ///
 /// Scenario: Seed a legacy Windows rule whose command is a real `.exe` path in
 /// the historical bare `hook` form, install a fresh binary, and assert the
