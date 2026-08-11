@@ -1740,6 +1740,29 @@ fn shell_tool_shape_key(agent_type: Option<&AgentType>) -> Option<&'static str> 
     }
 }
 
+/// One live pane a shell-activity sample could classify, resolved under the
+/// registry lock by [`AgentPtyRegistry::shell_activity_candidates`] and then
+/// classified without it by [`AgentPtyRegistry::classify_shell_activity`].
+///
+/// Deliberately **owned and lock-free**: it exists so the "is there anything to
+/// classify?" question (issue #493) and the fork/exec that answers it can be
+/// separated, with the registry lock held for neither the sample nor the
+/// classification. Carrying the per-pane `shapes` rather than the whole catalog
+/// keeps PRD #386's Open Question 2 resolved in exactly one place — the pane's
+/// agent kind is only visible under the lock, so the selection has to happen
+/// here (see [`shell_tool_shape_key`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellActivityCandidate {
+    /// The pane's spawn-time `DOT_AGENT_DECK_PANE_ID`.
+    pub pane_id: String,
+    /// The pid of the pane's PTY child — the root of the descendant walk.
+    pub shell_pid: i32,
+    /// The argv cross-check shapes measured against *this* pane's agent kind.
+    /// Empty for every kind that has never been measured, which leaves the
+    /// structural session-id test standing alone.
+    pub shapes: Vec<crate::platform::proc::ShellToolShape>,
+}
+
 /// Snapshot of one daemon-side agent that the M2.x rehydration path needs.
 /// Carries the registry id plus the spawn-time `DOT_AGENT_DECK_PANE_ID`
 /// captured in [`RunningAgent::pane_id_env`], so the TUI can rebuild its
@@ -4098,41 +4121,114 @@ impl AgentPtyRegistry {
     /// every pane would be a silent false negative rather than a harmless
     /// belt-and-braces check.
     ///
-    /// The process table is sampled **once**, before the registry lock is taken
-    /// — one `ps -A` per tick reused for every pane (PRD #386 Route A), and no
-    /// fork/exec while holding a lock the TUI-facing paths also take.
+    /// The process table is sampled **once**, and never while the registry lock
+    /// is held — one `ps -A` per tick reused for every pane (PRD #386 Route A),
+    /// with no fork/exec under a lock the TUI-facing paths also take. Issue #493
+    /// moved the sample to *after* the lock (see
+    /// [`Self::shell_activity_candidates`]) so the ordering now also skips the
+    /// sample entirely when there is nothing to classify; the "no subprocess
+    /// while locked" property is preserved because the lock is released before
+    /// sampling, not because the sample comes first.
     ///
     /// Returns `None` when the `ps` sample itself failed
     /// ([`crate::platform::proc::process_table`] returned `None`) — distinct
-    /// from `Some(vec![])`, which means the sample succeeded and there are
-    /// genuinely no live panes to report on. A caller that collapsed the two
-    /// would treat a failed sample as "no panes", clearing whatever busy/idle
-    /// state it tracks and re-emitting a spurious edge for every pane on the
-    /// next good sample.
+    /// from `Some(vec![])`, which means there are genuinely no live panes to
+    /// report on. A caller that collapsed the two would treat a failed sample as
+    /// "no panes", clearing whatever busy/idle state it tracks and re-emitting a
+    /// spurious edge for every pane on the next good sample.
+    ///
+    /// This is the **synchronous** composition, kept as the unit-testable seam
+    /// (`status/shell-activity/004`) and for callers outside an async context.
+    /// The daemon's poll loop composes the same two primitives around an
+    /// `async`, timeout-bounded sample instead — see `run_shell_activity_monitor`
+    /// and issue #429 — because a synchronous `ps` on a Tokio worker stalls
+    /// every other daemon task while it runs.
     pub fn shell_foreground_busy_snapshot(
         &self,
         shapes: &[crate::platform::proc::ShellToolShape],
     ) -> Option<Vec<(String, bool)>> {
+        let candidates = self.shell_activity_candidates(shapes);
+        // Issue #493: no live pane to classify, so there is nothing a process
+        // table could tell us — return the empty reading WITHOUT sampling.
+        // `Some(vec![])` (not `None`) is the honest answer: nothing failed.
+        if candidates.is_empty() {
+            return Some(Vec::new());
+        }
         let table = crate::platform::proc::process_table()?;
+        Some(Self::classify_shell_activity(&candidates, &table))
+    }
+
+    /// The live panes a shell-activity sample could say something about, each
+    /// already paired with the argv shapes that apply to *its* agent kind
+    /// (PRD #386 M3 / issue #493).
+    ///
+    /// This is the **lock half** of the snapshot, split out so the caller can
+    /// answer "is there anything to classify?" *before* paying for a process
+    /// table. It is the whole fix for issue #493: `process_table()` used to be
+    /// the first statement of [`Self::shell_foreground_busy_snapshot`], so a
+    /// daemon with zero panes still forked `ps -A` twice a second (plus a
+    /// `getsid(2)` per row) to classify nobody — and the daemon's idle shutdown
+    /// does not bound that, since it requires no clients *and* no agents, so a
+    /// TUI attached with no panes open polled forever for no possible benefit.
+    ///
+    /// Every field is **owned**, so the registry lock is released the moment
+    /// this returns and the sample (a fork/exec) runs with no lock held — the
+    /// property the original sample-first ordering existed to guarantee, now
+    /// guaranteed by the drop instead. `shell_pid` is read here rather than at
+    /// classification time for the same reason: it is a plain field read on the
+    /// child handle, so it is safe under the lock, and resolving it early means
+    /// a pane whose pid is unavailable drops out before it can force a sample.
+    pub fn shell_activity_candidates(
+        &self,
+        shapes: &[crate::platform::proc::ShellToolShape],
+    ) -> Vec<ShellActivityCandidate> {
         let inner = self.inner.lock().unwrap();
-        Some(
-            inner
-                .agents
-                .values()
-                .filter(|agent| !agent.exited.load(Ordering::SeqCst))
-                .filter_map(|agent| {
-                    let pane_id = agent.pane_id_env.clone()?;
-                    let key = shell_tool_shape_key(agent.agent_type.as_ref());
-                    let for_pane: Vec<crate::platform::proc::ShellToolShape> = shapes
-                        .iter()
-                        .copied()
-                        .filter(|shape| Some(shape.agent) == key)
-                        .collect();
-                    let busy = agent.shell_activity_in(&table, &for_pane)?;
-                    Some((pane_id, busy))
+        inner
+            .agents
+            .values()
+            .filter(|agent| !agent.exited.load(Ordering::SeqCst))
+            .filter_map(|agent| {
+                let pane_id = agent.pane_id_env.clone()?;
+                let shell_pid = agent.child.process_id()? as i32;
+                let key = shell_tool_shape_key(agent.agent_type.as_ref());
+                let shapes = shapes
+                    .iter()
+                    .copied()
+                    .filter(|shape| Some(shape.agent) == key)
+                    .collect();
+                Some(ShellActivityCandidate {
+                    pane_id,
+                    shell_pid,
+                    shapes,
                 })
-                .collect(),
-        )
+            })
+            .collect()
+    }
+
+    /// The **classification half** of the snapshot: pure, lock-free work over a
+    /// table the caller already sampled (PRD #386 Route A — one sample reused
+    /// for every pane, and every pane in a tick classified against one
+    /// consistent sample).
+    ///
+    /// A candidate the table has no opinion about is *dropped* rather than
+    /// reported as idle — see
+    /// [`crate::platform::proc::descendant_shell_activity`] for why `None` must
+    /// never be folded into `Some(false)`.
+    pub fn classify_shell_activity(
+        candidates: &[ShellActivityCandidate],
+        table: &[crate::platform::proc::ProcessInfo],
+    ) -> Vec<(String, bool)> {
+        candidates
+            .iter()
+            .filter_map(|candidate| {
+                let busy = crate::platform::proc::descendant_shell_activity(
+                    table,
+                    candidate.shell_pid,
+                    &candidate.shapes,
+                )?;
+                Some((candidate.pane_id.clone(), busy))
+            })
+            .collect()
     }
 
     /// PRD #370 M2 test-only seam: `inner` is private (by design — every
@@ -4469,6 +4565,35 @@ mod tests {
 
     // PRD #42 M1: the `pid_to_pgid` boundary-check unit tests moved with the
     // function to `crate::platform::proc` (see `src/platform/proc/unix.rs`).
+
+    /// Issue #493 at the synchronous seam: an empty registry must answer
+    /// `Some(vec![])`, not `None`.
+    ///
+    /// Both halves matter. `Some` is the contract — `None` means "the sample
+    /// failed", and a caller that saw it here would skip the tick and never
+    /// clear its edge-detection map, so a reused pane id would inherit a stale
+    /// busy/idle reading (the daemon's monitor depends on exactly this
+    /// distinction). And the empty candidate list is what makes the answer
+    /// reachable *without* sampling: `process_table()` used to be the first
+    /// statement here, which is what made a paneless daemon fork `ps -A` at 2Hz
+    /// forever. `shell_activity_candidates` is asserted directly because it is
+    /// the guard the early return is keyed off.
+    #[test]
+    fn an_empty_registry_reports_no_shell_activity_without_sampling() {
+        let registry = AgentPtyRegistry::new();
+        assert!(
+            registry
+                .shell_activity_candidates(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES)
+                .is_empty(),
+            "no agents means no candidate panes, which is the guard that skips the sample"
+        );
+        assert_eq!(
+            registry
+                .shell_foreground_busy_snapshot(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES),
+            Some(Vec::new()),
+            "an empty registry is a successful reading of zero panes, NOT a failed sample"
+        );
+    }
 
     // PRD #76 M2.11 fixup 4 — pin the canonical name resolver so the UI
     // helper, the controller's new-pane path, and the rename path all
