@@ -39,9 +39,9 @@ Three rules about sequencing, each of which exists because of a specific ruleset
 
 - **Request review last, not first.** `dismiss_stale_reviews_on_push: true`, so any push after an approval silently voids it. Settle CI, read Greptile's inline comments, push the fixes, resolve the threads — *then* ask for review. Requesting earlier buys a guaranteed second round trip.
 - **Resolve every review thread.** `required_review_thread_resolution: true` is what turns "read Greptile's inline comments" from a habit into something the merge button enforces — see [What is gated](#what-is-gated).
-- **The author merges after approval.** Nothing in the ruleset constrains who presses the button (`require_last_push_approval` is `false`), and the approving maintainer is under no obligation to. Reviewer-merges is a Prow/Kubernetes convention in which a *bot* merges on `/lgtm`; the GitHub-native equivalent is auto-merge, queued by the author. Auto-merge is currently disabled on this repository; enabling it would let the author queue the merge before review lands and never return to the pull request.
+- **The author merges after approval, or arms auto-merge.** Nothing in the ruleset constrains who presses the button (`require_last_push_approval` is `false`), and the approving maintainer is under no obligation to. Reviewer-merges is a Prow/Kubernetes convention in which a *bot* merges on `/lgtm`; the GitHub-native equivalent is auto-merge, queued by the author. **Auto-merge was enabled on 2026-08-11** (`allow_auto_merge: true`), so an author may arm a pull request and let GitHub land it when the ruleset is satisfied. The objection previously recorded here — that arming it early lets the author "never return to the pull request" — does not survive the two rules above: auto-merge waits for the required approval, so a human still reads and judges, and `required_review_thread_resolution: true` means an armed pull request cannot merge while Greptile's threads sit unresolved. Someone must still clear them by hand.
 
-**Never merge your own unapproved pull request.** For the owner it will succeed — the admin bypass makes it silent rather than blocked — and that silence is precisely the decay this arrangement exists to prevent. Any automated flow whose last step is a merge (`/prd-done`, `/prd-full`) must stop at "green, reviewed, approved" and hand off.
+**Never merge your own unapproved pull request.** For the owner it will succeed — the admin bypass makes it silent rather than blocked — and that silence is precisely the decay this arrangement exists to prevent. An automated flow whose last step is a merge (`/prd-done`, `/prd-full`) may arm auto-merge and hand off, since that cannot land anything unapproved, but it must never merge directly.
 
 ## Why CI has to change first
 
@@ -50,15 +50,15 @@ Two workflows push straight to `main`:
 - `.github/workflows/release.yml` — the changelog commit, in the `prepare` job
 - `.github/workflows/docs-publish.yml` — the docs chart bump, in the `publish` job
 
-Neither push carries check runs, and the default `GITHUB_TOKEN` is not an admin. Under a protected `main` both are rejected with `GH006: Protected branch update failed`, which kills the tag in `prepare` and breaks standalone `/publish-docs` runs. This is not hypothetical: it is precisely what happened to v0.35.6 when required status checks were briefly enabled, and it is why `main` carries no protection at all today (CLAUDE.md rule 8).
+Neither push carries check runs, and the default `GITHUB_TOKEN` is not an admin. Under a protected `main` both are rejected with `GH006: Protected branch update failed`, which kills the tag in `prepare` and breaks standalone `/publish-docs` runs. This is not hypothetical: it is precisely what happened to v0.35.6 when required status checks were briefly enabled, and it is why they stayed off for as long as they did (CLAUDE.md rule 8). Both halves are now closed — the `RELEASE_TOKEN` admin identity below, plus the fail-fast guard that replaced its `|| github.token` fallback — and required checks went back on 2026-08-11.
 
 The fix is a `RELEASE_TOKEN` secret holding a fine-grained PAT with **Contents: read and write** on this repository, owned by an account with admin access. Both workflows now pass it to `actions/checkout`:
 
 ```yaml
-token: ${{ secrets.RELEASE_TOKEN || github.token }}
+token: ${{ secrets.RELEASE_TOKEN }}
 ```
 
-The `|| github.token` fallback means the workflows behave exactly as they do today while the secret is unset. That is deliberate — it makes the workflow change safe to merge before any protection exists, so the two steps can be sequenced independently.
+Each job also verifies the secret is non-empty in its **first** step, failing there with an actionable message. This replaced an earlier `token: ${{ secrets.RELEASE_TOKEN || github.token }}` fallback, whose purpose was to let the workflow change merge before any protection existed so the rollout steps could be sequenced independently. That purpose expired when protection went up on 2026-08-08: from then on the fallback could only downgrade a missing or expired secret to `github-actions[bot]`, which cannot push to `main`, deferring the failure to the push step — for `release.yml` after the tag is cut, for `docs-publish.yml` after the image is already in GHCR. Removing it was the prerequisite for step 6.
 
 Note that `GITHUB_TOKEN` **cannot** be named as a ruleset bypass actor on a user-owned repository; the API rejects it with `422: Actor GitHub Actions integration must be part of the ruleset source or owner organization`. A PAT or a GitHub App is the only route.
 
@@ -66,7 +66,7 @@ Note that `GITHUB_TOKEN` **cannot** be named as a ruleset bypass actor on a user
 
 The order matters. Each step is safe to stop at.
 
-> **Where this stands:** steps 1–5 are done. The gate went up at `REQUIRED_APPROVALS=0` on 2026-08-08, and was raised to `1` on 2026-08-09 when [@prageethw](https://github.com/prageethw) joined as the second maintainer (issue #432). Step 6 — required status checks — is still open, and is now a sharper decision than it looks: see CLAUDE.md rule 8 for why a required check binds a `write` maintainer but not the admin owner. The steps below are kept as the procedure for onboarding the *next* maintainer.
+> **Where this stands: the rollout is complete.** The gate went up at `REQUIRED_APPROVALS=0` on 2026-08-08 and was raised to `1` on 2026-08-09 when [@prageethw](https://github.com/prageethw) joined as the second maintainer (issue #432). Step 6 — required status checks — landed on 2026-08-11 with `build`, `build-macos`, `build-windows` and `security`, alongside `allow_auto_merge: true`. The `write`-versus-admin asymmetry it raises was accepted deliberately rather than resolved: those four are objective, so they are the same bar the owner would hold himself to. Judgment-bearing signals — `Greptile Review` above all — are deliberately left unrequired, because waiving a finding is a legitimate approval. The steps below are kept as the procedure for onboarding the *next* maintainer.
 
 **1. Merge the plumbing.** The `token:` change, `scripts/apply-branch-protection.sh`, `MAINTAINERS.md`, and this page. Nothing is enforced yet and nothing changes behaviour.
 
@@ -94,7 +94,10 @@ This is the step that actually validates the token, and it has to come *after* s
 
 If the canary comes back `GH006`, the token cannot bypass. Fall back to a classic PAT (unambiguous, but `repo` scope reaches every repository the account can see) or move to the GitHub App variant below, which is both narrowly scoped and unambiguously a bypass actor.
 
-**6. Reconsider required status checks.** They were removed for the same `GH006` reason and can come back once the canary has proven the token bypasses. Add them to the ruleset's `rules` array as a `required_status_checks` entry.
+**6. Add required status checks.** Done on 2026-08-11 by adding a `required_status_checks` entry to the ruleset's `rules` array with `build`, `build-macos`, `build-windows` and `security`, and `strict_required_status_checks_policy: false` so pull requests are not forced up to date with `main` (with a dozen open, `true` means near-continuous rebasing for no correctness gain). Update the ruleset with a full `PUT` of every rule and bypass actor, not a partial payload — omitting `pull_request` or a bypass actor deletes it. Two things this surfaced, both worth knowing before doing it again elsewhere:
+
+- **A required check that never reported blocks the pull request forever.** #416, an outside contributor's fork whose workflows had never run, went `mergeable=UNKNOWN` the moment the checks went up, with no path forward until its runs exist. Check for fork pull requests with no check history *before* adding required checks, not after.
+- **Whether Renovate's `bypass_mode: pull_request` also bypasses required checks is UNVERIFIED.** It should, since the bypass applies to the ruleset's rules when merging via a pull request, and Renovate merges its own — see [Renovate and automerge](#renovate-and-automerge). But this has not been observed here, and if it does *not* hold, every automerge group stalls silently in exactly the way `REQUIRED_APPROVALS=1` caused. #503 (a `futures-util` patch bump opened minutes after the checks went up) is the first live test; confirm against it rather than assuming.
 
 ## Renovate and automerge
 
