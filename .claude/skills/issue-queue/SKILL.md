@@ -66,7 +66,7 @@ Two notes on the filters:
 
 - **`--limit` is a bound you must act on, not a disclaimer.** `gh issue list` silently truncates. If the count comes back equal to the limit, raise it and re-run; a truncated queue looks like a complete one.
 - **PRD exclusion is by label, not by title.** Some PRD issues have titles that start with "PRD:" and some do not (#381 does not); the `PRD` label is the reliable signal.
-- **Assignment on this repo is currently sparse** — on 2026-08-11, 0 of 110 open non-PRD issues had any assignee, so the assignee filter admitted everything. Do not conclude from that that the filter is useless; it is what keeps two maintainers from colliding once assignment is in use, which is the point of step 4.
+- **Assignment on this repo is currently sparse** — on 2026-08-11, 0 of 110 open non-PRD issues had any assignee, so the assignee filter admitted everything. Do not conclude from that that the filter is useless; it is what keeps two maintainers from colliding once assignment is in use, which is the point of step 6.
 
 ## Step 3 — Eliminate what is already in flight
 
@@ -141,13 +141,34 @@ Verify the write landed before dispatching; `gh issue edit` can succeed against 
 
 Then check the dispatch name is free. A name is single-use, and **removing a worktree keeps its branch**, so `agent/dispatch-<name>` surviving from finished work refuses a re-dispatch. Pick an unused name or delete the stale branch.
 
-## Step 7 — Dispatch, one unit per issue
+## Step 7 — Establish the shape, by asking
 
-Ask `--single` vs `--orchestration` per the dispatch contract, then:
+A unit starts either as **one agent** or as a **multi-role orchestration** — a team that divides the work between roles. Which one the runner wants is **not deducible, and this step exists because guessing it is expensive and visible**.
+
+There is no heuristic to write here, and attempts to write one are what make this go wrong. The two cases arrive as the same shape of words: *"work on these three features"* usually wants a team per feature, while *"verify these three PRs"* usually wants one agent each. Issue size does not settle it either — a small issue with a contested design (#482 is the example: three viable options and a real argument for doing nothing) can be better served by a team than a large mechanical one. **So do not infer the shape from the issue's size, labels, or wording. Ask.**
+
+Before the **first** dispatch of a session:
+
+```bash
+dot-agent-deck dispatch --list-targets
+```
+
+That prints the shapes this repo actually offers — always `single`, plus each orchestration by name. Then:
+
+- **More than one offered** → show the runner the list and ask which they want, before dispatching anything.
+- **Only `single` offered** → say so and use it. There is nothing to ask.
+
+Reuse the answer for later dispatches **in the same conversation** rather than asking again — but re-ask when the runner changes it, or when a new unit is **clearly different in kind** from the ones the answer was given for. A batch of implementation issues and a PR verification are arguably different in kind; if you reuse an answer across that boundary, say so in the report rather than letting it pass silently.
+
+**Pass the flag explicitly on every dispatch.** With neither flag the shape falls back to whatever the repo's config implies, which is precisely the guess this step exists to avoid:
 
 ```bash
 dot-agent-deck dispatch <name> --single --task "<self-contained text>"
+# or
+dot-agent-deck dispatch <name> --orchestration '<name>' --task "<self-contained text>"
 ```
+
+## Step 8 — Compose the task and dispatch, one unit per issue
 
 **The task text must be self-contained with respect to the conversation, not the repo.** The unit gets a copy of this repo, so reference paths, skills and issue numbers rather than pasting contents. Each task should carry:
 
@@ -163,7 +184,7 @@ dot-agent-deck dispatch <name> --single --task "<self-contained text>"
 
 Re-check the issue's state **immediately before each dispatch**, not once for the batch. Issues move: on 2026-08-11 three PRs appeared for this queue's own issues within minutes of dispatch.
 
-## Step 8 — Report where the work went
+## Step 9 — Report where the work went
 
 Give the runner, per unit: issue number, worktree path as `dispatch` reported it, and branch. Then state plainly:
 
