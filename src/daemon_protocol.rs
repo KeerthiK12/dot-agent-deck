@@ -197,7 +197,13 @@ pub const PROTOCOL_VERSION: u32 = 6;
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
 /// 16 MiB is well above any reasonable PTY chunk or scrollback snapshot.
-const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+///
+/// `pub(crate)` rather than private (issue #478) because the bound belongs to
+/// the *protocol*, not to [`read_frame`]: the TUI's synchronous one-shot client
+/// (`ui::send_daemon_request_blocking_with_timeout`) decodes the same 5-byte
+/// header without the async reader, and used to allocate straight off the u32.
+/// Both sides now read the one constant — do not re-spell the 16 MiB literal.
+pub(crate) const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 /// Bounded timeout for a single STREAM_OUT/STREAM_END write to a client. If
 /// a client stops draining its socket, the OS send buffer fills and our
