@@ -1087,7 +1087,9 @@ async fn run_shell_activity_monitor(
 ///
 /// `sample` is deliberately **not** given the timeout — the deadline is applied
 /// here, around whatever the sampler returns, so a test sampler that never
-/// completes exercises the real timeout path rather than a stubbed one.
+/// completes exercises the real timeout path rather than a stubbed one. That
+/// also lets a test count how many samples were *started*, which is what pins
+/// the one-child-at-a-time invariant described on `inflight` below.
 async fn run_shell_activity_monitor_with<S, F>(
     pty_registry: Arc<AgentPtyRegistry>,
     state: SharedState,
@@ -1112,13 +1114,35 @@ async fn run_shell_activity_monitor_with<S, F>(
     // enumeration) question, and it is why skipping the sample when no pane
     // needs it is worth the guard below rather than merely tidy.
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
-    // Issue #429: an upper bound on ONE sample. Generous next to the ~49ms a
-    // healthy `ps -A` takes, so ordinary load never trips it, while still
-    // bounding the tick — the loop awaits the sample, so this also
-    // self-throttles the cadence to at worst POLL_INTERVAL + this rather than
-    // letting samples pile up.
+    // Issue #429: an upper bound on how long a tick WAITS for a sample —
+    // deliberately not a bound on how long the sample's child may live (see
+    // `inflight` below). Generous next to the ~49ms a healthy `ps -A` takes, so
+    // ordinary load never trips it.
     const SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
     let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    // The sample still in flight from an earlier tick, if any (#500 review, P1).
+    //
+    // This exists so a wedged `ps` cannot ACCUMULATE. The obvious shape —
+    // `timeout(d, sample())`, drop the future on expiry, start a fresh one next
+    // tick — is wrong for the exact case the timeout is for: a process in
+    // uninterruptible sleep does not act on the `SIGKILL` that `kill_on_drop`
+    // sends until it leaves D-state, so the abandoned `ps` stays on the process
+    // table. Retrying every 2.5s would then add one undead `ps` per cycle
+    // (~24/minute), consuming pids and table entries — turning a stalled signal
+    // into a resource leak.
+    //
+    // So the timeout bounds the WAIT, not the child: on expiry the in-flight
+    // future is retained here and re-awaited on the next tick, which keeps the
+    // hard invariant that **at most one `ps` child exists at a time**. A sample
+    // that eventually answers is classified against the tick that receives it
+    // (candidates are re-resolved every tick, so they are current; the table may
+    // be as old as the sample, which is the correct trade — a late answer about
+    // a live pane still beats no answer). A sample that answers `None` is
+    // dropped, so the next tick starts fresh.
+    let mut inflight: Option<std::pin::Pin<Box<F>>> = None;
+    // Whether the in-flight sample has already been reported as overrunning, so
+    // a permanently-wedged `ps` logs once rather than every 2.5s forever.
+    let mut inflight_reported = false;
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -1152,7 +1176,17 @@ async fn run_shell_activity_monitor_with<S, F>(
             // id start edge-detection from a clean slate.
             Vec::new()
         } else {
-            match tokio::time::timeout(SAMPLE_TIMEOUT, sample()).await {
+            // Resume the sample already in flight, or start the tick's own. Only
+            // ever one of the two, which is what bounds the `ps` children to one
+            // — see `inflight`'s declaration.
+            let mut pending = match inflight.take() {
+                Some(pending) => pending,
+                None => {
+                    inflight_reported = false;
+                    Box::pin(sample())
+                }
+            };
+            match tokio::time::timeout(SAMPLE_TIMEOUT, pending.as_mut()).await {
                 Ok(Some(table)) => AgentPtyRegistry::classify_shell_activity(&candidates, &table),
                 // ── The load-bearing decision of issue #429 ──
                 //
@@ -1175,14 +1209,26 @@ async fn run_shell_activity_monitor_with<S, F>(
                 // new next tick and re-emit a spurious edge for each one) and
                 // nothing is emitted. The reading simply resumes on the next
                 // sample that answers.
+                //
+                // The two arms differ only in what happens to the sample itself:
+                // an answered-but-failed sample is finished, so it is dropped and
+                // the next tick starts a fresh one; an overrunning sample is
+                // RETAINED, so the next tick waits on the same `ps` instead of
+                // spawning a second one.
                 Ok(None) => continue,
                 Err(_elapsed) => {
-                    warn!(
-                        timeout_ms = SAMPLE_TIMEOUT.as_millis(),
-                        panes = candidates.len(),
-                        "shell-activity: process-table sample timed out; leaving every pane's \
-                         status alone this tick (a wedged `ps` says nothing about the panes)"
-                    );
+                    if !inflight_reported {
+                        inflight_reported = true;
+                        warn!(
+                            timeout_ms = SAMPLE_TIMEOUT.as_millis(),
+                            panes = candidates.len(),
+                            "shell-activity: process-table sample overran its deadline; leaving \
+                             every pane's status alone and continuing to wait on the SAME sample \
+                             (a wedged `ps` says nothing about the panes, and starting another \
+                             would only pile up unkillable children)"
+                        );
+                    }
+                    inflight = Some(pending);
                     continue;
                 }
             }
@@ -2242,11 +2288,14 @@ mod hook_ingestion_tests {
              ShellIdle would be visible"
         );
 
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let monitor_handle = tokio::spawn({
             let registry = registry.clone();
             let state = state.clone();
+            let samples = samples.clone();
             async move {
-                run_shell_activity_monitor_with(registry, state, event_tx, || {
+                run_shell_activity_monitor_with(registry, state, event_tx, move || {
+                    samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     // The wedged `ps`: a sample that never answers. The
                     // monitor's SAMPLE_TIMEOUT is what has to end this tick.
                     std::future::pending::<Option<Vec<crate::platform::proc::ProcessInfo>>>()
@@ -2255,9 +2304,10 @@ mod hook_ingestion_tests {
             }
         });
 
-        // One 500ms poll interval plus the monitor's 2s sample deadline, with
-        // margin — long enough for the timeout to fire at least once.
-        tokio::time::sleep(Duration::from_millis(3_200)).await;
+        // Long enough for the 500ms interval + 2s deadline to elapse TWICE, so a
+        // monitor that abandoned the overrunning sample would have started a
+        // second one by now.
+        tokio::time::sleep(Duration::from_millis(5_600)).await;
 
         assert_eq!(
             state.read().await.sessions[SESSION].status,
@@ -2270,6 +2320,18 @@ mod hook_ingestion_tests {
             matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
             "and no ShellIdle (or any other event) may be synthesized from a sample \
              that never answered"
+        );
+        // PR #500 review (P1): the deadline bounds the WAIT, not the child. A
+        // `ps` wedged in uninterruptible sleep ignores the `SIGKILL` that
+        // dropping the future sends, so abandoning it per tick would leave one
+        // undead `ps` behind every 2.5s. The monitor must keep waiting on the
+        // SAME sample instead — exactly one sample started, however long it
+        // overruns.
+        assert_eq!(
+            samples.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an overrunning sample must be re-awaited, not abandoned and replaced — \
+             starting a fresh `ps` per tick piles up unkillable D-state children"
         );
 
         monitor_handle.abort();
