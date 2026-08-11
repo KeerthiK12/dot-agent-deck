@@ -208,7 +208,7 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
 fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
     skip_unless!(common::check_claude_available());
 
-    let orchestration_root = tempfile::tempdir().expect("orchestration root tempdir");
+    let orchestration_root = common::harness_tempdir().expect("orchestration root tempdir");
     let project_dir = orchestration_root.path().join("project");
     std::fs::create_dir_all(&project_dir).expect("create orchestration project directory");
     let project_dir = project_dir
