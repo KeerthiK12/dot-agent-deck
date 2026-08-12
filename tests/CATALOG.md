@@ -934,6 +934,34 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** an LLM response (the safety invariant and native prompt-edit behavior are proven without submitting a model turn).
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/023 — Orchestrator prompt writes remain provisional until the matching submission is observed.
+- **Layer:** L1 (in-process orchestrator prompt consumer with a controllable `PaneController` and hook-derived state snapshot).
+- **Agent:** none.
+- **Asserts:** both `Applied` and `Queued` retain the prompt text, delivery identity, retry backoff, non-Working role, and unprompted tab; a matching `UserPromptSubmit`-derived event for that pane clears all provisional state and alone finalizes the role as Working without another write.
+- **Does not assert:** how confirmation is correlated internally or the daemon's PTY behavior; only the consumer's observable delivery state contract.
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/pane-input/024 — Seed-prompt writes remain provisional until the matching submission is observed.
+- **Layer:** L1 (in-process `process_pending_seed_prompts` consumer with a controllable `PaneController` and hook-derived state snapshot).
+- **Agent:** none.
+- **Asserts:** both `Applied` and `Queued` retain seed text, delivery identity, and retry backoff until the target pane reports the matching submitted prompt, which clears every piece of provisional state without another write.
+- **Does not assert:** orchestration-role status (covered by `prompt/pane-input/023`) or whether the seed came from dispatch versus a configured mode.
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/pane-input/025 — An applied but unconfirmed automatic prompt retries under bounded backoff and still reaches its deadline.
+- **Layer:** L1 (clock-controlled orchestrator prompt consumer and controllable `PaneController`).
+- **Agent:** none.
+- **Asserts:** an `Applied` write with no matching submission stays pending, retries only after its armed backoff, never marks the role Working, and is abandoned without a final write after `AUTOMATIC_PROMPT_DEADLINE`, clearing delivery state and surfacing the existing timed-out/abandoned status.
+- **Does not assert:** wall-clock scheduling in the render loop or exact tracing-log wording.
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/pane-input/026 — Only a matching prompt submission from the target pane confirms provisional delivery.
+- **Layer:** L1 (in-process seed-prompt consumer with two pane identities and synthetic hook-derived snapshots).
+- **Agent:** none.
+- **Asserts:** the exact pending text submitted from another pane and unrelated human text submitted in the target pane both leave delivery identity and retry armed; only matching pane plus matching prompt finalizes the seed.
+- **Does not assert:** a particular reconciliation key or algorithm beyond rejecting these observable false matches.
+- **Platform coverage:** mac+linux+windows.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
@@ -3586,6 +3614,20 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** REAL Claude Code (Haiku) ×2 role panes, cheap interactive turns (<$0.05/run). Flaky-tolerant pre-PR tier (real LLM + real network) — run once, not looped (rule 4). Runtime-skipped (Decision 26) when the `claude` CLI/credentials or `GITHUB_TOKEN` are absent.
 - **Asserts:** after the fire the daemon registers BOTH of the dispatched orchestration's role agents, each under its own ROLE NAME — `orchestrator` and `worker` (precondition — proves the live clone + worktree + spawn happened). Until `orchestration/dispatch/002` this looked for the shared schedule name `github-issues` on a role pane, which is what a dispatched role's `display_name` used to be; role panes now carry their role name (matching the interactive `Ctrl+n` path), and requiring both names is strictly stronger — one shared name could be satisfied by a single spawned pane. The dispatched ORCHESTRATION then surfaces LIVE as an orchestration TAB labelled `issue-work` (the fixture's `[[orchestrations]] name`) in the attached TUI's tab strip, with no reconnect/relaunch — RED today, because `spawn::spawn`'s orchestration branch does not call `surface_spawned_pane` and orchestration tabs are rebuilt only at hydration, so the role panes appear only as flat dashboard cards and no `issue-work` tab paints live. Best-effort (once GREEN, logged not gated): switching to the orchestration tab, the worker (delegated to by the orchestrator) lists the cloned repo's files including the committed sentinel `DISPATCH_E2E_SENTINEL.md`; and the fixture repo has no pushed `agent/issue-1` branch afterward (NO REMOTE WRITES).
 - **Does not assert:** the delegation chain / sentinel as a hard gate (logged best-effort — too LLM/timing-dependent); exact agent phrasing; the clone/worktree/branch derivation or skip/dedup/cap/cleanup logic (covered by the headless `scheduler/dispatch/001-009` and the deterministic-stub `scheduler/dispatch/011-012`); the single-agent live-surfacing path (covered by `scheduler/dispatch/011`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/014 — Concurrent single-agent dispatch seeds survive a deterministic boot-window swallow and are confirmed after retry.
+- **Layer:** L2 synthetic PTY-attached (real deck and daemon, three real dispatch worktrees, scripted Claude-shaped stand-ins that post hooks through the real CLI; no LLM).
+- **Agent:** synthetic hook-emitting stand-in that posts `SessionStart`, delays its input reader, consumes the first submitted line without a hook, then emits `UserPromptSubmit` only for a later line.
+- **Asserts:** three concurrent `dispatch --single` panes each record the swallowed first write, receive a retry, durably expose the exact submitted prompt through daemon session state, and produce info-level delivery logs carrying a delivery ID plus written/unconfirmed/confirmed state.
+- **Does not assert:** the retry's internal matching strategy, exact log sentence, or real-agent boot behavior (covered by `scheduler/dispatch/015`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/015 — Three concurrent real interactive Claude dispatches each genuinely submit their seed prompt. [reel]
+- **Layer:** L2 REAL PTY-attached (real deck and daemon, three sibling dispatch worktrees, imported isolated credentials, and project trust pre-seeded for every predicted worktree).
+- **Agent:** REAL interactive Claude Code ×3 pinned to `claude-haiku-4-5-20251001` with `--allowedTools Bash` and no `-p`; runtime-skipped when the CLI or credentials are absent and flaky-tolerant in the pre-PR tier.
+- **Asserts:** three back-to-back `dispatch --single` calls each spawn a real Claude pane and each pane's durable native `UserPromptSubmit` state exactly carries its distinct sentinel-bearing seed, so a healthy Idle pane with only PTY echo cannot pass.
+- **Does not assert:** exact model response phrasing, ordering between the three agents, or a fixed boot duration.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/pi

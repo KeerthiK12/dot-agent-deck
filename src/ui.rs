@@ -28308,6 +28308,8 @@ mod tests {
 
     #[derive(Debug, Clone, Copy)]
     enum InjectedSendOutcome {
+        Applied,
+        Queued,
         Error,
         HistoryOnly,
         NoLiveTarget,
@@ -28375,6 +28377,8 @@ mod tests {
         ) -> Result<crate::event::SendResult, PaneError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             match self.outcome {
+                InjectedSendOutcome::Applied => Ok(crate::event::SendResult::Applied),
+                InjectedSendOutcome::Queued => Ok(crate::event::SendResult::Queued),
                 InjectedSendOutcome::Error => Err(PaneError::CommandFailed(
                     "injected transport failure".into(),
                 )),
@@ -28413,6 +28417,397 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    fn ready_prompt_snapshot(pane_id: &str, agent_id: &str) -> AppState {
+        let mut snapshot = AppState::default();
+        snapshot.register_pane(pane_id.to_string());
+        snapshot.insert_placeholder_session(
+            pane_id.to_string(),
+            None,
+            Some(AgentType::Codex),
+            Some(agent_id.to_string()),
+        );
+        snapshot
+    }
+
+    fn apply_prompt_confirmation(
+        snapshot: &mut AppState,
+        pane_id: &str,
+        agent_id: &str,
+        prompt: &str,
+    ) {
+        snapshot.apply_event(AgentEvent {
+            session_id: format!("confirmed-{pane_id}"),
+            agent_type: AgentType::Codex,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: Some(prompt.to_string()),
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+    }
+
+    /// Scenario: Write an orchestrator's spawn-time prompt to a ready pane and have the controller report Applied or Queued without an agent hook. The prompt, identity, retry, and non-Working role must remain provisional until a matching UserPromptSubmit-derived event arrives, after which all delivery state clears and the role becomes Working.
+    #[spec("prompt/pane-input/023")]
+    #[test]
+    fn pane_input_023_orchestrator_write_is_provisional_until_confirmation() {
+        const PANE_ID: &str = "provisional-orchestrator-pane";
+        const AGENT_ID: &str = "provisional-orchestrator-agent";
+        const PROMPT: &str = "Read the orchestrator seed and begin";
+
+        for outcome in [InjectedSendOutcome::Applied, InjectedSendOutcome::Queued] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn PaneController> =
+                Arc::new(SendResultPaneController::new(outcome, attempts.clone()));
+            let now = std::time::Instant::now();
+            let tab_id: TabId = match outcome {
+                InjectedSendOutcome::Applied => 23,
+                InjectedSendOutcome::Queued => 230,
+                _ => unreachable!(),
+            };
+            let mut ui = default_ui();
+            ui.orchestration_created_at.insert(tab_id, now);
+            ui.orchestration_ready_since.insert(
+                tab_id,
+                now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("ready timestamp"),
+            );
+            let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+            let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+            let mut prompt = Some(PROMPT.to_string());
+
+            deliver_orchestrator_prompt(
+                &mut ui,
+                pane.as_ref(),
+                &snapshot,
+                now,
+                tab_id,
+                &[PANE_ID.to_string()],
+                0,
+                &mut role_statuses,
+                &mut prompt,
+            );
+
+            assert_eq!(
+                prompt.as_deref(),
+                Some(PROMPT),
+                "{outcome:?} means only that the PTY accepted bytes; the orchestrator prompt must remain provisional until UserPromptSubmit confirms it"
+            );
+            assert!(
+                ui.prompt_delivery.contains_key(PANE_ID),
+                "{outcome:?} must retain the delivery identity while confirmation is pending"
+            );
+            assert!(
+                ui.send_retry_backoff.contains_key(PANE_ID),
+                "{outcome:?} must arm retry backoff while confirmation is pending"
+            );
+            assert_ne!(
+                role_statuses[0],
+                OrchestrationRoleStatus::Working,
+                "a PTY write alone must not finalize the orchestrator role as Working"
+            );
+            assert!(
+                !ui.orchestration_prompted.contains(&tab_id),
+                "a PTY write alone must not mark the orchestration prompt confirmed"
+            );
+
+            apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+            deliver_orchestrator_prompt(
+                &mut ui,
+                pane.as_ref(),
+                &snapshot,
+                now.checked_add(std::time::Duration::from_millis(1))
+                    .expect("confirmation timestamp"),
+                tab_id,
+                &[PANE_ID.to_string()],
+                0,
+                &mut role_statuses,
+                &mut prompt,
+            );
+
+            assert!(
+                prompt.is_none(),
+                "the matching UserPromptSubmit event must finalize the orchestrator prompt"
+            );
+            assert!(
+                !ui.prompt_delivery.contains_key(PANE_ID)
+                    && !ui.send_retry_backoff.contains_key(PANE_ID),
+                "confirmation must clear delivery identity and retry state"
+            );
+            assert_eq!(role_statuses, [OrchestrationRoleStatus::Working]);
+            assert!(ui.orchestration_prompted.contains(&tab_id));
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "confirmation should finalize the first write without another PTY submission"
+            );
+        }
+    }
+
+    /// Scenario: Queue a seed prompt for a ready single-pane consumer and have its PTY write report Applied or Queued. The seed, identity, and retry remain pending until the same pane reports the matching submitted prompt, then the consumer clears all provisional state without writing again.
+    #[spec("prompt/pane-input/024")]
+    #[test]
+    fn pane_input_024_seed_write_is_provisional_until_confirmation() {
+        const PANE_ID: &str = "provisional-seed-pane";
+        const AGENT_ID: &str = "provisional-seed-agent";
+        const PROMPT: &str = "Read the dispatch seed and begin";
+
+        for outcome in [InjectedSendOutcome::Applied, InjectedSendOutcome::Queued] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn PaneController> =
+                Arc::new(SendResultPaneController::new(outcome, attempts.clone()));
+            let mut ui = default_ui();
+            ui.pending_seed_prompts.push(PendingSeedPrompt {
+                pane_id: PANE_ID.to_string(),
+                prompt: PROMPT.to_string(),
+                created_at: std::time::Instant::now(),
+                ready_since: Some(
+                    std::time::Instant::now()
+                        .checked_sub(
+                            SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1),
+                        )
+                        .expect("ready timestamp"),
+                ),
+            });
+            let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+            assert_eq!(
+                ui.pending_seed_prompts
+                    .first()
+                    .map(|pending| pending.prompt.as_str()),
+                Some(PROMPT),
+                "{outcome:?} means only that the PTY accepted bytes; the seed prompt must remain provisional until UserPromptSubmit confirms it"
+            );
+            assert!(ui.prompt_delivery.contains_key(PANE_ID));
+            assert!(
+                ui.send_retry_backoff.contains_key(PANE_ID),
+                "an unconfirmed {outcome:?} seed write must arm retry backoff"
+            );
+
+            apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+            assert!(
+                ui.pending_seed_prompts.is_empty(),
+                "the matching UserPromptSubmit event must finalize the seed prompt"
+            );
+            assert!(
+                !ui.prompt_delivery.contains_key(PANE_ID)
+                    && !ui.send_retry_backoff.contains_key(PANE_ID),
+                "confirmation must clear the seed's delivery identity and retry state"
+            );
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "confirmation should finalize the first seed write without another PTY submission"
+            );
+        }
+    }
+
+    /// Scenario: Write an automatic orchestrator prompt successfully at the PTY but never emit a matching submission hook. The delivery must retry only after its bounded backoff and then abandon with visible timeout feedback once the automatic-prompt deadline expires.
+    #[spec("prompt/pane-input/025")]
+    #[test]
+    fn pane_input_025_unconfirmed_write_retries_then_reaches_deadline() {
+        const PANE_ID: &str = "unconfirmed-deadline-pane";
+        const AGENT_ID: &str = "unconfirmed-deadline-agent";
+        const PROMPT: &str = "This prompt is swallowed before submission";
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let created = std::time::Instant::now();
+        let tab_id: TabId = 25;
+        let mut ui = default_ui();
+        ui.orchestration_created_at.insert(tab_id, created);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            created
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            created,
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(
+            prompt.as_deref(),
+            Some(PROMPT),
+            "an Applied-but-unconfirmed write must stay pending for retry"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let retry_at = created
+            .checked_add(std::time::Duration::from_secs(1))
+            .expect("retry timestamp");
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("provisional write must arm retry")
+            .next_attempt_at = retry_at;
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            retry_at,
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "an unconfirmed PTY write must be re-sent after its bounded backoff"
+        );
+        assert_eq!(prompt.as_deref(), Some(PROMPT));
+
+        let past_deadline = created
+            .checked_add(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
+            .expect("deadline timestamp");
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            past_deadline,
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+
+        assert!(prompt.is_none(), "past-deadline prompt must be abandoned");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "deadline abandonment must not perform one final write"
+        );
+        assert!(
+            !ui.prompt_delivery.contains_key(PANE_ID)
+                && !ui.send_retry_backoff.contains_key(PANE_ID),
+            "deadline abandonment must clear all retry state"
+        );
+        assert_ne!(
+            role_statuses[0],
+            OrchestrationRoleStatus::Working,
+            "an unconfirmed prompt must never mark the role Working"
+        );
+        assert!(
+            ui.status_message.as_ref().is_some_and(|(message, _)| {
+                let message = message.to_ascii_lowercase();
+                message.contains("timed out") && message.contains("abandoned")
+            }),
+            "deadline abandonment must surface the existing timeout status, got {:?}",
+            ui.status_message.as_ref().map(|(message, _)| message)
+        );
+    }
+
+    /// Scenario: Keep a seed prompt provisional after its PTY accepts the bytes, then inject an exact prompt submission from another pane and a human-authored prompt from the target pane. Neither event may confirm the delivery or disarm its retry; only the matching prompt from the matching pane may finalize it.
+    #[spec("prompt/pane-input/026")]
+    #[test]
+    fn pane_input_026_only_matching_pane_and_prompt_confirm_delivery() {
+        const PANE_ID: &str = "matching-target-pane";
+        const AGENT_ID: &str = "matching-target-agent";
+        const OTHER_PANE_ID: &str = "wrong-confirmation-pane";
+        const OTHER_AGENT_ID: &str = "wrong-confirmation-agent";
+        const PROMPT: &str = "Exact automatic seed text";
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: PANE_ID.to_string(),
+            prompt: PROMPT.to_string(),
+            created_at: std::time::Instant::now(),
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("ready timestamp"),
+            ),
+        });
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        snapshot.register_pane(OTHER_PANE_ID.to_string());
+        snapshot.insert_placeholder_session(
+            OTHER_PANE_ID.to_string(),
+            None,
+            Some(AgentType::Codex),
+            Some(OTHER_AGENT_ID.to_string()),
+        );
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            ui.pending_seed_prompts.len(),
+            1,
+            "the first PTY write must remain provisional"
+        );
+        assert!(ui.send_retry_backoff.contains_key(PANE_ID));
+
+        apply_prompt_confirmation(&mut snapshot, OTHER_PANE_ID, OTHER_AGENT_ID, PROMPT);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            ui.pending_seed_prompts.len(),
+            1,
+            "the exact prompt text submitted by another pane must not confirm this delivery"
+        );
+        assert!(ui.send_retry_backoff.contains_key(PANE_ID));
+
+        apply_prompt_confirmation(
+            &mut snapshot,
+            PANE_ID,
+            AGENT_ID,
+            "the human typed an unrelated prompt",
+        );
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            ui.pending_seed_prompts.len(),
+            1,
+            "an unrelated human prompt in the target pane must not confirm the automatic delivery"
+        );
+        assert!(
+            ui.prompt_delivery.contains_key(PANE_ID) && ui.send_retry_backoff.contains_key(PANE_ID),
+            "non-matching events must leave delivery identity and retry armed"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "non-matching confirmations must not bypass the active retry backoff"
+        );
+
+        apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert!(
+            ui.pending_seed_prompts.is_empty(),
+            "only matching pane plus matching prompt may confirm the delivery"
+        );
     }
 
     /// Scenario: Queue mode seed prompts and inject permanent non-delivery through
