@@ -3303,13 +3303,17 @@ mod tests {
         }
     }
 
-    /// Two absolute paths, spelled the way *this* platform means it.
+    /// Two absolute paths, spelled the way *this* platform means it — i.e. two
+    /// paths that satisfy [`parse_args`]'s `is_absolute()` check on the host.
     ///
-    /// `/scratch/one` is **not** absolute on Windows — it is root-relative, with
-    /// no drive letter — so `parse_args` rightly refused it and the test below
-    /// panicked in its own setup instead of exercising the replacement rule.
-    /// Like the sparse-file fixture above, that only became visible when issue
-    /// #489 put the workspace's tests in a gate on all three platforms.
+    /// `is_absolute()` is platform-specific: a leading `/` is absolute on Unix
+    /// but **not** on Windows, which requires a drive prefix. So `/scratch/one`
+    /// is root-relative there, `parse_args` rightly refused it, and the test
+    /// below panicked in its own setup instead of exercising the replacement
+    /// rule — a Windows-only failure (issue #511). Like the sparse-file fixture
+    /// above, that only became visible when issue #489 put the workspace's tests
+    /// in a gate on all three platforms. Nothing touches the filesystem; these
+    /// directories need not exist.
     #[cfg(not(windows))]
     const SCRATCH_ROOTS: [&str; 2] = ["/scratch/one", "/scratch/two"];
     #[cfg(windows)]
