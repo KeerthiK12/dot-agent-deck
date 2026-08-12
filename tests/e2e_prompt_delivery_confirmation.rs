@@ -284,13 +284,32 @@ fn trust_paths_for_worktrees(deck: &TuiDeck, names: &[&str]) -> Vec<String> {
     paths
 }
 
-/// Scenario: Launch an attached deck with isolated Claude credentials and trust for three predicted dispatch worktrees, then issue three dispatch --single calls back to back against real interactive Haiku Claude Code panes. Each real pane must submit its distinct sentinel-bearing seed through the native UserPromptSubmit hook, proving none finishes boot healthy and Idle with its seed merely echoed or swallowed.
+fn write_bootstrap_swallowing_real_claude(workdir: &Path) -> PathBuf {
+    let wrapper = workdir.join("bootstrap-swallowing-real-claude.sh");
+    let binary = shell_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    let body = format!(
+        "#!/bin/sh\n\
+         printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"bootstrap-%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" | {binary} hook --agent claude-code >/dev/null 2>&1 || exit 97\n\
+         IFS= read -r swallowed || exit 98\n\
+         printf 'swallowed|%s\\n' \"$swallowed\" >> prompt-attempts.log\n\
+         exec {REAL_AGENT_COMMAND}\n"
+    );
+    std::fs::write(&wrapper, body).expect("write real-Claude bootstrap launcher");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod real-Claude bootstrap launcher");
+    wrapper
+}
+
+/// Scenario: Launch an attached deck with isolated Claude credentials and a bootstrap launcher that announces SessionStart, consumes the first seed during boot, then execs real interactive Haiku Claude in each of three predicted dispatch worktrees. Every first write must be recorded as swallowed, and each real pane must later submit its distinct sentinel-bearing retry through Claude's native UserPromptSubmit hook.
 #[spec("scheduler/dispatch/015")]
 #[test]
 fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
     skip_unless!(common::check_claude_available());
 
-    let config = write_default_command_config(REAL_AGENT_COMMAND);
+    let staging = common::harness_tempdir().expect("real-Claude bootstrap staging dir");
+    let launcher = write_bootstrap_swallowing_real_claude(staging.path());
+    let config = write_default_command_config(&launcher.to_string_lossy());
     let deck = TuiDeck::builder()
         .with_env(
             "DOT_AGENT_DECK_CONFIG",
@@ -347,9 +366,13 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
             .iter()
             .all(|(name, prompt)| confirmed_prompt(&deck, name).as_deref() == Some(*prompt))
     });
+    let all_first_attempts_swallowed = cases.iter().all(|(name, prompt)| {
+        std::fs::read_to_string(dispatch_worktree_of(&deck, name).join("prompt-attempts.log"))
+            .is_ok_and(|attempts| attempts.contains(&format!("swallowed|{prompt}")))
+    });
     assert!(
-        all_confirmed,
-        "every real interactive Claude pane must genuinely submit its own sentinel-bearing seed; a healthy Idle pane with no matching UserPromptSubmit is an undelivered seed.{}\nFinal grid:\n{}",
+        all_first_attempts_swallowed && all_confirmed,
+        "every bootstrap launcher must swallow its first PTY submission and every real interactive Claude pane must genuinely submit a retried sentinel-bearing seed; a healthy Idle pane with no matching UserPromptSubmit is an undelivered seed. all_first_attempts_swallowed={all_first_attempts_swallowed}, all_confirmed={all_confirmed}{}\nFinal grid:\n{}",
         delivery_diagnostics(&deck, &cases),
         deck.snapshot_grid()
     );
