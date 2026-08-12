@@ -241,6 +241,15 @@ enum Commands {
         #[command(subcommand)]
         cmd: SnapshotCmd,
     },
+    /// Reclaim git worktrees whose PR is merged, whose tree is clean, and
+    /// which the deck can prove it created. Never inspects git ancestry for
+    /// merge state — squash-merges never enter `main`'s ancestry, and an
+    /// ancestor branch with no PR must never be removed. The branch always
+    /// survives; only the worktree directory is removed.
+    Worktree {
+        #[command(subcommand)]
+        cmd: WorktreeCmd,
+    },
     /// Wrap an agent command, passing its stdio through transparently while
     /// tee-ing output through pattern detection into `AgentEvent`s (PRD #20 M6
     /// — the generic stdout-wrapper integration strategy). The child stays
@@ -382,6 +391,18 @@ enum DaemonCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Print a read-only snapshot of the daemon's managed agents: pane id,
+    /// label, cwd, orchestration role, live status, and active tool. Fork
+    /// #47: a CLI consumer of the existing `AttachRequest::ListAgents` — it
+    /// never starts, stops, attaches to, resizes, writes to, or subscribes
+    /// to any agent, and a missing/unreachable daemon is reported rather
+    /// than lazily spawned.
+    Status {
+        /// Emit a versioned JSON document (`{schema_version, agents}`)
+        /// instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -451,6 +472,32 @@ enum SnapshotCmd {
     /// dashboard instead of restoring the previous workspace. Registry-only
     /// `remote remove` intentionally does NOT touch this global snapshot.
     Clear,
+}
+
+#[derive(Subcommand)]
+enum WorktreeCmd {
+    /// List every linked worktree with its resolved PR state, cleanliness,
+    /// ownership, and gate verdict (remove/ask/keep) with a reason. Read-only
+    /// — never removes anything.
+    List {
+        /// Emit a versioned JSON document (`{schema_version, worktrees}`)
+        /// instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove every worktree the gate marks `remove` (deck-owned, merged,
+    /// clean) unconditionally. A worktree the deck cannot prove it created is
+    /// reported as reclaimable-pending-confirmation and left alone unless
+    /// `--yes` is passed. A dirty worktree, an open/closed-unmerged PR, or an
+    /// unresolvable PR state always keeps, `--yes` or not. Never deletes the
+    /// branch.
+    Reclaim {
+        /// Authorize removing worktrees the deck did NOT prove it created
+        /// (the `ask` verdict), in addition to the ones it did. Has no effect
+        /// on worktrees the gate already keeps for another reason.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1079,6 +1126,7 @@ fn main() -> ExitCode {
             DaemonCmd::Hello => run_daemon_hello_cli(),
             DaemonCmd::Stop { force } => run_daemon_stop_cli(force),
             DaemonCmd::Restart { force } => run_daemon_restart_cli(force),
+            DaemonCmd::Status { json } => run_daemon_status_cli(json),
         },
         Some(Commands::Remote { cmd }) => match cmd {
             RemoteCmd::Add {
@@ -1160,6 +1208,10 @@ fn main() -> ExitCode {
                     }
                 }
             }
+        },
+        Some(Commands::Worktree { cmd }) => match cmd {
+            WorktreeCmd::List { json } => run_worktree_list_cli(json),
+            WorktreeCmd::Reclaim { yes } => run_worktree_reclaim_cli(yes),
         },
         Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
@@ -1542,6 +1594,79 @@ fn run_connect(name: Option<String>) -> ExitCode {
     }
 }
 
+/// `dot-agent-deck worktree list [--json]`. Pure CLI-subprocess operation
+/// over `git`/`gh` in the current directory's repo — no daemon involved, so
+/// this is plain synchronous code, no `#[tokio::main]`. Row shaping and the
+/// gate itself live in [`dot_agent_deck::worktree_reclaim`]; this wrapper
+/// only translates the outcome into stdout/stderr text and an exit code.
+fn run_worktree_list_cli(json: bool) -> ExitCode {
+    use dot_agent_deck::worktree_reclaim::{
+        WorktreeListDocument, examine_worktrees, format_list_human,
+    };
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("worktree list: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reports = match examine_worktrees(&cwd) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("worktree list: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if json {
+        match serde_json::to_string(&WorktreeListDocument::new(reports)) {
+            Ok(j) => {
+                println!("{j}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("worktree list: failed to serialize JSON: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        print!("{}", format_list_human(&reports));
+        ExitCode::SUCCESS
+    }
+}
+
+/// `dot-agent-deck worktree reclaim [--yes]`. Removes every worktree the
+/// gate marks `remove` (deck-owned, merged PR, clean tree) unconditionally,
+/// and — only with `--yes` — also those it marks `ask` (merged and clean,
+/// but the deck cannot prove it created them). Without `--yes`, `ask`-verdict
+/// worktrees are left alone and reported as a pending decision that leads
+/// the output, naming their exact paths and the ready-to-copy `--yes`
+/// command. Always exits successfully once it has finished examining and
+/// acting on every worktree; only a failure to enumerate worktrees at all
+/// (e.g. not a git repo) is reported as failure.
+fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
+    use dot_agent_deck::worktree_reclaim::{format_reclaim_human, run_reclaim};
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("worktree reclaim: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match run_reclaim(&cwd, yes) {
+        Ok(outcome) => {
+            print!("{}", format_reclaim_human(&outcome));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("worktree reclaim: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `dot-agent-deck daemon hello` — PRD #76 M2.21 protocol-version handshake.
 /// Prints a JSON-encoded [`dot_agent_deck::daemon_protocol::AttachResponse`]
 /// carrying `server_version = PROTOCOL_VERSION` (and, per PRD #103 M1.3,
@@ -1571,6 +1696,62 @@ fn run_daemon_hello_cli() -> ExitCode {
     };
     println!("{json}");
     ExitCode::SUCCESS
+}
+
+/// `dot-agent-deck daemon status [--json]`. Read-only CLI
+/// consumer of the existing `AttachRequest::ListAgents`
+/// ([`dot_agent_deck::daemon_client::DaemonClient::list_agents`]) — no new
+/// attach request type, no `PROTOCOL_VERSION` bump (see
+/// `.dot-agent-deck/47-status-query-design.md` in the root checkout). Row
+/// shaping lives in [`dot_agent_deck::daemon_status`]; this wrapper only
+/// bounds the round trip with [`dot_agent_deck::daemon_status::STATUS_REQUEST_TIMEOUT`]
+/// and translates the outcome into stdout/stderr text and an exit code.
+///
+/// "Unavailable" (no daemon, a transport error, or a timed-out request) is
+/// reported as failure — a status query that got no answer learned nothing,
+/// unlike `daemon stop`'s idempotent "no daemon running" — but deliberately
+/// never with clap's own exit code 2, so a caller can tell "this build
+/// doesn't understand the request" apart from "the daemon didn't answer".
+/// Never spawns, retries, or otherwise perturbs the daemon it's asking
+/// about: a timeout abandons the query rather than looping.
+#[tokio::main]
+async fn run_daemon_status_cli(json: bool) -> ExitCode {
+    use dot_agent_deck::daemon_status::{
+        STATUS_REQUEST_TIMEOUT, StatusDocument, build_status_agents, format_human,
+    };
+
+    let client = DaemonClient::new(attach_socket_path());
+    let records = match tokio::time::timeout(STATUS_REQUEST_TIMEOUT, client.list_agents()).await {
+        Ok(Ok(records)) => records,
+        Ok(Err(e)) => {
+            eprintln!("daemon status: unavailable ({e})");
+            return ExitCode::FAILURE;
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                "daemon status: unavailable (no response within {}s)",
+                STATUS_REQUEST_TIMEOUT.as_secs()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let agents = build_status_agents(records);
+    if json {
+        match serde_json::to_string(&StatusDocument::new(agents)) {
+            Ok(j) => {
+                println!("{j}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("daemon status: failed to serialize JSON: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        print!("{}", format_human(&agents));
+        ExitCode::SUCCESS
+    }
 }
 
 /// `dot-agent-deck daemon stop [--force]` — PRD #103 Phase 3 (M3.2).
