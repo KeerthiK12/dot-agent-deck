@@ -319,8 +319,24 @@ fn wait_for_role_panes(
 /// (`orchestration/dispatch/002` covers the same path with a real orchestrator
 /// deciding to run it.)
 fn run_delegate(deck: &TuiDeck, pane_id: &str, role: &str, task: &str) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .args(["delegate", "--to", role, "--task", task])
+    run_delegate_to(deck, pane_id, &[role], task)
+}
+
+/// [`run_delegate`] with the repeatable `--to` in its general form, for the
+/// fan-out cases — in particular the partially-resolvable one, where some roles
+/// have a worker pane and some do not.
+fn run_delegate_to(
+    deck: &TuiDeck,
+    pane_id: &str,
+    roles: &[&str],
+    task: &str,
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    cmd.arg("delegate");
+    for role in roles {
+        cmd.args(["--to", role]);
+    }
+    cmd.args(["--task", task])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", pane_id)
         .output()
@@ -881,6 +897,38 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
         "a failed `delegate` must name the ROLE it could not resolve on stderr.\n\
          stderr: {bad_role_err}"
     );
+
+    // ===== …and a HALF-landed delegate is not a failure =====================
+    //
+    // PR #466 review's blocker, from the real CLI. `--to worker
+    // --to nonexistent-role` fans out to the worker for real — the task is in
+    // its PTY and its idle-worker record is armed — so reporting failure would
+    // invite the orchestrator to retry under this command's own contract
+    // ("non-zero ⇒ it did not land") and dispatch the worker a second time,
+    // arming two records for one pane. Exit 0, and name BOTH sides so a retry
+    // can be aimed at just the role that missed.
+    let partial = run_delegate_to(
+        &deck,
+        &dispatched["orchestrator"],
+        &["worker", "nonexistent-role"],
+        "Half-landed delegation.",
+    );
+    let partial_err = String::from_utf8_lossy(&partial.stderr).into_owned();
+    assert!(
+        partial.status.success(),
+        "`delegate --to worker --to nonexistent-role` exited {:?}. The worker DID \
+         receive it, so a non-zero exit tells the orchestrator to retry a \
+         delegation that half landed — and the worker gets the task twice.\n\
+         stdout: {}\nstderr: {partial_err}",
+        partial.status.code(),
+        String::from_utf8_lossy(&partial.stdout)
+    );
+    assert!(
+        partial_err.contains("nonexistent-role") && partial_err.contains("worker"),
+        "a half-landed `delegate` must name BOTH the role that missed and the \
+         role that received it, or a retry cannot be aimed safely.\n\
+         stderr: {partial_err}"
+    );
 }
 
 fn card_label(role: &str) -> String {
@@ -1109,15 +1157,15 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
          file you were pointed at looks empty or missing, create {SENTINEL} anyway \
          instead of asking about it."
     );
-    let coder_pane = role_panes_in(deck.attach_socket_path(), ORCH, |_| true)
+    let role_panes = role_panes_in(deck.attach_socket_path(), ORCH, |_| true);
+    let coder_pane = role_panes
         .get("coder")
         .cloned()
         .expect("the dispatched orchestration has a `coder` role pane (asserted above)");
-    let orchestrator_pane = role_panes_in(deck.attach_socket_path(), ORCH, |_| true)
+    let orchestrator_pane = role_panes
         .get("orchestrator")
         .cloned()
         .expect("the dispatched orchestration has an `orchestrator` role pane");
-    let _ = &coder_pane; // named for the failure message below
 
     // Wait for every role pane to STOP painting before injecting anything.
     //

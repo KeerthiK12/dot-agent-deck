@@ -2972,6 +2972,13 @@ impl AppState {
         // exited 0. Derived by comparing the request against the resolved set
         // rather than plumbed out of `delegate_targets`, so the routing rules stay
         // in one place and this stays a pure read of its result.
+        //
+        // The two are independent, and BOTH are reported: `--to coder --to tester`
+        // with only a `coder` pane fans out to the coder for real, so a caller
+        // told only about `tester` and handed a failure exit code would retry the
+        // whole delegate and dispatch the coder twice (PR #466 review). Which
+        // means the CLI needs `delivered` as much as it needs `unresolved_roles`
+        // — see `delegate_verdict` in `main.rs`.
         let delivered: Vec<String> = {
             let mut seen: Vec<String> = Vec::new();
             for (role, _) in &targets {
@@ -3087,7 +3094,7 @@ impl AppState {
         crate::event::DelegateResponse {
             delivered,
             unresolved_roles,
-            error: None,
+            ..Default::default()
         }
     }
 
@@ -4680,6 +4687,187 @@ mod tests {
             state.delegate_targets("A_orch", &repeated),
             vec![("coder".to_string(), "A_coder".to_string())],
             "a role named twice in one signal must yield exactly one target"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // PR #466 review — what `handle_delegate` ANSWERS, not just where it
+    // routes. Every rejection below used to be a bare `return` whose only
+    // trace was a `warn!` in the daemon log: the orchestrator exited 0 and
+    // reported progress that was never going to happen.
+    //
+    // These live here, in the fast tier, because the e2e assertions that
+    // cover the same contract (`orchestration/dispatch/001`) sit behind
+    // `#![cfg(feature = "e2e")]` and no CI build job passes `--features
+    // e2e` — so a refactor that returned `DelegateResponse::default()` from
+    // the unknown-pane path, restoring the exact silent success being fixed
+    // here, would pass every gate that gates a merge.
+    // ---------------------------------------------------------------------
+
+    /// Run one delegate against `state` with an empty registry. The fan-out is
+    /// detached (`tokio::spawn` per target), so an absent PTY only makes those
+    /// tasks no-ops — it does not affect the response under test, which
+    /// reports what RESOLVED, not what the worker later did with it.
+    async fn delegate_from(
+        state: &AppState,
+        pane_id: &str,
+        to: &[&str],
+    ) -> crate::event::DelegateResponse {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        state
+            .handle_delegate(
+                DelegateSignal {
+                    pane_id: pane_id.to_string(),
+                    task: "probe".to_string(),
+                    to: to.iter().map(|s| s.to_string()).collect(),
+                    timestamp: Utc::now(),
+                },
+                &registry,
+                &event_tx,
+            )
+            .await
+    }
+
+    /// The reported bug itself: a pane the daemon holds no role for — which is
+    /// every pane of a `dispatch --orchestration` orchestration before this
+    /// change — must come back as an ERROR, not as a pristine response.
+    #[tokio::test]
+    async fn handle_delegate_rejects_an_unknown_pane() {
+        let state = AppState::default();
+        let resp = delegate_from(&state, "sched-dispatch-team-probe-0-r0", &["coder"]).await;
+        let error = resp
+            .error
+            .as_deref()
+            .expect("an unregistered sender must be reported as an error, not silently dropped");
+        assert!(
+            error.contains("sched-dispatch-team-probe-0-r0"),
+            "the error must name the pane that was rejected: {error}"
+        );
+        assert!(resp.delivered.is_empty(), "nothing can have been delivered");
+        assert!(
+            resp.is_delegate_reply(),
+            "the reply must identify itself, or the CLI treats it as an \
+             unrecognised daemon and exits 0"
+        );
+    }
+
+    /// Anti-spoofing: a worker pane is registered, but it is not its
+    /// orchestration's orchestrator, so it may not delegate — and must be told.
+    #[tokio::test]
+    async fn handle_delegate_rejects_a_registered_non_orchestrator_pane() {
+        let state = two_same_name_cwd_tabs(true);
+        let resp = delegate_from(&state, "A_coder", &["coder"]).await;
+        let error = resp
+            .error
+            .as_deref()
+            .expect("a non-orchestrator sender must be reported as an error");
+        assert!(
+            error.contains("A_coder") && error.contains("coder"),
+            "the error must name the pane and the role it actually holds: {error}"
+        );
+        assert!(resp.delivered.is_empty(), "nothing can have been delivered");
+    }
+
+    /// A legitimate orchestrator naming a role that resolves to no worker pane:
+    /// NOT an `error` (routing worked), but the role must come back in
+    /// `unresolved_roles` instead of being dropped with a daemon-log `warn!`.
+    #[tokio::test]
+    async fn handle_delegate_reports_a_role_that_resolves_to_no_pane() {
+        let state = two_same_name_cwd_tabs(true);
+        let resp = delegate_from(&state, "A_orch", &["nonexistent"]).await;
+        assert_eq!(resp.error, None, "the sender itself was fine");
+        assert_eq!(
+            resp.unresolved_roles,
+            vec!["nonexistent".to_string()],
+            "a role with no worker pane must be named back to the caller"
+        );
+        assert!(resp.delivered.is_empty());
+    }
+
+    /// THE blocker of the review. `--to coder --to tester` with only a `coder`
+    /// pane really does fan out to the coder, so the response has to carry BOTH
+    /// halves: a caller told only about `tester`, and handed a failure exit
+    /// code, retries under this change's own contract ("non-zero ⇒ it did not
+    /// land") and dispatches the coder a second time — two idle-worker records
+    /// for one pane, the hazard
+    /// `delegate_targets_de_duplicates_a_repeated_target_role` exists to
+    /// prevent, reached by another route. What the CLI then DOES with both
+    /// halves is pinned by `delegate_verdict`'s tests in `main.rs`.
+    #[tokio::test]
+    async fn handle_delegate_reports_a_partial_delivery_as_partial() {
+        let state = two_same_name_cwd_tabs(true);
+        let resp = delegate_from(&state, "A_orch", &["coder", "tester"]).await;
+        assert_eq!(
+            resp.error, None,
+            "the sender was fine and the coder resolved"
+        );
+        assert_eq!(
+            resp.delivered,
+            vec!["coder".to_string()],
+            "the coder DID receive the fan-out and must be named as delivered"
+        );
+        assert_eq!(
+            resp.unresolved_roles,
+            vec!["tester".to_string()],
+            "the tester resolved to no pane and must be named as unresolved"
+        );
+    }
+
+    /// The dispatched spawn path registers its orchestrator by `orch_idx`, not
+    /// by the raw `start = true` flag — which is the whole point, because
+    /// `orchestrator_role_index` falls back (role named `orchestrator` → any
+    /// `start = true` → role 0) where the bare flag is false for EVERY role of
+    /// an orchestration whose toml sets no `start`. Registering on the raw flag
+    /// would leave such an orchestration with a context-bearing orchestrator
+    /// that is still absent from `orchestrator_pane_ids`: the same bug this
+    /// change fixes, for a narrower input.
+    #[test]
+    fn register_orchestration_role_makes_orch_idx_the_orchestrator() {
+        let roles: Vec<crate::spawn::RoleSpawn> = ["coder", "orchestrator", "tester"]
+            .iter()
+            .enumerate()
+            .map(|(role_index, name)| crate::spawn::RoleSpawn {
+                role_index,
+                role_name: (*name).to_string(),
+                command: "cat".to_string(),
+                // No `start = true` anywhere — the shape that used to leave
+                // the orchestration with no registered orchestrator at all.
+                is_start_role: false,
+            })
+            .collect();
+        let orch_idx = crate::spawn::orchestrator_role_index(&roles);
+        assert_eq!(
+            orch_idx, 1,
+            "the role NAMED orchestrator is the orchestrator"
+        );
+
+        let mut state = AppState::default();
+        let identity = instance("orch-dispatch-0");
+        for (idx, role) in roles.iter().enumerate() {
+            state.register_orchestration_role(
+                &format!("pane-{idx}"),
+                &role.role_name,
+                idx == orch_idx,
+                identity.clone(),
+                Some("/tmp/deck"),
+            );
+        }
+
+        assert!(
+            state.orchestrator_pane_ids.contains("pane-1"),
+            "the `orch_idx` pane must be registered as the orchestrator"
+        );
+        assert_eq!(
+            state.orchestrator_pane_ids.len(),
+            1,
+            "exactly one pane may be the orchestrator: {:?}",
+            state.orchestrator_pane_ids
+        );
+        assert_eq!(
+            state.delegate_targets("pane-1", &["coder".to_string()]),
+            vec![("coder".to_string(), "pane-0".to_string())],
+            "and it must be able to delegate to its workers"
         );
     }
 

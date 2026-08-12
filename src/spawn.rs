@@ -579,6 +579,23 @@ pub async fn spawn(
                         // orchestrator that is still not in
                         // `orchestrator_pane_ids`, i.e. this same bug for a
                         // narrower input.
+                        //
+                        // KNOWN, and deliberately not fixed here (PR #466
+                        // review, issue #523): the registrar is shared, but this
+                        // RULE is not. The `AttachRequest::StartAgent` path still
+                        // registers on the raw flag — `tab.rs` sends
+                        // `is_start_role: role.start` in the membership — so for
+                        // a toml whose role is named `orchestrator` but sets no
+                        // `start = true`, a `Ctrl+N` tab still registers no
+                        // orchestrator at all and its delegate is rejected. That
+                        // path is not what this change set out to fix, and
+                        // unifying the rule is not local: `tab.rs` computes a
+                        // THIRD answer of its own (`start_role_index`, the bare
+                        // `position(|r| r.start).unwrap_or(0)`, with no
+                        // name-based fallback) and drives default focus and
+                        // orchestrator-prompt delivery off it, so aligning the
+                        // three is a user-visible TUI change owing its own tests
+                        // — see the issue.
                         idx == orch_idx,
                         identity.clone(),
                         Some(req.working_dir.as_str()),
