@@ -13,6 +13,7 @@ use std::time::Duration;
 use std::{collections::BTreeSet, collections::HashMap};
 
 use common::TuiDeck;
+use dot_agent_deck::event::{SESSION_START_ORIGIN_METADATA_KEY, WRAPPER_FORK_SESSION_START_ORIGIN};
 use spec::spec;
 
 const REAL_AGENT_COMMAND: &str = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash";
@@ -321,7 +322,7 @@ fn write_bootstrap_swallowing_real_claude(workdir: &Path) -> PathBuf {
     let binary = shell_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
     let body = format!(
         "#!/bin/sh\n\
-         printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"bootstrap-%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" | {binary} hook --agent claude-code >/dev/null 2>&1 || exit 97\n\
+         printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"bootstrap-%s\",\"metadata\":{{\"{SESSION_START_ORIGIN_METADATA_KEY}\":\"{WRAPPER_FORK_SESSION_START_ORIGIN}\"}}}}' \"$DOT_AGENT_DECK_PANE_ID\" | {binary} hook --agent claude-code >/dev/null 2>&1 || exit 97\n\
          IFS= read -r swallowed || exit 98\n\
          printf 'swallowed|%s\\n' \"$swallowed\" >> prompt-attempts.log\n\
          exec {REAL_AGENT_COMMAND}\n"
@@ -333,7 +334,7 @@ fn write_bootstrap_swallowing_real_claude(workdir: &Path) -> PathBuf {
     wrapper
 }
 
-/// Scenario: Launch an attached deck with isolated Claude credentials and a bootstrap launcher that announces SessionStart, consumes the first seed during boot, then execs real interactive Haiku Claude in each of three predicted dispatch worktrees. Every first write must be recorded as swallowed, and each real pane must later submit its distinct sentinel-bearing retry through Claude's native UserPromptSubmit hook.
+/// Scenario: Launch an attached deck with isolated Claude credentials and a bootstrap launcher that identifies its SessionStart as launcher-origin, consumes the first seed during boot, then execs real interactive Haiku Claude in each of three predicted dispatch worktrees. Every first write must be recorded as swallowed, and each real pane must later submit its distinct sentinel-bearing retry through Claude's native UserPromptSubmit hook.
 #[spec("scheduler/dispatch/015")]
 #[test]
 fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
