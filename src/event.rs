@@ -432,6 +432,21 @@ pub fn agent_event_type_from_state(state: &str) -> Option<EventType> {
 /// don't emit it; consumers treat its absence as "no friendly name known".
 pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
 
+/// `AgentEvent.metadata` key carrying a DAEMON-AUTHORED report that an
+/// automatic prompt delivery failed on this pane (issue #424).
+///
+/// Only [`crate::daemon`] sets it, on one synthetic [`EventType::Error`] event
+/// bound to the pane's existing card; no agent ever emits it. Consumers that
+/// don't know the key ignore it (the documented `metadata` contract), which is
+/// why reporting this way needs no protocol change: the value rides the same
+/// free-form map `DISPLAY_NAME_METADATA_KEY` and
+/// [`SESSION_START_ORIGIN_METADATA_KEY`] already use.
+///
+/// The value is FIXED daemon text. Nothing a repository, a prompt or a role
+/// controls is interpolated into it — the same rule that governed the in-pane
+/// notice this replaced, kept because the text still reaches a human.
+pub const DELIVERY_NOTICE_METADATA_KEY: &str = "delivery_notice";
+
 /// `AgentEvent.metadata` key declaring WHERE a `SessionStart` came from (PRD
 /// #225 M3). Only the wrapper adapter sets it, with the single value
 /// [`WRAPPER_FORK_SESSION_START_ORIGIN`]; every other producer omits it, and

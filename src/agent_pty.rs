@@ -1927,6 +1927,12 @@ pub struct AgentPtyRegistry {
     /// registry with no owning daemon (in-process unit tests), in which case
     /// no injection happens and children resolve the endpoint the old way.
     hook_socket: Mutex<Option<PathBuf>>,
+    /// Issue #424 (reviewer blocker 3 / auditor MEDIUM): where a daemon-side
+    /// delivery failure is REPORTED, so the report is durable state on the
+    /// pane's card rather than bytes typed into the agent's input buffer.
+    /// `None` for a registry with no owning daemon (in-process unit tests),
+    /// where publishing is a silent no-op. See [`DeliveryNotice`].
+    delivery_notice_sink: Mutex<Option<DeliveryNoticeSink>>,
     /// PRD #126: delegations that are still awaiting a `work-done` plus the set
     /// of panes currently mid-close. Both live under ONE mutex so "mark this
     /// pane closing AND drop its outstanding records" is a single atomic
@@ -2173,6 +2179,48 @@ struct RegistryInner {
     agents: HashMap<String, RunningAgent>,
 }
 
+/// Issue #424 (reviewer blocker 3 / auditor MEDIUM): one daemon-authored report
+/// that an automatic prompt delivery FAILED on `pane_id`.
+///
+/// This is the replacement for writing a diagnostic line into the agent's own
+/// input buffer. That mechanism (`write_notice_guarded`) is retained for PRD
+/// #249's orchestrator-pane use, but its own contract says LF may be
+/// interpreted as Enter and that a later ordinary submit sends
+/// `notice + newline + user prompt` as ONE turn — pinned by the passing
+/// regression `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`.
+/// Written into the very pane whose prompt handling is in doubt (and which may
+/// already hold swallowed seed bytes), the notice could submit as an agent turn
+/// or ride along with the user's next Enter. A delivery failure must not be
+/// reported by a mechanism that can itself become a task.
+///
+/// So the report travels as STATE instead: the daemon turns it into one
+/// synthetic [`crate::event::AgentEvent`] on the pane's existing card, through
+/// the same ingest path every real hook event uses (`daemon::ingest_event`), so
+/// it lands in the daemon's own `AppState` *and* is broadcast to attached
+/// clients. The card's status becomes `Error` and stays there until the agent
+/// itself asserts something newer. No new wire field and no protocol change:
+/// this rides the fan-out `spawn::surface_spawned_pane` already uses.
+#[derive(Debug, Clone)]
+pub struct DeliveryNotice {
+    /// The pane whose delivery failed.
+    pub pane_id: String,
+    /// The EXACT registry agent the prompt was written for. The report is
+    /// dropped unless this agent still owns the pane.
+    pub agent_id: String,
+    /// The logical delivery id, for correlating the card against the log.
+    pub delivery_id: String,
+    /// FIXED, daemon-authored text. Nothing a repository, a prompt or a role
+    /// controls may be interpolated here — that rule outlives the transport,
+    /// because the text still reaches a human-readable surface.
+    pub detail: &'static str,
+}
+
+/// Issue #424: the daemon's sink for [`DeliveryNotice`]s, installed via
+/// [`AgentPtyRegistry::set_delivery_notice_sink`]. A closure rather than a
+/// concrete type because publishing needs the daemon's `SharedState` and event
+/// broadcast, neither of which the registry owns.
+pub type DeliveryNoticeSink = Arc<dyn Fn(DeliveryNotice) + Send + Sync>;
+
 /// Internal selector for the two public byte-write entrypoints.
 /// `Submit` is the prompt path (payload + `SUBMIT_DELAY` + `\r`);
 /// `Notice` is the visibility path (payload + `\n`, no submit). Kept
@@ -2205,6 +2253,7 @@ impl AgentPtyRegistry {
             user_input_at: Mutex::new(HashMap::new()),
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
             hook_socket: Mutex::new(None),
+            delivery_notice_sink: Mutex::new(None),
             delegations: Mutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
         }
@@ -2219,6 +2268,48 @@ impl AgentPtyRegistry {
     /// socket for its lifetime, so a second call would carry the same path.
     pub fn set_hook_socket(&self, path: PathBuf) {
         *self.hook_socket.lock().unwrap() = Some(path);
+    }
+
+    /// Issue #424: install the daemon's sink for [`DeliveryNotice`]s. Called
+    /// once from [`crate::daemon::run_daemon_with`]; a registry without one
+    /// (every in-process unit test) simply drops notices.
+    pub fn set_delivery_notice_sink(&self, sink: DeliveryNoticeSink) {
+        *self.delivery_notice_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// Issue #424 (reviewer blocker 3): report a delivery failure against the
+    /// pane it happened on, as DAEMON-SIDE STATE.
+    ///
+    /// Guarded by the same identity rule every write on this path uses: the
+    /// EXACT agent the prompt was written for must still own the pane. A pane
+    /// that exited and was respawned belongs to a stranger, and a stale report
+    /// against it would mark the successor's card in error for a delivery that
+    /// was never its.
+    ///
+    /// Synchronous and non-blocking — no writer lock, no PTY, no `await` — so a
+    /// caller can run it inside an absolute deadline without the deadline
+    /// becoming advisory (reviewer HIGH: the in-pane notice it replaces awaited
+    /// a writer lock with no timeout, which is what let a registered task
+    /// outlive the one deadline B9 established).
+    pub fn publish_delivery_notice(&self, notice: DeliveryNotice) {
+        if self.pane_current_agent_id(&notice.pane_id).as_deref() != Some(notice.agent_id.as_str())
+        {
+            tracing::debug!(
+                pane_id = %notice.pane_id,
+                delivery_id = %notice.delivery_id,
+                "delivery notice suppressed; the pane no longer belongs to this agent"
+            );
+            return;
+        }
+        let sink = self.delivery_notice_sink.lock().unwrap().clone();
+        match sink {
+            Some(sink) => sink(notice),
+            None => tracing::debug!(
+                pane_id = %notice.pane_id,
+                delivery_id = %notice.delivery_id,
+                "no delivery-notice sink installed; the report stays in the log only"
+            ),
+        }
     }
 
     /// PRD #126: record that `role`'s worker pane has just been delegated to

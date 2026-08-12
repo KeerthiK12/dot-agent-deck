@@ -1781,6 +1781,55 @@ fn session_start_means_ready(event: &AgentEvent) -> bool {
             .is_none()
 }
 
+/// Issue #424 (reviewer option 3): everything one [`wait_for_session_start`]
+/// window observed — deliberately more than whether it succeeded.
+///
+/// THREE independent facts hide behind "did a `SessionStart` arrive", and the
+/// old `Option<AgentType>` return conflated or discarded all but one of them:
+///
+/// * **is a session up** (`ready`) — the gate's original question, which decides
+///   when the prompt is written;
+/// * **which producer owns this pane** (`observed_producer`) — whether an
+///   unconfirmed write could EVER be confirmed
+///   ([`crate::prompt_delivery::agent_reports_submitted_prompt`]). This is
+///   answered by events the readiness gate SKIPS as well as by the one it
+///   accepts, and losing it made an honest bootstrap look less capable than one
+///   impersonating an initialized session;
+/// * **which conversation the prompt is going into** (`generation`) — dropping
+///   this is what left the confirmation loop unbound, free to adopt whatever
+///   announced itself next, which after an unobserved rollover is the SUCCESSOR.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionStartWait {
+    /// A session announced itself as up within the window. `false` on timeout or
+    /// sender closure — the fallback path, which still delivers.
+    pub(crate) ready: bool,
+    /// The hook generation the readiness event established, with the timestamp
+    /// that established it — **only when that event was a genuine, initialized
+    /// session announcing itself**.
+    ///
+    /// A `SessionStart` carrying [`crate::event::WRAPPER_FORK_SESSION_START_ORIGIN`]
+    /// is explicit boot PROVENANCE — the producer says, on the record, that its
+    /// child is still the launcher and the real agent is seconds away — so it
+    /// leaves this `None` even when it satisfied the readiness gate. The
+    /// delivery then stays UNBOUND until a genuine generation announces itself,
+    /// which is precisely the one authorized handoff [`latch_generation`]
+    /// permits; every generation change after that is terminal.
+    pub(crate) generation: Option<(String, DateTime<Utc>)>,
+    /// The agent type of ANY matching `SessionStart` seen in the window,
+    /// including one skipped as boot provenance.
+    pub(crate) observed_producer: Option<AgentType>,
+}
+
+impl SessionStartWait {
+    fn unready(observed_producer: Option<AgentType>) -> Self {
+        Self {
+            ready: false,
+            generation: None,
+            observed_producer,
+        }
+    }
+}
+
 /// PRD #92 F9 followup-6: block until the daemon's hook broadcast
 /// surfaces a `SessionStart` event for `pane_id`, or `timeout`
 /// elapses. The caller is expected to have called `event_tx.subscribe()`
@@ -1809,15 +1858,13 @@ fn session_start_means_ready(event: &AgentEvent) -> bool {
 /// the daemon itself is shutting down), in which case there's nothing
 /// to wait for.
 ///
-/// Returns the readiness event's [`AgentType`] when SessionStart was observed,
-/// `None` on timeout or sender closure. The delegate path only asks whether it
-/// fired (`.is_some()`) and writes the prompt regardless, matching the baseline
-/// `process_pending_dispatches` semantics. Issue #424's spawn path needs the
-/// TYPE as well: whether this producer can report a submitted prompt at all
-/// decides whether an unconfirmed write may be re-submitted
-/// ([`crate::prompt_delivery::agent_reports_submitted_prompt`]), and the
-/// readiness event is the first and often only place that answer is available
-/// before the write.
+/// Returns a [`SessionStartWait`] describing everything the window observed;
+/// `ready` is false on timeout or on sender closure. The delegate path asks only
+/// whether readiness fired (`.ready`) and writes the prompt regardless, matching
+/// the baseline `process_pending_dispatches` semantics. Issue #424's spawn path
+/// needs the other two answers as well — which PRODUCER owns the pane, and which
+/// GENERATION the prompt is going into — and both were being thrown away here.
+/// See [`SessionStartWait`] for why all three are separate questions.
 ///
 /// PRD #127: also reused by the scheduler spawn primitive
 /// ([`crate::spawn::spawn`]) to gate a freshly-spawned scheduled card's
@@ -1838,10 +1885,13 @@ pub(crate) async fn wait_for_session_start(
     pane_id: &str,
     agent_id: &str,
     timeout: std::time::Duration,
-) -> Option<AgentType> {
+) -> SessionStartWait {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut observed_producer = None;
     loop {
-        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            return SessionStartWait::unready(observed_producer);
+        };
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(BroadcastMsg::Event(event))) => {
                 if event.event_type == EventType::SessionStart
@@ -1857,16 +1907,37 @@ pub(crate) async fn wait_for_session_start(
                              card-surfacing SessionStart; waiting for the agent's \
                              native one"
                         );
+                        // Issue #424: not readiness — but it IS this pane's
+                        // producer identifying itself, which is a different
+                        // question and the only one that decides whether an
+                        // unconfirmed write may ever be re-submitted. Dropping
+                        // it on the floor made a bootstrap that announces its
+                        // own provenance LOOK less capable than one that says
+                        // nothing (`scheduler/dispatch/015`).
+                        observed_producer = Some(event.agent_type);
                         continue;
                     }
-                    return Some(event.agent_type);
+                    // Issue #424 (reviewer option 3): a readiness event that
+                    // declares itself launcher/wrapper-fork provenance is NOT a
+                    // conversation, so it binds nothing — see
+                    // [`SessionStartWait::generation`]. This is only reachable
+                    // for an agent with no native hook installer, because
+                    // `session_start_means_ready` above keeps waiting for the
+                    // genuine `SessionStart` of every agent that will emit one.
+                    let genuine = !event.is_wrapper_fork_session_start();
+                    return SessionStartWait {
+                        ready: true,
+                        generation: genuine.then_some((event.session_id, event.timestamp)),
+                        observed_producer: Some(event.agent_type),
+                    };
                 }
             }
             // PRD #120: not a hook event — keep waiting for the SessionStart.
             Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Closed)) => return None,
-            Err(_) => return None,
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
+                return SessionStartWait::unready(observed_producer);
+            }
         }
     }
 }
@@ -1906,11 +1977,12 @@ pub(crate) enum PromptWatch {
     /// deadline at write speed with the advertised backoff never applied.
     Closed,
     /// Reviewer findings B1/B2: the target this delivery was written for is
-    /// gone. Either the pane rebound to a DIFFERENT registry agent, or the hook
-    /// session the bytes went into ENDED, so the conversation no longer exists.
-    /// Re-submitting would inject the old task into a new context, and a
+    /// gone. The pane rebound to a DIFFERENT registry agent, the hook session
+    /// the bytes went into ENDED, or a different generation announced itself
+    /// after this delivery had already bound one — so the conversation no longer
+    /// exists. Re-submitting would inject the old task into a new context, and a
     /// matching event from the successor could only falsely confirm. See
-    /// [`latch_generation`] for why a merely NEWER generation is not this.
+    /// [`latch_generation`] for the one handoff that is NOT this.
     TargetChanged { reason: &'static str },
 }
 
@@ -1940,10 +2012,10 @@ pub(crate) enum PromptWatch {
 /// as proof.
 ///
 /// `generation` is the caller's LATCH, retained across windows: which hook
-/// session this delivery is currently bound to. It tracks forward across a
-/// launcher-to-agent handover and is terminal only when that session ENDS — see
-/// [`latch_generation`], which documents why the stricter rule was measured and
-/// rejected.
+/// session this delivery is bound to. It permits exactly ONE handoff — from an
+/// explicitly launcher/wrapper-fork-origin boot to the genuine agent generation
+/// — and is terminal on every generation change after that, and on the bound
+/// session ending. See [`latch_generation`].
 ///
 /// The prompt comparison goes through
 /// [`crate::prompt_delivery::prompt_submission_matches`], never `==`: the hook
@@ -2009,68 +2081,115 @@ pub(crate) async fn wait_for_prompt_submission(
     }
 }
 
-/// Track which hook session the delivery is bound to, and report the ONE
-/// generation transition that is terminal: the bound conversation ENDING.
-/// `None` means "carry on"; `Some` is terminal.
+/// Track which hook session the delivery is bound to, and report every
+/// generation transition that is TERMINAL for it. `None` means "carry on";
+/// `Some` is terminal.
 ///
-/// **A new generation is not, by itself, evidence that our target is gone.** The
-/// obvious-looking rule — bind the first generation seen and stop on any other —
-/// was implemented, measured against `scheduler/dispatch/015`, and is wrong: it
-/// reproduced the pre-fix failure exactly (151 s, all three real panes healthy,
-/// Idle, `confirmed=None`, zero retries). The launcher class issue #424 §3 is
-/// about is precisely a pane that changes generation during boot — a nested
-/// bootstrap announces a session, the real agent `exec`s over it and announces
-/// its own — and treating that as a lost target abandons the delivery before the
-/// agent that is supposed to receive it has even started. That is the whole bug,
-/// re-created by its own guard.
+/// # The policy, and why it is provenance-based
 ///
-/// So a newer generation REBINDS. What stays terminal is:
+/// The delivery binds ONE generation and then **pins** it: after that, an
+/// announced generation change is terminal, full stop. The old rule tracked
+/// generations FORWARD — a newer one simply rebound — which authorized the
+/// stale prompt in every successor conversation inside the 60 s window
+/// (reviewer blocker 1, auditor HIGH). A conversation boundary is a REVOCATION
+/// of prior intent, and a dispatch seed deploys, deletes and publishes, so
+/// following the pane into the next conversation is not a bounded same-intent
+/// misdelivery; it is running a revoked task.
 ///
-/// * a `SessionEnd` for the bound generation (here) — the conversation the bytes
-///   went into is over, so a retry could only land in a successor, and a
-///   matching event from that successor could only falsely confirm. This is the
-///   signature of the auditor's `/clear` scenario: Claude Code posts `SessionEnd`
-///   for the outgoing session before `SessionStart` for the new one;
-/// * a DIFFERENT registry agent on the pane (the caller's check) — the strong,
-///   exact guard, and the one the pane-reuse race actually needs.
+/// Forward tracking was argued from `scheduler/dispatch/015`, where binding the
+/// first generation and stopping on any other reproduced the pre-fix failure.
+/// That measurement was shaped by the fixture: `/015`'s bootstrap launcher
+/// posted an UNMARKED Claude-native `SessionStart`, impersonating an initialized
+/// session, so its boot generation and a no-end `/clear` were indistinguishable
+/// **to that fixture** — not in general. The repo already models exactly this
+/// distinction ([`crate::event::SESSION_START_ORIGIN_METADATA_KEY`], PRD #225
+/// M3), so the discriminator is explicit boot PROVENANCE, not "we have not been
+/// confirmed yet" (every transition this loop sees is unconfirmed by
+/// construction — confirmation ends the task).
 ///
-/// The residual is a same-agent conversation restart that emits no `SessionEnd`:
-/// the retry then lands in the new conversation. It carries the same task, into
-/// the same pane, for the same agent, inside the delivery's own 60 s window, and
-/// the daemon-side `expected_session_id` guard still refuses it on the TUI
-/// paths. That is a bounded, same-intent misdelivery, and it is the price of not
-/// re-breaking the population the fix exists for.
+/// So:
 ///
-/// Ordering mirrors [`AppState::apply_event`]'s monotonic generation tracking: a
-/// DELAYED frame from a PRIOR generation has the same shape as a rollover and
-/// only the timestamp separates them, so an older frame never rebinds.
-fn latch_generation(
+/// * a `SessionStart` that declares launcher/wrapper-fork provenance **never
+///   binds and never terminates** while the delivery is unbound. It is the
+///   producer stating that its child is still the launcher. Leaving it unbound
+///   is what authorizes exactly ONE handoff: the genuine generation that
+///   announces itself next becomes the binding;
+/// * the first GENUINE `SessionStart` binds, and is then pinned;
+/// * a later `SessionStart` naming a different generation is TERMINAL;
+/// * a `SessionEnd` for the bound generation is TERMINAL — the conversation the
+///   bytes went into is over. This is the auditor's `/clear` signature: Claude
+///   Code posts `SessionEnd` for the outgoing session before `SessionStart` for
+///   the new one;
+/// * a `SessionEnd` arriving while NOTHING is bound is TERMINAL too. Ignoring it
+///   (the old rule) was the hole that let an old generation's end be followed by
+///   a successor's start and bind the successor — reachable on every producer,
+///   and the only shape available on Codex, which installs no `SessionEnd` hook
+///   at all, and on OpenCode, which ends only on `session.deleted`;
+/// * a DIFFERENT registry agent on the pane (the caller's check) stays the
+///   strong, exact guard for pane reuse.
+///
+/// # Why only a `SessionStart` may announce a change
+///
+/// A non-start frame carrying a different `session_id` is NOT an announcement —
+/// the same reasoning [`AppState::apply_event`] applies when deciding what may
+/// retire a card: `SessionStart` is self-describing and authoritative, anything
+/// else is inference. It also matters mechanically: a wrapped agent legitimately
+/// has TWO producers on one pane under one registry agent id (the wrapper emits
+/// under `{pane}-session`, the wrapped agent's native hooks under their own id),
+/// so treating an ordinary `Thinking` from the other producer as a rollover
+/// would abandon every wrapped-agent delivery. Ordinary frames only bump the
+/// bound generation's high-water timestamp.
+///
+/// Ordering mirrors `apply_event`'s monotonic tracking: a DELAYED announcement
+/// stamped older than the bound generation is a straggler from a superseded
+/// generation, not a rollover, so it is ignored rather than terminal. A
+/// matching-id `SessionEnd` is deliberately NOT timestamp-guarded — it names the
+/// very generation we are bound to, so it is evidence about US, and refusing to
+/// terminate on it because of clock granularity would be the unsafe direction.
+pub(crate) fn latch_generation(
     generation: &mut Option<(String, DateTime<Utc>)>,
     event: &AgentEvent,
 ) -> Option<PromptWatch> {
-    let ended = event.event_type == EventType::SessionEnd;
+    if event.event_type == EventType::SessionEnd {
+        return match generation {
+            Some((bound_id, _)) if *bound_id == event.session_id => {
+                Some(PromptWatch::TargetChanged {
+                    reason: "bound-session-ended",
+                })
+            }
+            // An end for a generation this delivery is not bound to: the
+            // wrapper's own session, or one already superseded. Not evidence
+            // about the conversation we wrote into.
+            Some(_) => None,
+            None => Some(PromptWatch::TargetChanged {
+                reason: "session-ended-while-unbound",
+            }),
+        };
+    }
+    if event.event_type != EventType::SessionStart {
+        // Not an announcement. It can only refresh the high-water mark of the
+        // generation we are already bound to.
+        if let Some((bound_id, bound_ts)) = generation
+            && *bound_id == event.session_id
+        {
+            *bound_ts = (*bound_ts).max(event.timestamp);
+        }
+        return None;
+    }
     match generation {
-        None if ended => None,
+        None if event.is_wrapper_fork_session_start() => None,
         None => {
             *generation = Some((event.session_id.clone(), event.timestamp));
             None
-        }
-        Some((bound_id, _)) if *bound_id == event.session_id && ended => {
-            Some(PromptWatch::TargetChanged {
-                reason: "bound-session-ended",
-            })
         }
         Some((bound_id, bound_ts)) if *bound_id == event.session_id => {
             *bound_ts = (*bound_ts).max(event.timestamp);
             None
         }
-        Some((bound_id, bound_ts)) if event.timestamp >= *bound_ts => {
-            *bound_id = event.session_id.clone();
-            *bound_ts = event.timestamp;
-            None
-        }
-        // Older frame from a superseded generation: neither a rollover nor an
-        // end of the generation we are bound to.
+        Some((_, bound_ts)) if event.timestamp >= *bound_ts => Some(PromptWatch::TargetChanged {
+            reason: "generation-changed",
+        }),
+        // Delayed announcement from a superseded generation.
         Some(_) => None,
     }
 }
@@ -2352,7 +2471,7 @@ async fn dispatch_one_owned(
                     SESSION_START_WAIT_TIMEOUT,
                 )
                 .await
-                .is_some();
+                .ready;
                 if !observed {
                     tracing::debug!(
                         role = %target_role,
@@ -4095,6 +4214,138 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #424 (C1): the generation policy, exercised as the state machine it
+    /// is. One handoff out of an explicitly launcher-origin boot, then pinned;
+    /// every announced change after that is terminal; an end is terminal bound
+    /// or unbound; and a second producer's ordinary frames are not
+    /// announcements.
+    #[test]
+    fn generation_latch_allows_one_bootstrap_handoff_then_pins() {
+        fn event(session: &str, event_type: EventType, secs: i64) -> AgentEvent {
+            AgentEvent {
+                session_id: session.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(secs),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some("pane".into()),
+                agent_id: Some("agent".into()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+        fn launcher(session: &str, secs: i64) -> AgentEvent {
+            let mut e = event(session, EventType::SessionStart, secs);
+            e.metadata.insert(
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+            );
+            e
+        }
+        let terminal = |w: Option<PromptWatch>| match w {
+            Some(PromptWatch::TargetChanged { reason }) => Some(reason),
+            None => None,
+            other => panic!("latch returned a non-terminal watch: {other:?}"),
+        };
+
+        // A launcher's own boot never binds, so the genuine generation that
+        // follows it is the ONE authorized handoff — this is `/015`'s shape.
+        let mut bound = None;
+        assert_eq!(
+            terminal(latch_generation(&mut bound, &launcher("boot", 1))),
+            None
+        );
+        assert!(bound.is_none(), "boot provenance must not bind: {bound:?}");
+        assert_eq!(
+            terminal(latch_generation(
+                &mut bound,
+                &event("real", EventType::SessionStart, 2)
+            )),
+            None
+        );
+        assert_eq!(bound.as_ref().map(|(id, _)| id.as_str()), Some("real"));
+
+        // Pinned: a second genuine announcement is a lost target, not a rebind.
+        // This is the `/clear`-with-no-`SessionEnd` shape (Codex installs no end
+        // hook at all; OpenCode ends only on `session.deleted`).
+        let mut rolled = bound.clone();
+        assert_eq!(
+            terminal(latch_generation(
+                &mut rolled,
+                &event("successor", EventType::SessionStart, 3)
+            )),
+            Some("generation-changed")
+        );
+
+        // ...including a second launcher fork, which is an announcement too once
+        // this delivery has a conversation of its own to lose.
+        let mut refork = bound.clone();
+        assert_eq!(
+            terminal(latch_generation(&mut refork, &launcher("boot-2", 3))),
+            Some("generation-changed")
+        );
+
+        // A second producer on one pane (a wrapped agent emits under
+        // `{pane}-session` while its native hooks use their own id) does NOT
+        // announce anything, so its ordinary frames must not abandon the
+        // delivery — they are not evidence of a conversation change.
+        let mut wrapped = bound.clone();
+        assert_eq!(
+            terminal(latch_generation(
+                &mut wrapped,
+                &event("wrapper-session", EventType::Thinking, 4)
+            )),
+            None
+        );
+        assert_eq!(wrapped.as_ref().map(|(id, _)| id.as_str()), Some("real"));
+
+        // A delayed announcement stamped older than the bound generation is a
+        // straggler from a superseded generation, not a rollover.
+        let mut delayed = bound.clone();
+        assert_eq!(
+            terminal(latch_generation(
+                &mut delayed,
+                &event("older", EventType::SessionStart, 0)
+            )),
+            None
+        );
+
+        // Ends: for the bound generation, and for NO generation at all. The
+        // second is the hole that let an old generation's end be followed by a
+        // successor's start and bind the successor.
+        let mut ending = bound.clone();
+        assert_eq!(
+            terminal(latch_generation(
+                &mut ending,
+                &event("real", EventType::SessionEnd, 5)
+            )),
+            Some("bound-session-ended")
+        );
+        let mut unbound = None;
+        assert_eq!(
+            terminal(latch_generation(
+                &mut unbound,
+                &event("whatever", EventType::SessionEnd, 5)
+            )),
+            Some("session-ended-while-unbound")
+        );
+        // But an end naming a generation this delivery is not bound to says
+        // nothing about the conversation we wrote into.
+        let mut other_end = bound.clone();
+        assert_eq!(
+            terminal(latch_generation(
+                &mut other_end,
+                &event("wrapper-session", EventType::SessionEnd, 5)
+            )),
+            None
+        );
+    }
 
     #[test]
     fn compose_delegate_prompt_is_single_line_file_pointer() {

@@ -340,6 +340,36 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         metadata.insert("tool_use_id".to_string(), tool_use_id);
     }
 
+    // Issue #424 (reviewer option 3): forward EXPLICIT BOOT PROVENANCE.
+    //
+    // A launcher that posts a Claude-shaped `SessionStart` for its own bootstrap
+    // (`devbox run claude …`, a wrapper script that `exec`s the real agent) can
+    // say so with [`crate::event::SESSION_START_ORIGIN_METADATA_KEY`], exactly
+    // as `dot-agent-deck wrap` does on its fork-time event (PRD #225 M3).
+    // Without this, the whole `metadata` object of a Claude-compatible payload
+    // was dropped on the floor here, so such a launcher was INDISTINGUISHABLE
+    // from an initialized session — which is what made a boot-time generation
+    // change and a `/clear` look identical to the delivery latch, and what was
+    // used to argue for the (rejected) forward-tracking rule. See
+    // [`crate::state::latch_generation`].
+    //
+    // Deliberately narrow: ONE key, only on `SessionStart`, only the one value
+    // the repo defines. Everything else in an incoming `metadata` object is
+    // still ignored, so this cannot become an arbitrary producer-controlled
+    // channel into the daemon's event metadata.
+    if event_type == EventType::SessionStart
+        && extra
+            .get("metadata")
+            .and_then(|m| m.get(crate::event::SESSION_START_ORIGIN_METADATA_KEY))
+            .and_then(|v| v.as_str())
+            == Some(crate::event::WRAPPER_FORK_SESSION_START_ORIGIN)
+    {
+        metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+    }
+
     // Store full bash command for reactive pane routing (tool_detail truncates).
     if matches!(event_type, EventType::ToolStart)
         && tool_name.as_deref() == Some("Bash")
@@ -1362,6 +1392,72 @@ mod tests {
 
     /// Serialize env-var-mutating tests to avoid races.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Issue #424: a launcher's Claude-shaped `SessionStart` can declare that it
+    /// is a BOOTSTRAP, and that declaration has to survive the hook builder —
+    /// the whole incoming `metadata` object used to be discarded here, which is
+    /// what made a launcher indistinguishable from an initialized session.
+    #[test]
+    fn session_start_origin_survives_the_claude_hook_builder() {
+        let origin_payload = |event: &str, value: &str| {
+            let mut extra = HashMap::new();
+            extra.insert(
+                "metadata".to_string(),
+                serde_json::json!({ crate::event::SESSION_START_ORIGIN_METADATA_KEY: value }),
+            );
+            ClaudeCodeHookInput {
+                session_id: "bootstrap-pane-1".into(),
+                hook_event_name: event.into(),
+                cwd: None,
+                tool_name: None,
+                tool_input: None,
+                tool_use_id: None,
+                prompt: None,
+                _extra: extra,
+            }
+        };
+
+        let launcher = build_event(origin_payload(
+            "SessionStart",
+            crate::event::WRAPPER_FORK_SESSION_START_ORIGIN,
+        ))
+        .expect("SessionStart maps to an event");
+        assert!(
+            launcher.is_wrapper_fork_session_start(),
+            "a launcher's declared boot provenance must reach the daemon: {:?}",
+            launcher.metadata
+        );
+
+        // Narrow on purpose: only this key, only this value, only on a
+        // `SessionStart`. Everything else stays ignored, so an arbitrary
+        // producer cannot push free-form metadata through the hook builder.
+        let unknown_value = build_event(origin_payload("SessionStart", "something-else"))
+            .expect("SessionStart maps to an event");
+        assert!(!unknown_value.is_wrapper_fork_session_start());
+        assert!(unknown_value.metadata.is_empty());
+        let wrong_event = build_event(origin_payload(
+            "UserPromptSubmit",
+            crate::event::WRAPPER_FORK_SESSION_START_ORIGIN,
+        ))
+        .expect("UserPromptSubmit maps to an event");
+        assert!(!wrong_event.is_wrapper_fork_session_start());
+        assert!(wrong_event.metadata.is_empty());
+
+        // And an ordinary agent's `SessionStart`, which carries no metadata at
+        // all, is still read as a genuine initialized session.
+        let genuine = build_event(ClaudeCodeHookInput {
+            session_id: "real".into(),
+            hook_event_name: "SessionStart".into(),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        })
+        .expect("SessionStart maps to an event");
+        assert!(!genuine.is_wrapper_fork_session_start());
+    }
 
     #[test]
     fn pane_id_propagated_from_env_claude_code() {

@@ -46,8 +46,8 @@ use tokio::sync::broadcast;
 use chrono::{DateTime, Utc};
 
 use crate::agent_pty::{
-    AgentPtyError, AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions,
-    TabMembership, command_needs_shell_wrap,
+    AgentPtyError, AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, DeliveryNotice, GuardedSend,
+    SpawnOptions, TabMembership, command_needs_shell_wrap,
 };
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
 use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
@@ -824,12 +824,12 @@ async fn deliver(
     // but "can this producer report a submitted prompt at all" — which decides
     // whether an unconfirmed write may be RE-submitted. See
     // [`confirm_prompt_delivery`].
-    let (mut event_rx, readiness) = match event_rx {
+    let (mut event_rx, observed) = match event_rx {
         Some(mut rx) => {
             let timeout = session_start_wait_timeout().min(remaining_before(deadline));
-            let readiness =
+            let observed =
                 crate::state::wait_for_session_start(&mut rx, pane_id, agent_id, timeout).await;
-            if readiness.is_none() {
+            if !observed.ready {
                 tracing::debug!(
                     pane_id,
                     timeout_ms = timeout.as_millis(),
@@ -837,11 +837,11 @@ async fn deliver(
                      delivering prompt via fallback path"
                 );
             }
-            (Some(rx), readiness)
+            (Some(rx), observed)
         }
         None => {
             tokio::time::sleep(DELIVER_BUFFER_DELAY.min(remaining_before(deadline))).await;
-            (None, None)
+            (None, crate::state::SessionStartWait::default())
         }
     };
     let delivery_id = mint_delivery_id(pane_id);
@@ -852,7 +852,14 @@ async fn deliver(
     // latch it fills means the very first retry already knows which hook session
     // it is bound to. Also the last chance to notice the pane rebound while we
     // waited out a 30 s readiness timeout.
-    let mut generation: Option<(String, DateTime<Utc>)> = None;
+    //
+    // Auditor HIGH / C1: the latch STARTS from the readiness event's own
+    // generation. Initializing it to `None` here threw that away, so the first
+    // `SessionStart` the confirmation loop happened to see became the binding —
+    // and after an unobserved rollover that is the SUCCESSOR conversation. A
+    // launcher/wrapper-fork readiness event contributes no generation by
+    // design; see `crate::state::SessionStartWait::generation`.
+    let mut generation: Option<(String, DateTime<Utc>)> = observed.generation.clone();
     let mut drained_capability = false;
     if let Some(rx) = event_rx.as_mut()
         && let Some(reason) = drain_pre_write_events(
@@ -888,7 +895,14 @@ async fn deliver(
         }
     }
     log_prompt_written(DELIVERY_LOG_PATH, pane_id, &delivery_id, 1);
-    let can_report_prompts = readiness
+    // Issue #424: read from `observed_producer`, not from readiness. A launcher
+    // that declares its boot provenance is skipped by the readiness gate but has
+    // still named the producer, and that is the only question this answers —
+    // whether an unconfirmed write could EVER be confirmed. Keying it off
+    // readiness meant an honest bootstrap disarmed its own recovery
+    // (`scheduler/dispatch/015`).
+    let can_report_prompts = observed
+        .observed_producer
         .as_ref()
         .is_some_and(crate::prompt_delivery::agent_reports_submitted_prompt)
         || drained_capability;
@@ -997,6 +1011,19 @@ async fn guarded_submit(
 /// before the write this precedes — latching the pane's hook generation and
 /// noting whether the producer can report a submitted prompt. Returns a stop
 /// reason when the drained frames show the target is already gone.
+///
+/// Auditor HIGH: the generation decision is [`crate::state::latch_generation`],
+/// the SAME function the post-write watch uses, rather than the open-coded copy
+/// that used to live here. That copy never inspected `event_type`, so it happily
+/// bound (or advanced to) a `SessionEnd` instead of stopping on it — a drained
+/// end of the conversation we were about to write into looked like an ordinary
+/// generation. One policy, one place: a future change to what is terminal cannot
+/// apply to only one of the two.
+///
+/// Called TWICE per attempt on purpose (see [`confirm_prompt_delivery`]): once
+/// before the first write, and again in the gap between a watch window expiring
+/// and the retry that follows it. That gap used to be unguarded, so an end/start
+/// pair arriving inside it was observed only AFTER the stale retry had landed.
 fn drain_pre_write_events(
     rx: &mut broadcast::Receiver<BroadcastMsg>,
     pane_id: &str,
@@ -1018,18 +1045,10 @@ fn drain_pre_write_events(
                 if crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type) {
                     *can_report_prompts = true;
                 }
-                // Rebinding, not stopping — see `state::latch_generation` for
-                // why a newer generation is not evidence of a lost target.
-                match generation {
-                    None => *generation = Some((event.session_id, event.timestamp)),
-                    Some((bound_id, bound_ts)) if *bound_id == event.session_id => {
-                        *bound_ts = (*bound_ts).max(event.timestamp);
-                    }
-                    Some((bound_id, bound_ts)) if event.timestamp >= *bound_ts => {
-                        *bound_id = event.session_id;
-                        *bound_ts = event.timestamp;
-                    }
-                    Some(_) => {}
+                if let Some(crate::state::PromptWatch::TargetChanged { reason }) =
+                    crate::state::latch_generation(generation, &event)
+                {
+                    return Some(reason);
                 }
             }
             Ok(BroadcastMsg::OrchestrationSurface(_)) => continue,
@@ -1058,8 +1077,8 @@ fn drain_pre_write_events(
 /// of whoever happens to own the pane string by then.
 ///
 /// Bounded by [`AUTOMATIC_PROMPT_DEADLINE`], after which the prompt is abandoned
-/// with a warn, a durable in-pane notice, and no further write. Every retry
-/// types the prompt into the pane again, so the escalating
+/// with a warn, a durable report on the pane's card, and no further write. Every
+/// retry types the prompt into the pane again, so the escalating
 /// [`unconfirmed_retry_delay`] keeps that to single digits across the whole
 /// window (see its docs).
 ///
@@ -1101,7 +1120,21 @@ async fn confirm_prompt_delivery(
     loop {
         let remaining = remaining_before(deadline);
         if remaining.is_zero() {
-            abandon_spawn_prompt(&registry, &pane_id, &agent_id, &delivery_id, attempt).await;
+            // Reviewer finding B3, daemon side: a delivery that never found a
+            // producer capable of reporting a submitted prompt was not FAILED —
+            // nothing could ever have confirmed it — so it is logged as
+            // unconfirmable and reported nowhere. Reporting an error on a `cat`
+            // pane's card would be a false alarm on every hookless delivery.
+            if armed {
+                abandon_spawn_prompt(&registry, &pane_id, &agent_id, &delivery_id, attempt);
+            } else {
+                log_prompt_unconfirmable(
+                    DELIVERY_LOG_PATH,
+                    &pane_id,
+                    &delivery_id,
+                    "this agent cannot report a submitted prompt, so nothing could confirm delivery",
+                );
+            }
             return;
         }
         let window = unconfirmed_retry_delay(attempt).min(remaining);
@@ -1146,19 +1179,42 @@ async fn confirm_prompt_delivery(
                 return;
             }
         }
+        // Reviewer finding B3, daemon side: capability is a property of the
+        // PRODUCER, not a verdict a 500 ms timeout may return. Nothing has
+        // identified itself yet, so the write stays PROVISIONAL — held, never
+        // retyped — and the next window asks again. Returning here (what this
+        // did) abandoned the watch half a second after the write while up to 59
+        // seconds of the deadline remained, so an agent booting behind a
+        // launcher had nobody left watching by the time it signalled: the exact
+        // silent loss issue #424 reports, re-created by its own capability gate.
+        // The cost is the mirror of the TUI's `ConfirmationCapability::Unknown`
+        // — a genuinely hookless pane holds a (timer-only) watch until the
+        // deadline instead of exiting after one window.
         if !armed {
-            log_prompt_unconfirmable(
-                DELIVERY_LOG_PATH,
-                &pane_id,
-                &delivery_id,
-                "this agent cannot report a submitted prompt, so nothing could confirm delivery",
-            );
-            return;
+            continue;
         }
         if remaining_before(deadline).is_zero() {
-            abandon_spawn_prompt(&registry, &pane_id, &agent_id, &delivery_id, attempt).await;
+            abandon_spawn_prompt(&registry, &pane_id, &agent_id, &delivery_id, attempt);
             return;
         }
+        // Auditor HIGH (the unguarded event gap): the watch window above stopped
+        // reading the moment it expired, and everything between that instant and
+        // the write below used to be observed only on the NEXT window — i.e.
+        // after the stale retry had already landed. A `/clear` (or any
+        // end/start pair) that lands in this gap is caught here instead, under
+        // the same policy the window itself applies.
+        let mut gap_capability = false;
+        if let Some(reason) = drain_pre_write_events(
+            &mut rx,
+            &pane_id,
+            &agent_id,
+            &mut generation,
+            &mut gap_capability,
+        ) {
+            log_prompt_stopped(DELIVERY_LOG_PATH, &pane_id, &delivery_id, reason);
+            return;
+        }
+        armed |= gap_capability;
         log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
         attempt = attempt.saturating_add(1);
         match guarded_submit(&registry, &pane_id, &agent_id, &prompt, deadline).await {
@@ -1192,20 +1248,25 @@ async fn confirm_prompt_delivery(
 /// `dispatch --single` whose prompt vanished was invisible in the default
 /// environment — `init_logging_from_env` installs a subscriber only when
 /// `DOT_AGENT_DECK_LOG` is set, which is exactly the diagnosability gap the
-/// issue is about. So the pane itself gets a durable one-line notice, in the
-/// scrollback of the pane the prompt was meant for, where an attached client
-/// sees it without any logging configured.
+/// issue is about.
 ///
-/// Follows PRD #249 M3's delegate-silence notice in every respect that made
-/// that one safe: ONE line, delivered with [`write_notice_guarded`] so it
-/// terminates on LF rather than the submit CR (a visible line, not a turn the
-/// agent must answer), bound to the exact agent id, and FIXED daemon-authored
-/// text with nothing interpolated that a repository or a prompt controls. Same
-/// caveat too: inertness is best-effort, so the identifying detail stays in the
-/// log and the pane gets "look at the log".
+/// Reviewer blocker 3 / auditor MEDIUM: the report is DAEMON-SIDE STATE on the
+/// pane's card, not bytes written into the agent's input buffer. The previous
+/// round wrote a one-line notice through `write_notice_guarded`; that
+/// primitive's own production contract says LF may be interpreted as Enter and
+/// that a later ordinary submit sends `notice + newline + user prompt` as a
+/// single turn (pinned by the passing
+/// `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`), so
+/// into a pane that may already hold swallowed seed bytes the diagnostic could
+/// itself become a task. PRD #249 is precedent for ACCEPTING that limitation in
+/// the orchestrator's pane, not evidence it is safe here. See
+/// [`DeliveryNotice`].
 ///
-/// [`write_notice_guarded`]: AgentPtyRegistry::write_notice_guarded
-async fn abandon_spawn_prompt(
+/// Now synchronous, which is the second half of reviewer finding B9: this used
+/// to `await` a writer lock with no timeout AFTER the absolute deadline had
+/// passed, so the registered task — and the cap slot it occupies — could outlive
+/// the one deadline that was supposed to bound the whole delivery.
+fn abandon_spawn_prompt(
     registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     agent_id: &str,
@@ -1213,32 +1274,15 @@ async fn abandon_spawn_prompt(
     attempts: u32,
 ) {
     log_prompt_abandoned(DELIVERY_LOG_PATH, pane_id, delivery_id, attempts);
-    let notice = "⚠ prompt possibly not delivered (dot-agent-deck daemon report): a spawn-time \
-                  prompt was written into this pane but the agent never reported submitting it \
-                  within the delivery deadline. It may never have arrived; check whether this \
-                  pane was given any task at all. The daemon log names the delivery id and the \
-                  attempt count.";
-    let closing = Arc::clone(registry);
-    let sent = registry
-        .write_notice_guarded(pane_id, notice, Some(agent_id), || async move {
-            !closing.is_pane_closing(pane_id)
-        })
-        .await;
-    match sent {
-        Ok(GuardedSend::Applied) => {}
-        Ok(other) => tracing::debug!(
-            pane_id,
-            delivery_id,
-            outcome = ?other,
-            "abandonment notice not delivered; the pane is already gone"
-        ),
-        Err(e) => tracing::debug!(
-            pane_id,
-            delivery_id,
-            error = %e,
-            "abandonment notice could not be written"
-        ),
-    }
+    registry.publish_delivery_notice(DeliveryNotice {
+        pane_id: pane_id.to_string(),
+        agent_id: agent_id.to_string(),
+        delivery_id: delivery_id.to_string(),
+        detail: "a spawn-time prompt was written into this pane but the agent never reported \
+                 submitting it within the delivery deadline; it may never have arrived — check \
+                 whether this pane was given any task at all (the daemon log names the delivery \
+                 id and the attempt count)",
+    });
 }
 
 /// Everything one detached confirmation loop needs, bundled so the loop's
@@ -1267,10 +1311,29 @@ struct ConfirmationTask {
 static CONFIRMATION_TASKS: std::sync::LazyLock<Mutex<HashMap<String, tokio::task::AbortHandle>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Ceiling on concurrently-live confirmation tasks across the daemon. Each one
-/// is a cheap timer-driven loop, so this is a runaway backstop — a caller
-/// dispatching thousands of panes gets its prompts written once and unwatched
-/// rather than an unbounded task pile.
+/// Ceiling on concurrently-live confirmation tasks across the daemon.
+///
+/// The map is keyed by pane and single-flight per pane, and each task is bounded
+/// by [`AUTOMATIC_PROMPT_DEADLINE`], so this is not a work queue that can back
+/// up: it is exceeded only when more than this many DISTINCT panes are inside
+/// their delivery window at the same instant. That is a runaway backstop, and it
+/// is kept.
+///
+/// What is NOT kept is what exhaustion used to mean (reviewer HIGH / auditor
+/// LOW). The 257th prompt was written once and then simply not watched, with the
+/// only trace an info-level log line — silent under the default no-subscriber
+/// configuration — so the delivery that most needed #424's recovery was opted
+/// out of it invisibly. It is reachable by CONFIGURATION rather than by
+/// corruption: `issue_dispatch.max_per_run` has no upper bound and schedules can
+/// overlap. Exhaustion is now reported on the pane's own card through the same
+/// [`DeliveryNotice`] surface as an abandoned delivery, so "written but
+/// unwatched" is visible exactly where "written and abandoned" is.
+///
+/// The number itself is deliberately unchanged. Raising it does not remove the
+/// cliff, only move it; removing the cap trades a visible, bounded degradation
+/// for an unbounded task pile. With exhaustion now visible, 256 concurrent
+/// in-window panes is a threshold an operator can see and act on rather than a
+/// silent policy.
 const MAX_CONFIRMATION_TASKS: usize = 256;
 
 /// Start the detached confirmation loop for one pane, under a PER-PANE
@@ -1298,6 +1361,17 @@ fn spawn_confirmation_task(
             &delivery_id,
             "too many in-flight prompt confirmations; not watching this one",
         );
+        // Reviewer HIGH: exhausting the cap silently opts the delivery out of
+        // the recovery this whole issue is about. Report it where an abandoned
+        // delivery is reported — see [`MAX_CONFIRMATION_TASKS`].
+        registry.publish_delivery_notice(DeliveryNotice {
+            pane_id: pane_id.clone(),
+            agent_id: task.agent_id.clone(),
+            delivery_id,
+            detail: "a spawn-time prompt was written into this pane but the daemon is already \
+                     watching its maximum number of unconfirmed deliveries, so this one is NOT \
+                     being confirmed or retried; check whether the pane acted on its task",
+        });
         return;
     }
     // Held across `tokio::spawn`, which is synchronous — no await, so a `std`
@@ -1818,6 +1892,69 @@ mod tests {
             "SessionEnd for the bound generation must stop before retry bytes reach the cleared conversation"
         );
         clear_registry.shutdown_all();
+    }
+
+    /// Issue #424 (reviewer blocker 3 / C4, coder-authored): abandonment is
+    /// REPORTED, not typed. The report reaches the daemon's notice sink bound to
+    /// the exact agent the prompt was written for, writes nothing into the
+    /// pane's PTY, and is suppressed once that agent no longer owns the pane —
+    /// so a stale report can never mark a successor's card.
+    #[tokio::test]
+    async fn abandonment_reports_state_and_never_writes_into_the_pane() {
+        const PANE_ID: &str = "abandon-notice-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn notice target");
+        let notices = Arc::new(Mutex::new(Vec::<DeliveryNotice>::new()));
+        let recorded = notices.clone();
+        registry.set_delivery_notice_sink(Arc::new(move |notice| {
+            recorded.lock().unwrap().push(notice);
+        }));
+
+        abandon_spawn_prompt(&registry, PANE_ID, &agent_id, "delivery-abandoned", 3);
+        {
+            let notices = notices.lock().unwrap();
+            assert_eq!(notices.len(), 1, "abandonment must report exactly once");
+            assert_eq!(notices[0].pane_id, PANE_ID);
+            assert_eq!(notices[0].agent_id, agent_id);
+            assert_eq!(notices[0].delivery_id, "delivery-abandoned");
+        }
+        // Reviewer blocker 3: the pane's own byte stream stays untouched. The
+        // previous round wrote the diagnostic into the agent's input buffer,
+        // where LF may be read as Enter and a later submit can carry it along as
+        // part of the user's turn.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let output = registry.snapshot(&agent_id).expect("pane snapshot");
+        assert!(
+            !String::from_utf8_lossy(&output).contains("prompt"),
+            "no diagnostic bytes may reach the agent's input: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+
+        // The pane changes hands: the old delivery's report belongs to nobody.
+        registry
+            .close_agent(&agent_id)
+            .expect("close notice target");
+        let replacement = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn replacement");
+        assert_ne!(replacement, agent_id);
+        abandon_spawn_prompt(&registry, PANE_ID, &agent_id, "delivery-abandoned", 3);
+        assert_eq!(
+            notices.lock().unwrap().len(),
+            1,
+            "a report against a replaced agent must be suppressed, not re-addressed"
+        );
+        registry.shutdown_all();
     }
 
     fn parse_config(toml: &str) -> ProjectConfig {

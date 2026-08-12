@@ -541,6 +541,10 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     pty_registry.set_hook_socket(socket_path.to_path_buf());
     let state = daemon.state;
     let event_tx = daemon.event_tx;
+    // Issue #424: give the spawn-time delivery path a way to REPORT a failed
+    // delivery as state on the pane's card instead of typing a diagnostic line
+    // into the agent's input buffer. See `install_delivery_notice_sink`.
+    install_delivery_notice_sink(&pty_registry, state.clone(), event_tx.clone());
     let client_count = daemon.client_count;
     let idle_shutdown = daemon.idle_shutdown;
     let scheduler = daemon.scheduler;
@@ -1049,6 +1053,94 @@ async fn ingest_event(
     let mut state = state.write().await;
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
     state.apply_event(event);
+}
+
+/// Issue #424 (reviewer blocker 3): teach the registry how to turn a
+/// [`DeliveryNotice`] into durable, client-visible STATE.
+///
+/// The spawn-time delivery path runs deep inside `crate::spawn` with only an
+/// `AgentPtyRegistry` in hand, so the daemon installs the ability rather than
+/// the path reaching for it. What lands is ONE synthetic `AgentEvent` pushed
+/// through [`ingest_event`] — the same single ordered operation every real hook
+/// event takes — so the daemon's own `AppState` records it (a client attaching
+/// later still sees it) and every attached client renders it live. The card's
+/// status becomes `Error`; the delivery id stays in the log, where the detail
+/// belongs.
+///
+/// Three properties are deliberate:
+///
+/// * **The event never moves the pane's GENERATION.** It is stamped with the
+///   pane's CURRENT hook session id, so `apply_event`'s monotonic
+///   `pane_hook_session` tracking sees the generation it already has. A
+///   synthetic id would roll the generation forward and, under the same-pane
+///   guards this issue is about, could abandon an unrelated in-flight delivery.
+///   The residual is a pane that has a card but no hook generation at all (a
+///   placeholder-only pane): stamping its card id establishes a generation where
+///   there was none — harmless there by construction, because a pane with no
+///   hook producer has no generation-bound delivery to disturb.
+/// * **It never mints a card.** With no session on the pane there is nothing to
+///   annotate, so the report stays in the log rather than conjuring a card for
+///   a pane the dashboard is not showing.
+/// * **It carries the registry `agent_id`**, so `apply_event`'s reuse guard
+///   lands it on that agent's existing card instead of creating a sibling.
+fn install_delivery_notice_sink(
+    registry: &Arc<AgentPtyRegistry>,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+) {
+    registry.set_delivery_notice_sink(std::sync::Arc::new(move |notice| {
+        let state = state.clone();
+        let event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            let session_id = {
+                let guard = state.read().await;
+                guard.pane_hook_session_id(&notice.pane_id).or_else(|| {
+                    guard
+                        .sessions
+                        .values()
+                        .find(|session| session.pane_id.as_deref() == Some(&notice.pane_id))
+                        .map(|session| session.session_id.clone())
+                })
+            };
+            let Some(session_id) = session_id else {
+                tracing::debug!(
+                    pane_id = %notice.pane_id,
+                    delivery_id = %notice.delivery_id,
+                    "delivery notice has no card to land on; log only"
+                );
+                return;
+            };
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(
+                crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+                notice.detail.to_string(),
+            );
+            ingest_event(
+                &state,
+                &event_tx,
+                AgentEvent {
+                    session_id,
+                    // The daemon is not the agent, and must not claim to be one:
+                    // `apply_event` only fills a session's type when it is still
+                    // unknown, so `None` cannot overwrite a real agent type.
+                    agent_type: crate::event::AgentType::None,
+                    event_type: crate::event::EventType::Error,
+                    tool_name: None,
+                    tool_detail: Some(notice.detail.to_string()),
+                    cwd: None,
+                    timestamp: chrono::Utc::now(),
+                    user_prompt: None,
+                    metadata,
+                    pane_id: Some(notice.pane_id.clone()),
+                    agent_id: Some(notice.agent_id.clone()),
+                    agent_version: None,
+                    schema_version: None,
+                    live_target: None,
+                },
+            )
+            .await;
+        });
+    }));
 }
 
 /// PRD #370 M2 / PRD #386 M3: periodically scans every live pane's PTY child

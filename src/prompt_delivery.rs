@@ -126,6 +126,27 @@ fn normalize_for_match(s: &str) -> &str {
 ///    short one did not, so short and long prompts behaved oppositely.
 ///
 /// Both sides are normalized with [`normalize_for_match`], never `str::trim`.
+///
+/// # Accepted residual: the copy bound does not survive truncation (#526)
+///
+/// [`MAX_REPEATED_SUBMISSION_COPIES`] bounds shape 3 EXACTLY only while the
+/// reported text is complete. Once the hook truncates at
+/// [`USER_PROMPT_MAX_LEN`], every repetition count whose rendering exceeds that
+/// limit collapses onto the SAME 200-byte prefix, so a submission of 17, 50 or
+/// 500 copies is indistinguishable from the 16 this accepts — and so is an
+/// arbitrary tail following a repeated expected prefix, since only the prefix
+/// survives. The earlier claim that "accepted submissions are at most 16 copies
+/// of the prompt" is therefore not enforceable and is withdrawn: what is
+/// enforced is that the reported text BEGINS with a repetition of the expected
+/// prompt. The bound is real for short prompts and is margin, not a security
+/// property, for long ones.
+///
+/// This is the same collision class as the deferred full-prompt digest and is
+/// folded into **#526**; a digest or delivery token is what would make the
+/// comparison exact regardless of truncation. Not fixed here: the alternative
+/// available at this seam — refusing every truncated report — would reject the
+/// ordinary confirmation of any prompt over 200 bytes, i.e. reinstate issue
+/// #424 for every long dispatch prompt.
 pub fn prompt_submission_matches(expected: &str, reported: &str) -> bool {
     let expected = normalize_for_match(expected);
     let reported = normalize_for_match(reported);
@@ -212,6 +233,26 @@ pub enum ConfirmationCapability {
     /// The write is held PROVISIONAL but is NOT retyped, and this is
     /// re-evaluated every frame: the moment a real producer identifies itself,
     /// retries arm and the prompt is still recoverable.
+    ///
+    /// # Accepted behaviour change: hookless panes finalize at 60 s, not 10 s
+    ///
+    /// This state has a user-visible cost and it is deliberate. Before it, "no
+    /// readiness signal after 10 s" was treated as a verdict — the prompt was
+    /// finalized and discarded there — so a genuinely hookless pane settled
+    /// quickly. Waiting for a producer instead means such a pane stays in its
+    /// provisional state until [`AUTOMATIC_PROMPT_DEADLINE`], so a hookless
+    /// orchestrator role remains `Waiting` roughly 50 s longer before being
+    /// finalized `Working`, and a hookless mode seed stays pending for the same
+    /// span. It affects real custom commands and hookless wrappers, not only
+    /// synthetic `cat` panes.
+    ///
+    /// The reviewer explicitly declined to block on the trade, and it is kept:
+    /// the 10 s verdict is what excluded the `devbox run claude …` launcher
+    /// class — the population issue #424 §3 names as the most fragile — from the
+    /// entire fix, because such a pane routinely identifies itself at 10.1 s and
+    /// found its prompt already thrown away. Nothing is written twice while
+    /// capability is unknown, so the cost is latency in a status label, not
+    /// duplicated work.
     Unknown,
 }
 
@@ -252,6 +293,25 @@ pub fn pane_confirmation_capability<'a>(
 /// comparison is causal rather than chronometric. `None` means the pane's
 /// journal was empty when we wrote — there is no pre-existing history to
 /// mistake for evidence, so anything that arrives afterwards is new.
+///
+/// # Accepted residual: this is ordering, not causality (#526)
+///
+/// The watermark rejects everything ALREADY VISIBLE when we wrote, which is the
+/// concrete prior-event-in-journal case that was confirming deliveries off
+/// history. It cannot reject an event that was PRODUCED before our write and
+/// merely arrived after it: delivery order does not follow producer stamps (hook
+/// sends arrive on separate connections handled by separate tasks), so such an
+/// event can carry a timestamp above the captured maximum and confirm a write it
+/// predates. Both reviews rate this Low/partial, and it is the direction that
+/// costs a false CONFIRMATION rather than a false retry.
+///
+/// Closing it needs something this comparison does not have: a daemon RECEIVE
+/// SEQUENCE (a cursor captured at admission, ordered by arrival rather than by
+/// producer clock) or the deferred full-prompt digest / delivery token that
+/// would identify the submission itself. Both are folded into **#526**. The
+/// daemon-side twin of the gap is the `try_recv`-until-`Empty` drain in
+/// `crate::spawn`, which has the same "queued at this instant" semantics and the
+/// same limit.
 pub fn submission_is_after_watermark(
     event_ts: DateTime<Utc>,
     watermark: Option<DateTime<Utc>>,
@@ -411,10 +471,19 @@ pub fn log_prompt_unconfirmable(path: &str, pane_id: &str, delivery_id: &str, re
 ///   among them. Missing evidence is not permission to submit a second copy
 ///   into an agent that is already acting on the first.
 /// * `event-stream-closed` (B8): nothing can ever report back now.
-/// * `bound-session-ended` / `agent-replaced` (B1/B2): the conversation we wrote
-///   into is over, or the pane rebound to a different agent. The prompt belongs
-///   to a target that no longer exists, and the only thing a retry could do is
-///   inject it into a stranger's context.
+/// * `bound-session-ended` / `session-ended-while-unbound` / `generation-changed`
+///   / `delivery-target-changed` / `agent-replaced` (B1/B2): the conversation we
+///   wrote into is over or has been superseded, or the pane rebound to a
+///   different agent. The prompt belongs to a target that no longer exists, and
+///   the only thing a retry could do is inject it into a stranger's context.
+///   Which of the five it is says WHERE the loss was detected — the bound
+///   session's own end, an end seen before any generation was bound, a newer
+///   generation announcing itself, the TUI's snapshot comparison, or the
+///   registry identity guard — which is the difference between a `/clear`, a
+///   wrapper restart and a pane-reuse race when reading a log after the fact.
+/// * a `SendResult` name (`wrong session`, `ambiguous`, …): the target refused a
+///   delivery that had already been written once, so it is gone; or the write
+///   was partial and must never be blindly repeated.
 pub fn log_prompt_stopped(path: &str, pane_id: &str, delivery_id: &str, reason: &str) {
     tracing::warn!(
         path,
