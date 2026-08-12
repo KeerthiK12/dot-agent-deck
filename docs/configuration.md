@@ -87,15 +87,6 @@ export OPENAI_API_KEY=sk-...      # for OpenAI
 # Ollama requires no API key
 ```
 
-Each provider also accepts a `DOT_AGENT_DECK_`-prefixed name, which takes precedence over the bare one:
-
-```bash
-export DOT_AGENT_DECK_ANTHROPIC_API_KEY=sk-...
-export DOT_AGENT_DECK_OPENAI_API_KEY=sk-...
-```
-
-Use the prefixed name when the bare one would collide with a coding agent's own authentication. Claude Code, for instance, prefers an exported `ANTHROPIC_API_KEY` over your Claude.ai subscription, so exporting a key for idle art silently switches Claude Code to API billing; exporting `DOT_AGENT_DECK_ANTHROPIC_API_KEY` instead keeps the two separate. A value that is empty or whitespace counts as unset, so a variable blanked out to defeat exactly that kind of collision does not shadow the fallback.
-
 ### Options
 
 | Key | Default | Description |
