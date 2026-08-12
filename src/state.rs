@@ -1809,12 +1809,15 @@ fn session_start_means_ready(event: &AgentEvent) -> bool {
 /// the daemon itself is shutting down), in which case there's nothing
 /// to wait for.
 ///
-/// Returns `true` when SessionStart was observed, `false` on timeout
-/// or sender closure. The boolean isn't currently consulted at the
-/// call site — the dispatch path writes the prompt regardless, matching
-/// the baseline `process_pending_dispatches` semantics — but it's
-/// returned so future telemetry / tracing can distinguish "fast path"
-/// from "fallback".
+/// Returns the readiness event's [`AgentType`] when SessionStart was observed,
+/// `None` on timeout or sender closure. The delegate path only asks whether it
+/// fired (`.is_some()`) and writes the prompt regardless, matching the baseline
+/// `process_pending_dispatches` semantics. Issue #424's spawn path needs the
+/// TYPE as well: whether this producer can report a submitted prompt at all
+/// decides whether an unconfirmed write may be re-submitted
+/// ([`crate::prompt_delivery::agent_reports_submitted_prompt`]), and the
+/// readiness event is the first and often only place that answer is available
+/// before the write.
 ///
 /// PRD #127: also reused by the scheduler spawn primitive
 /// ([`crate::spawn::spawn`]) to gate a freshly-spawned scheduled card's
@@ -1835,12 +1838,10 @@ pub(crate) async fn wait_for_session_start(
     pane_id: &str,
     agent_id: &str,
     timeout: std::time::Duration,
-) -> bool {
+) -> Option<AgentType> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
-            return false;
-        };
+        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(BroadcastMsg::Event(event))) => {
                 if event.event_type == EventType::SessionStart
@@ -1858,105 +1859,219 @@ pub(crate) async fn wait_for_session_start(
                         );
                         continue;
                     }
-                    return true;
+                    return Some(event.agent_type);
                 }
             }
             // PRD #120: not a hook event — keep waiting for the SessionStart.
             Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Closed)) => return false,
-            Err(_) => return false,
+            Ok(Err(broadcast::error::RecvError::Closed)) => return None,
+            Err(_) => return None,
         }
     }
 }
 
 /// Issue #424: the outcome of one [`wait_for_prompt_submission`] window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Everything except [`PromptWatch::Elapsed`] is TERMINAL for the caller: the
+/// delivery either succeeded, or the evidence needed to decide is gone, or the
+/// target it was written for no longer exists. Only `Elapsed` means "still
+/// waiting, a re-submission is on the table".
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PromptWatch {
     /// The agent reported submitting the expected prompt — the delivery is real.
     Confirmed,
-    /// The window elapsed with no confirmation. `hooked` records whether ANY
-    /// hook event from this exact agent was seen meanwhile, which is the proof
-    /// that this pane reports its activity at all — and therefore that a
-    /// re-submission could ever be confirmed. A pane running `cat` or a bare
-    /// shell never produces one, so a caller can use it to decide whether
-    /// retrying would be recovery or just re-typing the prompt into the void.
-    Elapsed { hooked: bool },
+    /// The window elapsed with no confirmation. `can_report_prompts` records
+    /// whether an event was seen from this exact agent whose producer is
+    /// capable of reporting SUBMITTED PROMPT TEXT
+    /// ([`crate::prompt_delivery::agent_reports_submitted_prompt`]) — the only
+    /// proof that a re-submission could ever be confirmed.
+    ///
+    /// Reviewer finding B4: this used to be `hooked`, set by ANY event carrying
+    /// the agent's id. Pi emits exactly such events and hardcodes
+    /// `user_prompt: None`, so a Pi pane armed a retry loop that could never
+    /// terminate on success and retyped the prompt until the deadline.
+    Elapsed { can_report_prompts: bool },
+    /// Reviewer finding B7: the observer broadcast dropped frames, so the real
+    /// `UserPromptSubmit` may have been among them. A lossy stream's silence is
+    /// not evidence of non-delivery, and re-submitting on it types a second copy
+    /// into an agent that may already be acting on the first — which a busy
+    /// daemon triggers by accident and a same-user process can trigger on
+    /// purpose by flooding the hook socket.
+    Indeterminate,
+    /// Reviewer finding B8: the event channel closed (daemon shutdown). Nothing
+    /// can ever report back now, so the retry loop must end rather than spin —
+    /// which is what collapsing this into `Elapsed` caused, since an already-
+    /// armed loop wrote, saw `Closed` again immediately, and burned the whole
+    /// deadline at write speed with the advertised backoff never applied.
+    Closed,
+    /// Reviewer findings B1/B2: the target this delivery was written for is
+    /// gone. Either the pane rebound to a DIFFERENT registry agent, or the hook
+    /// session the bytes went into ENDED, so the conversation no longer exists.
+    /// Re-submitting would inject the old task into a new context, and a
+    /// matching event from the successor could only falsely confirm. See
+    /// [`latch_generation`] for why a merely NEWER generation is not this.
+    TargetChanged { reason: &'static str },
 }
 
 /// Issue #424: block up to `window` for the agent in `pane_id` to report having
 /// SUBMITTED `expected` — the confirmation that turns a spawn-time PTY write
 /// into an actual delivery.
 ///
-/// Every supported agent maps "a user prompt was submitted" onto an event
-/// carrying `user_prompt` (Claude/Codex `UserPromptSubmit`, OpenCode
-/// `session.prompt`), so the event TYPE is deliberately not part of the match —
-/// the presence of the reported prompt is the evidence, and gating on
-/// `EventType::Thinking` would silently exclude any future agent that reports a
-/// submission under a different type.
+/// The event TYPE is deliberately not part of the match — the presence of the
+/// reported prompt is the evidence, and gating on `EventType::Thinking` would
+/// silently exclude any future agent that reports a submission under a
+/// different type. Which producers can report one at all is a separate
+/// question, answered by
+/// [`crate::prompt_delivery::agent_reports_submitted_prompt`].
 ///
-/// Matching mirrors [`wait_for_session_start`]: `pane_id` AND `agent_id`, so a
-/// late event from a superseded generation, or a successor that inherited the
-/// pane id, cannot confirm this delivery. An event carrying NO `agent_id` (a
-/// pre-F9 hook script, a wrapper that scrubbed the env) is admitted on the pane
-/// alone, matching the deliberately-permissive "both sides absent" branch the
-/// reuse guard in [`AppState::apply_event`] applies for the same reason.
+/// Matching requires an EXACT, non-optional `agent_id` plus the pane.
+///
+/// Reviewer finding B6: this used to admit an event carrying NO `agent_id` on
+/// the pane alone, borrowing the deliberately-permissive "both sides absent"
+/// branch the reuse guard in [`AppState::apply_event`] applies. That branch
+/// exists to protect ACCUMULATED HISTORY from a pre-F9 hook script, where the
+/// permissive answer is the safe one. Here the permissive answer is the unsafe
+/// one: the hook socket is owner-only but any same-user process can write to
+/// it, so a wildcard identity let a legacy, buggy or crafted event falsely
+/// confirm an undelivered prompt — clearing every scrap of retry state and
+/// re-creating issue #424's silent loss in a shape no log would explain. An
+/// event that cannot supply an identity is classified as unusable evidence, not
+/// as proof.
+///
+/// `generation` is the caller's LATCH, retained across windows: which hook
+/// session this delivery is currently bound to. It tracks forward across a
+/// launcher-to-agent handover and is terminal only when that session ENDS — see
+/// [`latch_generation`], which documents why the stricter rule was measured and
+/// rejected.
 ///
 /// The prompt comparison goes through
 /// [`crate::prompt_delivery::prompt_submission_matches`], never `==`: the hook
 /// layer truncates `user_prompt`, so a long seed is reported back in truncated
 /// form and exact equality would never match it.
 ///
-/// The caller must have SUBSCRIBED before the write, which the spawn path
-/// already does (it subscribes before spawning, to gate on `SessionStart`).
-/// `Lagged` keeps polling — a dropped message may or may not have been the
-/// confirmation, and the caller's own deadline covers "we missed it".
+/// The caller must have SUBSCRIBED before the write, and must have DRAINED
+/// everything queued at the moment of the write — that drain is the causal
+/// watermark, and without it a submission the agent made before our bytes
+/// landed is still sitting in the channel waiting to be mistaken for evidence.
 pub(crate) async fn wait_for_prompt_submission(
     rx: &mut broadcast::Receiver<BroadcastMsg>,
     pane_id: &str,
     agent_id: &str,
     expected: &str,
+    generation: &mut Option<(String, DateTime<Utc>)>,
     window: std::time::Duration,
 ) -> PromptWatch {
     let deadline = tokio::time::Instant::now() + window;
-    let mut hooked = false;
+    let mut can_report_prompts = false;
     loop {
         let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
-            return PromptWatch::Elapsed { hooked };
+            return PromptWatch::Elapsed { can_report_prompts };
         };
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(BroadcastMsg::Event(event))) => {
                 if event.pane_id.as_deref() != Some(pane_id) {
                     continue;
                 }
-                // Hook-capability proof is strict about identity: it requires
-                // this agent's OWN id. The daemon publishes a SYNTHETIC
-                // `SessionStart` per spawned pane to surface its card
-                // (`spawn::surface_spawned_pane`), and that one carries
-                // `agent_id: None` — counting it would "prove" that a `cat`
-                // pane reports its activity, which is exactly backwards.
-                if event.agent_id.as_deref() == Some(agent_id) {
-                    hooked = true;
+                match event.agent_id.as_deref() {
+                    // A DIFFERENT agent now producing on our pane means the pane
+                    // was rebound — the pane id is just a string and an exited
+                    // agent frees it for the next spawn. Our prompt belongs to
+                    // the predecessor.
+                    Some(reported) if reported != agent_id => {
+                        return PromptWatch::TargetChanged {
+                            reason: "agent-replaced",
+                        };
+                    }
+                    // No identity: unusable as evidence in either direction. The
+                    // daemon's own synthetic card-surfacing `SessionStart`
+                    // (`spawn::surface_spawned_pane`) is exactly this shape, so
+                    // treating it as a rebind would abort every spawn delivery.
+                    None => continue,
+                    Some(_) => {}
                 }
-                let agent_matches = event
-                    .agent_id
-                    .as_deref()
-                    .is_none_or(|reported| reported == agent_id);
-                if agent_matches
-                    && event.user_prompt.as_deref().is_some_and(|reported| {
-                        crate::prompt_delivery::prompt_submission_matches(expected, reported)
-                    })
-                {
+                if let Some(changed) = latch_generation(generation, &event) {
+                    return changed;
+                }
+                can_report_prompts |=
+                    crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type);
+                if event.user_prompt.as_deref().is_some_and(|reported| {
+                    crate::prompt_delivery::prompt_submission_matches(expected, reported)
+                }) {
                     return PromptWatch::Confirmed;
                 }
             }
             Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Closed)) => {
-                return PromptWatch::Elapsed { hooked };
-            }
-            Err(_) => return PromptWatch::Elapsed { hooked },
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => return PromptWatch::Indeterminate,
+            Ok(Err(broadcast::error::RecvError::Closed)) => return PromptWatch::Closed,
+            Err(_) => return PromptWatch::Elapsed { can_report_prompts },
         }
+    }
+}
+
+/// Track which hook session the delivery is bound to, and report the ONE
+/// generation transition that is terminal: the bound conversation ENDING.
+/// `None` means "carry on"; `Some` is terminal.
+///
+/// **A new generation is not, by itself, evidence that our target is gone.** The
+/// obvious-looking rule — bind the first generation seen and stop on any other —
+/// was implemented, measured against `scheduler/dispatch/015`, and is wrong: it
+/// reproduced the pre-fix failure exactly (151 s, all three real panes healthy,
+/// Idle, `confirmed=None`, zero retries). The launcher class issue #424 §3 is
+/// about is precisely a pane that changes generation during boot — a nested
+/// bootstrap announces a session, the real agent `exec`s over it and announces
+/// its own — and treating that as a lost target abandons the delivery before the
+/// agent that is supposed to receive it has even started. That is the whole bug,
+/// re-created by its own guard.
+///
+/// So a newer generation REBINDS. What stays terminal is:
+///
+/// * a `SessionEnd` for the bound generation (here) — the conversation the bytes
+///   went into is over, so a retry could only land in a successor, and a
+///   matching event from that successor could only falsely confirm. This is the
+///   signature of the auditor's `/clear` scenario: Claude Code posts `SessionEnd`
+///   for the outgoing session before `SessionStart` for the new one;
+/// * a DIFFERENT registry agent on the pane (the caller's check) — the strong,
+///   exact guard, and the one the pane-reuse race actually needs.
+///
+/// The residual is a same-agent conversation restart that emits no `SessionEnd`:
+/// the retry then lands in the new conversation. It carries the same task, into
+/// the same pane, for the same agent, inside the delivery's own 60 s window, and
+/// the daemon-side `expected_session_id` guard still refuses it on the TUI
+/// paths. That is a bounded, same-intent misdelivery, and it is the price of not
+/// re-breaking the population the fix exists for.
+///
+/// Ordering mirrors [`AppState::apply_event`]'s monotonic generation tracking: a
+/// DELAYED frame from a PRIOR generation has the same shape as a rollover and
+/// only the timestamp separates them, so an older frame never rebinds.
+fn latch_generation(
+    generation: &mut Option<(String, DateTime<Utc>)>,
+    event: &AgentEvent,
+) -> Option<PromptWatch> {
+    let ended = event.event_type == EventType::SessionEnd;
+    match generation {
+        None if ended => None,
+        None => {
+            *generation = Some((event.session_id.clone(), event.timestamp));
+            None
+        }
+        Some((bound_id, _)) if *bound_id == event.session_id && ended => {
+            Some(PromptWatch::TargetChanged {
+                reason: "bound-session-ended",
+            })
+        }
+        Some((bound_id, bound_ts)) if *bound_id == event.session_id => {
+            *bound_ts = (*bound_ts).max(event.timestamp);
+            None
+        }
+        Some((bound_id, bound_ts)) if event.timestamp >= *bound_ts => {
+            *bound_id = event.session_id.clone();
+            *bound_ts = event.timestamp;
+            None
+        }
+        // Older frame from a superseded generation: neither a rollover nor an
+        // end of the generation we are bound to.
+        Some(_) => None,
     }
 }
 
@@ -2236,7 +2351,8 @@ async fn dispatch_one_owned(
                     &new_agent_id,
                     SESSION_START_WAIT_TIMEOUT,
                 )
-                .await;
+                .await
+                .is_some();
                 if !observed {
                     tracing::debug!(
                         role = %target_role,

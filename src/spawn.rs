@@ -43,13 +43,16 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 
+use chrono::{DateTime, Utc};
+
 use crate::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership, command_needs_shell_wrap,
+    AgentPtyError, AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions,
+    TabMembership, command_needs_shell_wrap,
 };
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
 use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
 use crate::prompt_delivery::{
-    AUTOMATIC_PROMPT_DEADLINE, log_prompt_abandoned, log_prompt_confirmed,
+    AUTOMATIC_PROMPT_DEADLINE, log_prompt_abandoned, log_prompt_confirmed, log_prompt_stopped,
     log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written, mint_delivery_id,
     unconfirmed_retry_delay,
 };
@@ -809,17 +812,24 @@ async fn deliver(
     event_rx: Option<broadcast::Receiver<BroadcastMsg>>,
     prompt: &str,
 ) {
-    // Issue #424: `observed` is carried past the write. It is not "may we
-    // deliver" (the fallback still delivers, exactly as before) but "has this
-    // agent proved it reports its activity through hooks" — which decides
+    // Issue #424, reviewer finding B9: ONE absolute deadline for the whole
+    // delivery, captured BEFORE the readiness wait. `started` used to be minted
+    // inside `confirm_prompt_delivery` — i.e. after a readiness wait that is 30 s
+    // in production — so an automatic prompt could stay active for ~90 s while
+    // the two TUI paths enforce the shared 60 s `AUTOMATIC_PROMPT_DEADLINE` from
+    // enqueue. Every wait and every write below is bounded by this one instant.
+    let deadline = Instant::now() + AUTOMATIC_PROMPT_DEADLINE;
+    // Issue #424, reviewer finding B4: `readiness` is carried past the write. It
+    // is not "may we deliver" (the fallback still delivers, exactly as before)
+    // but "can this producer report a submitted prompt at all" — which decides
     // whether an unconfirmed write may be RE-submitted. See
     // [`confirm_prompt_delivery`].
-    let (event_rx, observed) = match event_rx {
+    let (mut event_rx, readiness) = match event_rx {
         Some(mut rx) => {
-            let timeout = session_start_wait_timeout();
-            let observed =
+            let timeout = session_start_wait_timeout().min(remaining_before(deadline));
+            let readiness =
                 crate::state::wait_for_session_start(&mut rx, pane_id, agent_id, timeout).await;
-            if !observed {
+            if readiness.is_none() {
                 tracing::debug!(
                     pane_id,
                     timeout_ms = timeout.as_millis(),
@@ -827,19 +837,61 @@ async fn deliver(
                      delivering prompt via fallback path"
                 );
             }
-            (Some(rx), observed)
+            (Some(rx), readiness)
         }
         None => {
-            tokio::time::sleep(DELIVER_BUFFER_DELAY).await;
-            (None, false)
+            tokio::time::sleep(DELIVER_BUFFER_DELAY.min(remaining_before(deadline))).await;
+            (None, None)
         }
     };
     let delivery_id = mint_delivery_id(pane_id);
-    if let Err(e) = registry.write_to_pane_and_submit(pane_id, prompt).await {
-        tracing::warn!(pane_id, error = %e, "scheduled prompt delivery failed");
+    // Issue #424, reviewer finding B1: the pre-write drain IS the causal
+    // watermark. Everything already queued on the broadcast was produced before
+    // our bytes exist, so a submission the agent made on its own beforehand
+    // cannot be mistaken for evidence about this delivery — and the generation
+    // latch it fills means the very first retry already knows which hook session
+    // it is bound to. Also the last chance to notice the pane rebound while we
+    // waited out a 30 s readiness timeout.
+    let mut generation: Option<(String, DateTime<Utc>)> = None;
+    let mut drained_capability = false;
+    if let Some(rx) = event_rx.as_mut()
+        && let Some(reason) = drain_pre_write_events(
+            rx,
+            pane_id,
+            agent_id,
+            &mut generation,
+            &mut drained_capability,
+        )
+    {
+        log_prompt_stopped(DELIVERY_LOG_PATH, pane_id, &delivery_id, reason);
         return;
     }
+    // Reviewer finding B1: the FIRST write is identity-guarded too. The plain
+    // `write_to_pane_and_submit` resolves whichever agent currently owns the
+    // pane string, and a pane id is just a string an exited agent frees for the
+    // next spawn — so after a multi-second readiness wait it could type this
+    // dispatch prompt into a replacement.
+    match guarded_submit(registry, pane_id, agent_id, prompt, deadline).await {
+        GuardedOutcome::Written => {}
+        GuardedOutcome::Refused(reason) => {
+            tracing::warn!(
+                pane_id,
+                delivery_id,
+                reason,
+                "scheduled prompt delivery refused"
+            );
+            return;
+        }
+        GuardedOutcome::Failed(e) => {
+            tracing::warn!(pane_id, error = %e, "scheduled prompt delivery failed");
+            return;
+        }
+    }
     log_prompt_written(DELIVERY_LOG_PATH, pane_id, &delivery_id, 1);
+    let can_report_prompts = readiness
+        .as_ref()
+        .is_some_and(crate::prompt_delivery::agent_reports_submitted_prompt)
+        || drained_capability;
     match event_rx {
         Some(rx) => {
             // Detached on purpose: the caller (a `dispatch` CLI round trip, a
@@ -851,18 +903,16 @@ async fn deliver(
             let pane_id = pane_id.to_string();
             let agent_id = agent_id.to_string();
             let prompt = prompt.to_string();
-            tokio::spawn(async move {
-                confirm_prompt_delivery(
-                    registry,
-                    pane_id,
-                    agent_id,
-                    rx,
-                    prompt,
-                    delivery_id,
-                    observed,
-                )
-                .await;
-            });
+            let task = ConfirmationTask {
+                pane_id,
+                agent_id,
+                prompt,
+                delivery_id,
+                generation,
+                can_report_prompts,
+                deadline,
+            };
+            spawn_confirmation_task(registry, rx, task);
         }
         // No event bus at all (a direct caller without one). Nothing can ever
         // report back, so the write is final.
@@ -872,6 +922,124 @@ async fn deliver(
             &delivery_id,
             "no hook-event bus for this delivery",
         ),
+    }
+}
+
+/// How long is left before `deadline`, saturating at zero.
+fn remaining_before(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// The outcome of one identity-guarded submission attempt, flattening
+/// [`GuardedSend`] into the three answers this path acts on.
+enum GuardedOutcome {
+    /// Bytes reached the exact expected agent.
+    Written,
+    /// The target refused the write and NOTHING was written — or the write was
+    /// partial and must not be repeated. Terminal either way.
+    Refused(&'static str),
+    /// Transport error before/around the write.
+    Failed(AgentPtyError),
+}
+
+/// Issue #424, reviewer finding B1 / auditor HIGH #1: submit `prompt` into
+/// `pane_id` bound to the EXACT `agent_id` and hook `generation` it was written
+/// for, re-validated after the writer lock is taken.
+///
+/// Two guards, and both matter for a different race:
+///
+/// * `expected_agent_id` catches a pane that exited and was respawned/rebound
+///   between attempts — [`AgentPtyRegistry`] explicitly supports same-pane
+///   respawn, and the pane id is reusable, so the unguarded write would have
+///   found the successor's writer and typed a stranger's task into it.
+/// * `revalidate` catches a pane whose close has BEGUN while we waited for the
+///   writer — the same recheck the delegate idle-watch performs at the same
+///   point, and the only liveness fact this path can consult without the daemon's
+///   `AppState`.
+///
+/// A SAME-agent `/clear` or thread restart is invisible to both: it rolls the
+/// hook session over while the registry identity stays put. Only the event
+/// stream sees that, so it is caught by the latched generation in
+/// [`drain_pre_write_events`] and [`crate::state::wait_for_prompt_submission`],
+/// which terminate the delivery before the next write is reached. The residual
+/// window is a rollover landing between the end of a watch window and the write
+/// that immediately follows it in the same task — sub-millisecond, and closable
+/// only by threading the daemon's `AppState` into the spawn primitive.
+///
+/// The whole call is bounded by the shared `deadline` (B9). A wedged PTY can
+/// still block inside the synchronous `write_all` under the writer mutex — that
+/// is pre-existing behaviour of every write on this path and is tracked as a
+/// follow-up, not fixed here — but the timeout does bound the far more common
+/// case of waiting behind another writer.
+async fn guarded_submit(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    agent_id: &str,
+    prompt: &str,
+    deadline: Instant,
+) -> GuardedOutcome {
+    let closing = Arc::clone(registry);
+    let send = registry.write_and_submit_guarded(pane_id, prompt, Some(agent_id), || async move {
+        !closing.is_pane_closing(pane_id)
+    });
+    match tokio::time::timeout(remaining_before(deadline), send).await {
+        Err(_) => GuardedOutcome::Refused("deadline elapsed while writing"),
+        Ok(Err(e)) => GuardedOutcome::Failed(e),
+        Ok(Ok(GuardedSend::Applied)) => GuardedOutcome::Written,
+        Ok(Ok(GuardedSend::WrongSession)) => GuardedOutcome::Refused("agent-replaced"),
+        Ok(Ok(GuardedSend::Stale)) => GuardedOutcome::Refused("target went stale"),
+        Ok(Ok(GuardedSend::NoLiveTarget)) => GuardedOutcome::Refused("no live target"),
+        Ok(Ok(GuardedSend::Ambiguous)) => GuardedOutcome::Refused("ambiguous partial write"),
+    }
+}
+
+/// Consume everything already queued on `rx` — every frame of it produced
+/// before the write this precedes — latching the pane's hook generation and
+/// noting whether the producer can report a submitted prompt. Returns a stop
+/// reason when the drained frames show the target is already gone.
+fn drain_pre_write_events(
+    rx: &mut broadcast::Receiver<BroadcastMsg>,
+    pane_id: &str,
+    agent_id: &str,
+    generation: &mut Option<(String, DateTime<Utc>)>,
+    can_report_prompts: &mut bool,
+) -> Option<&'static str> {
+    loop {
+        match rx.try_recv() {
+            Ok(BroadcastMsg::Event(event)) => {
+                if event.pane_id.as_deref() != Some(pane_id) {
+                    continue;
+                }
+                match event.agent_id.as_deref() {
+                    Some(reported) if reported != agent_id => return Some("agent-replaced"),
+                    None => continue,
+                    Some(_) => {}
+                }
+                if crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type) {
+                    *can_report_prompts = true;
+                }
+                // Rebinding, not stopping — see `state::latch_generation` for
+                // why a newer generation is not evidence of a lost target.
+                match generation {
+                    None => *generation = Some((event.session_id, event.timestamp)),
+                    Some((bound_id, bound_ts)) if *bound_id == event.session_id => {
+                        *bound_ts = (*bound_ts).max(event.timestamp);
+                    }
+                    Some((bound_id, bound_ts)) if event.timestamp >= *bound_ts => {
+                        *bound_id = event.session_id;
+                        *bound_ts = event.timestamp;
+                    }
+                    Some(_) => {}
+                }
+            }
+            Ok(BroadcastMsg::OrchestrationSurface(_)) => continue,
+            // Frames were dropped before we even wrote. Nothing that could have
+            // confirmed this delivery existed yet, so this costs only the
+            // generation latch, which the watcher re-establishes.
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Empty) => return None,
+            Err(broadcast::error::TryRecvError::Closed) => return Some("event-stream-closed"),
+        }
     }
 }
 
@@ -885,27 +1053,28 @@ async fn deliver(
 /// pane prompted and the other two healthy, in the right worktrees, and idle
 /// forever with no prompt at all.
 ///
-/// Unlike the TUI paths there is no ledger to work around here:
-/// [`AgentPtyRegistry::write_to_pane_and_submit`] is the plain, un-guarded write,
-/// so every re-submission is unconditionally a real second write to the PTY.
+/// Every re-submission goes back through [`guarded_submit`], so it is a real
+/// second write to the PTY *of the exact agent the first one reached* — never
+/// of whoever happens to own the pane string by then.
 ///
 /// Bounded by [`AUTOMATIC_PROMPT_DEADLINE`], after which the prompt is abandoned
-/// with a warn rather than retried forever. Every retry types the prompt into
-/// the pane again, so the escalating [`unconfirmed_retry_delay`] keeps that to
-/// single digits across the whole window (see its docs).
+/// with a warn, a durable in-pane notice, and no further write. Every retry
+/// types the prompt into the pane again, so the escalating
+/// [`unconfirmed_retry_delay`] keeps that to single digits across the whole
+/// window (see its docs).
 ///
-/// `hooks_observed` is the initial answer to "can this pane's delivery ever be
-/// confirmed" — `true` when the agent's `SessionStart` was seen before the
-/// write. It is not a fixed verdict: a pane that has proved NOTHING yet is
-/// watched for one window first, and any hook event carrying this agent's id
-/// arms retries from then on ([`crate::state::PromptWatch`]). That distinction
-/// is what keeps the two populations apart without guessing from the command
-/// line:
+/// `can_report_prompts` is the initial answer to "can this pane's delivery ever
+/// be confirmed" — `true` when a pre-write event came from a producer that
+/// reports submitted prompt text. It is not a fixed verdict: a pane that has
+/// proved NOTHING yet is watched for one window first, and a later event from
+/// such a producer arms retries from then on. That distinction keeps the two
+/// populations apart without guessing from the command line:
 ///
-/// * a bare shell / `cat` / a recorder stand-in emits no hook ever, so it is
-///   never armed and receives exactly ONE write — retrying it could not be
-///   recovery, only the same prompt typed into the pane again and again until
-///   the deadline;
+/// * a bare shell / `cat` / a recorder stand-in — and, per reviewer finding B4,
+///   a Pi pane, which emits well-formed status frames but structurally never a
+///   submitted prompt — is never armed and receives exactly ONE write. Retrying
+///   could not be recovery there, only the same prompt typed in again until the
+///   deadline;
 /// * a SLOW agent — the `devbox run claude …` launcher class from the issue,
 ///   whose readiness depends on a hook escaping a nested shell — signals late,
 ///   arms on that signal, and still gets its retries. Gating this on the
@@ -913,26 +1082,36 @@ async fn deliver(
 ///   agents issue #424 §3 identifies as having the most fragile delivery.
 async fn confirm_prompt_delivery(
     registry: Arc<AgentPtyRegistry>,
-    pane_id: String,
-    agent_id: String,
     mut rx: broadcast::Receiver<BroadcastMsg>,
-    prompt: String,
-    delivery_id: String,
-    hooks_observed: bool,
+    task: ConfirmationTask,
 ) {
     use crate::state::PromptWatch;
 
-    let started = Instant::now();
+    let ConfirmationTask {
+        pane_id,
+        agent_id,
+        prompt,
+        delivery_id,
+        mut generation,
+        can_report_prompts,
+        deadline,
+    } = task;
     let mut attempt: u32 = 1;
-    let mut armed = hooks_observed;
+    let mut armed = can_report_prompts;
     loop {
-        let Some(remaining) = AUTOMATIC_PROMPT_DEADLINE.checked_sub(started.elapsed()) else {
-            log_prompt_abandoned(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
+        let remaining = remaining_before(deadline);
+        if remaining.is_zero() {
+            abandon_spawn_prompt(&registry, &pane_id, &agent_id, &delivery_id, attempt).await;
             return;
-        };
+        }
         let window = unconfirmed_retry_delay(attempt).min(remaining);
         match crate::state::wait_for_prompt_submission(
-            &mut rx, &pane_id, &agent_id, &prompt, window,
+            &mut rx,
+            &pane_id,
+            &agent_id,
+            &prompt,
+            &mut generation,
+            window,
         )
         .await
         {
@@ -940,35 +1119,215 @@ async fn confirm_prompt_delivery(
                 log_prompt_confirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
                 return;
             }
-            PromptWatch::Elapsed { hooked } => armed |= hooked,
+            PromptWatch::Elapsed { can_report_prompts } => armed |= can_report_prompts,
+            // Reviewer findings B7/B8/B1: every one of these means the evidence
+            // or the target is gone. Stop — do not read missing evidence as
+            // permission to type the prompt again.
+            PromptWatch::Indeterminate => {
+                log_prompt_stopped(
+                    DELIVERY_LOG_PATH,
+                    &pane_id,
+                    &delivery_id,
+                    "lagged-event-stream",
+                );
+                return;
+            }
+            PromptWatch::Closed => {
+                log_prompt_stopped(
+                    DELIVERY_LOG_PATH,
+                    &pane_id,
+                    &delivery_id,
+                    "event-stream-closed",
+                );
+                return;
+            }
+            PromptWatch::TargetChanged { reason } => {
+                log_prompt_stopped(DELIVERY_LOG_PATH, &pane_id, &delivery_id, reason);
+                return;
+            }
         }
         if !armed {
             log_prompt_unconfirmable(
                 DELIVERY_LOG_PATH,
                 &pane_id,
                 &delivery_id,
-                "this agent reports no hook events, so nothing could confirm delivery",
+                "this agent cannot report a submitted prompt, so nothing could confirm delivery",
             );
             return;
         }
-        if started.elapsed() >= AUTOMATIC_PROMPT_DEADLINE {
-            log_prompt_abandoned(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
+        if remaining_before(deadline).is_zero() {
+            abandon_spawn_prompt(&registry, &pane_id, &agent_id, &delivery_id, attempt).await;
             return;
         }
         log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
         attempt = attempt.saturating_add(1);
-        if let Err(e) = registry.write_to_pane_and_submit(&pane_id, &prompt).await {
-            // The pane is gone (closed, exited, rebound) — there is nothing left
-            // to deliver into, so stop rather than burn the deadline retrying.
-            tracing::warn!(
-                pane_id,
-                delivery_id,
-                error = %e,
-                "prompt re-submission failed; giving up on confirmation"
-            );
-            return;
+        match guarded_submit(&registry, &pane_id, &agent_id, &prompt, deadline).await {
+            GuardedOutcome::Written => {
+                log_prompt_written(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt)
+            }
+            // The pane is gone (closed, exited, rebound) or the write must not
+            // be repeated — stop rather than burn the deadline retrying.
+            GuardedOutcome::Refused(reason) => {
+                log_prompt_stopped(DELIVERY_LOG_PATH, &pane_id, &delivery_id, reason);
+                return;
+            }
+            GuardedOutcome::Failed(e) => {
+                tracing::warn!(
+                    pane_id,
+                    delivery_id,
+                    error = %e,
+                    "prompt re-submission failed; giving up on confirmation"
+                );
+                return;
+            }
         }
-        log_prompt_written(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
+    }
+}
+
+/// Issue #424 §4 / reviewer finding on diagnosability: abandon an unconfirmed
+/// spawn-time prompt LOUDLY.
+///
+/// The two TUI paths surface abandonment in the status bar, but this one is
+/// detached and has no caller left by the time the deadline arrives, so a
+/// `dispatch --single` whose prompt vanished was invisible in the default
+/// environment — `init_logging_from_env` installs a subscriber only when
+/// `DOT_AGENT_DECK_LOG` is set, which is exactly the diagnosability gap the
+/// issue is about. So the pane itself gets a durable one-line notice, in the
+/// scrollback of the pane the prompt was meant for, where an attached client
+/// sees it without any logging configured.
+///
+/// Follows PRD #249 M3's delegate-silence notice in every respect that made
+/// that one safe: ONE line, delivered with [`write_notice_guarded`] so it
+/// terminates on LF rather than the submit CR (a visible line, not a turn the
+/// agent must answer), bound to the exact agent id, and FIXED daemon-authored
+/// text with nothing interpolated that a repository or a prompt controls. Same
+/// caveat too: inertness is best-effort, so the identifying detail stays in the
+/// log and the pane gets "look at the log".
+///
+/// [`write_notice_guarded`]: AgentPtyRegistry::write_notice_guarded
+async fn abandon_spawn_prompt(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    agent_id: &str,
+    delivery_id: &str,
+    attempts: u32,
+) {
+    log_prompt_abandoned(DELIVERY_LOG_PATH, pane_id, delivery_id, attempts);
+    let notice = "⚠ prompt possibly not delivered (dot-agent-deck daemon report): a spawn-time \
+                  prompt was written into this pane but the agent never reported submitting it \
+                  within the delivery deadline. It may never have arrived; check whether this \
+                  pane was given any task at all. The daemon log names the delivery id and the \
+                  attempt count.";
+    let closing = Arc::clone(registry);
+    let sent = registry
+        .write_notice_guarded(pane_id, notice, Some(agent_id), || async move {
+            !closing.is_pane_closing(pane_id)
+        })
+        .await;
+    match sent {
+        Ok(GuardedSend::Applied) => {}
+        Ok(other) => tracing::debug!(
+            pane_id,
+            delivery_id,
+            outcome = ?other,
+            "abandonment notice not delivered; the pane is already gone"
+        ),
+        Err(e) => tracing::debug!(
+            pane_id,
+            delivery_id,
+            error = %e,
+            "abandonment notice could not be written"
+        ),
+    }
+}
+
+/// Everything one detached confirmation loop needs, bundled so the loop's
+/// parameter list stays readable and the identity it is bound to travels as one
+/// value.
+struct ConfirmationTask {
+    pane_id: String,
+    agent_id: String,
+    prompt: String,
+    delivery_id: String,
+    /// The pane's hook session as last observed, with the timestamp that
+    /// established it. Latched pre-write and carried across every attempt so a
+    /// `/clear` between them is caught (reviewer findings B1/B2).
+    generation: Option<(String, DateTime<Utc>)>,
+    can_report_prompts: bool,
+    deadline: Instant,
+}
+
+/// Issue #424, reviewer finding B9 / auditor MEDIUM: the confirmation tasks
+/// currently holding a spawn-time prompt provisional, keyed by pane id.
+///
+/// Before this there was no cancellation handle at all: a closed pane, a
+/// rebound agent or a daemon shutdown was noticed only when a later write
+/// happened to fail, and repeated dispatch into one pane could accumulate
+/// tasks. This map gives all of that one home.
+static CONFIRMATION_TASKS: std::sync::LazyLock<Mutex<HashMap<String, tokio::task::AbortHandle>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Ceiling on concurrently-live confirmation tasks across the daemon. Each one
+/// is a cheap timer-driven loop, so this is a runaway backstop — a caller
+/// dispatching thousands of panes gets its prompts written once and unwatched
+/// rather than an unbounded task pile.
+const MAX_CONFIRMATION_TASKS: usize = 256;
+
+/// Start the detached confirmation loop for one pane, under a PER-PANE
+/// single-flight rule: a newer spawn-time prompt for the same pane cancels the
+/// older watch rather than racing it. Two loops on one pane would type two
+/// different prompts into it under two independent backoffs.
+fn spawn_confirmation_task(
+    registry: Arc<AgentPtyRegistry>,
+    rx: broadcast::Receiver<BroadcastMsg>,
+    task: ConfirmationTask,
+) {
+    let pane_id = task.pane_id.clone();
+    let delivery_id = task.delivery_id.clone();
+    let mut tasks = CONFIRMATION_TASKS.lock().unwrap();
+    // Reap finished watches here rather than having each task deregister
+    // itself: self-deregistration races its own registration (a fast task can
+    // finish before the handle is filed) and would leak the entry it could not
+    // find. `is_finished` needs no such coordination.
+    tasks.retain(|_, handle| !handle.is_finished());
+    if tasks.len() >= MAX_CONFIRMATION_TASKS && !tasks.contains_key(&pane_id) {
+        drop(tasks);
+        log_prompt_unconfirmable(
+            DELIVERY_LOG_PATH,
+            &pane_id,
+            &delivery_id,
+            "too many in-flight prompt confirmations; not watching this one",
+        );
+        return;
+    }
+    // Held across `tokio::spawn`, which is synchronous — no await, so a `std`
+    // mutex is safe here.
+    let handle = tokio::spawn(confirm_prompt_delivery(registry, rx, task));
+    if let Some(previous) = tasks.insert(pane_id, handle.abort_handle()) {
+        previous.abort();
+    }
+}
+
+/// Cancel the confirmation loop watching `pane_id`, if any. Called when the
+/// pane closes: the prompt's target no longer exists, so neither the retries
+/// nor the abandonment notice have anywhere to go.
+pub fn cancel_prompt_confirmation(pane_id: &str) {
+    if let Some(handle) = CONFIRMATION_TASKS.lock().unwrap().remove(pane_id) {
+        handle.abort();
+    }
+}
+
+/// Cancel every confirmation loop. Called on daemon shutdown, so a prompt watch
+/// cannot outlive the daemon that owns the PTY it is writing into.
+pub fn cancel_all_prompt_confirmations() {
+    let handles: Vec<_> = CONFIRMATION_TASKS
+        .lock()
+        .unwrap()
+        .drain()
+        .map(|(_, handle)| handle)
+        .collect();
+    for handle in handles {
+        handle.abort();
     }
 }
 

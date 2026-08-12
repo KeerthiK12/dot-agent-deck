@@ -756,6 +756,12 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     if let Some(h) = signal_handle {
         h.abort();
     }
+    // Issue #424 (reviewer finding B9): a spawn-time prompt's confirmation loop
+    // must not outlive the daemon that owns the PTY it re-submits into. The loop
+    // also ends on its own when the broadcast sender drops (`PromptWatch::Closed`),
+    // but that is a race against the next backoff window expiring, and this is
+    // the deterministic half.
+    crate::spawn::cancel_all_prompt_confirmations();
     drop(pty_registry);
 
     result

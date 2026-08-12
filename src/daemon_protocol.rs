@@ -1439,6 +1439,13 @@ async fn handle_connection(
                         "StopAgent: dropped outstanding delegations touching the closing pane"
                     );
                 }
+                // Issue #424 (reviewer finding B9): the same treatment for a
+                // spawn-time prompt still being held provisional on this pane.
+                // Its guarded re-submissions would refuse anyway once the agent
+                // is gone, but a deliberate close should not have to wait out a
+                // backoff window to stop being retried into, and the
+                // abandonment notice has nowhere left to go.
+                crate::spawn::cancel_prompt_confirmation(pane_id);
             }
             // PRD #92 F8 followup (auditor #1): `close_agent` runs the
             // synchronous SIGTERM-with-grace loop in
@@ -1654,6 +1661,7 @@ async fn handle_connection(
                 Some(did) => {
                     let fingerprint = crate::agent_pty::AgentPtyRegistry::delivery_fingerprint(
                         extras.expected_agent_id.as_deref(),
+                        extras.expected_session_id.as_deref(),
                         &pane_id,
                         &text,
                     );

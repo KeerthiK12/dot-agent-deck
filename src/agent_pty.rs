@@ -3116,15 +3116,30 @@ impl AgentPtyRegistry {
     }
 
     /// PRD #20 R20-004 (finding #3): a stable fingerprint of a delivery's
-    /// identity — the (expected) target agent id, the pane, and the exact text.
-    /// A `delivery_id` is bound to its fingerprint at first admission; a later
-    /// request that reuses the id with a DIFFERENT fingerprint is refused as a
-    /// conflict rather than replaying the first (unrelated) result. Process-local
-    /// (the ledger never crosses the wire), so `DefaultHasher` is sufficient.
-    pub fn delivery_fingerprint(expected_agent_id: Option<&str>, pane_id: &str, text: &str) -> u64 {
+    /// identity — the (expected) target agent id, the expected hook SESSION, the
+    /// pane, and the exact text. A `delivery_id` is bound to its fingerprint at
+    /// first admission; a later request that reuses the id with a DIFFERENT
+    /// fingerprint is refused as a conflict rather than replaying the first
+    /// (unrelated) result. Process-local (the ledger never crosses the wire), so
+    /// `DefaultHasher` is sufficient.
+    ///
+    /// Issue #424, auditor LOW: `expected_session_id` used to be omitted, so an
+    /// id reused with the same agent/pane/text but a DIFFERENT session replayed
+    /// the cached `Applied` without ever running the new session guard —
+    /// reporting a delivery into a generation nothing was written to, and
+    /// directly undercutting the generation binding the rest of this fix rests
+    /// on. Both sides of the comparison are computed daemon-side from the same
+    /// request, so widening the hash input is not a wire change.
+    pub fn delivery_fingerprint(
+        expected_agent_id: Option<&str>,
+        expected_session_id: Option<&str>,
+        pane_id: &str,
+        text: &str,
+    ) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         expected_agent_id.hash(&mut h);
+        expected_session_id.hash(&mut h);
         pane_id.hash(&mut h);
         text.hash(&mut h);
         h.finish()
@@ -7190,7 +7205,7 @@ mod spawn_tests {
     async fn delivery_ledger_replays_delivered_and_ambiguous_but_retries_non_delivery() {
         use crate::event::SendResult;
         let reg = AgentPtyRegistry::new();
-        let fp = AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), "pane", "text");
+        let fp = AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), None, "pane", "text");
 
         // First admission proceeds; record a DELIVERED outcome.
         let permit = match reg.admit_delivery("did-applied", fp).await {
@@ -7236,9 +7251,19 @@ mod spawn_tests {
     async fn delivery_ledger_conflicting_fingerprint_reuse_is_refused() {
         use crate::event::SendResult;
         let reg = AgentPtyRegistry::new();
-        let fp_a = AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), "pane", "payload-a");
-        let fp_b = AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), "pane", "payload-b");
+        let fp_a =
+            AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), None, "pane", "payload-a");
+        let fp_b =
+            AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), None, "pane", "payload-b");
         assert_ne!(fp_a, fp_b, "distinct payloads must fingerprint differently");
+        // Issue #424, auditor LOW: the expected SESSION is part of the identity
+        // too. Omitting it let an id reused across a `/clear` replay the cached
+        // `Applied` without running the new session guard.
+        assert_ne!(
+            AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), Some("gen-1"), "pane", "same"),
+            AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), Some("gen-2"), "pane", "same"),
+            "distinct expected sessions must fingerprint differently"
+        );
 
         let permit = match reg.admit_delivery("shared-id", fp_a).await {
             DeliveryAdmission::Proceed(p) => p,

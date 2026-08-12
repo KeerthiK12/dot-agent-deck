@@ -9,12 +9,22 @@
 //! prompt that was delivered and acted upon.
 //!
 //! The only honest evidence that a prompt was actually submitted is the agent
-//! saying so: every supported agent maps "a user prompt was submitted" onto an
+//! saying so, by reporting the submitted text back on an
 //! [`EventType::Thinking`](crate::event::EventType::Thinking) event carrying
 //! `user_prompt` (Claude/Codex `UserPromptSubmit`, OpenCode `session.prompt`).
 //! So a write is **provisional** until such an event comes back for the same
 //! pane carrying the same prompt text; until then the delivery keeps its prompt,
 //! its identity and its retry armed, and re-submits under a bounded backoff.
+//!
+//! **Not every producer can do that**, which is why re-submission is gated on
+//! [`agent_reports_submitted_prompt`] rather than on "some event carrying this
+//! agent's id arrived". Reporting a LIFECYCLE and reporting SUBMITTED PROMPT
+//! TEXT are separate capabilities: Pi's extension emits `agent-event` status
+//! frames with the right pane and agent ids but hardcodes `user_prompt: None`
+//! (`crate::main`'s `agent-event` subcommand), so treating any own-id event as
+//! confirmation capability would arm a retry loop that is structurally unable
+//! to ever confirm — retyping the prompt until the deadline. That is worse than
+//! the bug being fixed, so the two capabilities are modelled apart.
 //!
 //! Three independent delivery implementations consume this module, which is why
 //! the policy lives here rather than in any one of them:
@@ -30,7 +40,9 @@
 //! prompts and a rewrite of it is a much larger, riskier change than the fix the
 //! issue needs. See the coder's report on #424 for the follow-up proposal.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
+
+use crate::event::AgentType;
 
 /// The byte length `crate::hook` truncates a reported `user_prompt` to before it
 /// ever reaches [`crate::event::AgentEvent`].
@@ -49,15 +61,12 @@ pub const USER_PROMPT_MAX_LEN: usize = 200;
 /// trying" cannot drift between them.
 pub const AUTOMATIC_PROMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Clock-skew tolerance applied when deciding whether a reported submission is
-/// NEWER than our own write.
-///
-/// The write is timestamped by whoever performed it (the TUI process) while the
-/// event is timestamped by the agent's hook (the daemon host), so the two clocks
-/// are not the same clock. The tolerance only has to be larger than realistic
-/// NTP skew and far smaller than the age of any stale prompt history it exists
-/// to reject — a session that submitted this exact text before we ever wrote it.
-const CONFIRMATION_CLOCK_SKEW_SECS: i64 = 5;
+/// The largest number of accumulated copies of one prompt
+/// [`prompt_submission_matches`] will recognize as a CR-swallowed
+/// re-submission. See that function's docs; the retry schedule cannot produce
+/// more than single digits inside [`AUTOMATIC_PROMPT_DEADLINE`], so this is
+/// margin, not a tuning knob.
+const MAX_REPEATED_SUBMISSION_COPIES: u32 = 16;
 
 /// Truncate `s` to at most `max` BYTES, appending `…` when anything was cut.
 ///
@@ -76,25 +85,181 @@ pub fn truncate_on_char_boundary(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// Normalize a prompt for comparison using EXACTLY the PTY encoder's contract.
+///
+/// [`crate::pane_input::encode_pane_payload`] strips only trailing `\n`, `\r`,
+/// space and tab before the bytes reach the PTY, so that — and only that — is
+/// the difference between what we hand the encoder and what the agent submits
+/// and reports back.
+///
+/// Reviewer finding B10: this used to be `str::trim`, which is both too wide and
+/// wrong on the wrong end. Too wide because `trim` also removes trailing Unicode
+/// whitespace the encoder PRESERVES (a NBSP, an ideographic space), so a
+/// different submitted prompt differing only in such a character confirmed this
+/// delivery; wrong on the wrong end because `trim` also strips LEADING
+/// whitespace, which the encoder preserves and which can be meaningful in a
+/// prompt (an indented code block, a leading blank line).
+fn normalize_for_match(s: &str) -> &str {
+    s.trim_end_matches(['\n', '\r', ' ', '\t'])
+}
+
 /// Whether a hook-reported `user_prompt` confirms submission of `expected` —
 /// the prompt text we wrote into the pane.
 ///
-/// Accepts either the full text or the [`USER_PROMPT_MAX_LEN`]-truncated form
-/// the hook layer produces, because which one arrives depends only on the
-/// prompt's length. Both sides are trimmed: `encode_pane_payload` strips
-/// trailing whitespace before the bytes ever reach the PTY, so the agent
-/// submits — and reports — the trimmed text.
+/// Three shapes are accepted, each for a specific mechanical reason:
+///
+/// 1. **The text verbatim.** The ordinary case.
+/// 2. **Its [`USER_PROMPT_MAX_LEN`]-truncated form.** Which one arrives depends
+///    only on the prompt's length; see that constant.
+/// 3. **N copies of it separated by newlines** (reviewer finding B5). When the
+///    submit CR is swallowed by a still-booting agent TUI in the PRD #128 mode
+///    where it becomes a *newline in the input box* rather than a no-op, the
+///    payload stays in the box and the next retry's submission carries
+///    `seed \n seed`. That is proof the seed was submitted — twice — so it must
+///    finalize the delivery. Reading it as a mismatch instead left the loop
+///    ARMED after the agent had already started acting, and a dispatch prompt
+///    performs deployments, deletions and issue operations: running one a third
+///    and fourth time is strictly worse than a visibly idle pane a human can
+///    recover. This also removes an inconsistency that made the hazard
+///    length-dependent — a seed longer than [`USER_PROMPT_MAX_LEN`] already
+///    matched its doubled submission (both truncate to the same prefix) while a
+///    short one did not, so short and long prompts behaved oppositely.
+///
+/// Both sides are normalized with [`normalize_for_match`], never `str::trim`.
 pub fn prompt_submission_matches(expected: &str, reported: &str) -> bool {
-    let expected = expected.trim();
-    let reported = reported.trim();
-    reported == expected || reported == truncate_on_char_boundary(expected, USER_PROMPT_MAX_LEN)
+    let expected = normalize_for_match(expected);
+    let reported = normalize_for_match(reported);
+    if expected.is_empty() {
+        // Nothing was written, so nothing can be evidence about it. Guards the
+        // repetition loop below against an infinite family of empty candidates.
+        return false;
+    }
+    if reported == expected || reported == truncate_on_char_boundary(expected, USER_PROMPT_MAX_LEN)
+    {
+        return true;
+    }
+    // Shape 3. Built incrementally and bounded by the REPORTED length so a
+    // multi-kilobyte dispatch prompt never allocates more than the hook could
+    // possibly have reported.
+    let mut candidate = String::from(expected);
+    for _ in 2..=MAX_REPEATED_SUBMISSION_COPIES {
+        candidate.push('\n');
+        candidate.push_str(expected);
+        if candidate.len() > reported.len() {
+            // Every longer candidate is longer still, so only a TRUNCATED form
+            // can match from here — and truncation is a fixed 200-byte prefix
+            // of the same repeating text, identical for every larger copy
+            // count. One check settles all of them.
+            return reported == truncate_on_char_boundary(&candidate, USER_PROMPT_MAX_LEN);
+        }
+        if reported == candidate {
+            return true;
+        }
+    }
+    false
 }
 
-/// The earliest event timestamp that may count as confirmation of a write
-/// performed at `written_at`. Anything older is pre-existing prompt history for
-/// the pane, not evidence about this delivery.
-pub fn confirmation_floor(written_at: DateTime<Utc>) -> DateTime<Utc> {
-    written_at - TimeDelta::seconds(CONFIRMATION_CLOCK_SKEW_SECS)
+/// Whether an agent of this type can report SUBMITTED PROMPT TEXT — the
+/// capability the whole confirmation design rests on, as distinct from merely
+/// reporting a lifecycle.
+///
+/// Reviewer finding B4. Claude Code and Devin post `UserPromptSubmit` through
+/// the native hook engine, Codex's wrapper synthesizes the same shape, and
+/// OpenCode forwards `session.prompt` — all four land as an event carrying
+/// `user_prompt` (`crate::hook`). **Pi cannot**: its extension reaches the
+/// daemon through the `agent-event` subcommand, which hardcodes
+/// `user_prompt: None`, so a Pi pane emits perfectly well-formed status frames
+/// carrying the right pane and agent ids and never a single submitted prompt.
+/// Arming re-submission off those frames retypes the prompt until the deadline
+/// into an agent that may already be working on it.
+///
+/// [`AgentType::None`] is BOTH "unrecognized binary" and the `#[serde(other)]`
+/// forward-compat landing pad for an agent type this build has never heard of,
+/// so it is answered `false`: an unknown producer has not proved the
+/// capability, and the conservative answer only ever costs a retry we were not
+/// entitled to make. The match is exhaustive on purpose — a new agent type must
+/// answer this question rather than inherit a default.
+pub fn agent_reports_submitted_prompt(agent_type: &AgentType) -> bool {
+    match agent_type {
+        AgentType::ClaudeCode | AgentType::OpenCode | AgentType::Codex | AgentType::Devin => true,
+        AgentType::Pi | AgentType::None => false,
+    }
+}
+
+/// What a pane is known to be able to do about confirming a delivery, as
+/// distinct from what it has happened to do YET.
+///
+/// Reviewer finding B3. The old code collapsed this onto "did a readiness signal
+/// arrive within 10 s", finalized the write the moment it had not, and threw the
+/// prompt away. But "no readiness event yet" is not proof of a hookless shell —
+/// it is equally a real Claude whose nested launcher, MCP startup, trust gate or
+/// hook is slower than 10 s, and that pane can emit `SessionStart` at 10.1 s to
+/// find its prompt already finalized and unretryable. That silently excluded the
+/// `devbox run claude …` launcher class issue #424 §3 names as the most fragile
+/// population from the entire fix. Capability is a property of the PRODUCER, so
+/// it is read from the producer, and [`Unknown`](Self::Unknown) is a real state
+/// the delivery waits in rather than a timeout verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmationCapability {
+    /// A producer that reports submitted prompt text owns this pane. An
+    /// unconfirmed write may be re-submitted.
+    Reports,
+    /// A recognized producer that structurally cannot report one (Pi). The
+    /// write is final: retrying could never be confirmed, only retyped.
+    CannotReport,
+    /// Nothing on this pane has identified itself yet — a bare shell, `cat`, a
+    /// recorder stand-in, or an agent behind a launcher that has not signalled.
+    /// The write is held PROVISIONAL but is NOT retyped, and this is
+    /// re-evaluated every frame: the moment a real producer identifies itself,
+    /// retries arm and the prompt is still recoverable.
+    Unknown,
+}
+
+/// Resolve [`ConfirmationCapability`] from the agent types currently declared on
+/// one pane's sessions. Any reporting producer wins; otherwise a recognized
+/// non-reporting one settles it; otherwise the answer is not yet known.
+pub fn pane_confirmation_capability<'a>(
+    agent_types: impl Iterator<Item = &'a AgentType>,
+) -> ConfirmationCapability {
+    let mut capability = ConfirmationCapability::Unknown;
+    for agent_type in agent_types {
+        if agent_reports_submitted_prompt(agent_type) {
+            return ConfirmationCapability::Reports;
+        }
+        if *agent_type != AgentType::None {
+            capability = ConfirmationCapability::CannotReport;
+        }
+    }
+    capability
+}
+
+/// Whether a reported submission at `event_ts` is CAUSALLY after the write this
+/// delivery is trying to confirm, given the `watermark` captured from the same
+/// event journal immediately before that write.
+///
+/// Reviewer finding B2/#2. This used to be a wall-clock comparison against our
+/// own write timestamp with a fixed five-second skew allowance, which was wrong
+/// in three independent ways. It accepted an event from up to five seconds
+/// BEFORE the write, so re-enqueueing a seed shortly after a previous
+/// submission confirmed instantly off the *old* event with no clock skew
+/// involved at all. And because a TUI's clock and the event producer's clock are
+/// genuinely different clocks for a remote deck, a TUI more than five seconds
+/// ahead rejected every real confirmation forever, while one running behind
+/// widened the stale window by however far it lagged.
+///
+/// A watermark taken from the pane's own event journal has neither problem: it
+/// is a value from the SAME clock that stamps the events being compared, so the
+/// comparison is causal rather than chronometric. `None` means the pane's
+/// journal was empty when we wrote — there is no pre-existing history to
+/// mistake for evidence, so anything that arrives afterwards is new.
+pub fn submission_is_after_watermark(
+    event_ts: DateTime<Utc>,
+    watermark: Option<DateTime<Utc>>,
+) -> bool {
+    match watermark {
+        Some(mark) => event_ts > mark,
+        None => true,
+    }
 }
 
 /// Backoff before re-submitting a written-but-UNCONFIRMED prompt: 0.5 s, 1 s,
@@ -214,9 +379,16 @@ pub fn log_prompt_confirmed(path: &str, pane_id: &str, delivery_id: &str, attemp
 
 /// Info-level record that this delivery has no confirmation channel at all, so
 /// the write is final and no retry will be attempted. Emitted for a target that
-/// never signalled readiness (a bare shell, `cat`, a hook-less launcher): such
-/// an agent reports no submitted prompts either, so retrying would only type the
-/// prompt into it repeatedly and then abandon it.
+/// cannot report submitted prompt text — no hook-event bus at all, or a
+/// producer [`agent_reports_submitted_prompt`] answers `false` for. Such an
+/// agent reports no submitted prompts, so retrying would only type the prompt
+/// into it repeatedly and then abandon it.
+///
+/// Deliberately NOT emitted merely because a readiness signal has not arrived
+/// yet (reviewer finding B3): "no `SessionStart` after 10 s" is equally the
+/// state of a real Claude whose nested launcher, MCP startup or trust gate is
+/// slower than that, and finalizing there re-created the exact silent loss
+/// issue #424 is about for the most fragile population it names.
 pub fn log_prompt_unconfirmable(path: &str, pane_id: &str, delivery_id: &str, reason: &str) {
     tracing::info!(
         path,
@@ -224,6 +396,32 @@ pub fn log_prompt_unconfirmable(path: &str, pane_id: &str, delivery_id: &str, re
         delivery_id,
         reason,
         "prompt written to pane; delivery cannot be confirmed by this agent, not retrying"
+    );
+}
+
+/// Warn-level record that automatic re-submission has STOPPED for a reason that
+/// is neither confirmation nor the deadline: the evidence needed to decide is
+/// missing or the target we wrote to is gone.
+///
+/// The prompt is left as written — not retyped and not declared delivered —
+/// because in every case that reaches here, writing again is the unsafe move:
+///
+/// * `lagged-event-stream` (reviewer finding B7): the daemon's observer
+///   broadcast dropped frames, so the real `UserPromptSubmit` may have been
+///   among them. Missing evidence is not permission to submit a second copy
+///   into an agent that is already acting on the first.
+/// * `event-stream-closed` (B8): nothing can ever report back now.
+/// * `bound-session-ended` / `agent-replaced` (B1/B2): the conversation we wrote
+///   into is over, or the pane rebound to a different agent. The prompt belongs
+///   to a target that no longer exists, and the only thing a retry could do is
+///   inject it into a stranger's context.
+pub fn log_prompt_stopped(path: &str, pane_id: &str, delivery_id: &str, reason: &str) {
+    tracing::warn!(
+        path,
+        pane_id,
+        delivery_id,
+        reason,
+        "prompt delivery stopped without confirmation; not re-submitting"
     );
 }
 
@@ -254,6 +452,81 @@ mod tests {
         // `encode_pane_payload` strips trailing whitespace before the bytes
         // reach the PTY, so the agent reports the trimmed form.
         assert!(prompt_submission_matches("do the thing\n", "do the thing"));
+    }
+
+    /// Reviewer finding B10: normalization must be the ENCODER's contract, not
+    /// `str::trim`. Leading whitespace is preserved by the encoder and so is
+    /// meaningful; trailing Unicode whitespace is preserved too, so it cannot
+    /// be normalized away into a different prompt's report.
+    #[test]
+    fn normalization_matches_the_encoder_contract() {
+        assert!(!prompt_submission_matches("  indented", "indented"));
+        assert!(prompt_submission_matches("  indented", "  indented"));
+        // U+00A0 NO-BREAK SPACE survives `encode_pane_payload`, so two prompts
+        // differing only by one are DIFFERENT prompts.
+        assert!(!prompt_submission_matches("do it\u{a0}", "do it"));
+        // ...while the four bytes the encoder does strip are still equivalent.
+        assert!(prompt_submission_matches("do it \t\r\n", "do it"));
+    }
+
+    /// Reviewer finding B5: the CR-swallow shape. The payload stayed in the
+    /// input box, the retry submitted, and the hook reports `seed \n seed`.
+    /// That is the seed submitted — twice — so it must finalize the delivery
+    /// rather than leave the retry armed against an agent already working.
+    #[test]
+    fn repeated_copies_of_the_seed_count_as_delivered() {
+        let seed = "Read .dot-agent-deck/worker-task-coder.md and begin";
+        assert!(prompt_submission_matches(seed, &format!("{seed}\n{seed}")));
+        assert!(prompt_submission_matches(
+            seed,
+            &format!("{seed}\n{seed}\n{seed}")
+        ));
+        // Short and long prompts must behave the SAME way here; before this
+        // they behaved oppositely, because a long prompt's doubled submission
+        // truncates to the same prefix while a short one's does not.
+        let long = "y".repeat(USER_PROMPT_MAX_LEN + 40);
+        let doubled = format!("{long}\n{long}");
+        assert!(prompt_submission_matches(
+            &long,
+            &truncate_on_char_boundary(&doubled, USER_PROMPT_MAX_LEN)
+        ));
+        // A prompt whose doubled form crosses the truncation limit only from
+        // the second copy on — the case neither the verbatim nor the
+        // single-truncation branch can reach.
+        let medium = "m".repeat(USER_PROMPT_MAX_LEN - 20);
+        let medium_doubled = format!("{medium}\n{medium}");
+        assert!(prompt_submission_matches(
+            &medium,
+            &truncate_on_char_boundary(&medium_doubled, USER_PROMPT_MAX_LEN)
+        ));
+        // Repetition must not become a wildcard: a different prompt appended
+        // after ours is NOT proof that only ours was submitted.
+        assert!(!prompt_submission_matches(
+            seed,
+            &format!("{seed}\nnow delete the production database")
+        ));
+        assert!(!prompt_submission_matches(seed, ""));
+        assert!(!prompt_submission_matches("", "anything"));
+    }
+
+    /// Reviewer finding B4: reporting a lifecycle and reporting submitted
+    /// prompt text are different capabilities, and Pi is the shipped
+    /// counterexample that proves it.
+    #[test]
+    fn only_producers_that_can_report_a_prompt_arm_retries() {
+        assert!(agent_reports_submitted_prompt(&AgentType::ClaudeCode));
+        assert!(agent_reports_submitted_prompt(&AgentType::Codex));
+        assert!(agent_reports_submitted_prompt(&AgentType::OpenCode));
+        assert!(agent_reports_submitted_prompt(&AgentType::Devin));
+        assert!(
+            !agent_reports_submitted_prompt(&AgentType::Pi),
+            "Pi's agent-event frames hardcode user_prompt: None, so a Pi \
+             delivery can never be confirmed and must never arm a retry"
+        );
+        assert!(
+            !agent_reports_submitted_prompt(&AgentType::None),
+            "an unrecognized or future producer has not proved the capability"
+        );
     }
 
     /// The trap from the tester's finding #2: a prompt longer than the hook's
@@ -330,9 +603,27 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// Reviewer finding B2/#2: the watermark is CAUSAL, so an event that was
+    /// already in the pane's journal when we wrote can never confirm the write
+    /// — including the identical seed submitted a second before it.
     #[test]
-    fn confirmation_floor_precedes_the_write() {
-        let now = Utc::now();
-        assert!(confirmation_floor(now) < now);
+    fn only_events_after_the_watermark_can_confirm() {
+        let mark = Utc::now();
+        assert!(!submission_is_after_watermark(
+            mark - chrono::TimeDelta::seconds(1),
+            Some(mark)
+        ));
+        assert!(
+            !submission_is_after_watermark(mark, Some(mark)),
+            "the watermark event IS the pre-existing history; it is not evidence"
+        );
+        assert!(submission_is_after_watermark(
+            mark + chrono::TimeDelta::milliseconds(1),
+            Some(mark)
+        ));
+        assert!(
+            submission_is_after_watermark(mark - chrono::TimeDelta::hours(1), None),
+            "an empty journal has no history to mistake for evidence"
+        );
     }
 }
