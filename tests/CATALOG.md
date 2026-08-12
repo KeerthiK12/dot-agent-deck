@@ -941,10 +941,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** how confirmation is correlated internally or the daemon's PTY behavior; only the consumer's observable delivery state contract.
 - **Platform coverage:** mac+linux+windows.
 
-##### prompt/pane-input/024 — Seed delivery distinguishes confirmable panes, unconfirmable panes, and swallowed-CR duplicate submissions.
+##### prompt/pane-input/024 — Seed delivery distinguishes confirmable panes, unconfirmable panes, and both swallowed-CR duplicate shapes.
 - **Layer:** L1 (in-process `process_pending_seed_prompts` consumer with a controllable `PaneController` and hook-derived state snapshot).
 - **Agent:** none.
-- **Asserts:** `Applied`/`Queued` reporting panes remain provisional until matching submission; one Pi status event and a pane with no identity each write exactly once without arming retries; short and >200-byte doubled submissions stop before a third write; repetition is bounded to 16 copies and is not a wildcard.
+- **Asserts:** `Applied`/`Queued` reporting panes remain provisional until matching submission; one Pi status event and a pane with no identity each write exactly once without arming retries; short and >200-byte doubled submissions joined by either a newline or no separator clear retry state before an immediately eligible third write; repetition is bounded to 16 newline-separated copies and is not a wildcard.
 - **Does not assert:** orchestration-role status (covered by `prompt/pane-input/023`) or whether the seed came from dispatch versus a configured mode.
 - **Platform coverage:** mac+linux+windows.
 

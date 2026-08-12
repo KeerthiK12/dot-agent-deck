@@ -29544,7 +29544,7 @@ mod tests {
         }
     }
 
-    /// Scenario: Queue seed prompts for reporting, non-reporting, and unidentifiable consumers, including a swallowed-CR duplicate submission. Reporting panes stay provisional until matching submission evidence arrives, while Pi and identity-less panes write once without arming retries, and a doubled submitted seed terminates before a third write.
+    /// Scenario: Queue seed prompts for reporting, non-reporting, and unidentifiable consumers, including swallowed-CR duplicate submissions joined by a newline or no separator. Reporting panes stay provisional until matching submission evidence arrives, while Pi and identity-less panes write once without arming retries, and every doubled submitted seed clears retry state before a third write.
     #[spec("prompt/pane-input/024")]
     #[test]
     fn pane_input_024_seed_write_is_provisional_until_confirmation() {
@@ -29683,55 +29683,89 @@ mod tests {
             "a pane with no identity anywhere must be written once and never retyped"
         );
 
-        // Reviewer B5: if the first CR became a newline, the retry submits
-        // `seed\nseed`. That is terminal delivery evidence for both sides of
-        // the old 200-byte inconsistency, so no third write may follow.
-        for seed in [
-            "short swallowed seed".to_string(),
-            "L".repeat(crate::prompt_delivery::USER_PROMPT_MAX_LEN + 40),
-        ] {
-            let doubled_attempts = Arc::new(AtomicUsize::new(0));
-            let doubled_pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
-                InjectedSendOutcome::Applied,
-                doubled_attempts.clone(),
-            ));
-            let mut doubled_ui = default_ui();
-            doubled_ui
-                .pending_seed_prompts
-                .push(ready_seed_prompt("doubled-seed-pane", &seed));
-            let mut doubled_snapshot =
-                ready_prompt_snapshot("doubled-seed-pane", "doubled-seed-agent");
+        // Reviewer B5 plus the real `/015` failure: a swallowed CR can leave
+        // the first seed in the input as either `seed\nseed` or bare
+        // `seedseed` (observed as the `waitUse` seam). Both are terminal
+        // delivery evidence, for short and hook-truncated long reports, so even
+        // a retry made immediately eligible after the event must not write a
+        // third copy.
+        let field_seed = "Use Bash to verify seed-confirm-alpha-7f31.txt exists in the current directory then print its exact filename and wait";
+        let seeds = [
+            ("short", field_seed.to_string()),
+            (
+                "long",
+                format!(
+                    "{field_seed} {}",
+                    "keep the exact sentinel-bearing task unchanged; ".repeat(4)
+                ),
+            ),
+        ];
+        assert!(
+            seeds[1].1.len() > crate::prompt_delivery::USER_PROMPT_MAX_LEN,
+            "the long fixture must exercise hook truncation"
+        );
+        let mut doubled_outcomes = Vec::new();
+        for (length, seed) in seeds {
+            for (separator_name, separator) in [("newline", "\n"), ("bare", "")] {
+                let doubled_attempts = Arc::new(AtomicUsize::new(0));
+                let doubled_pane: Arc<dyn PaneController> =
+                    Arc::new(SendResultPaneController::new(
+                        InjectedSendOutcome::Applied,
+                        doubled_attempts.clone(),
+                    ));
+                let mut doubled_ui = default_ui();
+                doubled_ui
+                    .pending_seed_prompts
+                    .push(ready_seed_prompt("doubled-seed-pane", &seed));
+                let mut doubled_snapshot =
+                    ready_prompt_snapshot("doubled-seed-pane", "doubled-seed-agent");
 
-            process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
-            doubled_ui
-                .send_retry_backoff
-                .get_mut("doubled-seed-pane")
-                .expect("first unconfirmed write arms retry")
-                .next_attempt_at = std::time::Instant::now();
-            process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
-            assert_eq!(doubled_attempts.load(Ordering::SeqCst), 2);
+                process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
+                doubled_ui
+                    .send_retry_backoff
+                    .get_mut("doubled-seed-pane")
+                    .expect("first unconfirmed write arms retry")
+                    .next_attempt_at = std::time::Instant::now();
+                process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
+                assert_eq!(doubled_attempts.load(Ordering::SeqCst), 2);
 
-            let doubled = format!("{seed}\n{seed}");
-            let reported = crate::prompt_delivery::truncate_on_char_boundary(
-                &doubled,
-                crate::prompt_delivery::USER_PROMPT_MAX_LEN,
-            );
-            apply_prompt_confirmation(
-                &mut doubled_snapshot,
-                "doubled-seed-pane",
-                "doubled-seed-agent",
-                &reported,
-            );
-            process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
-            process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
-            assert!(doubled_ui.pending_seed_prompts.is_empty());
-            assert_eq!(
-                doubled_attempts.load(Ordering::SeqCst),
-                2,
-                "a submitted doubled seed must terminate the loop before a third write (seed bytes={})",
-                seed.len()
-            );
+                let doubled = format!("{seed}{separator}{seed}");
+                let reported = crate::prompt_delivery::truncate_on_char_boundary(
+                    &doubled,
+                    crate::prompt_delivery::USER_PROMPT_MAX_LEN,
+                );
+                apply_prompt_confirmation(
+                    &mut doubled_snapshot,
+                    "doubled-seed-pane",
+                    "doubled-seed-agent",
+                    &reported,
+                );
+                doubled_ui
+                    .send_retry_backoff
+                    .get_mut("doubled-seed-pane")
+                    .expect("second unconfirmed write keeps retry armed")
+                    .next_attempt_at = std::time::Instant::now();
+                process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
+                process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
+                doubled_outcomes.push((
+                    format!("{length}-{separator_name}"),
+                    doubled_ui.pending_seed_prompts.is_empty(),
+                    !doubled_ui.prompt_delivery.contains_key("doubled-seed-pane")
+                        && !doubled_ui
+                            .send_retry_backoff
+                            .contains_key("doubled-seed-pane"),
+                    doubled_attempts.load(Ordering::SeqCst),
+                ));
+            }
         }
+        assert!(
+            doubled_outcomes
+                .iter()
+                .all(|(_, delivered, retry_cleared, attempts)| {
+                    *delivered && *retry_cleared && *attempts == 2
+                }),
+            "every reported doubled seed must be delivered with retry state cleared and no third write; outcomes={doubled_outcomes:#?}"
+        );
 
         let repeated = "bounded repetition";
         assert!(prompt_submission_matches(
