@@ -1782,10 +1782,22 @@ mod tests {
         }
     }
 
-    /// Scenario: Hold a detached spawn prompt in its confirmation backoff, replace the registry agent owning the pane, and separately emit SessionEnd for the bound same-agent generation. The replacement and cleared conversation must each receive zero retry bytes, and both confirmation tasks must terminate.
+    fn spawn_byte_target(registry: &AgentPtyRegistry, pane_id: &str) -> String {
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn byte-observation target")
+    }
+
+    /// Scenario: Hold detached spawn prompts in confirmation backoff while their pane is replaced, generation ends, event stream lags or closes, pane closes, daemon shuts down, or a newer prompt supersedes the watch. Every terminal/cancelled watch must finish without stale retry bytes, and the newer same-pane watch must be the only flight left.
     #[spec("scheduler/dispatch/016")]
+    #[serial_test::serial(prompt_confirmation_tasks)]
     #[tokio::test]
     async fn dispatch_016_detached_retry_stops_before_replacement_or_clear() {
+        cancel_all_prompt_confirmations();
         const PROMPT: &str = "DETACHED-STALE-PROMPT-MARKER";
         const PANE_ID: &str = "detached-retry-rebind";
 
@@ -1892,15 +1904,194 @@ mod tests {
             "SessionEnd for the bound generation must stop before retry bytes reach the cleared conversation"
         );
         clear_registry.shutdown_all();
+
+        // A lagged stream may have dropped the real confirmation; a closed
+        // stream can never report one. Both are terminal and neither permits a
+        // retry after the ordinary 500 ms first window.
+        let stream_registry = Arc::new(AgentPtyRegistry::new());
+        let lagged_pane = "detached-retry-lagged";
+        let lagged_agent = spawn_byte_target(&stream_registry, lagged_pane);
+        let (lagged_tx, lagged_rx) = broadcast::channel(1);
+        lagged_tx
+            .send(BroadcastMsg::Event(prompt_watch_event(
+                "other-pane-a",
+                "other-agent",
+                "other-session-a",
+                EventType::Thinking,
+            )))
+            .expect("queue first event before lag");
+        lagged_tx
+            .send(BroadcastMsg::Event(prompt_watch_event(
+                "other-pane-b",
+                "other-agent",
+                "other-session-b",
+                EventType::Thinking,
+            )))
+            .expect("overflow confirmation receiver");
+        let lagged_confirmation = tokio::spawn(confirm_prompt_delivery(
+            stream_registry.clone(),
+            lagged_rx,
+            ConfirmationTask {
+                pane_id: lagged_pane.into(),
+                agent_id: lagged_agent.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: "lagged-stream-test".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), lagged_confirmation)
+            .await
+            .expect("lagged stream must terminate the confirmation watch")
+            .expect("lagged confirmation task must not panic");
+
+        let closed_pane = "detached-retry-closed";
+        let closed_agent = spawn_byte_target(&stream_registry, closed_pane);
+        let (closed_tx, closed_rx) = broadcast::channel(1);
+        drop(closed_tx);
+        let closed_confirmation = tokio::spawn(confirm_prompt_delivery(
+            stream_registry.clone(),
+            closed_rx,
+            ConfirmationTask {
+                pane_id: closed_pane.into(),
+                agent_id: closed_agent.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: "closed-stream-test".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), closed_confirmation)
+            .await
+            .expect("closed stream must terminate instead of spinning")
+            .expect("closed confirmation task must not panic");
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        for (agent_id, terminal) in [
+            (&lagged_agent, "Lagged must become terminal Indeterminate"),
+            (&closed_agent, "Closed must remain terminal"),
+        ] {
+            let output = stream_registry.snapshot(agent_id).expect("stream snapshot");
+            assert!(
+                !output
+                    .windows(PROMPT.len())
+                    .any(|window| window == PROMPT.as_bytes()),
+                "{terminal}; no retry bytes may follow: {:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        drop(lagged_tx);
+        stream_registry.shutdown_all();
+
+        // The registry-owned lifecycle: pane close aborts its watch, shutdown
+        // aborts all watches, and a newer prompt for one pane aborts the older
+        // flight before its first retry can land.
+        let managed_registry = Arc::new(AgentPtyRegistry::new());
+        let (managed_tx, _) = broadcast::channel(8);
+        let close_pane = "detached-close-cancel";
+        let close_agent = spawn_byte_target(&managed_registry, close_pane);
+        spawn_confirmation_task(
+            managed_registry.clone(),
+            managed_tx.subscribe(),
+            ConfirmationTask {
+                pane_id: close_pane.into(),
+                agent_id: close_agent.clone(),
+                prompt: "CLOSE-CANCELLED-OLD-PROMPT".into(),
+                delivery_id: "close-cancel-test".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        );
+        cancel_prompt_confirmation(close_pane);
+
+        let single_pane = "detached-single-flight";
+        let single_agent = spawn_byte_target(&managed_registry, single_pane);
+        spawn_confirmation_task(
+            managed_registry.clone(),
+            managed_tx.subscribe(),
+            ConfirmationTask {
+                pane_id: single_pane.into(),
+                agent_id: single_agent.clone(),
+                prompt: "SUPERSEDED-OLD-PROMPT".into(),
+                delivery_id: "single-flight-old".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        );
+        spawn_confirmation_task(
+            managed_registry.clone(),
+            managed_tx.subscribe(),
+            ConfirmationTask {
+                pane_id: single_pane.into(),
+                agent_id: single_agent.clone(),
+                prompt: "NEWER-PROMPT-HELD-WITHOUT-RETRY".into(),
+                delivery_id: "single-flight-new".into(),
+                generation: None,
+                can_report_prompts: false,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        );
+
+        let shutdown_panes = ["detached-shutdown-a", "detached-shutdown-b"];
+        let shutdown_agents = shutdown_panes.map(|pane_id| {
+            let agent_id = spawn_byte_target(&managed_registry, pane_id);
+            spawn_confirmation_task(
+                managed_registry.clone(),
+                managed_tx.subscribe(),
+                ConfirmationTask {
+                    pane_id: pane_id.into(),
+                    agent_id: agent_id.clone(),
+                    prompt: format!("SHUTDOWN-CANCELLED-{pane_id}"),
+                    delivery_id: format!("shutdown-cancel-{pane_id}"),
+                    generation: None,
+                    can_report_prompts: true,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                },
+            );
+            agent_id
+        });
+        cancel_all_prompt_confirmations();
+        tokio::time::sleep(Duration::from_millis(550)).await;
+
+        let close_output = managed_registry
+            .snapshot(&close_agent)
+            .expect("pane-close cancellation snapshot");
+        assert!(
+            !String::from_utf8_lossy(&close_output).contains("CLOSE-CANCELLED-OLD-PROMPT"),
+            "pane close must abort its confirmation task before retry bytes"
+        );
+        let single_output = managed_registry
+            .snapshot(&single_agent)
+            .expect("single-flight snapshot");
+        assert!(
+            !String::from_utf8_lossy(&single_output).contains("SUPERSEDED-OLD-PROMPT"),
+            "the newer same-pane watch must abort the older prompt before it retries"
+        );
+        for (pane_id, agent_id) in shutdown_panes.iter().zip(shutdown_agents.iter()) {
+            let output = managed_registry
+                .snapshot(agent_id)
+                .expect("daemon-shutdown cancellation snapshot");
+            assert!(
+                !String::from_utf8_lossy(&output).contains("SHUTDOWN-CANCELLED"),
+                "daemon shutdown must abort the watch for {pane_id} before retry bytes"
+            );
+        }
+        assert!(
+            CONFIRMATION_TASKS.lock().unwrap().is_empty(),
+            "daemon shutdown must drain the confirmation task registry"
+        );
+        drop(managed_tx);
+        managed_registry.shutdown_all();
     }
 
-    /// Issue #424 (reviewer blocker 3 / C4, coder-authored): abandonment is
-    /// REPORTED, not typed. The report reaches the daemon's notice sink bound to
-    /// the exact agent the prompt was written for, writes nothing into the
-    /// pane's PTY, and is suppressed once that agent no longer owns the pane —
-    /// so a stale report can never mark a successor's card.
+    /// Scenario: Abandon a spawn prompt against its exact pane owner, then replace that owner and exhaust the 256-watch cap for a new delivery. Abandonment must report state without pane bytes, a stale report must not mark the replacement, and the 257th delivery must visibly report that it is unwatched.
+    #[serial_test::serial(prompt_confirmation_tasks)]
     #[tokio::test]
     async fn abandonment_reports_state_and_never_writes_into_the_pane() {
+        cancel_all_prompt_confirmations();
         const PANE_ID: &str = "abandon-notice-pane";
         let registry = Arc::new(AgentPtyRegistry::new());
         let agent_id = registry
@@ -1954,6 +2145,91 @@ mod tests {
             1,
             "a report against a replaced agent must be suppressed, not re-addressed"
         );
+
+        // Fill exactly the configured watch budget with live pending tasks.
+        // The next distinct pane is the 257th delivery and must publish the
+        // visible state report that the old silent-cap behavior omitted.
+        {
+            let mut tasks = CONFIRMATION_TASKS.lock().unwrap();
+            for index in 0..MAX_CONFIRMATION_TASKS {
+                let pending = tokio::spawn(std::future::pending::<()>());
+                tasks.insert(format!("cap-fill-{index}"), pending.abort_handle());
+            }
+        }
+        let (cap_tx, cap_rx) = broadcast::channel(1);
+        spawn_confirmation_task(
+            registry.clone(),
+            cap_rx,
+            ConfirmationTask {
+                pane_id: PANE_ID.into(),
+                agent_id: replacement.clone(),
+                prompt: "CAP-EXHAUSTED-PROMPT".into(),
+                delivery_id: "cap-exhausted-257".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        );
+        {
+            let notices = notices.lock().unwrap();
+            assert_eq!(
+                notices.len(),
+                2,
+                "the 257th delivery must be visibly reported, not silently unwatched"
+            );
+            assert_eq!(notices[1].delivery_id, "cap-exhausted-257");
+            assert!(
+                notices[1].detail.contains("maximum") && notices[1].detail.contains("NOT"),
+                "the report must explain that confirmation and retry are unavailable: {:?}",
+                notices[1]
+            );
+        }
+        drop(cap_tx);
+        cancel_all_prompt_confirmations();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Consume most of an absolute delivery deadline in a simulated readiness wait, then leave the reporting confirmation unanswered. The watch must publish abandonment within only the remaining budget, rather than granting itself a fresh confirmation deadline.
+    #[tokio::test]
+    async fn readiness_wait_is_inside_the_absolute_confirmation_deadline() {
+        const PANE_ID: &str = "absolute-deadline-pane";
+        const PROMPT: &str = "ABSOLUTE-DEADLINE-PROMPT";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
+        let notices = Arc::new(Mutex::new(Vec::<DeliveryNotice>::new()));
+        let recorded = notices.clone();
+        registry.set_delivery_notice_sink(Arc::new(move |notice| {
+            recorded.lock().unwrap().push(notice);
+        }));
+        let (_event_tx, event_rx) = broadcast::channel(8);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let confirmation = tokio::spawn(confirm_prompt_delivery(
+            registry.clone(),
+            event_rx,
+            ConfirmationTask {
+                pane_id: PANE_ID.into(),
+                agent_id: agent_id.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: "absolute-deadline-test".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline,
+            },
+        ));
+        tokio::time::timeout(Duration::from_millis(250), confirmation)
+            .await
+            .expect("confirmation must use only the deadline budget left after readiness")
+            .expect("absolute-deadline confirmation task must not panic");
+        assert_eq!(
+            notices.lock().unwrap().len(),
+            1,
+            "abandonment must be visible by one total deadline, including readiness; elapsed={:?}",
+            started.elapsed()
+        );
+
         registry.shutdown_all();
     }
 

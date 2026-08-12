@@ -30399,16 +30399,33 @@ mod tests {
         );
     }
 
-    /// Issue #424 (reviewer MEDIUM / C6, coder-authored): a pane can hold a known
-    /// registry identity and a reporting `AgentType` while its hook binary emits
-    /// events that carry no `agent_id` at all. `prompt_submission_confirmed`
-    /// rejects every one of those as unusable evidence, so the delivery must not
-    /// be classified as retryable — that retypes the prompt until the deadline
-    /// through a channel structurally incapable of confirming.
+    /// Scenario: Record an untagged scheduler-style event before a seed write, then an untagged hook event after it, followed by identified evidence. Pre-write history must not disable confirmation, post-write unidentified-only evidence must hold without retrying, and an identified event must recover the reporting channel.
     #[test]
     fn untagged_hook_events_are_not_a_confirmation_channel() {
         const PANE_ID: &str = "legacy-hook-pane";
+        let untagged = |snapshot: &mut AppState, event_type: EventType, prompt: Option<&str>| {
+            snapshot.apply_event(AgentEvent {
+                session_id: "legacy-session".into(),
+                agent_type: AgentType::ClaudeCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: prompt.map(str::to_string),
+                metadata: Default::default(),
+                pane_id: Some(PANE_ID.into()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            });
+        };
         let mut snapshot = ready_prompt_snapshot(PANE_ID, "legacy-hook-agent");
+        // `surface_spawned_pane` emits this untagged SessionStart shape before
+        // the delivery writes. The watermark must exclude it, or every
+        // scheduler-spawned pane would look like a post-write legacy channel.
+        untagged(&mut snapshot, EventType::SessionStart, None);
         let mut delivery = PromptDelivery {
             expected_agent_id: Some("legacy-hook-agent".into()),
             expected_session_id: None,
@@ -30425,25 +30442,11 @@ mod tests {
             "a quiet pane has not yet shown anything about its evidence channel"
         );
 
-        let untagged = |snapshot: &mut AppState, prompt: &str| {
-            snapshot.apply_event(AgentEvent {
-                session_id: "legacy-session".into(),
-                agent_type: AgentType::ClaudeCode,
-                event_type: EventType::Thinking,
-                tool_name: None,
-                tool_detail: None,
-                cwd: None,
-                timestamp: Utc::now(),
-                user_prompt: Some(prompt.to_string()),
-                metadata: Default::default(),
-                pane_id: Some(PANE_ID.into()),
-                agent_id: None,
-                agent_version: None,
-                schema_version: None,
-                live_target: None,
-            });
-        };
-        untagged(&mut snapshot, "something the agent submitted");
+        untagged(
+            &mut snapshot,
+            EventType::Thinking,
+            Some("something the agent submitted"),
+        );
         assert_eq!(
             delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
             ConfirmationCapability::Unknown,
@@ -30464,7 +30467,11 @@ mod tests {
         delivery.attempts = 0;
         let mut untouched = AppState::default();
         untouched.register_pane(PANE_ID.to_string());
-        untagged(&mut untouched, "pre-write chatter");
+        untagged(
+            &mut untouched,
+            EventType::Thinking,
+            Some("pre-write chatter"),
+        );
         assert!(!evidence_channel_is_unidentified(
             &untouched, PANE_ID, &delivery
         ));

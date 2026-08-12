@@ -3641,13 +3641,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** L2 REAL PTY-attached (real deck and daemon, three sibling dispatch worktrees, imported isolated credentials, and project trust pre-seeded for every predicted worktree). A bootstrap launcher mirrors the field report's nested `devbox` startup seam: it announces an explicitly launcher-origin (`wrapper_fork`) `SessionStart`, consumes and records exactly one early PTY submission while the real agent is not yet running, then `exec`s Claude.
 - **Agent:** REAL interactive Claude Code ×3 pinned to `claude-haiku-4-5-20251001` with `--allowedTools Bash` and no `-p`, reached through the deterministic one-write-swallowing bootstrap launcher; runtime-skipped when the CLI or credentials are absent and flaky-tolerant in the pre-PR tier.
 - **Asserts:** all three bootstrap launchers record their distinct first seed as swallowed, then each real Claude pane's durable native `UserPromptSubmit` state exactly carries the retried sentinel-bearing seed, so neither an unexercised startup window nor a healthy Idle pane with only PTY echo can pass.
+- **Failure diagnostics:** every failing path reports, per pane, the full expected prompt, the exact durable confirmed value, whether the first submission was swallowed, and the complete bootstrap attempt log, plus the final rendered grid.
 - **Does not assert:** exact model response phrasing, ordering between the three agents, or a fixed boot duration.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/016 — Detached prompt retries stop before pane replacement or a same-agent clear.
+##### scheduler/dispatch/016 — Detached prompt retries stop whenever their target or evidence stream is terminal, cancelled, or superseded.
 - **Layer:** L1 (in-process detached spawn confirmation task with real registry-owned shell PTYs and synthetic hook events).
 - **Agent:** none (real `/bin/sh` PTYs are byte-observation targets, not agent stand-ins).
-- **Asserts:** replacing the registry agent during the confirmation backoff terminates the old watch and leaves the successor with zero stale prompt bytes; `SessionEnd` for the bound generation likewise terminates before a retry reaches the same-agent cleared conversation.
+- **Asserts:** replacement, a bound `SessionEnd`, broadcast lag, and broadcast closure each terminally stop the watch without stale retry bytes; pane close and daemon shutdown cancel registered watches; a newer same-pane delivery aborts the older single flight before it retries.
 - **Does not assert:** TUI-owned automatic seed/orchestrator delivery (covered by `prompt/pane-input/028`) or finer same-agent generation tracking without `SessionEnd` (provisional behavior intentionally not pinned).
 - **Platform coverage:** mac+linux.
 

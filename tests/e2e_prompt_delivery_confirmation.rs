@@ -141,14 +141,26 @@ fn confirmed_prompt(deck: &TuiDeck, name: &str) -> Option<String> {
         .and_then(|live| live.last_user_prompt)
 }
 
+fn prompt_attempt_log(deck: &TuiDeck, name: &str) -> String {
+    std::fs::read_to_string(dispatch_worktree_of(deck, name).join("prompt-attempts.log"))
+        .unwrap_or_else(|_| "<no attempt log>".to_string())
+}
+
+fn first_submission_was_swallowed(deck: &TuiDeck, name: &str, prompt: &str) -> bool {
+    prompt_attempt_log(deck, name)
+        .lines()
+        .any(|line| line == format!("swallowed|{prompt}"))
+}
+
 fn delivery_diagnostics(deck: &TuiDeck, cases: &[(&str, &str)]) -> String {
     let mut out = String::new();
     for (name, prompt) in cases {
-        let worktree = dispatch_worktree_of(deck, name);
-        let attempts = std::fs::read_to_string(worktree.join("prompt-attempts.log"))
-            .unwrap_or_else(|_| "<no attempt log>".to_string());
+        let attempts = prompt_attempt_log(deck, name);
+        let first_submission_swallowed = attempts
+            .lines()
+            .any(|line| line == format!("swallowed|{prompt}"));
         out.push_str(&format!(
-            "\n{name}: expected={prompt:?}, confirmed={:?}, attempts={attempts:?}",
+            "\n{name}: expected={prompt:?}, confirmed_exact={:?}, first_submission_swallowed={first_submission_swallowed}, attempt_log={attempts:?}",
             confirmed_prompt(deck, name)
         ));
     }
@@ -334,7 +346,7 @@ fn write_bootstrap_swallowing_real_claude(workdir: &Path) -> PathBuf {
     wrapper
 }
 
-/// Scenario: Launch an attached deck with isolated Claude credentials and a bootstrap launcher that identifies its SessionStart as launcher-origin, consumes the first seed during boot, then execs real interactive Haiku Claude in each of three predicted dispatch worktrees. Every first write must be recorded as swallowed, and each real pane must later submit its distinct sentinel-bearing retry through Claude's native UserPromptSubmit hook.
+/// Scenario: Launch an attached deck with isolated Claude credentials and a bootstrap launcher that identifies its SessionStart as launcher-origin, consumes the first seed during boot, then execs real interactive Haiku Claude in each of three predicted dispatch worktrees. Every first write must be recorded as swallowed, each real pane must later submit its distinct sentinel-bearing retry through Claude's native UserPromptSubmit hook, and any failure must print each pane's exact confirmation and attempt evidence.
 #[spec("scheduler/dispatch/015")]
 #[test]
 fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
@@ -392,17 +404,34 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
     let _guards = SiblingWorktreeGuards(worktrees);
 
     let outputs = dispatch_concurrently(&deck, &caller_pane, &cases);
-    assert_dispatch_commands_succeeded(&cases, &outputs);
+    let failed_commands: Vec<String> = cases
+        .iter()
+        .zip(&outputs)
+        .filter(|(_, output)| !output.status.success())
+        .map(|((name, _), output)| {
+            format!(
+                "{name}: status={} stdout={:?} stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+        .collect();
+    assert!(
+        failed_commands.is_empty(),
+        "real dispatch commands failed: {failed_commands:#?}{}\nFinal grid:\n{}",
+        delivery_diagnostics(&deck, &cases),
+        deck.snapshot_grid()
+    );
 
     let all_confirmed = common::wait_until(Duration::from_secs(150), || {
         cases
             .iter()
             .all(|(name, prompt)| confirmed_prompt(&deck, name).as_deref() == Some(*prompt))
     });
-    let all_first_attempts_swallowed = cases.iter().all(|(name, prompt)| {
-        std::fs::read_to_string(dispatch_worktree_of(&deck, name).join("prompt-attempts.log"))
-            .is_ok_and(|attempts| attempts.contains(&format!("swallowed|{prompt}")))
-    });
+    let all_first_attempts_swallowed = cases
+        .iter()
+        .all(|(name, prompt)| first_submission_was_swallowed(&deck, name, prompt));
     assert!(
         all_first_attempts_swallowed && all_confirmed,
         "every bootstrap launcher must swallow its first PTY submission and every real interactive Claude pane must genuinely submit a retried sentinel-bearing seed; a healthy Idle pane with no matching UserPromptSubmit is an undelivered seed. all_first_attempts_swallowed={all_first_attempts_swallowed}, all_confirmed={all_confirmed}{}\nFinal grid:\n{}",
