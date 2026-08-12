@@ -2209,6 +2209,18 @@ pub struct DeliveryNotice {
     pub agent_id: String,
     /// The logical delivery id, for correlating the card against the log.
     pub delivery_id: String,
+    /// Issue #424 D3: the hook GENERATION the delivery was bound to, when it had
+    /// one.
+    ///
+    /// The identity check on `agent_id` catches a pane that was rebound to a
+    /// different agent, but a same-agent conversation successor — a `/clear`, a
+    /// thread restart — keeps the registry id and would still take the
+    /// predecessor delivery's report on its card. `Some(generation)` makes the
+    /// sink require that generation to still be current before it reports;
+    /// `None` (an unbound delivery, e.g. a launcher pane that never announced a
+    /// conversation) carries no such constraint, because there is nothing to
+    /// name.
+    pub session_id: Option<String>,
     /// FIXED, daemon-authored text. Nothing a repository, a prompt or a role
     /// controls may be interpolated here — that rule outlives the transport,
     /// because the text still reaches a human-readable surface.
@@ -2291,6 +2303,14 @@ impl AgentPtyRegistry {
     /// becoming advisory (reviewer HIGH: the in-pane notice it replaces awaited
     /// a writer lock with no timeout, which is what let a registered task
     /// outlive the one deadline B9 established).
+    ///
+    /// Issue #424 D3: the check below is an EARLY-OUT, not the authorization.
+    /// The sink is asynchronous — it schedules a task that reads and ingests
+    /// state later — so this answer can be stale by the time anything lands. The
+    /// sink RE-VALIDATES the same identity at ingestion, under the state write
+    /// lock that applies the event; see `crate::daemon::install_delivery_notice_sink`.
+    /// Both exist because the cheap check here suppresses the overwhelmingly
+    /// common case without scheduling anything at all.
     pub fn publish_delivery_notice(&self, notice: DeliveryNotice) {
         if self.pane_current_agent_id(&notice.pane_id).as_deref() != Some(notice.agent_id.as_str())
         {

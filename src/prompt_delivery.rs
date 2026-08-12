@@ -61,12 +61,58 @@ pub const USER_PROMPT_MAX_LEN: usize = 200;
 /// trying" cannot drift between them.
 pub const AUTOMATIC_PROMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The largest number of accumulated copies of one prompt
-/// [`prompt_submission_matches`] will recognize as a CR-swallowed
-/// re-submission. See that function's docs; the retry schedule cannot produce
-/// more than single digits inside [`AUTOMATIC_PROMPT_DEADLINE`], so this is
-/// margin, not a tuning knob.
+/// How many accumulated copies of one prompt the repetition shapes below build
+/// candidates for before giving up.
+///
+/// This bounds the LOOP, not the accepted submissions. It is an exact bound only
+/// while the reported text is complete: past [`USER_PROMPT_MAX_LEN`] every
+/// repetition count collapses onto the same 200-byte prefix, so a report of 17,
+/// 50 or 500 copies is indistinguishable from the 16 this builds — see
+/// [`prompt_submission_matches`]'s residual section, which withdraws the claim
+/// that accepted submissions are at most this many copies. The retry schedule
+/// cannot produce more than single digits inside [`AUTOMATIC_PROMPT_DEADLINE`],
+/// so the number is margin, not a tuning knob.
 const MAX_REPEATED_SUBMISSION_COPIES: u32 = 16;
+
+/// How many attempts of one logical delivery may write the PROMPT PAYLOAD before
+/// later attempts fall back to the submit-only probe
+/// ([`attempt_writes_payload`]).
+///
+/// Two, and each one is load-bearing:
+///
+/// * the FIRST write is the delivery itself;
+/// * the SECOND is the one bounded REPLACEMENT payload. It has to exist because
+///   a launcher genuinely CONSUMES the first one — `scheduler/dispatch/015`'s
+///   bootstrap wrapper reads the bytes itself and the agent that starts behind it
+///   never sees them — so a delivery that only ever probed submit after attempt 1
+///   could never deliver in that case at all;
+/// * every attempt after that probes. By then a payload may be sitting unsubmitted
+///   in the agent's input box, and appending the whole prompt again is what
+///   produced the observed `seedseed` accumulation.
+const MAX_PAYLOAD_SUBMISSIONS: u32 = 2;
+
+/// Whether attempt `attempt` (1-based) of a delivery writes the prompt PAYLOAD,
+/// or only probes submission.
+///
+/// Issue #424 (both reviewers, D5). A retry existed for one reason — the submit
+/// CR may have been swallowed by a still-booting agent TUI — but it was
+/// implemented as "type the whole prompt again", which is only the right recovery
+/// when the first payload never landed. When the payload DID land and only its CR
+/// was eaten, the payload is still sitting in the input box, so retyping appends a
+/// second copy and the agent eventually submits `seedseed`: a corrupted task, and
+/// one the confirmation matcher then rejects, which leaves the loop armed and
+/// types a THIRD copy. Probing submit instead leaves the pending bytes alone and
+/// simply asks the TUI to submit what it already holds.
+///
+/// The probe is not a weaker write: it goes through the same identity-guarded,
+/// writer-serialized, deadline-bounded path as an ordinary attempt and classifies
+/// a partial write the same way. It differs only in carrying an EMPTY payload, so
+/// the encoder emits no bytes and the target receives just the delayed submit CR
+/// ([`crate::pane_input::encode_pane_payload`],
+/// `AgentPtyRegistry::write_and_submit_guarded`). No protocol change is involved.
+pub fn attempt_writes_payload(attempt: u32) -> bool {
+    attempt <= MAX_PAYLOAD_SUBMISSIONS
+}
 
 /// Truncate `s` to at most `max` BYTES, appending `…` when anything was cut.
 ///
@@ -180,6 +226,65 @@ pub fn prompt_submission_matches(expected: &str, reported: &str) -> bool {
     false
 }
 
+/// Whether a hook-reported `user_prompt` shows our prompt ACCUMULATED in the
+/// agent's input box and submitted as N ≥ 2 copies run together with NO
+/// separator — the `seedseed` shape observed in the field at the `waitUse` seam.
+///
+/// # Why this is not part of [`prompt_submission_matches`]
+///
+/// Both reviewers rejected widening the confirmation matcher to cover it, and
+/// they are right: the matcher already has one repetition grammar whose bound
+/// dissolves at the [`USER_PROMPT_MAX_LEN`] truncation boundary, and a second,
+/// separator-free grammar makes the set of strings that count as PROOF OF
+/// DELIVERY larger and harder to reason about in exactly the region where
+/// truncation already erases the difference between candidates. The long-prompt
+/// half of the tester's fixture demonstrates the hazard rather than a design to
+/// copy: `long-bare` is accepted today only because the doubled text truncates
+/// onto the ordinary long-prompt prefix.
+///
+/// So this is a strictly separate question, asked only after
+/// [`prompt_submission_matches`] has already said no, and it authorizes strictly
+/// less: it does not CONFIRM a delivery, it TERMINATES one. The distinction is
+/// the whole point — the agent demonstrably submitted a turn whose text begins
+/// with our prompt repeated, so it is already acting on something derived from
+/// our task, and typing a third copy into it is the unsafe direction for a
+/// dispatch prompt that deploys, deletes and publishes. Stopping is right;
+/// claiming the delivery landed cleanly would not be.
+///
+/// This is a SAFETY NET, not the remedy. The remedy is [`attempt_writes_payload`]
+/// — not producing the accumulation in the first place. The net exists because
+/// prevention starts at attempt 3 and the doubling can already have happened by
+/// then, and because a delivery whose first payload was consumed by a launcher
+/// still writes one replacement.
+pub fn prompt_submission_accumulated(expected: &str, reported: &str) -> bool {
+    let expected = normalize_for_match(expected);
+    let reported = normalize_for_match(reported);
+    if expected.is_empty() {
+        // Nothing was written, so nothing can be evidence about it — and an
+        // empty `expected` would make the repetition loop below degenerate.
+        return false;
+    }
+    // Built incrementally and bounded by the REPORTED length, exactly as the
+    // newline-separated shape is, so a multi-kilobyte dispatch prompt never
+    // allocates more than the hook could possibly have reported. Starts at TWO
+    // copies: one copy is [`prompt_submission_matches`]'s business, and treating
+    // it as accumulation here would terminate every ordinary delivery.
+    let mut candidate = String::from(expected);
+    for _ in 2..=MAX_REPEATED_SUBMISSION_COPIES {
+        candidate.push_str(expected);
+        if candidate.len() > reported.len() {
+            // Every longer candidate is longer still, so only a TRUNCATED form
+            // can match from here — and truncation is a fixed 200-byte prefix of
+            // the same repeating text, identical for every larger copy count.
+            return reported == truncate_on_char_boundary(&candidate, USER_PROMPT_MAX_LEN);
+        }
+        if reported == candidate {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether an agent of this type can report SUBMITTED PROMPT TEXT — the
 /// capability the whole confirmation design rests on, as distinct from merely
 /// reporting a lifecycle.
@@ -274,9 +379,15 @@ pub fn pane_confirmation_capability<'a>(
     capability
 }
 
-/// Whether a reported submission at `event_ts` is CAUSALLY after the write this
+/// Whether a reported submission at `event_ts` sorts AFTER the write this
 /// delivery is trying to confirm, given the `watermark` captured from the same
 /// event journal immediately before that write.
+///
+/// The name to keep in mind while reading this is ORDERING. An earlier revision
+/// of these docs called the comparison "causal", and the residual section below
+/// then spent a paragraph explaining that it is not — see #526. It rejects
+/// everything that was already visible when we wrote, which is a strictly weaker
+/// property than "was produced after our bytes".
 ///
 /// Reviewer finding B2/#2. This used to be a wall-clock comparison against our
 /// own write timestamp with a fixed five-second skew allowance, which was wrong
@@ -290,7 +401,9 @@ pub fn pane_confirmation_capability<'a>(
 ///
 /// A watermark taken from the pane's own event journal has neither problem: it
 /// is a value from the SAME clock that stamps the events being compared, so the
-/// comparison is causal rather than chronometric. `None` means the pane's
+/// comparison is positional within one journal rather than chronometric across
+/// two clocks. That removes the skew hazards; it does not make it causal — see
+/// the residual below. `None` means the pane's
 /// journal was empty when we wrote — there is no pre-existing history to
 /// mistake for evidence, so anything that arrives afterwards is new.
 ///
@@ -422,6 +535,39 @@ pub fn log_prompt_unconfirmed(path: &str, pane_id: &str, delivery_id: &str, atte
         delivery_id,
         attempt,
         "prompt delivery unconfirmed; re-submitting"
+    );
+}
+
+/// Info-level record that attempt `attempt` probed SUBMISSION only — no payload
+/// bytes — because a payload may already be sitting unsubmitted in the agent's
+/// input box. See [`attempt_writes_payload`].
+pub fn log_prompt_probe_submitted(path: &str, pane_id: &str, delivery_id: &str, attempt: u32) {
+    tracing::info!(
+        path,
+        pane_id,
+        delivery_id,
+        attempt,
+        "prompt delivery unconfirmed; probing submit without rewriting the payload"
+    );
+}
+
+/// Warn-level record that the agent reported submitting our prompt as REPEATED
+/// COPIES run together with no separator — the accumulation
+/// [`prompt_submission_accumulated`] recognizes.
+///
+/// Warn rather than info because it is not a clean delivery: the agent submitted
+/// a turn whose text is our prompt doubled, so it is acting on something derived
+/// from the task rather than on the task as written. The delivery is TERMINATED
+/// on it — retyping a third copy into an agent already working is the unsafe
+/// direction — and this line is what tells the two apart afterwards.
+pub fn log_prompt_accumulated(path: &str, pane_id: &str, delivery_id: &str, attempts: u32) {
+    tracing::warn!(
+        path,
+        pane_id,
+        delivery_id,
+        attempts,
+        "agent reported the prompt submitted as repeated concatenated copies; \
+         treating delivery as complete and stopping retries"
     );
 }
 
@@ -576,6 +722,70 @@ mod tests {
         ));
         assert!(!prompt_submission_matches(seed, ""));
         assert!(!prompt_submission_matches("", "anything"));
+    }
+
+    /// D5: the separator-free `seedseed` shape observed in the field is
+    /// recognized as ACCUMULATION — terminal evidence — but stays out of the
+    /// confirmation matcher, which both reviewers refused to widen.
+    #[test]
+    fn bare_concatenation_is_accumulation_and_not_confirmation() {
+        let seed = "Use Bash to verify seed-confirm-alpha-7f31.txt exists then print it and wait";
+        let doubled = format!("{seed}{seed}");
+        assert!(
+            !prompt_submission_matches(seed, &doubled),
+            "the confirmation matcher must NOT learn a second repetition grammar"
+        );
+        assert!(prompt_submission_accumulated(seed, &doubled));
+        assert!(prompt_submission_accumulated(
+            seed,
+            &format!("{seed}{seed}{seed}")
+        ));
+        // The hook-truncated form of the same accumulation, which is all a
+        // report of a prompt this long can carry.
+        assert!(prompt_submission_accumulated(
+            seed,
+            &truncate_on_char_boundary(&doubled, USER_PROMPT_MAX_LEN)
+        ));
+
+        // One copy is the ordinary delivery, never accumulation — otherwise
+        // every confirmed prompt would terminate through this path instead.
+        assert!(!prompt_submission_accumulated(seed, seed));
+        assert!(!prompt_submission_accumulated(
+            seed,
+            &truncate_on_char_boundary(seed, USER_PROMPT_MAX_LEN)
+        ));
+        // Accumulation must not become a wildcard either: a different task
+        // appended after ours is not our prompt doubled.
+        assert!(!prompt_submission_accumulated(
+            seed,
+            &format!("{seed}now delete the production database")
+        ));
+        assert!(!prompt_submission_accumulated(seed, ""));
+        assert!(!prompt_submission_accumulated("", "anything"));
+        // The newline-separated shape belongs to the matcher, not here.
+        assert!(!prompt_submission_accumulated(
+            seed,
+            &format!("{seed}\n{seed}")
+        ));
+    }
+
+    /// D5: the retry schedule writes the payload twice and probes thereafter.
+    #[test]
+    fn only_the_first_two_attempts_write_the_payload() {
+        assert!(
+            attempt_writes_payload(1),
+            "attempt 1 IS the delivery's payload"
+        );
+        assert!(
+            attempt_writes_payload(2),
+            "one bounded replacement payload, because /015's launcher consumes the first"
+        );
+        for attempt in 3..=12 {
+            assert!(
+                !attempt_writes_payload(attempt),
+                "attempt {attempt} must probe submit rather than append another copy"
+            );
+        }
     }
 
     /// Reviewer finding B4: reporting a lifecycle and reporting submitted

@@ -976,6 +976,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the detached scheduler/dispatch confirmation task or a real agent's `/clear` command; it pins the same observable identity/generation contract at the TUI controller seam.
 - **Platform coverage:** mac+linux+windows.
 
+##### prompt/pane-input/030 — A delivery first written into a launcher pane with no generation binds the genuine one before the retry that enters it, then probes submission instead of retyping.
+- **Layer:** L1 (in-process seed consumer with a payload/identity-recording `PaneController` and hook-derived generation state).
+- **Agent:** none.
+- **Asserts:** the first write into a pane with no announced hook session declares no generation; once the real agent's `SessionStart` arrives, the next retry both binds and sends that generation and retains it; the third attempt writes an empty payload under the same bound generation and a distinct wire delivery id.
+- **Does not assert:** the daemon-side confirmation task's own latch (covered by `scheduler/dispatch/016`) or the PTY bytes an empty payload produces (covered by the registry's submit path).
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/pane-input/031 — Events the daemon synthesizes for a pane are not evidence that the pane's producer can report a submitted prompt.
+- **Layer:** L1 (in-process seed consumer with a payload-recording `PaneController` and synthetic hook-derived snapshots).
+- **Agent:** none.
+- **Asserts:** identified daemon-authored shell-activity and delivery-notice events landing after the write, alongside a real but untagged legacy hook frame, leave the delivery held — no second physical write.
+- **Does not assert:** which producers can report prompts by agent type (covered by `prompt/pane-input/024`), nor authentication of the delivery-notice metadata key, which grants no privilege.
+- **Platform coverage:** mac+linux+windows.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.

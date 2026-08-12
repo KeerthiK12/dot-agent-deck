@@ -1791,10 +1791,9 @@ fn session_start_means_ready(event: &AgentEvent) -> bool {
 ///   when the prompt is written;
 /// * **which producer owns this pane** (`observed_producer`) — whether an
 ///   unconfirmed write could EVER be confirmed
-///   ([`crate::prompt_delivery::agent_reports_submitted_prompt`]). This is
-///   answered by events the readiness gate SKIPS as well as by the one it
-///   accepts, and losing it made an honest bootstrap look less capable than one
-///   impersonating an initialized session;
+///   ([`crate::prompt_delivery::agent_reports_submitted_prompt`]). Answered ONLY
+///   by the event that satisfied the gate: a skipped boot-provenance start names
+///   an intent, not a reporting channel (issue #424 D4);
 /// * **which conversation the prompt is going into** (`generation`) — dropping
 ///   this is what left the confirmation loop unbound, free to adopt whatever
 ///   announced itself next, which after an unobserved rollover is the SUCCESSOR.
@@ -1815,17 +1814,26 @@ pub(crate) struct SessionStartWait {
     /// which is precisely the one authorized handoff [`latch_generation`]
     /// permits; every generation change after that is terminal.
     pub(crate) generation: Option<(String, DateTime<Utc>)>,
-    /// The agent type of ANY matching `SessionStart` seen in the window,
-    /// including one skipped as boot provenance.
+    /// The agent type of the matching `SessionStart` that SATISFIED the
+    /// readiness gate.
+    ///
+    /// Issue #424 D4: a `SessionStart` the gate SKIPS as boot provenance is
+    /// deliberately not recorded here. It declares what a launcher intends to
+    /// start, not that the eventual child can report a submitted prompt, and
+    /// arming retries off it retypes a task through a channel that may never
+    /// exist — see the skip branch in [`wait_for_session_start`]. An agent whose
+    /// wrapper IS the reporting producer (no native hook installer) satisfies the
+    /// gate on its fork-time start rather than being skipped, so it is still
+    /// recorded and still arms.
     pub(crate) observed_producer: Option<AgentType>,
 }
 
 impl SessionStartWait {
-    fn unready(observed_producer: Option<AgentType>) -> Self {
+    fn unready() -> Self {
         Self {
             ready: false,
             generation: None,
-            observed_producer,
+            observed_producer: None,
         }
     }
 }
@@ -1887,10 +1895,9 @@ pub(crate) async fn wait_for_session_start(
     timeout: std::time::Duration,
 ) -> SessionStartWait {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut observed_producer = None;
     loop {
         let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
-            return SessionStartWait::unready(observed_producer);
+            return SessionStartWait::unready();
         };
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(BroadcastMsg::Event(event))) => {
@@ -1907,14 +1914,22 @@ pub(crate) async fn wait_for_session_start(
                              card-surfacing SessionStart; waiting for the agent's \
                              native one"
                         );
-                        // Issue #424: not readiness — but it IS this pane's
-                        // producer identifying itself, which is a different
-                        // question and the only one that decides whether an
-                        // unconfirmed write may ever be re-submitted. Dropping
-                        // it on the floor made a bootstrap that announces its
-                        // own provenance LOOK less capable than one that says
-                        // nothing (`scheduler/dispatch/015`).
-                        observed_producer = Some(event.agent_type);
+                        // Issue #424 D4 (both reviewers): this event is NOT read
+                        // as capability. It was skipped precisely because the
+                        // real agent is not running yet, so its self-declared
+                        // `AgentType` says what the launcher INTENDS to start,
+                        // never that the eventual child has a usable tagged
+                        // `UserPromptSubmit` channel. Arming the full retry
+                        // schedule from it lets a same-user producer — or an
+                        // honest launcher configured under the wrong agent type
+                        // — start retyping a task no producer can ever report
+                        // for, and it starts those retries EARLIER, inside the
+                        // not-submit-ready window that produced the observed
+                        // accumulation. Nothing is lost by declining: the
+                        // watcher stays alive unarmed (`!armed { continue; }` in
+                        // `crate::spawn::confirm_prompt_delivery`), and the
+                        // first genuine identified native event both binds the
+                        // generation and arms retries.
                         continue;
                     }
                     // Issue #424 (reviewer option 3): a readiness event that
@@ -1936,7 +1951,7 @@ pub(crate) async fn wait_for_session_start(
             Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
-                return SessionStartWait::unready(observed_producer);
+                return SessionStartWait::unready();
             }
         }
     }
@@ -1952,6 +1967,16 @@ pub(crate) async fn wait_for_session_start(
 pub(crate) enum PromptWatch {
     /// The agent reported submitting the expected prompt — the delivery is real.
     Confirmed,
+    /// Issue #424 D5: the agent reported submitting our prompt as REPEATED
+    /// COPIES run together with no separator
+    /// ([`crate::prompt_delivery::prompt_submission_accumulated`]) — a payload
+    /// stayed in its input box and a later write appended to it.
+    ///
+    /// TERMINAL, and deliberately not folded into [`Confirmed`]: the agent is
+    /// acting on a corrupted turn rather than on the task as written, so the two
+    /// must be distinguishable in the log. What it settles is that writing a
+    /// THIRD copy into an agent already working is not recovery.
+    Accumulated,
     /// The window elapsed with no confirmation. `can_report_prompts` records
     /// whether an event was seen from this exact agent whose producer is
     /// capable of reporting SUBMITTED PROMPT TEXT
@@ -2023,9 +2048,11 @@ pub(crate) enum PromptWatch {
 /// form and exact equality would never match it.
 ///
 /// The caller must have SUBSCRIBED before the write, and must have DRAINED
-/// everything queued at the moment of the write — that drain is the causal
-/// watermark, and without it a submission the agent made before our bytes
-/// landed is still sitting in the channel waiting to be mistaken for evidence.
+/// everything queued at the moment of the write — that drain is the watermark,
+/// and without it a submission the agent made before our bytes landed is still
+/// sitting in the channel waiting to be mistaken for evidence. It establishes
+/// ORDERING against what was already visible, not causality; see
+/// [`crate::prompt_delivery::submission_is_after_watermark`] and #526.
 pub(crate) async fn wait_for_prompt_submission(
     rx: &mut broadcast::Receiver<BroadcastMsg>,
     pane_id: &str,
@@ -2067,10 +2094,16 @@ pub(crate) async fn wait_for_prompt_submission(
                 }
                 can_report_prompts |=
                     crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type);
-                if event.user_prompt.as_deref().is_some_and(|reported| {
-                    crate::prompt_delivery::prompt_submission_matches(expected, reported)
-                }) {
-                    return PromptWatch::Confirmed;
+                if let Some(reported) = event.user_prompt.as_deref() {
+                    if crate::prompt_delivery::prompt_submission_matches(expected, reported) {
+                        return PromptWatch::Confirmed;
+                    }
+                    // Issue #424 D5: asked only after the matcher has said no,
+                    // and it terminates rather than confirms. See
+                    // [`PromptWatch::Accumulated`].
+                    if crate::prompt_delivery::prompt_submission_accumulated(expected, reported) {
+                        return PromptWatch::Accumulated;
+                    }
                 }
             }
             Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
@@ -2140,12 +2173,33 @@ pub(crate) async fn wait_for_prompt_submission(
 /// would abandon every wrapped-agent delivery. Ordinary frames only bump the
 /// bound generation's high-water timestamp.
 ///
-/// Ordering mirrors `apply_event`'s monotonic tracking: a DELAYED announcement
-/// stamped older than the bound generation is a straggler from a superseded
-/// generation, not a rollover, so it is ignored rather than terminal. A
-/// matching-id `SessionEnd` is deliberately NOT timestamp-guarded — it names the
-/// very generation we are bound to, so it is evidence about US, and refusing to
-/// terminate on it because of clock granularity would be the unsafe direction.
+/// # Why a different `SessionStart` is NOT timestamp-guarded (both reviewers, D2)
+///
+/// This used to ignore a different `SessionStart` stamped older than the bound
+/// generation's high-water mark, reading it as a straggler from a superseded
+/// generation. That made the pin hold only WHILE TIMESTAMPS COOPERATE, and the
+/// timestamp is producer-supplied: the hook socket is owner-only but accepts raw
+/// `AgentEvent` JSON, so a same-user producer could post one unmarked
+/// `SessionStart` under a fake generation with a FAR-FUTURE stamp before the
+/// first write, bind it, and have every genuine announcement afterwards — the
+/// real generation's start, its end, and the `SessionStart` following a `/clear`
+/// — look "older" and be ignored forever. The delivery then keeps a binding no
+/// real conversation has, the registry agent never changes, and the retry lands
+/// in a successor. Clock correction reproduces the same shape with no attacker at
+/// all.
+///
+/// So a `SessionStart` naming a different generation is TERMINAL regardless of
+/// its timestamp. The cost is that a genuinely delayed announcement now abandons
+/// a delivery that could have continued; both reviewers state the trade plainly,
+/// and it is the right way round — abandoning on a delayed start leaves a written
+/// prompt sitting in a pane a human can see, while admitting a stale retry runs a
+/// revoked task in someone else's conversation.
+///
+/// Timestamps still order SAME-generation frames, which is what the high-water
+/// mark is actually for, and a matching-id `SessionEnd` remains un-guarded for the
+/// same reason it always was: it names the very generation we are bound to, so it
+/// is evidence about US, and refusing to terminate on it because of clock
+/// granularity would be the unsafe direction.
 pub(crate) fn latch_generation(
     generation: &mut Option<(String, DateTime<Utc>)>,
     event: &AgentEvent,
@@ -2186,11 +2240,11 @@ pub(crate) fn latch_generation(
             *bound_ts = (*bound_ts).max(event.timestamp);
             None
         }
-        Some((_, bound_ts)) if event.timestamp >= *bound_ts => Some(PromptWatch::TargetChanged {
+        // A DIFFERENT generation announcing itself is authoritative, whatever its
+        // producer clock says. See the section above.
+        Some(_) => Some(PromptWatch::TargetChanged {
             reason: "generation-changed",
         }),
-        // Delayed announcement from a superseded generation.
-        Some(_) => None,
     }
 }
 
@@ -2795,6 +2849,48 @@ impl AppState {
             stats.total_tools += session.tool_count as u64;
         }
         stats
+    }
+
+    /// Issue #424 D3: apply a DAEMON-AUTHORED report event without letting it
+    /// touch the pane's hook GENERATION.
+    ///
+    /// The delivery-notice sink synthesizes an `EventType::Error` to put a failed
+    /// delivery on the pane's own card. That event is a statement ABOUT a pane,
+    /// never a producer speaking FOR one, so it must not participate in
+    /// generation tracking — and `apply_event` alone cannot guarantee that. It
+    /// stamps whatever session id the daemon read, and both the read and the
+    /// apply used to sit either side of a lock gap: a genuine `SessionStart`
+    /// landing in between meant the synthetic event carried the OLD generation
+    /// with a NEW timestamp and rolled `pane_hook_session` BACKWARD, which then
+    /// read to an in-flight TUI delivery bound to the genuine successor as a
+    /// changed target and abandoned it.
+    ///
+    /// Rather than reason about which stamping choices happen to be inert, the
+    /// generation entry is snapshotted and restored around the apply. That makes
+    /// "a delivery report never moves the generation, forward or backward" a
+    /// property of this function instead of a property of the caller's timing,
+    /// and it holds for the placeholder-only pane the old comment listed as a
+    /// residual (stamping a card id where no generation existed established one).
+    ///
+    /// Everything else `apply_event` does — the card's status, the recent-event
+    /// journal, the reuse guard — is unchanged, because the report is meant to be
+    /// visible exactly like any other event on that card.
+    pub fn apply_daemon_report_event(&mut self, event: AgentEvent) {
+        let pane_id = event.pane_id.clone();
+        let before = pane_id
+            .as_ref()
+            .and_then(|pane| self.pane_hook_session.get(pane).cloned());
+        self.apply_event(event);
+        if let Some(pane) = pane_id {
+            match before {
+                Some(entry) => {
+                    self.pane_hook_session.insert(pane, entry);
+                }
+                None => {
+                    self.pane_hook_session.remove(&pane);
+                }
+            }
+        }
     }
 
     /// PRD #20 M3: the write-semantics of the live session bound to `pane_id`.
@@ -3929,8 +4025,28 @@ impl AppState {
         // event from a PRIOR generation (older timestamp, different id) is
         // IGNORED, so it can neither restore a stale generation nor overwrite the
         // current one.
+        //
+        // Issue #424 D2 (both reviewers): the monotonic rule above has ONE
+        // exception, and it is the same policy `latch_generation` applies. A
+        // genuine `SessionStart` naming a different generation ANNOUNCES that
+        // generation, so it advances whatever its producer clock says. Without
+        // the carve-out the stored timestamp is an unbeatable high-water mark
+        // that a producer chooses: one forged `SessionStart` stamped far in the
+        // future pins this pane's generation permanently, every real
+        // announcement afterwards is discarded as a straggler, and the TUI keeps
+        // reporting — and authorizing sends against — a conversation that no
+        // longer exists. Ordinary frames keep the monotonic rule, so a delayed
+        // `Thinking` still cannot restore a superseded generation.
+        //
+        // A LAUNCHER-ORIGIN start is excluded from the carve-out on purpose: it
+        // is explicitly not a conversation announcing itself (PRD #225 M3), and a
+        // wrapped pane legitimately has two producers under one registry agent,
+        // so letting the wrapper's fork-time start win unconditionally would make
+        // the #532 alternation worse rather than better.
         if let Some(ref pane_id) = event.pane_id {
             let incoming_ts = event.timestamp;
+            let announces_generation = event.event_type == EventType::SessionStart
+                && !event.is_wrapper_fork_session_start();
             let advance = match self.pane_hook_session.get(pane_id) {
                 None => true,
                 Some((current_id, current_ts)) => {
@@ -3939,8 +4055,9 @@ impl AppState {
                         // timestamp so subsequent older events stay rejected.
                         incoming_ts > *current_ts
                     } else {
-                        // Different generation: only a not-older event wins.
-                        incoming_ts >= *current_ts
+                        // Different generation: an announcement always wins; any
+                        // other frame must not be older.
+                        announces_generation || incoming_ts >= *current_ts
                     }
                 }
             };
@@ -4215,6 +4332,154 @@ impl AppState {
 mod tests {
     use super::*;
 
+    /// Issue #424 D2: `AppState`'s pane generation must not be pinnable by a
+    /// producer-chosen timestamp either.
+    ///
+    /// The latch is only half the gate — the TUI reads `pane_hook_session_id`
+    /// for both `delivery_target_changed` and the session it sends, and the
+    /// daemon's send guard compares against it. While a far-future stamp could
+    /// suppress a genuine announcement HERE, the same poisoning recovered the
+    /// original cross-conversation retry through the TUI path.
+    #[test]
+    fn a_genuine_session_start_takes_over_whatever_the_producer_clock_says() {
+        fn frame(session: &str, event_type: EventType, secs: i64) -> AgentEvent {
+            AgentEvent {
+                session_id: session.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(secs),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some("pane".into()),
+                agent_id: Some("agent".into()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+
+        let mut state = AppState::default();
+        state.register_pane("pane".to_string());
+        // A forged/misdated start binds first, stamped far in the future.
+        state.apply_event(frame("forged", EventType::SessionStart, 10_000));
+        assert_eq!(
+            state.pane_hook_session_id("pane").as_deref(),
+            Some("forged")
+        );
+
+        // The genuine generation announces itself with an ordinary stamp. Before
+        // D2 it was discarded as a straggler and the pane kept reporting — and
+        // authorizing sends against — a conversation that does not exist.
+        state.apply_event(frame("real", EventType::SessionStart, 5));
+        assert_eq!(state.pane_hook_session_id("pane").as_deref(), Some("real"));
+
+        // Ordinary frames keep the monotonic rule: a delayed `Thinking` from a
+        // superseded generation still must not restore it.
+        state.apply_event(frame("forged", EventType::Thinking, 1));
+        assert_eq!(state.pane_hook_session_id("pane").as_deref(), Some("real"));
+
+        // A LAUNCHER-ORIGIN start is not a conversation announcing itself, so it
+        // is excluded from the carve-out — a wrapped pane's two producers must
+        // not start trading the generation back and forth (#532).
+        let mut boot = frame("wrapper", EventType::SessionStart, 1);
+        boot.metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+        state.apply_event(boot);
+        assert_eq!(state.pane_hook_session_id("pane").as_deref(), Some("real"));
+    }
+
+    /// Issue #424 D3: a daemon-authored delivery report annotates a card and
+    /// moves NOTHING about the pane's generation — not forward, not backward,
+    /// and not into existence on a pane that had none.
+    ///
+    /// The old sink argued this from the id it stamped, which was resolved under
+    /// a read lock it then released; a genuine `SessionStart` landing in the gap
+    /// made the synthetic event roll the generation BACK to the old id, which an
+    /// in-flight TUI delivery bound to the successor read as a lost target.
+    #[test]
+    fn a_daemon_report_event_never_moves_the_pane_generation() {
+        fn report(session: &str, pane: &str) -> AgentEvent {
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(
+                crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+                "a spawn-time prompt was never confirmed".to_string(),
+            );
+            AgentEvent {
+                session_id: session.to_string(),
+                agent_type: AgentType::None,
+                event_type: EventType::Error,
+                tool_name: None,
+                tool_detail: Some("a spawn-time prompt was never confirmed".to_string()),
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(pane.to_string()),
+                agent_id: Some("agent".into()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+
+        let mut state = AppState::default();
+        state.register_pane("pane".to_string());
+        state.apply_event(AgentEvent {
+            session_id: "current".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("pane".into()),
+            agent_id: Some("agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+
+        // Even a report naming a DIFFERENT (stale) generation with a fresher
+        // timestamp — the read-to-ingest race — leaves the generation alone.
+        state.apply_daemon_report_event(report("superseded", "pane"));
+        assert_eq!(
+            state.pane_hook_session_id("pane").as_deref(),
+            Some("current"),
+            "a delivery report must not roll the generation backward"
+        );
+        assert!(
+            state
+                .sessions
+                .values()
+                .any(|session| session.status == SessionStatus::Error),
+            "the report must still be visible on the pane's card"
+        );
+
+        // A placeholder-only pane has no generation, and a report must not
+        // establish one — that was the old implementation's stated residual.
+        let mut placeholder = AppState::default();
+        placeholder.register_pane("bare".to_string());
+        placeholder.insert_placeholder_session(
+            "bare".to_string(),
+            None,
+            Some(AgentType::ClaudeCode),
+            Some("agent".to_string()),
+        );
+        placeholder.apply_daemon_report_event(report("card-id", "bare"));
+        assert_eq!(
+            placeholder.pane_hook_session_id("bare"),
+            None,
+            "a report must not conjure a generation where there was none"
+        );
+    }
+
     /// Issue #424 (C1): the generation policy, exercised as the state machine it
     /// is. One handoff out of an explicitly launcher-origin boot, then pinned;
     /// every announced change after that is terminal; an end is terminal bound
@@ -4305,16 +4570,34 @@ mod tests {
         );
         assert_eq!(wrapped.as_ref().map(|(id, _)| id.as_str()), Some("real"));
 
-        // A delayed announcement stamped older than the bound generation is a
-        // straggler from a superseded generation, not a rollover.
+        // Issue #424 D2 (both reviewers): a DIFFERENT `SessionStart` is
+        // authoritative whatever its producer clock says. `2752019` ignored one
+        // stamped older than the bound generation, reading it as a straggler —
+        // which made the pin hold only while timestamps cooperate, and the
+        // timestamp is producer-supplied. One forged far-future `SessionStart`
+        // bound first then suppressed every genuine announcement for the rest of
+        // the delivery, and clock correction reproduces the same shape with no
+        // attacker. Abandoning on a delayed start is the safe direction;
+        // admitting a stale retry into a successor conversation is not.
         let mut delayed = bound.clone();
         assert_eq!(
             terminal(latch_generation(
                 &mut delayed,
                 &event("older", EventType::SessionStart, 0)
             )),
+            Some("generation-changed")
+        );
+        // Timestamps still order SAME-generation frames — that is what the
+        // high-water mark is for, and it is untouched.
+        let mut same = bound.clone();
+        assert_eq!(
+            terminal(latch_generation(
+                &mut same,
+                &event("real", EventType::Thinking, 0)
+            )),
             None
         );
+        assert_eq!(same.as_ref().map(|(id, _)| id.as_str()), Some("real"));
 
         // Ends: for the bound generation, and for NO generation at all. The
         // second is the hole that let an old generation's end be followed by a

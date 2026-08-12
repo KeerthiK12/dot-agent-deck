@@ -1067,41 +1067,91 @@ async fn ingest_event(
 /// status becomes `Error`; the delivery id stays in the log, where the detail
 /// belongs.
 ///
-/// Three properties are deliberate:
+/// Five properties are deliberate:
 ///
-/// * **The event never moves the pane's GENERATION.** It is stamped with the
-///   pane's CURRENT hook session id, so `apply_event`'s monotonic
-///   `pane_hook_session` tracking sees the generation it already has. A
-///   synthetic id would roll the generation forward and, under the same-pane
-///   guards this issue is about, could abandon an unrelated in-flight delivery.
-///   The residual is a pane that has a card but no hook generation at all (a
-///   placeholder-only pane): stamping its card id establishes a generation where
-///   there was none — harmless there by construction, because a pane with no
-///   hook producer has no generation-bound delivery to disturb.
+/// * **Identity is re-validated AT INGESTION** (issue #424 D3, both reviewers).
+///   `publish_delivery_notice` checks that the delivery's agent still owns the
+///   pane, but that check happens before an asynchronous handoff: the sink
+///   schedules a detached task which reads state later and ingests later still.
+///   A pane closed and rebound inside that window used to receive the
+///   predecessor's report anyway — and because the stale `Error` carries the
+///   PREDECESSOR agent id with a CURRENT timestamp, `apply_event` could read it
+///   as a superseding generation, retire the successor's card and recreate
+///   predecessor state under it. So the registry owner is re-checked here, and
+///   the whole check → build → broadcast → apply sequence runs under ONE held
+///   write lock, which is also what closes the second (read-to-ingest) race: the
+///   session id the event is stamped with can no longer be resolved from a
+///   snapshot that a genuine `SessionStart` invalidates before the apply.
+/// * **A same-agent conversation successor is refused too.** The registry id
+///   survives a `/clear`, so identity alone would let a predecessor delivery's
+///   late report mark a successor conversation's card. A notice that names the
+///   generation it was written for is dropped unless that generation is still
+///   current; one that names none (an unbound delivery on a launcher pane)
+///   carries no such constraint because there is nothing to compare.
+/// * **The event never moves the pane's GENERATION.** Not by construction from
+///   the stamped id — that was the old argument, and it was wrong in the
+///   read-to-ingest race — but because it is applied through
+///   [`AppState::apply_daemon_report_event`], which snapshots and restores the
+///   pane's generation entry around the apply. It cannot advance it, cannot roll
+///   it back, and cannot establish one on a placeholder-only pane.
 /// * **It never mints a card.** With no session on the pane there is nothing to
 ///   annotate, so the report stays in the log rather than conjuring a card for
 ///   a pane the dashboard is not showing.
 /// * **It carries the registry `agent_id`**, so `apply_event`'s reuse guard
 ///   lands it on that agent's existing card instead of creating a sibling.
+///
+/// The registry is captured WEAKLY: it owns the sink, so an `Arc` here would be a
+/// reference cycle that keeps the registry (and every PTY it holds) alive for the
+/// process's lifetime.
 fn install_delivery_notice_sink(
     registry: &Arc<AgentPtyRegistry>,
     state: SharedState,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) {
+    let weak_registry = Arc::downgrade(registry);
     registry.set_delivery_notice_sink(std::sync::Arc::new(move |notice| {
         let state = state.clone();
         let event_tx = event_tx.clone();
+        let registry = weak_registry.clone();
         tokio::spawn(async move {
-            let session_id = {
-                let guard = state.read().await;
-                guard.pane_hook_session_id(&notice.pane_id).or_else(|| {
-                    guard
-                        .sessions
-                        .values()
-                        .find(|session| session.pane_id.as_deref() == Some(&notice.pane_id))
-                        .map(|session| session.session_id.clone())
-                })
+            // ONE write lock for the whole operation: re-validate, resolve
+            // the target card, broadcast, apply. Nothing sampled here can go
+            // stale before the event lands, which is the difference between
+            // this and the read-then-ingest version it replaces.
+            let mut guard = state.write().await;
+            let Some(registry) = registry.upgrade() else {
+                return;
             };
+            if registry.pane_current_agent_id(&notice.pane_id).as_deref()
+                != Some(notice.agent_id.as_str())
+            {
+                tracing::debug!(
+                    pane_id = %notice.pane_id,
+                    delivery_id = %notice.delivery_id,
+                    "delivery notice dropped at ingestion; the pane no longer \
+                     belongs to this agent"
+                );
+                return;
+            }
+            let current_generation = guard.pane_hook_session_id(&notice.pane_id);
+            if let Some(bound) = notice.session_id.as_deref()
+                && current_generation.as_deref() != Some(bound)
+            {
+                tracing::debug!(
+                    pane_id = %notice.pane_id,
+                    delivery_id = %notice.delivery_id,
+                    "delivery notice dropped at ingestion; the conversation it \
+                     was written for is no longer current"
+                );
+                return;
+            }
+            let session_id = current_generation.or_else(|| {
+                guard
+                    .sessions
+                    .values()
+                    .find(|session| session.pane_id.as_deref() == Some(&notice.pane_id))
+                    .map(|session| session.session_id.clone())
+            });
             let Some(session_id) = session_id else {
                 tracing::debug!(
                     pane_id = %notice.pane_id,
@@ -1115,30 +1165,27 @@ fn install_delivery_notice_sink(
                 crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
                 notice.detail.to_string(),
             );
-            ingest_event(
-                &state,
-                &event_tx,
-                AgentEvent {
-                    session_id,
-                    // The daemon is not the agent, and must not claim to be one:
-                    // `apply_event` only fills a session's type when it is still
-                    // unknown, so `None` cannot overwrite a real agent type.
-                    agent_type: crate::event::AgentType::None,
-                    event_type: crate::event::EventType::Error,
-                    tool_name: None,
-                    tool_detail: Some(notice.detail.to_string()),
-                    cwd: None,
-                    timestamp: chrono::Utc::now(),
-                    user_prompt: None,
-                    metadata,
-                    pane_id: Some(notice.pane_id.clone()),
-                    agent_id: Some(notice.agent_id.clone()),
-                    agent_version: None,
-                    schema_version: None,
-                    live_target: None,
-                },
-            )
-            .await;
+            let event = AgentEvent {
+                session_id,
+                // The daemon is not the agent, and must not claim to be one:
+                // `apply_event` only fills a session's type when it is still
+                // unknown, so `None` cannot overwrite a real agent type.
+                agent_type: crate::event::AgentType::None,
+                event_type: crate::event::EventType::Error,
+                tool_name: None,
+                tool_detail: Some(notice.detail.to_string()),
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(notice.pane_id.clone()),
+                agent_id: Some(notice.agent_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            };
+            let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
+            guard.apply_daemon_report_event(event);
         });
     }));
 }

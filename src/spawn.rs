@@ -845,10 +845,12 @@ async fn deliver(
         }
     };
     let delivery_id = mint_delivery_id(pane_id);
-    // Issue #424, reviewer finding B1: the pre-write drain IS the causal
-    // watermark. Everything already queued on the broadcast was produced before
-    // our bytes exist, so a submission the agent made on its own beforehand
-    // cannot be mistaken for evidence about this delivery — and the generation
+    // Issue #424, reviewer finding B1: the pre-write drain IS the watermark.
+    // Everything already queued on the broadcast was already visible before our
+    // bytes exist, so a submission the agent made on its own beforehand cannot
+    // be mistaken for evidence about this delivery. (Ordering, not causality —
+    // an event PRODUCED before the write that arrives after it is the residual
+    // tracked in #526.) The generation
     // latch it fills means the very first retry already knows which hook session
     // it is bound to. Also the last chance to notice the pane rebound while we
     // waited out a 30 s readiness timeout.
@@ -1052,10 +1054,28 @@ fn drain_pre_write_events(
                 }
             }
             Ok(BroadcastMsg::OrchestrationSurface(_)) => continue,
-            // Frames were dropped before we even wrote. Nothing that could have
-            // confirmed this delivery existed yet, so this costs only the
-            // generation latch, which the watcher re-establishes.
-            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            // Issue #424 D2 (both reviewers): TERMINAL, where this used to carry
+            // on. The old comment claimed the dropped frames cost only the
+            // generation latch "which the watcher re-establishes" — it does not.
+            // `latch_generation` binds and re-binds on `SessionStart` alone, by
+            // design, so if the only end/start transition for this pane fell out
+            // of the broadcast ring the surviving ordinary frames announce
+            // nothing and the delivery silently KEEPS a binding whose
+            // conversation is gone. That is target-revocation evidence being
+            // erased, which a same-user flood can arrange on purpose and ordinary
+            // daemon load can arrange by accident.
+            //
+            // Post-write lag was already terminal in
+            // `crate::state::wait_for_prompt_submission`; this is the same rule
+            // at the two remaining drains. Before the first write it costs the
+            // delivery entirely — the prompt is not written at all, logged under
+            // this reason — which is a real availability cost, taken because a
+            // 1024-frame ring overflowing inside the drain window is rare while
+            // writing a spawn prompt into a conversation that may already have
+            // been revoked is not recoverable.
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                return Some("lagged-event-stream");
+            }
             Err(broadcast::error::TryRecvError::Empty) => return None,
             Err(broadcast::error::TryRecvError::Closed) => return Some("event-stream-closed"),
         }
@@ -1126,7 +1146,14 @@ async fn confirm_prompt_delivery(
             // unconfirmable and reported nowhere. Reporting an error on a `cat`
             // pane's card would be a false alarm on every hookless delivery.
             if armed {
-                abandon_spawn_prompt(&registry, &pane_id, &agent_id, &delivery_id, attempt);
+                abandon_spawn_prompt(
+                    &registry,
+                    &pane_id,
+                    &agent_id,
+                    &delivery_id,
+                    attempt,
+                    generation.as_ref(),
+                );
             } else {
                 log_prompt_unconfirmable(
                     DELIVERY_LOG_PATH,
@@ -1150,6 +1177,19 @@ async fn confirm_prompt_delivery(
         {
             PromptWatch::Confirmed => {
                 log_prompt_confirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
+                return;
+            }
+            // Issue #424 D5: our prompt came back doubled with no separator, so
+            // a payload had been sitting in the input box and a later write
+            // appended to it. The agent has submitted it; a third copy is not
+            // recovery. Terminal, and logged apart from a clean confirmation.
+            PromptWatch::Accumulated => {
+                crate::prompt_delivery::log_prompt_accumulated(
+                    DELIVERY_LOG_PATH,
+                    &pane_id,
+                    &delivery_id,
+                    attempt,
+                );
                 return;
             }
             PromptWatch::Elapsed { can_report_prompts } => armed |= can_report_prompts,
@@ -1194,7 +1234,14 @@ async fn confirm_prompt_delivery(
             continue;
         }
         if remaining_before(deadline).is_zero() {
-            abandon_spawn_prompt(&registry, &pane_id, &agent_id, &delivery_id, attempt);
+            abandon_spawn_prompt(
+                &registry,
+                &pane_id,
+                &agent_id,
+                &delivery_id,
+                attempt,
+                generation.as_ref(),
+            );
             return;
         }
         // Auditor HIGH (the unguarded event gap): the watch window above stopped
@@ -1217,10 +1264,24 @@ async fn confirm_prompt_delivery(
         armed |= gap_capability;
         log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
         attempt = attempt.saturating_add(1);
-        match guarded_submit(&registry, &pane_id, &agent_id, &prompt, deadline).await {
-            GuardedOutcome::Written => {
+        // Issue #424 D5: after the one bounded replacement payload, later
+        // attempts PROBE SUBMISSION instead of typing the prompt in again — same
+        // guarded path, same writer serialization, same deadline, same
+        // partial-write classification, only an empty payload so the target
+        // receives just the delayed submit CR. See
+        // [`crate::prompt_delivery::attempt_writes_payload`].
+        let writes_payload = crate::prompt_delivery::attempt_writes_payload(attempt);
+        let payload = if writes_payload { prompt.as_str() } else { "" };
+        match guarded_submit(&registry, &pane_id, &agent_id, payload, deadline).await {
+            GuardedOutcome::Written if writes_payload => {
                 log_prompt_written(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt)
             }
+            GuardedOutcome::Written => crate::prompt_delivery::log_prompt_probe_submitted(
+                DELIVERY_LOG_PATH,
+                &pane_id,
+                &delivery_id,
+                attempt,
+            ),
             // The pane is gone (closed, exited, rebound) or the write must not
             // be repeated — stop rather than burn the deadline retrying.
             GuardedOutcome::Refused(reason) => {
@@ -1272,12 +1333,14 @@ fn abandon_spawn_prompt(
     agent_id: &str,
     delivery_id: &str,
     attempts: u32,
+    generation: Option<&(String, DateTime<Utc>)>,
 ) {
     log_prompt_abandoned(DELIVERY_LOG_PATH, pane_id, delivery_id, attempts);
     registry.publish_delivery_notice(DeliveryNotice {
         pane_id: pane_id.to_string(),
         agent_id: agent_id.to_string(),
         delivery_id: delivery_id.to_string(),
+        session_id: generation.map(|(id, _)| id.clone()),
         detail: "a spawn-time prompt was written into this pane but the agent never reported \
                  submitting it within the delivery deadline; it may never have arrived — check \
                  whether this pane was given any task at all (the daemon log names the delivery \
@@ -1368,6 +1431,7 @@ fn spawn_confirmation_task(
             pane_id: pane_id.clone(),
             agent_id: task.agent_id.clone(),
             delivery_id,
+            session_id: task.generation.as_ref().map(|(id, _)| id.clone()),
             detail: "a spawn-time prompt was written into this pane but the daemon is already \
                      watching its maximum number of unconfirmed deliveries, so this one is NOT \
                      being confirmed or retried; check whether the pane acted on its task",
@@ -1792,6 +1856,59 @@ mod tests {
             .expect("spawn byte-observation target")
     }
 
+    /// Issue #424 D2 (both reviewers): a lagged PRE-WRITE / gap drain is
+    /// terminal.
+    ///
+    /// It used to `continue`, on the argument that the dropped frames cost only
+    /// the generation latch "which the watcher re-establishes". It does not:
+    /// `latch_generation` binds on a `SessionStart` alone, so if the only
+    /// end/start transition for this pane fell out of the ring, the surviving
+    /// ordinary frames announce nothing and the delivery keeps a binding whose
+    /// conversation is gone. That is target-revocation evidence being erased —
+    /// arrangeable on purpose by a same-user flood and by accident under load.
+    #[test]
+    fn a_lagged_pre_write_drain_is_terminal_rather_than_silently_continuing() {
+        const PANE_ID: &str = "lagged-drain-pane";
+        const AGENT_ID: &str = "lagged-drain-agent";
+
+        let (tx, mut rx) = broadcast::channel(2);
+        // Overflow the ring for this receiver, then leave one ordinary frame
+        // behind it — the shape where the transition is gone and only
+        // non-announcing frames remain.
+        for i in 0..4 {
+            let _ = tx.send(BroadcastMsg::Event(prompt_watch_event(
+                PANE_ID,
+                AGENT_ID,
+                &format!("successor-{i}"),
+                EventType::Thinking,
+            )));
+        }
+        let mut generation = Some(("original-generation".to_string(), Utc::now()));
+        let mut capability = false;
+        assert_eq!(
+            drain_pre_write_events(&mut rx, PANE_ID, AGENT_ID, &mut generation, &mut capability),
+            Some("lagged-event-stream"),
+            "dropped frames may have carried the end/start this delivery needed to see"
+        );
+
+        // A drain that loses nothing still returns `None`, so the ordinary path
+        // is untouched.
+        let (tx, mut rx) = broadcast::channel(8);
+        let _ = tx.send(BroadcastMsg::Event(prompt_watch_event(
+            PANE_ID,
+            AGENT_ID,
+            "original-generation",
+            EventType::Thinking,
+        )));
+        let mut generation = Some(("original-generation".to_string(), Utc::now()));
+        let mut capability = false;
+        assert_eq!(
+            drain_pre_write_events(&mut rx, PANE_ID, AGENT_ID, &mut generation, &mut capability),
+            None
+        );
+        assert!(capability, "an identified Claude frame proves the channel");
+    }
+
     /// Scenario: Hold detached spawn prompts in confirmation backoff while their pane is replaced, generation ends, event stream lags or closes, pane closes, daemon shuts down, or a newer prompt supersedes the watch. Every terminal/cancelled watch must finish without stale retry bytes, and the newer same-pane watch must be the only flight left.
     #[spec("scheduler/dispatch/016")]
     #[serial_test::serial(prompt_confirmation_tasks)]
@@ -2107,7 +2224,7 @@ mod tests {
             recorded.lock().unwrap().push(notice);
         }));
 
-        abandon_spawn_prompt(&registry, PANE_ID, &agent_id, "delivery-abandoned", 3);
+        abandon_spawn_prompt(&registry, PANE_ID, &agent_id, "delivery-abandoned", 3, None);
         {
             let notices = notices.lock().unwrap();
             assert_eq!(notices.len(), 1, "abandonment must report exactly once");
@@ -2139,7 +2256,7 @@ mod tests {
             })
             .expect("spawn replacement");
         assert_ne!(replacement, agent_id);
-        abandon_spawn_prompt(&registry, PANE_ID, &agent_id, "delivery-abandoned", 3);
+        abandon_spawn_prompt(&registry, PANE_ID, &agent_id, "delivery-abandoned", 3, None);
         assert_eq!(
             notices.lock().unwrap().len(),
             1,

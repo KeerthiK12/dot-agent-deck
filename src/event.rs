@@ -632,6 +632,32 @@ impl AgentEvent {
             .get(SESSION_START_ORIGIN_METADATA_KEY)
             .is_some_and(|origin| origin == WRAPPER_FORK_SESSION_START_ORIGIN)
     }
+
+    /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than
+    /// produced by the pane's agent?
+    ///
+    /// The daemon emits identified events of its own through the same pipeline
+    /// real hook events take — [`EventType::ShellBusy`]/[`EventType::ShellIdle`]
+    /// from the shell-activity monitor (PRD #370/#386), and the delivery-notice
+    /// [`EventType::Error`] (issue #424). They carry the pane's registry
+    /// `agent_id` because that is how they land on the right card, and that is
+    /// exactly what made them indistinguishable from producer evidence to
+    /// `crate::ui::evidence_channel_is_unidentified`: one of them arriving was
+    /// enough to conclude the pane has a tagged reporting channel, when it proves
+    /// only that the DAEMON can tag its own events. A pane behind a legacy
+    /// untagged hook then resumed retyping through a channel that still could not
+    /// confirm anything.
+    ///
+    /// The delivery-notice half is recognized by its metadata key, and that is
+    /// safe in the only direction it can be abused: a forged event claiming the
+    /// key is EXCLUDED from the evidence channel, i.e. it loses standing rather
+    /// than gaining any. The key is not, and must not be treated as, an
+    /// authentication marker (auditor) — a forged raw `Error` without it marks a
+    /// card exactly as it did before.
+    pub fn is_daemon_synthetic(&self) -> bool {
+        matches!(self.event_type, EventType::ShellBusy | EventType::ShellIdle)
+            || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+    }
 }
 
 /// Envelope for messages sent to the daemon over the Unix socket.

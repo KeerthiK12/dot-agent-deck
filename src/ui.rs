@@ -30,10 +30,11 @@ use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::prompt_delivery::{
-    AUTOMATIC_PROMPT_DEADLINE, ConfirmationCapability, attempt_delivery_id, log_prompt_abandoned,
-    log_prompt_confirmed, log_prompt_stopped, log_prompt_unconfirmable, log_prompt_unconfirmed,
-    log_prompt_written, mint_delivery_id, pane_confirmation_capability, prompt_submission_matches,
-    submission_is_after_watermark, unconfirmed_retry_delay,
+    AUTOMATIC_PROMPT_DEADLINE, ConfirmationCapability, attempt_delivery_id, attempt_writes_payload,
+    log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed, log_prompt_probe_submitted,
+    log_prompt_stopped, log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written,
+    mint_delivery_id, pane_confirmation_capability, prompt_submission_accumulated,
+    prompt_submission_matches, submission_is_after_watermark, unconfirmed_retry_delay,
 };
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
@@ -1603,11 +1604,18 @@ struct PromptDelivery {
     /// daemon "any generation will do" — enough to refuse a different registry
     /// agent, useless against a same-agent `/clear` or thread restart, which is
     /// precisely the case where the old prompt lands in a NEW conversation.
-    /// `None` here means no generation existed yet when we wrote; it is latched
-    /// ONCE, as soon as one appears (see [`bind_delivery_generation`]), rather
-    /// than standing as authorization across every future generation — and
-    /// never re-latched, because a generation change after that is a lost
-    /// target, not a new address to write to.
+    /// `None` here means no generation has been named yet. It is latched ONCE
+    /// and never re-latched, because a generation change after the latch is a
+    /// lost target, not a new address to write to. Two places may perform that
+    /// one latch, for two different reasons:
+    ///
+    /// * [`bind_delivery_generation`], BEFORE the first write — the ordinary
+    ///   case, naming the conversation the bytes are about to enter;
+    /// * [`bind_generation_before_retry`], before a RETRY made by a delivery
+    ///   whose first write went into a pane that had no generation at all (the
+    ///   launcher/10 s-fallback case). Issue #424 D1: leaving that delivery
+    ///   permanently unbound meant every retry told the daemon "any generation
+    ///   will do" for exactly the population this issue exists to repair.
     expected_session_id: Option<String>,
     delivery_id: String,
     /// Issue #424 (reviewer blocker 2): which WIRE-IDENTITY epoch this delivery
@@ -1641,10 +1649,11 @@ struct PromptDelivery {
     /// [`attempt_delivery_id`] so the daemon's ledger cannot replay a cached
     /// `Applied` in place of the second physical submission a retry exists for.
     attempts: u32,
-    /// Issue #424 (reviewer finding B2/#3): the CAUSAL watermark — the newest
+    /// Issue #424 (reviewer finding B2/#3): the ORDERING watermark — the newest
     /// timestamp in this pane's own event journal at the instant of the first
     /// write. A submission at or before it was already history when we wrote and
-    /// is not evidence about this delivery. See
+    /// is not evidence about this delivery. It does not establish causality —
+    /// see #526 and
     /// [`submission_is_after_watermark`] for why this replaced a wall-clock
     /// comparison against our own write time.
     watermark: Option<DateTime<Utc>>,
@@ -3049,16 +3058,32 @@ fn process_pending_seed_prompts(
                 return false;
             }
             bind_delivery_generation(delivery, snapshot, &sp.pane_id);
-            if prompt_submission_confirmed(snapshot, &sp.pane_id, &sp.prompt, delivery) {
-                log_prompt_confirmed(
-                    "seed",
-                    &sp.pane_id,
-                    &delivery.delivery_id,
-                    delivery.attempts,
-                );
-                backoff.remove(&sp.pane_id);
-                deliveries.remove(&sp.pane_id);
-                return false;
+            match prompt_submission_evidence(snapshot, &sp.pane_id, &sp.prompt, delivery) {
+                Some(SubmissionEvidence::Confirmed) => {
+                    log_prompt_confirmed(
+                        "seed",
+                        &sp.pane_id,
+                        &delivery.delivery_id,
+                        delivery.attempts,
+                    );
+                    backoff.remove(&sp.pane_id);
+                    deliveries.remove(&sp.pane_id);
+                    return false;
+                }
+                // Issue #424 D5: the seed came back doubled with no separator.
+                // Terminal — see [`SubmissionEvidence::Accumulated`].
+                Some(SubmissionEvidence::Accumulated) => {
+                    log_prompt_accumulated(
+                        "seed",
+                        &sp.pane_id,
+                        &delivery.delivery_id,
+                        delivery.attempts,
+                    );
+                    backoff.remove(&sp.pane_id);
+                    deliveries.remove(&sp.pane_id);
+                    return false;
+                }
+                None => {}
             }
         }
         // PRD #20 R20-005 (finding #13): the hard timeout is checked FIRST, before
@@ -3151,9 +3176,7 @@ fn process_pending_seed_prompts(
                 }
             });
             let expected_agent_id = delivery.expected_agent_id.clone();
-            let expected_session_id = delivery.expected_session_id.clone();
             let delivery_id = delivery.delivery_id.clone();
-            let epoch = delivery.epoch;
             let already_written = delivery.attempts > 0;
             // Reviewer finding B3: read the capability as of THIS frame, not as
             // of the readiness timeout — a producer that identifies itself at
@@ -3167,22 +3190,35 @@ fn process_pending_seed_prompts(
             if already_written && capability != ConfirmationCapability::Reports {
                 return true;
             }
+            // Issue #424 D1: we are past every hold, so this frame WILL write
+            // into whatever conversation the pane currently has. Name it before
+            // doing so — see [`bind_generation_before_retry`]. Must come before
+            // the epoch and session are read below, because binding can rotate
+            // the epoch.
+            bind_generation_before_retry(delivery, snapshot, &sp.pane_id);
+            let expected_session_id = delivery.expected_session_id.clone();
+            let epoch = delivery.epoch;
             // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT
             // rides its own wire id, or the daemon's ledger would replay the
             // first `Applied` and this retry would never reach the PTY at all.
             let attempt = delivery.attempts.saturating_add(1);
-            let wire_delivery_id = wire_attempt_id(&delivery_id, epoch, attempt);
+            // Issue #424 D5: after the one bounded replacement payload, later
+            // attempts probe SUBMISSION rather than typing the seed in again —
+            // same identity guards, same terminal-outcome classification, empty
+            // payload. See [`crate::prompt_delivery::attempt_writes_payload`].
+            let writes_payload = attempt_writes_payload(attempt);
+            let wire_delivery_id = wire_attempt_id(&delivery_id, epoch, attempt, !writes_payload);
             // Reviewer blocker 2: from here on, a request under this wire id may
             // be recorded in the daemon's ledger, so a later identity change has
             // to rotate the epoch rather than reuse it.
             delivery.wire_issued = true;
-            // Reviewer finding B2/#3: read the causal watermark IMMEDIATELY
-            // before the write, so everything already in the pane's journal is
-            // pre-existing history by construction.
+            // Reviewer finding B2/#3: read the watermark IMMEDIATELY before the
+            // write, so everything already in the pane's journal is pre-existing
+            // history by construction.
             let watermark = pane_event_watermark(snapshot, &sp.pane_id);
             match pane.write_and_submit_to_pane_with_identity(
                 &sp.pane_id,
-                &sp.prompt,
+                if writes_payload { &sp.prompt } else { "" },
                 expected_agent_id.as_deref(),
                 expected_session_id.as_deref(),
                 Some(&wire_delivery_id),
@@ -3200,7 +3236,11 @@ fn process_pending_seed_prompts(
                     if delivery.watermark.is_none() {
                         delivery.watermark = watermark;
                     }
-                    log_prompt_written("seed", &sp.pane_id, &delivery_id, attempt);
+                    if writes_payload {
+                        log_prompt_written("seed", &sp.pane_id, &delivery_id, attempt);
+                    } else {
+                        log_prompt_probe_submitted("seed", &sp.pane_id, &delivery_id, attempt);
+                    }
                     match capability {
                         // A recognized producer that structurally cannot report
                         // a submitted prompt (Pi). Retrying could never be
@@ -3371,8 +3411,8 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
 /// * the TEXT — an unrelated prompt the human typed into the target pane is not
 ///   our prompt arriving, and comparison goes through
 ///   [`prompt_submission_matches`] so a seed longer than `USER_PROMPT_MAX_LEN`
-///   still matches its truncated report, and a CR-swallowed doubled submission
-///   counts as delivered rather than leaving the retry armed;
+///   still matches its truncated report, and a CR-swallowed newline-separated
+///   doubled submission counts as delivered rather than leaving the retry armed;
 /// * the WATERMARK — an event already in the pane's journal when we wrote is
 ///   pre-existing history. `attempts == 0` (nothing written yet) can never
 ///   confirm.
@@ -3385,40 +3425,75 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
 /// CURRENT generation, so the delivery is stopped outright the moment that
 /// differs from the bound one — which makes "the generation is unchanged" a
 /// precondition of ever reaching this function.
-fn prompt_submission_confirmed(
+fn prompt_submission_evidence(
     snapshot: &AppState,
     pane_id: &str,
     expected: &str,
     delivery: &PromptDelivery,
-) -> bool {
+) -> Option<SubmissionEvidence> {
     if delivery.attempts == 0 {
-        return false;
+        return None;
     }
-    snapshot
+    let mut evidence = None;
+    for session in snapshot
         .sessions
         .values()
         .filter(|session| session.pane_id.as_deref() == Some(pane_id))
-        .any(|session| {
-            session.recent_events.iter().any(|event| {
-                let Some(reported_agent) = event.agent_id.as_deref() else {
-                    return false;
-                };
-                let identity_matches = delivery
-                    .expected_agent_id
+    {
+        for event in &session.recent_events {
+            let Some(reported_agent) = event.agent_id.as_deref() else {
+                continue;
+            };
+            let identity_matches = delivery
+                .expected_agent_id
+                .as_deref()
+                .is_none_or(|expected_agent| expected_agent == reported_agent)
+                && session
+                    .agent_id
                     .as_deref()
-                    .is_none_or(|expected_agent| expected_agent == reported_agent)
-                    && session
-                        .agent_id
-                        .as_deref()
-                        .is_none_or(|owner| owner == reported_agent);
-                identity_matches
-                    && submission_is_after_watermark(event.timestamp, delivery.watermark)
-                    && event
-                        .user_prompt
-                        .as_deref()
-                        .is_some_and(|reported| prompt_submission_matches(expected, reported))
-            })
-        })
+                    .is_none_or(|owner| owner == reported_agent);
+            if !identity_matches
+                || !submission_is_after_watermark(event.timestamp, delivery.watermark)
+            {
+                continue;
+            }
+            let Some(reported) = event.user_prompt.as_deref() else {
+                continue;
+            };
+            if prompt_submission_matches(expected, reported) {
+                // A clean confirmation anywhere in the journal wins outright:
+                // accumulation elsewhere does not make a real delivery dirty.
+                return Some(SubmissionEvidence::Confirmed);
+            }
+            if prompt_submission_accumulated(expected, reported) {
+                evidence = Some(SubmissionEvidence::Accumulated);
+            }
+        }
+    }
+    evidence
+}
+
+/// Issue #424 D5: what a pane's journal says about a written prompt, once
+/// identity and watermark have already been satisfied.
+///
+/// Two outcomes, kept apart because they authorize different things and because
+/// a log has to be able to tell them apart afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionEvidence {
+    /// The agent reported submitting our prompt — verbatim, truncated, or as
+    /// newline-separated copies ([`prompt_submission_matches`]). The delivery is
+    /// real.
+    Confirmed,
+    /// The agent reported our prompt submitted as repeated copies run together
+    /// with no separator ([`prompt_submission_accumulated`]). A payload had been
+    /// sitting in the input box and a later write appended to it, so what the
+    /// agent is acting on is a corrupted turn rather than the task as written.
+    ///
+    /// Terminal all the same: it is proof the bytes were submitted, and typing a
+    /// third copy into an agent already working is the direction that runs a
+    /// dispatch task twice. See [`prompt_submission_accumulated`] for why this is
+    /// a safety net rather than the remedy.
+    Accumulated,
 }
 
 /// Issue #424 (reviewer findings B1/B2, reviewer blocker 1): is the
@@ -3501,12 +3576,12 @@ fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &Prompt
 ///   session, so a pane whose events carry drifting session ids would abandon
 ///   deliveries it never endangered (`prompt/pane-input/026`).
 ///
-/// The consequence is explicit: a prompt written into a pane that had NO
-/// generation — the 10 s-fallback launcher case — carries no generation guard on
-/// its retries, and is guarded instead by the exact registry agent id, the
-/// confirmation identity and the causal watermark. Writing into a pane with no
-/// announced conversation is precisely the state in which there is nothing to
-/// name, and inventing one afterwards would be a guard against the wrong thing.
+/// A prompt written into a pane that had NO generation — the 10 s-fallback
+/// launcher case — therefore stays UNBOUND for as long as it is merely being
+/// held. It is not left unbound forever, though: see
+/// [`bind_generation_before_retry`], which is the other half of this policy and
+/// the one that keeps a launcher delivery from retrying with no generation guard
+/// at all.
 ///
 /// Capability is sticky so a `SessionEnd` cannot disarm a delivery mid-flight,
 /// and is refreshed on EVERY frame — that half is what lets a late-identifying
@@ -3516,15 +3591,7 @@ fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, 
         && delivery.attempts == 0
         && let Some(current) = snapshot.pane_hook_session_id(pane_id)
     {
-        delivery.expected_session_id = Some(current);
-        // Reviewer blocker 2: this bind changes the delivery FINGERPRINT. If a
-        // wire request is already recorded under the current attempt id, reusing
-        // it now is a permanent ledger conflict, so the wire identity rotates.
-        // See [`PromptDelivery::epoch`].
-        if delivery.wire_issued {
-            delivery.epoch = delivery.epoch.saturating_add(1);
-            delivery.wire_issued = false;
-        }
+        adopt_generation(delivery, current);
     }
     if !delivery.can_report_prompts {
         delivery.can_report_prompts = pane_confirmation_capability(
@@ -3537,15 +3604,87 @@ fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, 
     }
 }
 
+/// Issue #424 D1 (both reviewers): bind the pane's CURRENT generation
+/// immediately before a retry that is about to be sent INTO that generation.
+///
+/// [`bind_delivery_generation`] refuses to claim a target retroactively, and that
+/// is right as far as it goes — a generation that appeared after our bytes is not
+/// the conversation they went into. What it did not justify is what happened
+/// next. In the launcher case at the centre of #424 the 10 s fallback writes
+/// while no hook generation exists and a normal `Applied` sets `attempts = 1`;
+/// when the genuine `SessionStart` then arrives, `delivery_target_changed`
+/// answers false (still unbound) and the one-shot bind is refused (a write
+/// exists), so `expected_session_id` stayed `None` FOREVER. Capability became
+/// `Reports`, attempt 2 went into the now-genuine generation while still
+/// declaring no generation at all, and if it was swallowed and the user then
+/// cleared or switched conversation, attempt 3 carried no session guard and could
+/// inject the old task into the successor under the same registry agent. Exact
+/// agent identity does not separate two conversations owned by one process.
+///
+/// So the refusal is narrowed to what it can actually defend: we do not claim a
+/// target for a write already made, but we do NAME the conversation we are about
+/// to write into, at the moment we write into it. From then on the delivery is
+/// pinned exactly like any other and [`delivery_target_changed`] guards it. This
+/// is the same late adoption `crate::state::latch_generation` performs on the
+/// daemon side; without it the "one pinned policy across all three paths" claim
+/// is false.
+///
+/// Deliberately called ONLY at the write site, never on the every-frame pass. A
+/// delivery being HELD (capability `Unknown`, no retry in flight) is not writing
+/// into anything, so binding it would re-introduce exactly the retroactive claim
+/// `bind_delivery_generation` refuses — and would make an unrelated later
+/// generation read as a lost target for a delivery that was never endangered.
+///
+/// The `prompt/pane-input/026` counter-example that argued against binding late
+/// does not reach this: it concerned a pane whose ORDINARY frames carry drifting
+/// session ids, and the daemon-side latch now treats only a `SessionStart` as an
+/// announcement. The residual that does remain is #532's wrapped-agent
+/// alternation, which `AppState::pane_hook_session` still tracks across two
+/// producers; that shows up as an abandoned delivery — the safe direction — and
+/// is already documented on [`delivery_target_changed`].
+fn bind_generation_before_retry(delivery: &mut PromptDelivery, snapshot: &AppState, pane_id: &str) {
+    if delivery.attempts == 0 || delivery.expected_session_id.is_some() {
+        return;
+    }
+    if let Some(current) = snapshot.pane_hook_session_id(pane_id) {
+        adopt_generation(delivery, current);
+    }
+}
+
+/// Record `generation` as this delivery's bound target, rotating the WIRE epoch
+/// when a request may already be recorded under the current attempt id.
+///
+/// Reviewer blocker 2: binding changes the delivery FINGERPRINT, and the daemon's
+/// ledger refuses a reused id carrying a different one — a permanent `Conflict`
+/// the error branch would retry unchanged until the deadline. See
+/// [`PromptDelivery::epoch`]. Shared by both bind sites so the rotation cannot be
+/// remembered in one and forgotten in the other.
+fn adopt_generation(delivery: &mut PromptDelivery, generation: String) {
+    delivery.expected_session_id = Some(generation);
+    if delivery.wire_issued {
+        delivery.epoch = delivery.epoch.saturating_add(1);
+        delivery.wire_issued = false;
+    }
+}
+
 /// Issue #424 (reviewer blocker 2): the wire id for `attempt` of a delivery,
 /// including its epoch. Epoch 0 — every delivery whose identity never changed
 /// mid-flight, i.e. the overwhelming majority — produces exactly the id
 /// [`attempt_delivery_id`] always produced.
-fn wire_attempt_id(delivery_id: &str, epoch: u32, attempt: u32) -> String {
-    match epoch {
-        0 => attempt_delivery_id(delivery_id, attempt),
-        _ => attempt_delivery_id(&format!("{delivery_id}#e{epoch}"), attempt),
-    }
+///
+/// Issue #424 D5: a SUBMIT-ONLY PROBE gets its own id shape. The ledger binds an
+/// id to a fingerprint of the target identity AND THE TEXT at first admission, so
+/// a probe's empty payload is a different fingerprint by construction; giving it a
+/// visibly different id keeps a probe and a payload attempt from ever being
+/// confused in a log or in the ledger, rather than relying on the attempt counter
+/// alone to keep them apart.
+fn wire_attempt_id(delivery_id: &str, epoch: u32, attempt: u32, probe: bool) -> String {
+    let base = match epoch {
+        0 => delivery_id.to_string(),
+        _ => format!("{delivery_id}#e{epoch}"),
+    };
+    let base = if probe { format!("{base}#probe") } else { base };
+    attempt_delivery_id(&base, attempt)
 }
 
 /// Issue #424 (reviewer finding B3): the pane's confirmation capability as of
@@ -3618,17 +3757,28 @@ fn delivery_capability(
 /// else?
 ///
 /// True only when all three hold: the delivery has actually written; the pane's
-/// journal holds at least one event newer than the delivery's watermark; and
-/// NONE of those events carries an `agent_id`. One identified post-write event
-/// settles the question the other way immediately, so a pane that is merely
-/// quiet, or that has some untagged frames among tagged ones, is never
-/// classified here.
+/// journal holds at least one PRODUCER event newer than the delivery's
+/// watermark; and NONE of those events carries an `agent_id`. One identified
+/// post-write producer event settles the question the other way immediately, so a
+/// pane that is merely quiet, or that has some untagged frames among tagged ones,
+/// is never classified here.
 ///
 /// The watermark bound matters: a pane's journal routinely opens with an
 /// untagged frame the daemon itself synthesized (`spawn::surface_spawned_pane`
 /// emits `agent_id: None` on purpose so a real hook supersedes it), and reading
 /// that as proof of an untagged channel would opt every scheduler-spawned pane
 /// out of the recovery this issue exists for.
+///
+/// Issue #424 D4 (both reviewers): DAEMON-SYNTHETIC events are excluded from the
+/// channel entirely — not counted as identified evidence, and not counted as
+/// untagged evidence either. The shell-activity monitor's `ShellBusy`/`ShellIdle`
+/// and this issue's own delivery notice are identified because they must land on
+/// the right card, and none of them proves that a NATIVE hook on this pane can
+/// report a submitted prompt. Letting one of them answer the question the other
+/// way is what defeated C6: a mixed legacy-hook pane whose real events are all
+/// untagged fell back to sticky `Reports` on the strength of an event the daemon
+/// wrote itself, and resumed retyping through a channel that can never confirm.
+/// See [`crate::event::AgentEvent::is_daemon_synthetic`].
 fn evidence_channel_is_unidentified(
     snapshot: &AppState,
     pane_id: &str,
@@ -3643,11 +3793,10 @@ fn evidence_channel_is_unidentified(
         .values()
         .filter(|session| session.pane_id.as_deref() == Some(pane_id))
     {
-        for event in session
-            .recent_events
-            .iter()
-            .filter(|event| submission_is_after_watermark(event.timestamp, delivery.watermark))
-        {
+        for event in session.recent_events.iter().filter(|event| {
+            submission_is_after_watermark(event.timestamp, delivery.watermark)
+                && !event.is_daemon_synthetic()
+        }) {
             if event.agent_id.is_some() {
                 return false;
             }
@@ -3657,9 +3806,10 @@ fn evidence_channel_is_unidentified(
     saw_post_write_evidence
 }
 
-/// Issue #424 (reviewer finding B2/#3): the causal watermark for `pane_id` — the
-/// newest timestamp in its own event journal right now. Captured immediately
-/// before the first write; see [`submission_is_after_watermark`].
+/// Issue #424 (reviewer finding B2/#3): the ordering watermark for `pane_id` —
+/// the newest timestamp in its own event journal right now. Captured immediately
+/// before the first write; see [`submission_is_after_watermark`], which
+/// documents why this is ordering rather than causality (#526).
 fn pane_event_watermark(snapshot: &AppState, pane_id: &str) -> Option<DateTime<Utc>> {
     snapshot
         .sessions
@@ -3839,11 +3989,22 @@ fn deliver_orchestrator_prompt(
             return;
         }
         bind_delivery_generation(delivery, snapshot, &start_pane_id);
-        let confirmed = orchestrator_prompt.as_deref().is_some_and(|expected| {
-            prompt_submission_confirmed(snapshot, &start_pane_id, expected, delivery)
+        let evidence = orchestrator_prompt.as_deref().and_then(|expected| {
+            prompt_submission_evidence(snapshot, &start_pane_id, expected, delivery)
         });
-        if confirmed {
-            log_prompt_confirmed("orchestrator", &start_pane_id, &delivery_id, attempts);
+        if let Some(evidence) = evidence {
+            match evidence {
+                SubmissionEvidence::Confirmed => {
+                    log_prompt_confirmed("orchestrator", &start_pane_id, &delivery_id, attempts)
+                }
+                // Issue #424 D5: the role prompt came back doubled with no
+                // separator. The orchestrator HAS submitted it, so the role is
+                // genuinely working and finalizing is honest; what must stop is
+                // the retry that would type a third copy into it.
+                SubmissionEvidence::Accumulated => {
+                    log_prompt_accumulated("orchestrator", &start_pane_id, &delivery_id, attempts)
+                }
+            }
             finalize_orchestrator_prompt(
                 ui,
                 tab_id,
@@ -3957,39 +4118,55 @@ fn deliver_orchestrator_prompt(
         &start_pane_id,
         ui.prompt_delivery.get(start_pane_id.as_str()),
     );
-    let (expected_agent_id, expected_session_id, delivery_id, epoch, attempt) =
+    let (expected_agent_id, delivery_id, attempt) =
         match ui.prompt_delivery.get(start_pane_id.as_str()) {
             Some(d) => (
                 d.expected_agent_id.clone(),
-                d.expected_session_id.clone(),
                 Some(d.delivery_id.clone()),
-                d.epoch,
                 d.attempts.saturating_add(1),
             ),
-            None => (None, None, None, 0, 1),
+            None => (None, None, 1),
         };
     // Reviewer finding B3: a prompt already written into a pane whose producer
     // is unknown is HELD, never rewritten — see the seed path's twin gate.
     if attempt > 1 && capability != ConfirmationCapability::Reports {
         return;
     }
+    // Issue #424 D1: past every hold, so this frame WILL write into whatever
+    // conversation the pane currently has. Name it first, and read the epoch
+    // AFTER — binding can rotate it. See [`bind_generation_before_retry`].
+    let (expected_session_id, epoch) = match ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+        Some(delivery) => {
+            bind_generation_before_retry(delivery, snapshot, &start_pane_id);
+            (delivery.expected_session_id.clone(), delivery.epoch)
+        }
+        None => (None, 0),
+    };
+    // Issue #424 D5: after the one bounded replacement payload, later attempts
+    // probe SUBMISSION rather than typing the role prompt in again. See
+    // [`crate::prompt_delivery::attempt_writes_payload`].
+    let writes_payload = attempt_writes_payload(attempt);
     // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT rides
     // its own wire id, or the daemon's ledger replays the first `Applied` and a
     // retry never reaches the PTY at all. See [`attempt_delivery_id`].
     let wire_delivery_id = delivery_id
         .as_deref()
-        .map(|id| wire_attempt_id(id, epoch, attempt));
+        .map(|id| wire_attempt_id(id, epoch, attempt, !writes_payload));
     // Reviewer blocker 2: a request under this wire id may now be recorded in
     // the daemon's ledger — see [`PromptDelivery::epoch`].
     if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
         delivery.wire_issued = true;
     }
-    let prompt_text = orchestrator_prompt
-        .as_deref()
-        .unwrap_or_default()
-        .to_string();
-    // Reviewer finding B2/#3: the causal watermark, read immediately before the
-    // write so everything already in the pane's journal is pre-existing history.
+    let prompt_text = if writes_payload {
+        orchestrator_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        String::new()
+    };
+    // Reviewer finding B2/#3: the watermark, read immediately before the write so
+    // everything already in the pane's journal is pre-existing history.
     let watermark = pane_event_watermark(snapshot, &start_pane_id);
     match pane.write_and_submit_to_pane_with_identity(
         &start_pane_id,
@@ -4011,7 +4188,11 @@ fn deliver_orchestrator_prompt(
                 }
                 delivery.can_report_prompts |= capability == ConfirmationCapability::Reports;
             }
-            log_prompt_written("orchestrator", &start_pane_id, &logged_id, attempt);
+            if writes_payload {
+                log_prompt_written("orchestrator", &start_pane_id, &logged_id, attempt);
+            } else {
+                log_prompt_probe_submitted("orchestrator", &start_pane_id, &logged_id, attempt);
+            }
             match capability {
                 // A recognized producer that structurally cannot report a
                 // submitted prompt (Pi). Retrying could never be confirmed —
@@ -29789,6 +29970,280 @@ mod tests {
         ));
     }
 
+    /// A controller that records the exact payload and bound session of every
+    /// identity-bearing write, which is what the D1/D5 policies are stated in
+    /// terms of. Deliberately separate from `SendResultPaneController` so
+    /// nothing existing changes shape.
+    /// One recorded identity-bearing write: the payload, the generation it was
+    /// bound to, and the wire delivery id.
+    type RecordedWrite = (String, Option<String>, Option<String>);
+
+    #[derive(Default)]
+    struct RecordingPaneController {
+        writes: Arc<std::sync::Mutex<Vec<RecordedWrite>>>,
+    }
+
+    impl PaneController for RecordingPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            _pane_id: &str,
+            text: &str,
+            _expected_agent_id: Option<&str>,
+            expected_session_id: Option<&str>,
+            delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            self.writes.lock().unwrap().push((
+                text.to_string(),
+                expected_session_id.map(str::to_string),
+                delivery_id.map(str::to_string),
+            ));
+            Ok(crate::event::SendResult::Applied)
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Scenario: Write a seed into a launcher pane that has announced no hook generation, let the real agent's SessionStart arrive afterwards, then release two retries. The second attempt must bind and carry that genuine generation instead of declaring none, and the third must probe submission with an empty payload rather than typing the seed a third time.
+    #[spec("prompt/pane-input/030")]
+    #[test]
+    fn pane_input_030_late_generation_binds_before_the_retry_that_enters_it() {
+        const PANE_ID: &str = "late-generation-pane";
+        const AGENT_ID: &str = "late-generation-agent";
+        const PROMPT: &str = "Read the dispatch seed and begin";
+
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        // The launcher shape: identity and a reporting agent type are known, but
+        // nothing has announced a conversation yet.
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        assert_eq!(
+            snapshot.pane_hook_session_id(PANE_ID),
+            None,
+            "precondition: the fallback writes into a pane with no generation"
+        );
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].0, PROMPT);
+            assert_eq!(
+                writes[0].1, None,
+                "the first write has no generation to name, and must not invent one"
+            );
+        }
+
+        // The real agent finally announces itself — the 10.1 s launcher case.
+        snapshot.apply_event(AgentEvent {
+            session_id: "genuine-generation".into(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE_ID.into()),
+            agent_id: Some(AGENT_ID.into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("an unconfirmed write arms retry")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 2, "the retry must reach the pane");
+            assert_eq!(
+                writes[1].1.as_deref(),
+                Some("genuine-generation"),
+                "D1: a retry sent INTO a generation must declare it, or a later \
+                 /clear can take the same prompt with no session guard at all"
+            );
+            assert_eq!(
+                writes[1].0, PROMPT,
+                "attempt 2 is the one bounded replacement payload"
+            );
+        }
+        assert_eq!(
+            ui.prompt_delivery
+                .get(PANE_ID)
+                .and_then(|d| d.expected_session_id.clone())
+                .as_deref(),
+            Some("genuine-generation"),
+            "the binding must be retained, not merely sent once"
+        );
+
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("still unconfirmed")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 3);
+            assert_eq!(
+                writes[2].0, "",
+                "D5: by attempt 3 a payload may be sitting in the input box, so \
+                 the attempt probes submission instead of appending another copy"
+            );
+            assert_eq!(
+                writes[2].1.as_deref(),
+                Some("genuine-generation"),
+                "a probe carries the same identity guards as any other attempt"
+            );
+            assert_ne!(
+                writes[2].2, writes[1].2,
+                "a probe's payload differs, so it needs its own ledger identity"
+            );
+        }
+    }
+
+    /// Scenario: Write a seed, then let the pane produce only untagged hook frames alongside identified events the daemon synthesized itself (a shell-activity frame and a delivery notice). The synthetic events must not be read as proof of a tagged reporting channel, so the delivery stays held and is never retyped.
+    #[spec("prompt/pane-input/031")]
+    #[test]
+    fn pane_input_031_daemon_synthetic_events_are_not_a_reporting_channel() {
+        const PANE_ID: &str = "synthetic-evidence-pane";
+        const PROMPT: &str = "one legacy-hook seed";
+
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        let mut snapshot = AppState::default();
+        snapshot.register_pane(PANE_ID.to_string());
+        snapshot.insert_placeholder_session(
+            PANE_ID.to_string(),
+            None,
+            Some(AgentType::ClaudeCode),
+            Some("legacy-agent".to_string()),
+        );
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(writes.lock().unwrap().len(), 1);
+
+        let mut synthetic = |event_type: EventType, notice: bool| {
+            let mut metadata = std::collections::HashMap::new();
+            if notice {
+                metadata.insert(
+                    crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+                    "a spawn-time prompt was never confirmed".to_string(),
+                );
+            }
+            snapshot.apply_event(AgentEvent {
+                session_id: "legacy-session".into(),
+                agent_type: AgentType::None,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata,
+                // Identified, because that is how a daemon-authored event lands
+                // on the right card — and exactly what defeated C6.
+                pane_id: Some(PANE_ID.into()),
+                agent_id: Some("legacy-agent".into()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            });
+        };
+        synthetic(EventType::ShellBusy, false);
+        synthetic(EventType::Error, true);
+
+        // ...while the pane's REAL producer speaks through a pre-F9 untagged
+        // hook, which `prompt_submission_confirmed` can never accept.
+        snapshot.apply_event(AgentEvent {
+            session_id: "legacy-session".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE_ID.into()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+
+        ui.send_retry_backoff
+            .entry(PANE_ID.to_string())
+            .or_insert(SendRetryState {
+                next_attempt_at: std::time::Instant::now(),
+                attempts: 1,
+            })
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "D4: events the daemon wrote itself prove only that the DAEMON can \
+             tag an event; they must not re-arm retyping through a channel that \
+             still cannot confirm anything"
+        );
+    }
+
     /// Scenario: Lose the response after a ledger caches the first physical seed write, retry that same attempt id, then let the unconfirmed-delivery retry rotate to a new id whose physical write is ambiguous. The duplicate must replay without writing, the rotated attempt must reach the writer, and Ambiguous must abandon without another attempt.
     #[spec("prompt/pane-input/027")]
     #[test]
@@ -30355,9 +30810,9 @@ mod tests {
         // so `attempts` is still 0 and the next request reuses attempt 1.
         let mut lost = delivery();
         lost.wire_issued = true;
-        let before = wire_attempt_id(&lost.delivery_id, lost.epoch, lost.attempts + 1);
+        let before = wire_attempt_id(&lost.delivery_id, lost.epoch, lost.attempts + 1, false);
         bind_delivery_generation(&mut lost, &snapshot, PANE_ID);
-        let after = wire_attempt_id(&lost.delivery_id, lost.epoch, lost.attempts + 1);
+        let after = wire_attempt_id(&lost.delivery_id, lost.epoch, lost.attempts + 1, false);
         assert_eq!(
             lost.expected_session_id.as_deref(),
             Some("generation-that-appeared-late")
@@ -30390,11 +30845,11 @@ mod tests {
         // what makes a genuine lost-response retry replay instead of writing a
         // second copy.
         let mut clean = delivery();
-        let unrotated = wire_attempt_id(&clean.delivery_id, clean.epoch, 1);
+        let unrotated = wire_attempt_id(&clean.delivery_id, clean.epoch, 1, false);
         bind_delivery_generation(&mut clean, &snapshot, PANE_ID);
         assert_eq!(clean.epoch, 0);
         assert_eq!(
-            wire_attempt_id(&clean.delivery_id, clean.epoch, 1),
+            wire_attempt_id(&clean.delivery_id, clean.epoch, 1, false),
             unrotated
         );
     }
@@ -30503,9 +30958,22 @@ mod tests {
         }
         // Epoch 0 — every delivery whose identity never moved — keeps exactly
         // the wire id shape the ledger and the logs already knew.
-        assert_eq!(wire_attempt_id("d", 0, 2), attempt_delivery_id("d", 2));
-        assert_ne!(wire_attempt_id("d", 1, 2), attempt_delivery_id("d", 2));
-        assert!(wire_attempt_id("d", 1, 2).ends_with("#a2"));
+        assert_eq!(
+            wire_attempt_id("d", 0, 2, false),
+            attempt_delivery_id("d", 2)
+        );
+        assert_ne!(
+            wire_attempt_id("d", 1, 2, false),
+            attempt_delivery_id("d", 2)
+        );
+        assert!(wire_attempt_id("d", 1, 2, false).ends_with("#a2"));
+        // Issue #424 D5: a submit-only probe carries a different payload, so it
+        // must never share a ledger identity with the payload attempt it follows.
+        assert_ne!(
+            wire_attempt_id("d", 0, 3, true),
+            wire_attempt_id("d", 0, 3, false)
+        );
+        assert!(wire_attempt_id("d", 0, 3, true).ends_with("#a3"));
     }
 
     /// Scenario: Queue mode seed prompts and inject permanent non-delivery through
