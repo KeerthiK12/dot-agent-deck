@@ -31,7 +31,7 @@ pub const CONFIG_KEYS: &[(&str, &str)] = &[
     ),
     (
         "idle_art.provider",
-        "LLM provider: anthropic (ANTHROPIC_API_KEY), openai (OPENAI_API_KEY), ollama (no key needed) (default: anthropic)",
+        "LLM provider: anthropic (DOT_AGENT_DECK_ANTHROPIC_API_KEY, or ANTHROPIC_API_KEY), openai (DOT_AGENT_DECK_OPENAI_API_KEY, or OPENAI_API_KEY), ollama (no key needed) (default: anthropic)",
     ),
     ("idle_art.model", "LLM model (default: claude-haiku-4-5)"),
     (
