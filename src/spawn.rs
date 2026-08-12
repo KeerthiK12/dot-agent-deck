@@ -48,7 +48,17 @@ use crate::agent_pty::{
 };
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
 use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
+use crate::prompt_delivery::{
+    AUTOMATIC_PROMPT_DEADLINE, log_prompt_abandoned, log_prompt_confirmed,
+    log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written, mint_delivery_id,
+    unconfirmed_retry_delay,
+};
 use crate::scheduler::{Notifier, NotifyEvent};
+
+/// The `path` field every delivery log line from this module carries, so a
+/// daemon log with all three delivery paths writing into it can be read per
+/// path. See [`crate::prompt_delivery`].
+const DELIVERY_LOG_PATH: &str = "spawn";
 
 /// Fallback buffer delay between spawning the PTY and writing the prompt, used
 /// ONLY when [`deliver`] has no hook-event broadcast to gate on (a direct
@@ -793,13 +803,18 @@ async fn run_delivery(
 }
 
 async fn deliver(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     agent_id: &str,
     event_rx: Option<broadcast::Receiver<BroadcastMsg>>,
     prompt: &str,
 ) {
-    match event_rx {
+    // Issue #424: `observed` is carried past the write. It is not "may we
+    // deliver" (the fallback still delivers, exactly as before) but "has this
+    // agent proved it reports its activity through hooks" — which decides
+    // whether an unconfirmed write may be RE-submitted. See
+    // [`confirm_prompt_delivery`].
+    let (event_rx, observed) = match event_rx {
         Some(mut rx) => {
             let timeout = session_start_wait_timeout();
             let observed =
@@ -812,11 +827,148 @@ async fn deliver(
                      delivering prompt via fallback path"
                 );
             }
+            (Some(rx), observed)
         }
-        None => tokio::time::sleep(DELIVER_BUFFER_DELAY).await,
-    }
+        None => {
+            tokio::time::sleep(DELIVER_BUFFER_DELAY).await;
+            (None, false)
+        }
+    };
+    let delivery_id = mint_delivery_id(pane_id);
     if let Err(e) = registry.write_to_pane_and_submit(pane_id, prompt).await {
         tracing::warn!(pane_id, error = %e, "scheduled prompt delivery failed");
+        return;
+    }
+    log_prompt_written(DELIVERY_LOG_PATH, pane_id, &delivery_id, 1);
+    match event_rx {
+        Some(rx) => {
+            // Detached on purpose: the caller (a `dispatch` CLI round trip, a
+            // scheduler fire) is freed the instant the bytes are written, exactly
+            // as before this change. Only the CONFIRMATION — which legitimately
+            // runs for tens of seconds against a Claude Code pane starting five
+            // MCP servers — moves to the background.
+            let registry = Arc::clone(registry);
+            let pane_id = pane_id.to_string();
+            let agent_id = agent_id.to_string();
+            let prompt = prompt.to_string();
+            tokio::spawn(async move {
+                confirm_prompt_delivery(
+                    registry,
+                    pane_id,
+                    agent_id,
+                    rx,
+                    prompt,
+                    delivery_id,
+                    observed,
+                )
+                .await;
+            });
+        }
+        // No event bus at all (a direct caller without one). Nothing can ever
+        // report back, so the write is final.
+        None => log_prompt_unconfirmable(
+            DELIVERY_LOG_PATH,
+            pane_id,
+            &delivery_id,
+            "no hook-event bus for this delivery",
+        ),
+    }
+}
+
+/// Issue #424: hold a spawn-time prompt PROVISIONAL until the agent reports
+/// submitting it, re-submitting under a bounded backoff while it does not.
+///
+/// This is the daemon-side third delivery path — `dispatch`, the scheduler and
+/// issue-dispatch all reach the PTY through [`deliver`], not through either of
+/// the TUI-owned paths in `crate::ui` — and it is the one the reported failure
+/// actually goes through: three `dispatch … --single` calls inside a minute, one
+/// pane prompted and the other two healthy, in the right worktrees, and idle
+/// forever with no prompt at all.
+///
+/// Unlike the TUI paths there is no ledger to work around here:
+/// [`AgentPtyRegistry::write_to_pane_and_submit`] is the plain, un-guarded write,
+/// so every re-submission is unconditionally a real second write to the PTY.
+///
+/// Bounded by [`AUTOMATIC_PROMPT_DEADLINE`], after which the prompt is abandoned
+/// with a warn rather than retried forever. Every retry types the prompt into
+/// the pane again, so the escalating [`unconfirmed_retry_delay`] keeps that to
+/// single digits across the whole window (see its docs).
+///
+/// `hooks_observed` is the initial answer to "can this pane's delivery ever be
+/// confirmed" — `true` when the agent's `SessionStart` was seen before the
+/// write. It is not a fixed verdict: a pane that has proved NOTHING yet is
+/// watched for one window first, and any hook event carrying this agent's id
+/// arms retries from then on ([`crate::state::PromptWatch`]). That distinction
+/// is what keeps the two populations apart without guessing from the command
+/// line:
+///
+/// * a bare shell / `cat` / a recorder stand-in emits no hook ever, so it is
+///   never armed and receives exactly ONE write — retrying it could not be
+///   recovery, only the same prompt typed into the pane again and again until
+///   the deadline;
+/// * a SLOW agent — the `devbox run claude …` launcher class from the issue,
+///   whose readiness depends on a hook escaping a nested shell — signals late,
+///   arms on that signal, and still gets its retries. Gating this on the
+///   pre-write `SessionStart` alone would have denied a retry to exactly the
+///   agents issue #424 §3 identifies as having the most fragile delivery.
+async fn confirm_prompt_delivery(
+    registry: Arc<AgentPtyRegistry>,
+    pane_id: String,
+    agent_id: String,
+    mut rx: broadcast::Receiver<BroadcastMsg>,
+    prompt: String,
+    delivery_id: String,
+    hooks_observed: bool,
+) {
+    use crate::state::PromptWatch;
+
+    let started = Instant::now();
+    let mut attempt: u32 = 1;
+    let mut armed = hooks_observed;
+    loop {
+        let Some(remaining) = AUTOMATIC_PROMPT_DEADLINE.checked_sub(started.elapsed()) else {
+            log_prompt_abandoned(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
+            return;
+        };
+        let window = unconfirmed_retry_delay(attempt).min(remaining);
+        match crate::state::wait_for_prompt_submission(
+            &mut rx, &pane_id, &agent_id, &prompt, window,
+        )
+        .await
+        {
+            PromptWatch::Confirmed => {
+                log_prompt_confirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
+                return;
+            }
+            PromptWatch::Elapsed { hooked } => armed |= hooked,
+        }
+        if !armed {
+            log_prompt_unconfirmable(
+                DELIVERY_LOG_PATH,
+                &pane_id,
+                &delivery_id,
+                "this agent reports no hook events, so nothing could confirm delivery",
+            );
+            return;
+        }
+        if started.elapsed() >= AUTOMATIC_PROMPT_DEADLINE {
+            log_prompt_abandoned(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
+            return;
+        }
+        log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
+        attempt = attempt.saturating_add(1);
+        if let Err(e) = registry.write_to_pane_and_submit(&pane_id, &prompt).await {
+            // The pane is gone (closed, exited, rebound) — there is nothing left
+            // to deliver into, so stop rather than burn the deadline retrying.
+            tracing::warn!(
+                pane_id,
+                delivery_id,
+                error = %e,
+                "prompt re-submission failed; giving up on confirmation"
+            );
+            return;
+        }
+        log_prompt_written(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
     }
 }
 

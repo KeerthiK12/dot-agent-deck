@@ -232,12 +232,13 @@ fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> O
     Some(detail)
 }
 
+/// Issue #424: delegates to the shared, char-boundary-safe truncation. The
+/// former `&s[..max]` PANICKED whenever the cut landed inside a multi-byte
+/// character — in this binary that kills the hook process and the event is never
+/// emitted at all, which for a `user_prompt` now also means a delivered prompt
+/// can never be confirmed. Identical output for ASCII, so nothing else moves.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
+    crate::prompt_delivery::truncate_on_char_boundary(s, max)
 }
 
 /// PRD #20 W1: normalize a Codex `shell` tool's `command` value into a single
@@ -325,7 +326,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     }
     let tool_detail = extract_tool_detail(tool_name.as_deref(), tool_input.as_ref());
 
-    let user_prompt = prompt.map(|p| truncate(&p, 200));
+    let user_prompt = prompt.map(|p| truncate(&p, crate::prompt_delivery::USER_PROMPT_MAX_LEN));
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
     // PRD #92 F9 followup-7: the daemon injects DOT_AGENT_DECK_AGENT_ID
     // on spawn (same pattern as DOT_AGENT_DECK_PANE_ID). Forwarding it
@@ -393,7 +394,9 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
 fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     let event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
     let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
-    let user_prompt = input.prompt.map(|p| truncate(&p, 200));
+    let user_prompt = input
+        .prompt
+        .map(|p| truncate(&p, crate::prompt_delivery::USER_PROMPT_MAX_LEN));
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
     let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
 

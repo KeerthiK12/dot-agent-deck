@@ -29,6 +29,11 @@ use crate::keybindings::{Action as KbAction, KeybindingConfig};
 use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
+use crate::prompt_delivery::{
+    AUTOMATIC_PROMPT_DEADLINE, attempt_delivery_id, confirmation_floor, log_prompt_abandoned,
+    log_prompt_confirmed, log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written,
+    mint_delivery_id, prompt_submission_matches, unconfirmed_retry_delay,
+};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
 use crate::tab_layout::fit_tab_labels;
@@ -1590,6 +1595,16 @@ struct PromptDelivery {
     expected_agent_id: Option<String>,
     expected_session_id: Option<String>,
     delivery_id: String,
+    /// Issue #424: how many PTY submissions this LOGICAL delivery has made. `0`
+    /// means nothing has been written yet, so nothing the pane reports can be
+    /// evidence about it. Each attempt goes on the wire under its own
+    /// [`attempt_delivery_id`] so the daemon's ledger cannot replay a cached
+    /// `Applied` in place of the second physical submission a retry exists for.
+    attempts: u32,
+    /// Issue #424: when the FIRST submission was written, so a prompt the pane
+    /// submitted BEFORE we ever wrote (pre-existing history that happens to
+    /// carry the same text) can't be mistaken for confirmation of this delivery.
+    written_at: Option<DateTime<Utc>>,
 }
 
 /// PRD #20 R20-005: bounded exponential backoff for a retried automatic prompt.
@@ -1605,40 +1620,6 @@ fn send_retry_delay(attempts: u32) -> std::time::Duration {
     const CAP: std::time::Duration = std::time::Duration::from_secs(2);
     let shift = attempts.saturating_sub(1).min(6);
     std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift)).min(CAP)
-}
-
-/// PRD #20 R20-004 (finding #3): hard cap on how long an automatic prompt (a
-/// mode seed or an orchestrator role prompt) is retried before it is abandoned.
-/// The deadline is checked BEFORE the readiness/backoff/delivery branches so it
-/// is actually reachable — the previous code checked it only after the delivery
-/// branch, which always returned first, so a permanent non-delivery
-/// (`wrong-session`, a never-live role) retried one RPC every ~2s forever.
-const AUTOMATIC_PROMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// PRD #20 R20-004 (finding #3): mint a GLOBALLY-UNIQUE delivery id for an
-/// automatic prompt. The old `seed-<pane>-<seq>` restarted its counter at 1 in
-/// EVERY TUI process while the daemon's dedup ledger persists — so a reconnecting
-/// (restarted) TUI could reuse an id the daemon still had cached and have a
-/// genuinely-new prompt silently suppressed (or replayed against conflicting
-/// content). This combines a per-PROCESS nonce (two processes never collide)
-/// with a global monotonic counter (two ids within one process never collide),
-/// keyed by pane for log readability.
-fn mint_delivery_id(pane_id: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nonce = *NONCE.get_or_init(|| {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        std::process::id().hash(&mut h);
-        // Nanos since the epoch disambiguate a pid reused across restarts.
-        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            dur.as_nanos().hash(&mut h);
-        }
-        h.finish()
-    });
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("send-{nonce:016x}-{pane_id}-{seq}")
 }
 
 struct UiState {
@@ -2987,6 +2968,29 @@ fn process_pending_seed_prompts(
     let mut backoff = std::mem::take(&mut ui.send_retry_backoff);
     let mut deliveries = std::mem::take(&mut ui.prompt_delivery);
     prompts.retain_mut(|sp| {
+        // Issue #424: CONFIRMATION FIRST. A previous frame's `Applied`/`Queued`
+        // only proved the PTY accepted bytes, so the seed is still here; if the
+        // agent has since reported submitting it, this delivery is done — clear
+        // the seed and all its retry state. Checked ahead of the backoff gate
+        // because the write that gets confirmed is precisely the one whose
+        // backoff window is still open (`prompt/pane-input/024`, `/026`).
+        let written_at = deliveries
+            .get(&sp.pane_id)
+            .filter(|delivery| delivery.attempts > 0)
+            .and_then(|delivery| delivery.written_at);
+        if prompt_submission_confirmed(snapshot, &sp.pane_id, &sp.prompt, written_at) {
+            if let Some(delivery) = deliveries.get(&sp.pane_id) {
+                log_prompt_confirmed(
+                    "seed",
+                    &sp.pane_id,
+                    &delivery.delivery_id,
+                    delivery.attempts,
+                );
+            }
+            backoff.remove(&sp.pane_id);
+            deliveries.remove(&sp.pane_id);
+            return false;
+        }
         // PRD #20 R20-005 (finding #13): the hard timeout is checked FIRST, before
         // the readiness/backoff/delivery branches — so it is actually reachable.
         // The old code checked it only AFTER the delivery branch (which always
@@ -2994,7 +2998,15 @@ fn process_pending_seed_prompts(
         // non-delivery re-attempted one RPC every ~2s forever. An expired seed is
         // abandoned here with NO further delivery attempt.
         if sp.created_at.elapsed() > AUTOMATIC_PROMPT_DEADLINE {
-            tracing::warn!(pane_id = %sp.pane_id, "seed prompt: timed out; abandoning");
+            // Issue #424: the same warn this always emitted, now carrying the
+            // delivery identity and how many submissions were made — the two
+            // facts that tell "never written" apart from "written N times and
+            // never confirmed" when reading back a lost seed after the fact.
+            let (delivery_id, attempts) = deliveries
+                .get(&sp.pane_id)
+                .map(|delivery| (delivery.delivery_id.clone(), delivery.attempts))
+                .unwrap_or_default();
+            log_prompt_abandoned("seed", &sp.pane_id, &delivery_id, attempts);
             backoff.remove(&sp.pane_id);
             deliveries.remove(&sp.pane_id);
             return false;
@@ -3041,23 +3053,57 @@ fn process_pending_seed_prompts(
                     // PRD #20 finding #3: globally-unique id (process nonce +
                     // global counter), not a per-process `seed-<pane>-N`.
                     delivery_id: mint_delivery_id(&sp.pane_id),
+                    attempts: 0,
+                    written_at: None,
                 }
             });
             let expected_agent_id = delivery.expected_agent_id.clone();
             let expected_session_id = delivery.expected_session_id.clone();
             let delivery_id = delivery.delivery_id.clone();
+            // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT
+            // rides its own wire id, or the daemon's ledger would replay the
+            // first `Applied` and this retry would never reach the PTY at all.
+            let attempt = delivery.attempts.saturating_add(1);
+            let wire_delivery_id = attempt_delivery_id(&delivery_id, attempt);
             match pane.write_and_submit_to_pane_with_identity(
                 &sp.pane_id,
                 &sp.prompt,
                 expected_agent_id.as_deref(),
                 expected_session_id.as_deref(),
-                Some(&delivery_id),
+                Some(&wire_delivery_id),
             ) {
-                // Delivered (or accepted for delivery): drop the seed + its state.
+                // Issue #424: the PTY accepted the bytes — that is ALL this
+                // means. Whether the agent's TUI was in submit-CR-aware mode
+                // when the CR landed is not knowable here, so the seed, its
+                // identity and its retry are RETAINED until the agent reports
+                // submitting it (checked at the top of this closure).
                 Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
-                    backoff.remove(&sp.pane_id);
-                    deliveries.remove(&sp.pane_id);
-                    return false;
+                    let delivery = deliveries
+                        .get_mut(&sp.pane_id)
+                        .expect("delivery inserted above");
+                    delivery.attempts = attempt;
+                    delivery.written_at.get_or_insert_with(Utc::now);
+                    log_prompt_written("seed", &sp.pane_id, &delivery_id, attempt);
+                    // ...unless nothing on this pane can ever confirm. An agent
+                    // that never signalled readiness (`timeout_ready`: a bare
+                    // shell, `cat`, a hook-less launcher) emits no submitted
+                    // prompts either, so holding the seed provisional would only
+                    // re-type it into that pane until the deadline abandoned it.
+                    // For those the write stays terminal, exactly as before.
+                    if timeout_ready {
+                        log_prompt_unconfirmable(
+                            "seed",
+                            &sp.pane_id,
+                            &delivery_id,
+                            "no readiness signal from this agent",
+                        );
+                        backoff.remove(&sp.pane_id);
+                        deliveries.remove(&sp.pane_id);
+                        return false;
+                    }
+                    log_prompt_unconfirmed("seed", &sp.pane_id, &delivery_id, attempt);
+                    schedule_unconfirmed_retry(&mut backoff, &sp.pane_id, now, attempt);
+                    return true;
                 }
                 // Explicit non-delivery: retain for retry, back off, surface
                 // feedback. Bounded by the deadline checked at the top of this
@@ -3130,6 +3176,74 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
             // counter) so a TUI restart can't collide with the daemon's still-live
             // dedup ledger.
             delivery_id: mint_delivery_id(pane_id),
+            attempts: 0,
+            written_at: None,
+        },
+    );
+}
+
+/// Issue #424: whether `snapshot` shows the agent in `pane_id` having actually
+/// SUBMITTED `expected` — the only honest evidence that a written prompt was
+/// delivered rather than swallowed by a still-booting agent TUI.
+///
+/// Reads the pane's sessions' `recent_events` rather than `last_user_prompt`
+/// because the latter is a single overwritable slot: a prompt the human types a
+/// frame after the seed lands would erase the evidence before the delivery loop
+/// next runs, turning a real delivery into a spurious re-submission.
+///
+/// Two independent axes must BOTH match, because either alone produces a false
+/// confirmation that reinstates the bug in a new shape:
+///
+/// * the PANE — the same text submitted in a sibling pane says nothing about
+///   this delivery (`prompt/pane-input/026`);
+/// * the TEXT — an unrelated prompt the human typed into the target pane is not
+///   our prompt arriving, and comparison goes through
+///   [`prompt_submission_matches`] so a seed longer than
+///   `USER_PROMPT_MAX_LEN` still matches its truncated report.
+///
+/// `written_at` adds the third: an event that predates our own write is
+/// pre-existing history for the pane, not evidence about this delivery. `None`
+/// (no submission made yet) can never confirm.
+fn prompt_submission_confirmed(
+    snapshot: &AppState,
+    pane_id: &str,
+    expected: &str,
+    written_at: Option<DateTime<Utc>>,
+) -> bool {
+    let Some(floor) = written_at.map(confirmation_floor) else {
+        return false;
+    };
+    snapshot
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+        .any(|session| {
+            session.recent_events.iter().any(|event| {
+                event.timestamp >= floor
+                    && event
+                        .user_prompt
+                        .as_deref()
+                        .is_some_and(|reported| prompt_submission_matches(expected, reported))
+            })
+        })
+}
+
+/// Issue #424: record that an automatic prompt for `pane_id` was WRITTEN but is
+/// not yet confirmed — arming the re-submission after
+/// [`unconfirmed_retry_delay`]. Distinct from [`schedule_send_retry`], which
+/// backs off a target that REFUSED delivery; see that helper's docs for why the
+/// two schedules differ.
+fn schedule_unconfirmed_retry(
+    backoff: &mut HashMap<String, SendRetryState>,
+    pane_id: &str,
+    now: std::time::Instant,
+    attempts: u32,
+) {
+    backoff.insert(
+        pane_id.to_string(),
+        SendRetryState {
+            next_attempt_at: now + unconfirmed_retry_delay(attempts),
+            attempts,
         },
     );
 }
@@ -3172,6 +3286,32 @@ fn abandon_orchestrator_prompt(
     ui.status_message = Some((msg, now));
 }
 
+/// Issue #424: finalize an orchestrator role prompt whose delivery is now
+/// CONFIRMED — the start role becomes `Working`, the tab is marked prompted (so
+/// the render-loop gate stops re-entering), and every scrap of provisional
+/// delivery state is dropped.
+///
+/// Extracted from the old `Applied`/`Queued` arm, which ran this the moment the
+/// PTY accepted bytes. That is precisely the defect issue #424 reports: it made
+/// "swallowed by a booting TUI" and "delivered and acted upon" indistinguishable,
+/// and threw away the retry state that could have recovered the first case. The
+/// body is unchanged; what changed is what has to be true before it runs.
+fn finalize_orchestrator_prompt(
+    ui: &mut UiState,
+    tab_id: TabId,
+    start_pane_id: &str,
+    start_role_index: usize,
+    role_statuses: &mut [OrchestrationRoleStatus],
+    orchestrator_prompt: &mut Option<String>,
+) {
+    *orchestrator_prompt = None;
+    role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
+    ui.orchestration_prompted.insert(tab_id);
+    ui.send_retry_backoff.remove(start_pane_id);
+    ui.prompt_delivery.remove(start_pane_id);
+    ui.orchestration_ready_since.remove(&tab_id);
+}
+
 /// PRD #20 R20-003/004/005 (findings #5, #13): deliver (or retry, or abandon) an
 /// orchestrator start-role prompt for ONE orchestration tab. Extracted from the
 /// render loop with an INJECTED `now` so the deadline / terminal-outcome policy
@@ -3194,6 +3334,39 @@ fn deliver_orchestrator_prompt(
 ) {
     let start_pane_id = role_pane_ids[start_role_index].clone();
 
+    // Issue #424: CONFIRMATION FIRST. A previous frame's `Applied`/`Queued`
+    // proved only that the PTY accepted bytes, so the prompt is still here and
+    // the role is still not `Working`; if the orchestrator has since reported
+    // submitting it, the delivery is real and everything finalizes now. Checked
+    // ahead of the backoff gate because the write being confirmed is exactly the
+    // one whose backoff window is still open (`prompt/pane-input/023`).
+    let pending = ui
+        .prompt_delivery
+        .get(start_pane_id.as_str())
+        .filter(|delivery| delivery.attempts > 0)
+        .map(|delivery| {
+            (
+                delivery.delivery_id.clone(),
+                delivery.attempts,
+                delivery.written_at,
+            )
+        });
+    if let Some((delivery_id, attempts, written_at)) = pending
+        && let Some(expected) = orchestrator_prompt.as_deref()
+        && prompt_submission_confirmed(snapshot, &start_pane_id, expected, written_at)
+    {
+        log_prompt_confirmed("orchestrator", &start_pane_id, &delivery_id, attempts);
+        finalize_orchestrator_prompt(
+            ui,
+            tab_id,
+            &start_pane_id,
+            start_role_index,
+            role_statuses,
+            orchestrator_prompt,
+        );
+        return;
+    }
+
     // PRD #20 R20-005 (finding #13): DEADLINE FIRST — before the readiness /
     // backoff / delivery branches — so the hard timeout is actually reachable.
     // The old block had no orchestrator deadline at all, so a permanent
@@ -3203,7 +3376,16 @@ fn deliver_orchestrator_prompt(
         .get(&tab_id)
         .is_some_and(|t| now.duration_since(*t) > AUTOMATIC_PROMPT_DEADLINE)
     {
-        tracing::warn!(pane_id = %start_pane_id, "orchestrator prompt: timed out; abandoning");
+        // Issue #424: the same warn this always emitted, now carrying the
+        // delivery identity and how many submissions were made — the two facts
+        // that tell "never written" apart from "written N times and never
+        // confirmed" when reading back a lost prompt after the fact.
+        let (delivery_id, attempts) = ui
+            .prompt_delivery
+            .get(start_pane_id.as_str())
+            .map(|delivery| (delivery.delivery_id.clone(), delivery.attempts))
+            .unwrap_or_default();
+        log_prompt_abandoned("orchestrator", &start_pane_id, &delivery_id, attempts);
         abandon_orchestrator_prompt(
             ui,
             tab_id,
@@ -3244,15 +3426,22 @@ fn deliver_orchestrator_prompt(
     if !ui.prompt_delivery.contains_key(start_pane_id.as_str()) {
         capture_prompt_delivery(ui, &start_pane_id, pane);
     }
-    let (expected_agent_id, expected_session_id, delivery_id) =
+    let (expected_agent_id, expected_session_id, delivery_id, attempt) =
         match ui.prompt_delivery.get(start_pane_id.as_str()) {
             Some(d) => (
                 d.expected_agent_id.clone(),
                 d.expected_session_id.clone(),
                 Some(d.delivery_id.clone()),
+                d.attempts.saturating_add(1),
             ),
-            None => (None, None, None),
+            None => (None, None, None, 1),
         };
+    // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT rides
+    // its own wire id, or the daemon's ledger replays the first `Applied` and a
+    // retry never reaches the PTY at all. See [`attempt_delivery_id`].
+    let wire_delivery_id = delivery_id
+        .as_deref()
+        .map(|id| attempt_delivery_id(id, attempt));
     let prompt_text = orchestrator_prompt
         .as_deref()
         .unwrap_or_default()
@@ -3262,15 +3451,44 @@ fn deliver_orchestrator_prompt(
         &prompt_text,
         expected_agent_id.as_deref(),
         expected_session_id.as_deref(),
-        delivery_id.as_deref(),
+        wire_delivery_id.as_deref(),
     ) {
+        // Issue #424: the PTY accepted the bytes — that is ALL this means. The
+        // prompt, the role's non-`Working` status, the delivery identity and the
+        // retry are RETAINED until the orchestrator reports submitting it
+        // (checked at the top of this function).
         Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
-            *orchestrator_prompt = None;
-            role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
-            ui.orchestration_prompted.insert(tab_id);
-            ui.send_retry_backoff.remove(start_pane_id.as_str());
-            ui.prompt_delivery.remove(start_pane_id.as_str());
-            ui.orchestration_ready_since.remove(&tab_id);
+            let logged_id = delivery_id.clone().unwrap_or_default();
+            if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+                delivery.attempts = attempt;
+                delivery.written_at.get_or_insert_with(Utc::now);
+            }
+            log_prompt_written("orchestrator", &start_pane_id, &logged_id, attempt);
+            // ...unless nothing on this pane can ever confirm. An agent that
+            // never signalled readiness (`timeout_ready`: a bare shell, `cat`, a
+            // hook-less launcher such as `devbox run …`) emits no submitted
+            // prompts either, so holding the prompt provisional would only
+            // re-type it into that pane until the deadline abandoned it. For
+            // those the write stays terminal, exactly as before.
+            if timeout_ready {
+                log_prompt_unconfirmable(
+                    "orchestrator",
+                    &start_pane_id,
+                    &logged_id,
+                    "no readiness signal from this agent",
+                );
+                finalize_orchestrator_prompt(
+                    ui,
+                    tab_id,
+                    &start_pane_id,
+                    start_role_index,
+                    role_statuses,
+                    orchestrator_prompt,
+                );
+                return;
+            }
+            log_prompt_unconfirmed("orchestrator", &start_pane_id, &logged_id, attempt);
+            schedule_unconfirmed_retry(&mut ui.send_retry_backoff, &start_pane_id, now, attempt);
         }
         // PRD #20 finding #13: a TERMINAL outcome is abandoned (no forever
         // retry); a RETRYABLE liveness transition is retried under backoff,

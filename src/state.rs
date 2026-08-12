@@ -1870,6 +1870,96 @@ pub(crate) async fn wait_for_session_start(
     }
 }
 
+/// Issue #424: the outcome of one [`wait_for_prompt_submission`] window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptWatch {
+    /// The agent reported submitting the expected prompt — the delivery is real.
+    Confirmed,
+    /// The window elapsed with no confirmation. `hooked` records whether ANY
+    /// hook event from this exact agent was seen meanwhile, which is the proof
+    /// that this pane reports its activity at all — and therefore that a
+    /// re-submission could ever be confirmed. A pane running `cat` or a bare
+    /// shell never produces one, so a caller can use it to decide whether
+    /// retrying would be recovery or just re-typing the prompt into the void.
+    Elapsed { hooked: bool },
+}
+
+/// Issue #424: block up to `window` for the agent in `pane_id` to report having
+/// SUBMITTED `expected` — the confirmation that turns a spawn-time PTY write
+/// into an actual delivery.
+///
+/// Every supported agent maps "a user prompt was submitted" onto an event
+/// carrying `user_prompt` (Claude/Codex `UserPromptSubmit`, OpenCode
+/// `session.prompt`), so the event TYPE is deliberately not part of the match —
+/// the presence of the reported prompt is the evidence, and gating on
+/// `EventType::Thinking` would silently exclude any future agent that reports a
+/// submission under a different type.
+///
+/// Matching mirrors [`wait_for_session_start`]: `pane_id` AND `agent_id`, so a
+/// late event from a superseded generation, or a successor that inherited the
+/// pane id, cannot confirm this delivery. An event carrying NO `agent_id` (a
+/// pre-F9 hook script, a wrapper that scrubbed the env) is admitted on the pane
+/// alone, matching the deliberately-permissive "both sides absent" branch the
+/// reuse guard in [`AppState::apply_event`] applies for the same reason.
+///
+/// The prompt comparison goes through
+/// [`crate::prompt_delivery::prompt_submission_matches`], never `==`: the hook
+/// layer truncates `user_prompt`, so a long seed is reported back in truncated
+/// form and exact equality would never match it.
+///
+/// The caller must have SUBSCRIBED before the write, which the spawn path
+/// already does (it subscribes before spawning, to gate on `SessionStart`).
+/// `Lagged` keeps polling — a dropped message may or may not have been the
+/// confirmation, and the caller's own deadline covers "we missed it".
+pub(crate) async fn wait_for_prompt_submission(
+    rx: &mut broadcast::Receiver<BroadcastMsg>,
+    pane_id: &str,
+    agent_id: &str,
+    expected: &str,
+    window: std::time::Duration,
+) -> PromptWatch {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut hooked = false;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            return PromptWatch::Elapsed { hooked };
+        };
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(BroadcastMsg::Event(event))) => {
+                if event.pane_id.as_deref() != Some(pane_id) {
+                    continue;
+                }
+                // Hook-capability proof is strict about identity: it requires
+                // this agent's OWN id. The daemon publishes a SYNTHETIC
+                // `SessionStart` per spawned pane to surface its card
+                // (`spawn::surface_spawned_pane`), and that one carries
+                // `agent_id: None` — counting it would "prove" that a `cat`
+                // pane reports its activity, which is exactly backwards.
+                if event.agent_id.as_deref() == Some(agent_id) {
+                    hooked = true;
+                }
+                let agent_matches = event
+                    .agent_id
+                    .as_deref()
+                    .is_none_or(|reported| reported == agent_id);
+                if agent_matches
+                    && event.user_prompt.as_deref().is_some_and(|reported| {
+                        crate::prompt_delivery::prompt_submission_matches(expected, reported)
+                    })
+                {
+                    return PromptWatch::Confirmed;
+                }
+            }
+            Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
+                return PromptWatch::Elapsed { hooked };
+            }
+            Err(_) => return PromptWatch::Elapsed { hooked },
+        }
+    }
+}
+
 /// Resolve what a delegated worker is actually told to act on: the one-line
 /// pointer to its `.dot-agent-deck/worker-task-<role>.md`, or the task body
 /// INLINED when no such file could be written.
