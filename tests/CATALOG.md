@@ -941,25 +941,39 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** how confirmation is correlated internally or the daemon's PTY behavior; only the consumer's observable delivery state contract.
 - **Platform coverage:** mac+linux+windows.
 
-##### prompt/pane-input/024 — Seed-prompt writes remain provisional until the matching submission is observed.
+##### prompt/pane-input/024 — Seed delivery distinguishes confirmable panes, unconfirmable panes, and swallowed-CR duplicate submissions.
 - **Layer:** L1 (in-process `process_pending_seed_prompts` consumer with a controllable `PaneController` and hook-derived state snapshot).
 - **Agent:** none.
-- **Asserts:** both `Applied` and `Queued` retain seed text, delivery identity, and retry backoff until the target pane reports the matching submitted prompt, which clears every piece of provisional state without another write.
+- **Asserts:** `Applied`/`Queued` reporting panes remain provisional until matching submission; one Pi status event and a pane with no identity each write exactly once without arming retries; short and >200-byte doubled submissions stop before a third write; repetition is bounded to 16 copies and is not a wildcard.
 - **Does not assert:** orchestration-role status (covered by `prompt/pane-input/023`) or whether the seed came from dispatch versus a configured mode.
 - **Platform coverage:** mac+linux+windows.
 
-##### prompt/pane-input/025 — An applied but unconfirmed automatic prompt retries under bounded backoff and still reaches its deadline.
+##### prompt/pane-input/025 — Unconfirmed prompts retry to deadline, including a producer identified only after the readiness fallback.
 - **Layer:** L1 (clock-controlled orchestrator prompt consumer and controllable `PaneController`).
 - **Agent:** none.
-- **Asserts:** an `Applied` write with no matching submission stays pending, retries only after its armed backoff, never marks the role Working, and is abandoned without a final write after `AUTOMATIC_PROMPT_DEADLINE`, clearing delivery state and surfacing the existing timed-out/abandoned status.
+- **Asserts:** an `Applied` write with no matching submission stays pending, retries only after its armed backoff, never marks the role Working, and is abandoned without a final write after `AUTOMATIC_PROMPT_DEADLINE`; an unidentified fallback write stays provisional without retyping and arms a real retry when a late reporting `SessionStart` arrives.
 - **Does not assert:** wall-clock scheduling in the render loop or exact tracing-log wording.
 - **Platform coverage:** mac+linux+windows.
 
-##### prompt/pane-input/026 — Only a matching prompt submission from the target pane confirms provisional delivery.
+##### prompt/pane-input/026 — Only fresh matching prompt evidence carrying the target identity confirms provisional delivery.
 - **Layer:** L1 (in-process seed-prompt consumer with two pane identities and synthetic hook-derived snapshots).
 - **Agent:** none.
-- **Asserts:** the exact pending text submitted from another pane and unrelated human text submitted in the target pane both leave delivery identity and retry armed; only matching pane plus matching prompt finalizes the seed.
+- **Asserts:** matching text with no agent id, matching text from another pane, unrelated target-pane text, and matching text already present before the write all leave delivery identity and retry armed; only fresh matching pane/text/identity evidence finalizes the seed.
 - **Does not assert:** a particular reconciliation key or algorithm beyond rejecting these observable false matches.
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/pane-input/027 — Attempt-ID rotation crosses a caching delivery ledger without weakening same-attempt idempotency.
+- **Layer:** L1 (in-process seed consumer backed by a faithful per-delivery-id caching controller).
+- **Agent:** none.
+- **Asserts:** a lost response retries the same `#a1` id and replays cached `Applied` without a second physical write; the later unconfirmed retry rotates to `#a2`, reaches the writer physically, and a returned `Ambiguous` terminally clears all delivery state with no further attempt.
+- **Does not assert:** daemon socket framing or the registry's ledger implementation internals; the controller reproduces its observable caching contract.
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/pane-input/028 — A provisional retry never reaches a replacement agent or a same-agent conversation ended by clear.
+- **Layer:** L1 (in-process seed consumer with an identity-guarding, rebindable `PaneController` and hook-derived generation state).
+- **Agent:** none.
+- **Asserts:** after the first write, a different registry agent appearing on the pane gets zero bytes and terminally disarms the old delivery; a `SessionEnd` for the bound generation likewise prevents any same-agent retry and clears provisional state.
+- **Does not assert:** the detached scheduler/dispatch confirmation task or a real agent's `/clear` command; it pins the same observable identity/generation contract at the TUI controller seam.
 - **Platform coverage:** mac+linux+windows.
 
 #### prompt/quit
@@ -3619,15 +3633,22 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### scheduler/dispatch/014 — Concurrent single-agent dispatch seeds survive a deterministic boot-window swallow and are confirmed after retry.
 - **Layer:** L2 synthetic PTY-attached (real deck and daemon, three real dispatch worktrees, scripted Claude-shaped stand-ins that post hooks through the real CLI; no LLM).
 - **Agent:** synthetic hook-emitting stand-in that posts `SessionStart`, delays its input reader, consumes the first submitted line without a hook, then emits `UserPromptSubmit` only for a later line.
-- **Asserts:** three concurrent `dispatch --single` panes each record the swallowed first write, receive a retry, durably expose the exact submitted prompt through daemon session state, and produce info-level delivery logs carrying a delivery ID plus written/unconfirmed/confirmed state.
+- **Asserts:** three concurrent `dispatch --single` panes each record the swallowed first write, receive a retry, durably expose the exact submitted prompt through daemon session state, and produce written/unconfirmed/confirmed delivery logs for each of three distinct delivery IDs.
 - **Does not assert:** the retry's internal matching strategy, exact log sentence, or real-agent boot behavior (covered by `scheduler/dispatch/015`).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/015 — Three concurrent real interactive Claude dispatches each genuinely submit their seed prompt. [reel]
+##### scheduler/dispatch/015 — Three concurrent real interactive Claude dispatches each genuinely submit their seed prompt.
 - **Layer:** L2 REAL PTY-attached (real deck and daemon, three sibling dispatch worktrees, imported isolated credentials, and project trust pre-seeded for every predicted worktree). A bootstrap launcher mirrors the field report's nested `devbox` startup seam: it announces `SessionStart`, consumes and records exactly one early PTY submission while the real agent is not yet running, then `exec`s Claude.
 - **Agent:** REAL interactive Claude Code ×3 pinned to `claude-haiku-4-5-20251001` with `--allowedTools Bash` and no `-p`, reached through the deterministic one-write-swallowing bootstrap launcher; runtime-skipped when the CLI or credentials are absent and flaky-tolerant in the pre-PR tier.
 - **Asserts:** all three bootstrap launchers record their distinct first seed as swallowed, then each real Claude pane's durable native `UserPromptSubmit` state exactly carries the retried sentinel-bearing seed, so neither an unexercised startup window nor a healthy Idle pane with only PTY echo can pass.
 - **Does not assert:** exact model response phrasing, ordering between the three agents, or a fixed boot duration.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/016 — Detached prompt retries stop before pane replacement or a same-agent clear.
+- **Layer:** L1 (in-process detached spawn confirmation task with real registry-owned shell PTYs and synthetic hook events).
+- **Agent:** none (real `/bin/sh` PTYs are byte-observation targets, not agent stand-ins).
+- **Asserts:** replacing the registry agent during the confirmation backoff terminates the old watch and leaves the successor with zero stale prompt bytes; `SessionEnd` for the bound generation likewise terminates before a retry reaches the same-agent cleared conversation.
+- **Does not assert:** TUI-owned automatic seed/orchestrator delivery (covered by `prompt/pane-input/028`) or finer same-agent generation tracking without `SessionEnd` (provisional behavior intentionally not pinned).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/pi

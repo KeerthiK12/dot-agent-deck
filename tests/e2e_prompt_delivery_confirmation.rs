@@ -10,6 +10,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output};
 use std::time::Duration;
+use std::{collections::BTreeSet, collections::HashMap};
 
 use common::TuiDeck;
 use spec::spec;
@@ -153,6 +154,36 @@ fn delivery_diagnostics(deck: &TuiDeck, cases: &[(&str, &str)]) -> String {
     out
 }
 
+fn delivery_log_states(log: &str) -> HashMap<String, BTreeSet<&'static str>> {
+    let mut states: HashMap<String, BTreeSet<&'static str>> = HashMap::new();
+    for line in log.lines() {
+        let state = if line.contains("prompt written to pane; provisional") {
+            "written"
+        } else if line.contains("prompt delivery unconfirmed; re-submitting") {
+            "unconfirmed"
+        } else if line.contains("prompt delivery confirmed by the agent") {
+            "confirmed"
+        } else {
+            continue;
+        };
+        let Some(after_marker) = line.split_once("delivery_id=").map(|(_, after)| after) else {
+            continue;
+        };
+        let delivery_id = if let Some(quoted) = after_marker.strip_prefix('"') {
+            quoted.split_once('"').map(|(id, _)| id)
+        } else {
+            after_marker.split_whitespace().next()
+        };
+        if let Some(delivery_id) = delivery_id {
+            states
+                .entry(delivery_id.trim_end_matches(',').to_string())
+                .or_default()
+                .insert(state);
+        }
+    }
+    states
+}
+
 fn write_swallowing_agent(workdir: &Path) -> PathBuf {
     let path = workdir.join("swallow-first-seed-agent.sh");
     let bin = shell_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
@@ -185,7 +216,7 @@ fn write_default_command_config(command: &str) -> tempfile::TempDir {
     dir
 }
 
-/// Scenario: Launch an attached deck whose single-agent command posts SessionStart, delays its input reader, and deliberately swallows the first submitted line, then issue three dispatch --single calls concurrently. Every pane must receive a backoff retry, emit a matching UserPromptSubmit hook for that retry, retain a durable confirmation, and produce info-level written/unconfirmed/confirmed delivery logs.
+/// Scenario: Launch an attached deck whose single-agent command posts SessionStart, delays its input reader, and deliberately swallows the first submitted line, then issue three dispatch --single calls concurrently. Every pane must receive a backoff retry, emit a matching UserPromptSubmit hook for that retry, retain a durable confirmation, and produce written/unconfirmed/confirmed logs under its own distinct delivery id.
 #[spec("scheduler/dispatch/014")]
 #[test]
 fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
@@ -230,15 +261,16 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
             && attempts.contains(&format!("confirmed|{prompt}"))
     });
     let log = std::fs::read_to_string(deck.workdir().join(log_name)).unwrap_or_default();
-    let lower_log = log.to_ascii_lowercase();
-    let logged = lower_log.contains("prompt")
-        && lower_log.contains("delivery_id")
-        && lower_log.contains("unconfirmed")
-        && lower_log.contains("confirmed");
+    let states_by_delivery = delivery_log_states(&log);
+    let required_states = BTreeSet::from(["written", "unconfirmed", "confirmed"]);
+    let logged = states_by_delivery.len() == cases.len()
+        && states_by_delivery
+            .values()
+            .all(|states| states == &required_states);
 
     assert!(
         confirmed && retried && logged,
-        "all concurrently booting panes must retry a swallowed first PTY write until UserPromptSubmit confirms the seed, and log written/unconfirmed/confirmed delivery state. confirmed={confirmed}, retried={retried}, logged={logged}{}\nlog tail:\n{}",
+        "all concurrently booting panes must retry a swallowed first PTY write until UserPromptSubmit confirms the seed, and each distinct delivery id must log written/unconfirmed/confirmed state. confirmed={confirmed}, retried={retried}, logged={logged}, states_by_delivery={states_by_delivery:?}{}\nlog tail:\n{}",
         delivery_diagnostics(&deck, &cases),
         log.lines()
             .rev()

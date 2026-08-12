@@ -1682,6 +1682,143 @@ async fn deliver_on_idle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
+
+    fn prompt_watch_event(
+        pane_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        event_type: EventType,
+    ) -> AgentEvent {
+        AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// Scenario: Hold a detached spawn prompt in its confirmation backoff, replace the registry agent owning the pane, and separately emit SessionEnd for the bound same-agent generation. The replacement and cleared conversation must each receive zero retry bytes, and both confirmation tasks must terminate.
+    #[spec("scheduler/dispatch/016")]
+    #[tokio::test]
+    async fn dispatch_016_detached_retry_stops_before_replacement_or_clear() {
+        const PROMPT: &str = "DETACHED-STALE-PROMPT-MARKER";
+        const PANE_ID: &str = "detached-retry-rebind";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let original_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn original delivery target");
+        let (event_tx, event_rx) = broadcast::channel(8);
+        let confirmation = tokio::spawn(confirm_prompt_delivery(
+            registry.clone(),
+            event_rx,
+            ConfirmationTask {
+                pane_id: PANE_ID.to_string(),
+                agent_id: original_id.clone(),
+                prompt: PROMPT.to_string(),
+                delivery_id: "replacement-guard-test".into(),
+                generation: Some(("original-generation".into(), Utc::now())),
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+
+        // The first confirmation window is the deterministic blocked retry.
+        // Rebind while it is waiting, before the 500ms retry is resolved.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        registry
+            .close_agent(&original_id)
+            .expect("close original target");
+        let replacement_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn replacement on reused pane id");
+        tokio::time::timeout(Duration::from_secs(2), confirmation)
+            .await
+            .expect("replacement must terminate confirmation task")
+            .expect("confirmation task must not panic");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let replacement_output = registry
+            .snapshot(&replacement_id)
+            .expect("replacement snapshot");
+        assert!(
+            !replacement_output
+                .windows(PROMPT.len())
+                .any(|window| window == PROMPT.as_bytes()),
+            "a detached retry must send zero stale prompt bytes to a replacement agent; output={:?}",
+            String::from_utf8_lossy(&replacement_output)
+        );
+        drop(event_tx);
+        registry.shutdown_all();
+
+        const CLEAR_PANE_ID: &str = "detached-retry-clear";
+        let clear_registry = Arc::new(AgentPtyRegistry::new());
+        let clear_agent_id = clear_registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    CLEAR_PANE_ID.to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn same-agent clear target");
+        let (clear_tx, clear_rx) = broadcast::channel(8);
+        let clear_confirmation = tokio::spawn(confirm_prompt_delivery(
+            clear_registry.clone(),
+            clear_rx,
+            ConfirmationTask {
+                pane_id: CLEAR_PANE_ID.to_string(),
+                agent_id: clear_agent_id.clone(),
+                prompt: PROMPT.to_string(),
+                delivery_id: "clear-generation-test".into(),
+                generation: Some(("bound-before-clear".into(), Utc::now())),
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+        clear_tx
+            .send(BroadcastMsg::Event(prompt_watch_event(
+                CLEAR_PANE_ID,
+                &clear_agent_id,
+                "bound-before-clear",
+                EventType::SessionEnd,
+            )))
+            .expect("send bound SessionEnd");
+        tokio::time::timeout(Duration::from_secs(1), clear_confirmation)
+            .await
+            .expect("SessionEnd must terminate confirmation task")
+            .expect("clear confirmation task must not panic");
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        let clear_output = clear_registry
+            .snapshot(&clear_agent_id)
+            .expect("same-agent snapshot");
+        assert!(
+            !clear_output
+                .windows(PROMPT.len())
+                .any(|window| window == PROMPT.as_bytes()),
+            "SessionEnd for the bound generation must stop before retry bytes reach the cleared conversation"
+        );
+        clear_registry.shutdown_all();
+    }
 
     fn parse_config(toml: &str) -> ProjectConfig {
         toml::from_str(toml).expect("parse project config")
