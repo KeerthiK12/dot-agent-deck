@@ -1617,6 +1617,33 @@ struct PromptDelivery {
     ///   permanently unbound meant every retry told the daemon "any generation
     ///   will do" for exactly the population this issue exists to repair.
     expected_session_id: Option<String>,
+    /// Issue #424 F2 (auditor HIGH): the pane generation this delivery has SEEN
+    /// while it was written but still unbound — a witness, not a binding.
+    ///
+    /// D1 named the conversation a retry is about to enter, which closed the
+    /// case where the late generation is still current when the retry runs. It
+    /// did not close the counter-sequence: attempt 1 writes while the pane has
+    /// no generation, a genuine `SessionStart(R)` arrives WHILE THE RETRY IS
+    /// BACKED OFF (so the every-frame bind refuses — a write already exists),
+    /// `R` then ends before the retry is due, and by then
+    /// [`delivery_target_changed`] is comparing against `None` and answers
+    /// "unchanged" because nothing was ever bound. The retry either adopts `R`'s
+    /// successor and sends the old task into it, or goes out with no generation
+    /// guard at all.
+    ///
+    /// The daemon-side latch observes `R` and its end sequentially and
+    /// terminates on the second ([`crate::state::latch_generation`]); the TUI
+    /// samples a snapshot per frame and would otherwise forget the transition
+    /// happened. This field is what makes it remember: once a generation has
+    /// been seen after our bytes, its disappearance or replacement is a lost
+    /// target exactly as a bound one's would be.
+    ///
+    /// Deliberately NOT a binding: it is not sent on the wire, does not rotate
+    /// the epoch, and does not claim a conversation the bytes never entered —
+    /// see [`bind_delivery_generation`] for why binding every frame is the thing
+    /// that laundered a `/clear` into an authorization, and `prompt/pane-input/026`
+    /// for the drifting-session-id pane it would abandon.
+    observed_generation: Option<String>,
     delivery_id: String,
     /// Issue #424 (reviewer blocker 2): which WIRE-IDENTITY epoch this delivery
     /// is on.
@@ -3165,6 +3192,7 @@ fn process_pending_seed_prompts(
                     // conversation.
                     expected_agent_id: pane.pane_agent_id(&sp.pane_id),
                     expected_session_id: snapshot.pane_hook_session_id(&sp.pane_id),
+                    observed_generation: None,
                     // PRD #20 finding #3: globally-unique id (process nonce +
                     // global counter), not a per-process `seed-<pane>-N`.
                     delivery_id: mint_delivery_id(&sp.pane_id),
@@ -3372,6 +3400,7 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
         PromptDelivery {
             expected_agent_id,
             expected_session_id: None,
+            observed_generation: None,
             // PRD #20 finding #3: globally-unique id (process nonce + global
             // counter) so a TUI restart can't collide with the daemon's still-live
             // dedup ledger.
@@ -3537,13 +3566,24 @@ enum SubmissionEvidence {
 /// fix belongs at `pane_hook_session`, which should not treat a non-announcing
 /// frame from a second producer as a generation.
 fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &PromptDelivery) -> bool {
-    let Some(bound) = delivery.expected_session_id.as_deref() else {
+    if delivery.attempts == 0 {
+        return false;
+    }
+    // Issue #424 F2: an unbound delivery is not automatically unchanged. If a
+    // generation was SEEN after our bytes and is now gone or replaced, the
+    // conversation those bytes could have entered is over — the same transition
+    // the daemon's latch consumes sequentially, retained across frames here.
+    // See [`PromptDelivery::observed_generation`].
+    let reference = delivery
+        .expected_session_id
+        .as_deref()
+        .or(delivery.observed_generation.as_deref());
+    let Some(reference) = reference else {
         return false;
     };
-    delivery.attempts > 0
-        && snapshot
-            .pane_hook_session_id(pane_id)
-            .is_none_or(|current| current != bound)
+    snapshot
+        .pane_hook_session_id(pane_id)
+        .is_none_or(|current| current != reference)
 }
 
 /// Issue #424: bind the parts of a delivery's identity that are only knowable
@@ -3592,6 +3632,26 @@ fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, 
         && let Some(current) = snapshot.pane_hook_session_id(pane_id)
     {
         adopt_generation(delivery, current);
+    }
+    // Issue #424 F2: a generation that appears after our write cannot be bound —
+    // we never addressed it — but it must not be forgotten either. Witnessed
+    // here, on the same every-frame pass, so its later end/replacement reaches
+    // [`delivery_target_changed`] instead of vanishing between two snapshots.
+    // First witness only: what matters is the transition away from the
+    // conversation that existed while our bytes sat there.
+    //
+    // ANNOUNCED generations only, which is the same discriminator
+    // [`crate::state::latch_generation`] applies and the reason this is not the
+    // every-frame bind in disguise: `AppState::pane_hook_session` advances on
+    // any frame carrying a pane id, so a pane whose ordinary events drift
+    // through session ids (`prompt/pane-input/026`) would otherwise acquire a
+    // witness it never announced and abandon a delivery nothing endangered.
+    if delivery.expected_session_id.is_none()
+        && delivery.attempts > 0
+        && delivery.observed_generation.is_none()
+        && let Some(announced) = pane_announced_generation(snapshot, pane_id)
+    {
+        delivery.observed_generation = Some(announced);
     }
     if !delivery.can_report_prompts {
         delivery.can_report_prompts = pane_confirmation_capability(
@@ -3804,6 +3864,41 @@ fn evidence_channel_is_unidentified(
         }
     }
     saw_post_write_evidence
+}
+
+/// Issue #424 F2: the pane's current hook generation, but only when this pane
+/// has actually ANNOUNCED it — a genuine (non-launcher-origin) `SessionStart`
+/// naming it sits in the pane's own journal.
+///
+/// The discriminator is [`crate::state::latch_generation`]'s, for its reasons: a
+/// `SessionStart` is self-describing and authoritative, and anything else is
+/// inference. `AppState::pane_hook_session` deliberately advances on ANY frame
+/// carrying a pane id — good for the send guard, useless as evidence that a
+/// conversation began — so reading it raw would make a pane whose ordinary
+/// events drift through session ids look like a rolling series of
+/// conversations. That pane is `prompt/pane-input/026`, and it is also the #532
+/// wrapped-agent alternation.
+///
+/// Matched by TIMESTAMP rather than by session id, because the two are not the
+/// same string by the time they reach here: `AppState::apply_event`'s reuse
+/// guard remaps a same-agent `SessionStart` onto the existing card's id for UI
+/// continuity, while the generation map deliberately records the ORIGINAL,
+/// pre-remap id. Asking whether the pane's newest genuine `SessionStart` is what
+/// ESTABLISHED the current generation compares the two facts that survive that
+/// remap.
+fn pane_announced_generation(snapshot: &AppState, pane_id: &str) -> Option<String> {
+    let (current, established_at) = snapshot.pane_hook_session_entry(pane_id)?;
+    let announced_at = snapshot
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+        .flat_map(|session| session.recent_events.iter())
+        .filter(|event| {
+            event.event_type == EventType::SessionStart && !event.is_wrapper_fork_session_start()
+        })
+        .map(|event| event.timestamp)
+        .max()?;
+    (announced_at >= established_at).then_some(current)
 }
 
 /// Issue #424 (reviewer finding B2/#3): the ordering watermark for `pane_id` —
@@ -31152,6 +31247,7 @@ mod tests {
         let delivery = || PromptDelivery {
             expected_agent_id: Some("epoch-agent".into()),
             expected_session_id: None,
+            observed_generation: None,
             delivery_id: "delivery-7".into(),
             attempts: 0,
             watermark: None,
@@ -31256,6 +31352,7 @@ mod tests {
         let mut delivery = PromptDelivery {
             expected_agent_id: Some("legacy-hook-agent".into()),
             expected_session_id: None,
+            observed_generation: None,
             delivery_id: "legacy-1".into(),
             attempts: 1,
             watermark: pane_event_watermark(&snapshot, PANE_ID),

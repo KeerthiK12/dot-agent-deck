@@ -1912,6 +1912,26 @@ pub struct AgentPtyRegistry {
     /// so a scheduled delivery never resets its own debounce clock. In-memory,
     /// monotonically growing by `pane_id_env` seen (negligible).
     user_input_at: Mutex<HashMap<String, Instant>>,
+    /// Issue #424 F1: the last time THIS daemon put bytes into a pane through a
+    /// guarded send, keyed by `pane_id_env`. Paired with [`Self::user_input_at`]
+    /// it answers the one question a submit-only probe has to ask before it
+    /// fires — "is what the target is holding still OUR payload, or has the user
+    /// typed since?" — and it is a clock the daemon owns rather than one a
+    /// producer can assert. See [`Self::user_typed_since_automatic_write`].
+    automatic_write_at: Mutex<HashMap<String, Instant>>,
+    /// Issue #424 F4: agents whose pane declared BOOT PROVENANCE before their
+    /// spawn-time prompt was written — a `wrapper_fork`-origin `SessionStart`
+    /// that the readiness gate skipped
+    /// ([`crate::state::SessionStartWait::launcher_handoff`]).
+    ///
+    /// Lives here because the fact is discovered in `crate::spawn::deliver`,
+    /// before the write, and needed by the detached confirmation loop, after it
+    /// — two functions that share nothing but this registry. Keyed by AGENT id,
+    /// not pane id: pane ids are reused across spawns, and a previous
+    /// occupant's launcher declaration must not grant standing to the next
+    /// delivery. Grows by agents spawned in one daemon's lifetime, like
+    /// [`Self::user_input_at`] (negligible: one short string each).
+    launcher_handoff_agents: Mutex<HashSet<String>>,
     /// PRD #20 R20-004 (finding #3): atomic, fingerprint-bound idempotency ledger
     /// for guarded write-and-submit. Keyed by the caller's stable `delivery_id`;
     /// each record binds the id to a fingerprint of the target agent identity,
@@ -2263,6 +2283,8 @@ impl AgentPtyRegistry {
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             user_input_at: Mutex::new(HashMap::new()),
+            automatic_write_at: Mutex::new(HashMap::new()),
+            launcher_handoff_agents: Mutex::new(HashSet::new()),
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
             hook_socket: Mutex::new(None),
             delivery_notice_sink: Mutex::new(None),
@@ -2780,6 +2802,80 @@ impl AgentPtyRegistry {
     /// window to choose deliver-now vs queue.
     pub fn last_user_input_at(&self, pane_id_env: &str) -> Option<Instant> {
         self.user_input_at.lock().unwrap().get(pane_id_env).copied()
+    }
+
+    /// Issue #424 F1: has a USER keystroke reached `pane_id_env` since the last
+    /// time this daemon wrote into it?
+    ///
+    /// This is the question a SUBMIT-ONLY PROBE has to answer, and it is not the
+    /// question any of the existing guards answer. Identity, generation, writer
+    /// serialization and the deadline all establish WHICH PANE the delivery may
+    /// touch; none of them says anything about what the pane's input editor is
+    /// currently holding. Attempts 3 and later write an EMPTY payload plus a
+    /// submit CR ([`crate::prompt_delivery::attempt_writes_payload`]), whose
+    /// entire effect is "submit whatever is in the box". That is exactly right
+    /// while the box still holds the payload we wrote and wrong the moment it
+    /// does not: a user who typed an unrelated prompt, a slash command or a
+    /// half-finished thought after our last write, and deliberately did not
+    /// press Enter, would have it submitted for them — repeatedly, once per
+    /// remaining attempt, in their own pane. That is not an attacker scenario;
+    /// it is an ordinary person typing.
+    ///
+    /// Both clocks are the daemon's own: [`Self::note_user_input`] is fed by the
+    /// attach STREAM_IN path (real keystrokes) and
+    /// [`Self::note_automatic_write`] by the guarded send itself, so nothing a
+    /// producer can assert moves either one. A pane with no recorded user input
+    /// answers `false` and probes normally, which is every headless scheduled
+    /// and dispatch pane.
+    pub fn user_typed_since_automatic_write(&self, pane_id_env: &str) -> bool {
+        let Some(typed) = self.last_user_input_at(pane_id_env) else {
+            return false;
+        };
+        match self
+            .automatic_write_at
+            .lock()
+            .unwrap()
+            .get(pane_id_env)
+            .copied()
+        {
+            Some(written) => typed > written,
+            // Nothing of ours is in that pane, so a blind CR can only submit
+            // whatever the user put there.
+            None => true,
+        }
+    }
+
+    /// Issue #424 F4: record that `agent_id`'s pane declared, before its prompt
+    /// was written, that a real agent is starting behind a launcher. See
+    /// [`Self::launcher_handoff_agents`] and
+    /// [`crate::state::SessionStartWait::launcher_handoff`].
+    pub fn note_launcher_handoff(&self, agent_id: &str) {
+        self.launcher_handoff_agents
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string());
+    }
+
+    /// Issue #424 F4: whether `agent_id`'s pane made that declaration — the only
+    /// standing on which a producer identifying itself AFTER the write may arm
+    /// this delivery's retries.
+    pub fn agent_declared_launcher_handoff(&self, agent_id: &str) -> bool {
+        self.launcher_handoff_agents
+            .lock()
+            .unwrap()
+            .contains(agent_id)
+    }
+
+    /// Issue #424 F1: record that a guarded send just put bytes into
+    /// `pane_id_env`. See [`Self::user_typed_since_automatic_write`].
+    fn note_automatic_write(&self, pane_id_env: &str) {
+        if pane_id_env.is_empty() || pane_id_env.starts_with('<') {
+            return;
+        }
+        self.automatic_write_at
+            .lock()
+            .unwrap()
+            .insert(pane_id_env.to_string(), Instant::now());
     }
 
     /// PRD #127 M2.2: whether `agent_id` is still a live (non-exited) agent in
@@ -3575,6 +3671,38 @@ impl AgentPtyRegistry {
         if !revalidate().await {
             return Ok(GuardedSend::Stale);
         }
+        // Issue #424 F1 (auditor HIGH): a SUBMIT-ONLY PROBE — an empty payload
+        // whose only effect is the submit CR — must not fire once the user has
+        // typed into this pane since our last write. Every other guard on this
+        // path identifies the PANE; this is the one that asks what the pane's
+        // input editor is holding, which is the question a blind CR actually
+        // depends on. See [`Self::user_typed_since_automatic_write`].
+        //
+        // Enforced HERE, at the single writer all three delivery
+        // implementations funnel through, rather than in each of them: the TUI
+        // paths reach the PTY through the daemon and have no way to consult this
+        // clock themselves, and a per-path check is one refactor away from being
+        // remembered in two places and forgotten in the third.
+        //
+        // Reported as `Stale` — the delivery's premise (the target still holds
+        // our unsubmitted payload) no longer holds — because it is the existing
+        // terminal-refusal vocabulary every caller already classifies, and no
+        // bytes are written either way. `crate::spawn`'s confirmation loop asks
+        // this question itself before probing so it can report the specific
+        // reason on the pane's card instead of stopping silently.
+        if matches!(mode, SubmitMode::Submit)
+            && payload.is_empty()
+            && self.user_typed_since_automatic_write(pane_id)
+        {
+            tracing::debug!(
+                pane_id = %pane_id,
+                agent_id = %target.agent_id,
+                "submit-only probe refused: the user has typed into this pane \
+                 since the last automatic write, so a blind submit would send \
+                 their unsent draft"
+            );
+            return Ok(GuardedSend::Stale);
+        }
         // Authorized — write the payload and the mode's configured terminator,
         // holding the writer across the whole sequence (mirrors
         // `write_to_pane_internal`'s atomic submit contract).
@@ -3608,8 +3736,17 @@ impl AgentPtyRegistry {
             SubmitMode::Notice => deliver_payload_as_notice(&mut **w, &payload).await,
         };
         match delivery {
-            PayloadDelivery::Applied => Ok(GuardedSend::Applied),
-            PayloadDelivery::Ambiguous => Ok(GuardedSend::Ambiguous),
+            // Issue #424 F1: bytes of OURS are now in this pane, which is what
+            // makes a later submit-only probe meaningful. Recorded for the
+            // ambiguous (partial) case too — something of ours landed there.
+            PayloadDelivery::Applied => {
+                self.note_automatic_write(pane_id);
+                Ok(GuardedSend::Applied)
+            }
+            PayloadDelivery::Ambiguous => {
+                self.note_automatic_write(pane_id);
+                Ok(GuardedSend::Ambiguous)
+            }
             PayloadDelivery::CleanFailure(e) => Err(AgentPtyError::Writer(e)),
         }
     }

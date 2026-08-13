@@ -1094,9 +1094,16 @@ async fn ingest_event(
 ///   [`AppState::apply_daemon_report_event`], which snapshots and restores the
 ///   pane's generation entry around the apply. It cannot advance it, cannot roll
 ///   it back, and cannot establish one on a placeholder-only pane.
-/// * **It never mints a card.** With no session on the pane there is nothing to
-///   annotate, so the report stays in the log rather than conjuring a card for
-///   a pane the dashboard is not showing.
+/// * **It addresses the card the CLIENTS have, not only the one the daemon has**
+///   (issue #424 F5). A scheduled/dispatch pane is surfaced to attached TUIs by
+///   `crate::spawn::surface_spawned_pane` through the event broadcast alone, so
+///   the daemon can legitimately hold no `pane_hook_session` and no `sessions`
+///   entry for a pane every attached client is rendering. When neither resolves,
+///   the report is addressed by PANE ID — the `session_id`
+///   `surface_spawned_pane` stamps on that card — instead of being dropped to
+///   the log. It is still never a card for an UNKNOWN pane: the registry
+///   ownership re-check above has already proved the pane is live and belongs to
+///   this delivery's agent.
 /// * **It carries the registry `agent_id`**, so `apply_event`'s reuse guard
 ///   lands it on that agent's existing card instead of creating a sibling.
 ///
@@ -1145,21 +1152,44 @@ fn install_delivery_notice_sink(
                 );
                 return;
             }
-            let session_id = current_generation.or_else(|| {
-                guard
-                    .sessions
-                    .values()
-                    .find(|session| session.pane_id.as_deref() == Some(&notice.pane_id))
-                    .map(|session| session.session_id.clone())
-            });
-            let Some(session_id) = session_id else {
-                tracing::debug!(
-                    pane_id = %notice.pane_id,
-                    delivery_id = %notice.delivery_id,
-                    "delivery notice has no card to land on; log only"
-                );
-                return;
-            };
+            let session_id = current_generation
+                .or_else(|| {
+                    guard
+                        .sessions
+                        .values()
+                        .find(|session| session.pane_id.as_deref() == Some(&notice.pane_id))
+                        .map(|session| session.session_id.clone())
+                })
+                // Issue #424 F5 (reviewer blocker): a fresh hookless scheduled /
+                // dispatch pane has a card in every ATTACHED client and none in
+                // the daemon's own `AppState`, because
+                // `crate::spawn::surface_spawned_pane` publishes it through the
+                // event broadcast ONLY and never applies it locally. Resolving
+                // solely from daemon state therefore took the log-only branch for
+                // exactly the population that fills the 256-task cap — hookless
+                // confirmations hold their slots the full deadline — so the one
+                // delivery that most needed the report was the one that could not
+                // receive it, and under the default no-subscriber logging setup
+                // the visible card stayed clean.
+                //
+                // The card those clients are showing is identified by the PANE
+                // ID: that is the `session_id` `surface_spawned_pane` stamps. So
+                // that is what the report is addressed to. This does not weaken
+                // the "never mint a card for an unknown pane" property it
+                // replaces — the immediately preceding check has already proved
+                // this pane is a live registry pane owned by this exact delivery's
+                // agent — and applying it locally as well keeps the daemon's own
+                // state consistent with what it just told every client, so a
+                // client attaching afterwards sees the failure too.
+                .unwrap_or_else(|| {
+                    tracing::debug!(
+                        pane_id = %notice.pane_id,
+                        delivery_id = %notice.delivery_id,
+                        "delivery notice has no daemon-side card; addressing the \
+                         broadcast-surfaced card by pane id"
+                    );
+                    notice.pane_id.clone()
+                });
             let mut metadata = std::collections::HashMap::new();
             metadata.insert(
                 crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),

@@ -903,11 +903,32 @@ async fn deliver(
     // whether an unconfirmed write could EVER be confirmed. Keying it off
     // readiness meant an honest bootstrap disarmed its own recovery
     // (`scheduler/dispatch/015`).
+    //
+    // Issue #424 F4 (auditor HIGH): both inputs to this answer are taken BEFORE
+    // the write, and that is the point — `observed_producer` is a producer that
+    // was already running when we wrote, and `drained_capability` comes from
+    // frames queued before we wrote. The confirmation loop no longer ADDS to it
+    // from a later event's declared type: provenance and `AgentType` are
+    // producer assertions wherever they appear, so an unmarked start arriving
+    // afterwards would otherwise arm the full replacement payload, and the blind
+    // submit CRs after it, against a pane that may be a shell.
     let can_report_prompts = observed
         .observed_producer
         .as_ref()
         .is_some_and(crate::prompt_delivery::agent_reports_submitted_prompt)
         || drained_capability;
+    // Issue #424 F4: the launcher handoff is STANDING, not capability, so it is
+    // recorded rather than folded into the answer above. Arming here instead
+    // would put the one replacement payload on the retry schedule's clock —
+    // ~500 ms after the write — which for `scheduler/dispatch/015` means typing
+    // it into a launcher that has not exec'd the real agent yet, and every
+    // attempt after that is a submit-only probe with nothing to submit. What the
+    // handoff licenses is accepting the successor WHEN IT ANNOUNCES ITSELF, so
+    // the payload goes in exactly when the agent is there to receive it. See
+    // [`crate::state::SessionStartWait::launcher_handoff`].
+    if observed.launcher_handoff {
+        registry.note_launcher_handoff(agent_id);
+    }
     match event_rx {
         Some(rx) => {
             // Detached on purpose: the caller (a `dispatch` CLI round trip, a
@@ -1137,6 +1158,16 @@ async fn confirm_prompt_delivery(
     } = task;
     let mut attempt: u32 = 1;
     let mut armed = can_report_prompts;
+    // Issue #424 F4: whether a producer identifying itself AFTER the write may
+    // arm this delivery at all. True only when the pane declared a launcher
+    // handoff before we wrote, which is the one shape in which a producer that
+    // appears later is genuinely this delivery's target — the launcher consumed
+    // our bytes and the agent behind it is the authorized successor, the same
+    // single handoff `crate::state::latch_generation` permits for the
+    // generation. Everything else is an unauthenticated claim about a pane our
+    // bytes have already gone into.
+    let accepts_late_producer = registry.agent_declared_launcher_handoff(&agent_id);
+    let mut refused_claim_logged = false;
     loop {
         let remaining = remaining_before(deadline);
         if remaining.is_zero() {
@@ -1192,7 +1223,27 @@ async fn confirm_prompt_delivery(
                 );
                 return;
             }
-            PromptWatch::Elapsed { can_report_prompts } => armed |= can_report_prompts,
+            // Issue #424 F4: a producer that identifies itself only after our
+            // bytes were written has told us what it CLAIMS to be; it has not
+            // told us that our bytes went to it. It arms this delivery only on
+            // the pane's own pre-write launcher declaration — see
+            // `accepts_late_producer` above. Refusals are logged once, so a
+            // delivery that then holds to its deadline is diagnosable rather
+            // than mysterious.
+            PromptWatch::Elapsed { can_report_prompts } => {
+                armed |= can_report_prompts && accepts_late_producer;
+                if can_report_prompts && !armed && !refused_claim_logged {
+                    refused_claim_logged = true;
+                    log_prompt_unconfirmable(
+                        DELIVERY_LOG_PATH,
+                        &pane_id,
+                        &delivery_id,
+                        "a producer claimed a reporting agent only after the prompt was written \
+                         and this pane declared no launcher handoff before it; holding the write \
+                         instead of retyping into a target that may never report",
+                    );
+                }
+            }
             // Reviewer findings B7/B8/B1: every one of these means the evidence
             // or the target is gone. Stop — do not read missing evidence as
             // permission to type the prompt again.
@@ -1250,6 +1301,8 @@ async fn confirm_prompt_delivery(
         // after the stale retry had already landed. A `/clear` (or any
         // end/start pair) that lands in this gap is caught here instead, under
         // the same policy the window itself applies.
+        // Issue #424 F4: the gap drain's capability observation is post-write
+        // too, so it needs the same standing the window's does.
         let mut gap_capability = false;
         if let Some(reason) = drain_pre_write_events(
             &mut rx,
@@ -1261,7 +1314,7 @@ async fn confirm_prompt_delivery(
             log_prompt_stopped(DELIVERY_LOG_PATH, &pane_id, &delivery_id, reason);
             return;
         }
-        armed |= gap_capability;
+        armed |= gap_capability && accepts_late_producer;
         log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
         attempt = attempt.saturating_add(1);
         // Issue #424 D5: after the one bounded replacement payload, later
@@ -1271,6 +1324,35 @@ async fn confirm_prompt_delivery(
         // receives just the delayed submit CR. See
         // [`crate::prompt_delivery::attempt_writes_payload`].
         let writes_payload = crate::prompt_delivery::attempt_writes_payload(attempt);
+        // Issue #424 F1 (auditor HIGH): a probe submits whatever the target is
+        // holding, so it is only meaningful while that is still OUR payload. The
+        // registry refuses it outright once the user has typed since the last
+        // automatic write — that check is the backstop for all three delivery
+        // paths — but this loop asks first so the delivery stops for the reason
+        // it actually stopped for, and REPORTS it on the pane's card. Without
+        // the report this would be exactly the failure #424 is about: a written,
+        // unconfirmed prompt that quietly stops being watched. There is nothing
+        // else to try — retyping the payload into a pane someone is typing in is
+        // strictly worse than stopping — so it is terminal, and the notice tells
+        // the user their pane holds an automatic prompt they never submitted.
+        if !writes_payload && registry.user_typed_since_automatic_write(&pane_id) {
+            log_prompt_stopped(
+                DELIVERY_LOG_PATH,
+                &pane_id,
+                &delivery_id,
+                "user-input-since-write",
+            );
+            registry.publish_delivery_notice(DeliveryNotice {
+                pane_id: pane_id.clone(),
+                agent_id: agent_id.clone(),
+                delivery_id: delivery_id.clone(),
+                session_id: generation.as_ref().map(|(id, _)| id.clone()),
+                detail: "a spawn-time prompt was written into this pane and never confirmed, but \
+                         you have typed into the pane since, so it was NOT submitted for you; \
+                         the prompt may still be sitting unsent in the agent's input box",
+            });
+            return;
+        }
         let payload = if writes_payload { prompt.as_str() } else { "" };
         match guarded_submit(&registry, &pane_id, &agent_id, payload, deadline).await {
             GuardedOutcome::Written if writes_payload => {

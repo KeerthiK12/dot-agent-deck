@@ -1826,14 +1826,37 @@ pub(crate) struct SessionStartWait {
     /// gate on its fork-time start rather than being skipped, so it is still
     /// recorded and still arms.
     pub(crate) observed_producer: Option<AgentType>,
+    /// Issue #424 F4: this pane declared, BEFORE the prompt was written, that
+    /// what we were about to write into is a LAUNCHER with a real agent coming
+    /// behind it — a `SessionStart` carrying
+    /// [`crate::event::WRAPPER_FORK_SESSION_START_ORIGIN`] that the readiness
+    /// gate SKIPPED, whose declared type reports submitted prompts.
+    ///
+    /// This is not capability, and D4's ruling is unchanged: the flag is set
+    /// from an event the gate refused to accept as readiness, and the declared
+    /// type is used only to WITHHOLD the flag (a wrapped Pi still never arms),
+    /// never as proof. What it is, is STANDING — the one situation in which a
+    /// producer that identifies itself only AFTER our bytes can legitimately be
+    /// this delivery's target, because the launcher CONSUMED those bytes and the
+    /// agent behind it is the authorized successor. It is the same single
+    /// handoff [`latch_generation`] already permits for the generation, and the
+    /// only reason the one replacement payload exists at all
+    /// ([`crate::prompt_delivery::attempt_writes_payload`]).
+    ///
+    /// Recorded even when the window then TIMES OUT, which is the whole point:
+    /// `scheduler/dispatch/015`'s bootstrap launcher declares itself, holds the
+    /// gate open until the fallback writes, eats that write, and only then execs
+    /// the real agent.
+    pub(crate) launcher_handoff: bool,
 }
 
 impl SessionStartWait {
-    fn unready() -> Self {
+    fn unready(launcher_handoff: bool) -> Self {
         Self {
             ready: false,
             generation: None,
             observed_producer: None,
+            launcher_handoff,
         }
     }
 }
@@ -1895,9 +1918,13 @@ pub(crate) async fn wait_for_session_start(
     timeout: std::time::Duration,
 ) -> SessionStartWait {
     let deadline = tokio::time::Instant::now() + timeout;
+    // Issue #424 F4: see [`SessionStartWait::launcher_handoff`]. Carried across
+    // every exit from this loop, including the timeout, because the launcher
+    // case is exactly the one that times out.
+    let mut launcher_handoff = false;
     loop {
         let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
-            return SessionStartWait::unready();
+            return SessionStartWait::unready(launcher_handoff);
         };
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(BroadcastMsg::Event(event))) => {
@@ -1906,6 +1933,14 @@ pub(crate) async fn wait_for_session_start(
                     && event.agent_id.as_deref() == Some(agent_id)
                 {
                     if !session_start_means_ready(&event) {
+                        // Issue #424 F4: the skip itself is the declaration —
+                        // this producer says a real agent is starting behind a
+                        // launcher, so a start arriving after our write is the
+                        // ONE authorized successor rather than an unrelated
+                        // claim. The declared type can only withhold it.
+                        launcher_handoff |= crate::prompt_delivery::agent_reports_submitted_prompt(
+                            &event.agent_type,
+                        );
                         tracing::debug!(
                             pane_id,
                             agent_id,
@@ -1928,8 +1963,13 @@ pub(crate) async fn wait_for_session_start(
                         // accumulation. Nothing is lost by declining: the
                         // watcher stays alive unarmed (`!armed { continue; }` in
                         // `crate::spawn::confirm_prompt_delivery`), and the
-                        // first genuine identified native event both binds the
-                        // generation and arms retries.
+                        // first genuine identified native event binds the
+                        // generation. Issue #424 F4: that later event no longer
+                        // arms retries BY ITSELF either — a declared type is a
+                        // producer assertion wherever it appears — which is why
+                        // the skip records `launcher_handoff` above. The standing
+                        // to accept a post-write producer comes from THIS
+                        // declaration, made before the bytes were written.
                         continue;
                     }
                     // Issue #424 (reviewer option 3): a readiness event that
@@ -1944,6 +1984,7 @@ pub(crate) async fn wait_for_session_start(
                         ready: true,
                         generation: genuine.then_some((event.session_id, event.timestamp)),
                         observed_producer: Some(event.agent_type),
+                        launcher_handoff,
                     };
                 }
             }
@@ -1951,7 +1992,7 @@ pub(crate) async fn wait_for_session_start(
             Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
-                return SessionStartWait::unready();
+                return SessionStartWait::unready(launcher_handoff);
             }
         }
     }
@@ -2947,6 +2988,21 @@ impl AppState {
         self.pane_hook_session
             .get(pane_id)
             .map(|(id, _)| id.clone())
+    }
+
+    /// Issue #424 F2: the pane's current hook generation together with the
+    /// timestamp of the event that ESTABLISHED it.
+    ///
+    /// The timestamp is what tells a generation apart from generation-shaped
+    /// drift. This map advances on any frame carrying a pane id — deliberately,
+    /// because the send guard wants the freshest value — so the id alone cannot
+    /// say whether a conversation announced itself or an ordinary event from a
+    /// second producer moved the pointer. `crate::ui`'s unbound-delivery witness
+    /// compares this instant against the pane's newest genuine `SessionStart`
+    /// to answer exactly that, which is the same "only a start announces" rule
+    /// [`latch_generation`] applies daemon-side.
+    pub fn pane_hook_session_entry(&self, pane_id: &str) -> Option<(String, DateTime<Utc>)> {
+        self.pane_hook_session.get(pane_id).cloned()
     }
 
     /// PRD #20 Greptile finding #3: the write-semantics of the newest live
@@ -4043,10 +4099,28 @@ impl AppState {
         // wrapped pane legitimately has two producers under one registry agent,
         // so letting the wrapper's fork-time start win unconditionally would make
         // the #532 alternation worse rather than better.
+        //
+        // Issue #424 F3 (auditor HIGH): that exclusion has to cut BOTH ways. A
+        // launcher-origin start naming a DIFFERENT generation used to fall
+        // through to the ordinary `incoming_ts >= current_ts` rule, and the
+        // timestamp is producer-supplied — so a `wrapper_fork` frame naming the
+        // generation a genuine successor had already replaced, stamped far in the
+        // future, moved `pane_hook_session` BACKWARD onto the superseded id. Both
+        // the TUI's target check and the daemon's guarded-send revalidation read
+        // that same value, so both then authorized a retry into a conversation
+        // that is over while the agent is really in the successor. Boot
+        // provenance is a statement that the real agent has not started yet: it
+        // may ESTABLISH a generation where the pane has none, and refresh the one
+        // it already names, but it is never authority to move a pane that already
+        // has a conversation — in either direction. That also strictly improves
+        // #532: the wrapper's fork-time start can no longer take the generation
+        // off the wrapped agent's native session.
         if let Some(ref pane_id) = event.pane_id {
             let incoming_ts = event.timestamp;
-            let announces_generation = event.event_type == EventType::SessionStart
-                && !event.is_wrapper_fork_session_start();
+            let launcher_origin_start = event.event_type == EventType::SessionStart
+                && event.is_wrapper_fork_session_start();
+            let announces_generation =
+                event.event_type == EventType::SessionStart && !launcher_origin_start;
             let advance = match self.pane_hook_session.get(pane_id) {
                 None => true,
                 Some((current_id, current_ts)) => {
@@ -4054,6 +4128,9 @@ impl AppState {
                         // Same generation: keep the id, bump the established
                         // timestamp so subsequent older events stay rejected.
                         incoming_ts > *current_ts
+                    } else if launcher_origin_start {
+                        // Boot provenance never replaces a live conversation.
+                        false
                     } else {
                         // Different generation: an announcement always wins; any
                         // other frame must not be older.
