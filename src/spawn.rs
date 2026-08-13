@@ -2112,10 +2112,26 @@ mod tests {
         }
     }
 
-    fn spawn_byte_target(registry: &AgentPtyRegistry, pane_id: &str) -> String {
+    fn spawn_shell_target(registry: &AgentPtyRegistry, pane_id: &str) -> String {
+        let command = crate::platform::shell::fixed_command_shell("/bin/sh");
         registry
             .spawn_agent(SpawnOptions {
-                command: Some("/bin/cat"),
+                command: Some(&command),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell observation target")
+    }
+
+    fn spawn_byte_target(registry: &AgentPtyRegistry, pane_id: &str) -> String {
+        #[cfg(unix)]
+        let command = "/bin/cat";
+        #[cfg(windows)]
+        let command = "more.com";
+
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(command),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
                 ..SpawnOptions::default()
             })
@@ -2264,13 +2280,7 @@ mod tests {
         const PANE_ID: &str = "detached-retry-rebind";
 
         let registry = Arc::new(AgentPtyRegistry::new());
-        let original_id = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn original delivery target");
+        let original_id = spawn_shell_target(&registry, PANE_ID);
         let (event_tx, event_rx) = broadcast::channel(8);
         let confirmation = tokio::spawn(confirm_prompt_delivery(
             registry.clone(),
@@ -2292,13 +2302,7 @@ mod tests {
         registry
             .close_agent(&original_id)
             .expect("close original target");
-        let replacement_id = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn replacement on reused pane id");
+        let replacement_id = spawn_shell_target(&registry, PANE_ID);
         tokio::time::timeout(Duration::from_secs(2), confirmation)
             .await
             .expect("replacement must terminate confirmation task")
@@ -2319,16 +2323,7 @@ mod tests {
 
         const CLEAR_PANE_ID: &str = "detached-retry-clear";
         let clear_registry = Arc::new(AgentPtyRegistry::new());
-        let clear_agent_id = clear_registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(
-                    DOT_AGENT_DECK_PANE_ID.to_string(),
-                    CLEAR_PANE_ID.to_string(),
-                )],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn same-agent clear target");
+        let clear_agent_id = spawn_shell_target(&clear_registry, CLEAR_PANE_ID);
         let (clear_tx, clear_rx) = broadcast::channel(8);
         let clear_confirmation = tokio::spawn(confirm_prompt_delivery(
             clear_registry.clone(),
@@ -3181,13 +3176,7 @@ mod tests {
         cancel_all_prompt_confirmations();
         const PANE_ID: &str = "abandon-notice-pane";
         let registry = Arc::new(AgentPtyRegistry::new());
-        let agent_id = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn notice target");
+        let agent_id = spawn_shell_target(&registry, PANE_ID);
         let notices = Arc::new(Mutex::new(Vec::<DeliveryNotice>::new()));
         let recorded = notices.clone();
         registry.set_delivery_notice_sink(Arc::new(move |notice| {
@@ -3218,13 +3207,7 @@ mod tests {
         registry
             .close_agent(&agent_id)
             .expect("close notice target");
-        let replacement = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn replacement");
+        let replacement = spawn_shell_target(&registry, PANE_ID);
         assert_ne!(replacement, agent_id);
         abandon_spawn_prompt(&registry, PANE_ID, &agent_id, "delivery-abandoned", 3, None);
         assert_eq!(

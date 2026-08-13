@@ -3674,11 +3674,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/dispatch/016 — Detached prompt retries stop on terminal targets/evidence and do not arm from an unauthenticated producer claim.
-- **Layer:** L1 (in-process detached spawn confirmation task with real registry-owned shell PTYs and synthetic hook events).
-- **Agent:** none (real `/bin/sh` PTYs are byte-observation targets, not agent stand-ins).
+- **Layer:** L1 (in-process detached spawn confirmation task with real registry-owned platform-native shell/byte-observation PTYs and synthetic hook events).
+- **Agent:** none (the real platform-native PTYs — `/bin/sh` and `/bin/cat` on Unix, `cmd.exe` and `more.com` on Windows — are observation targets, not agent stand-ins).
 - **Asserts:** replacement, a bound `SessionEnd`, broadcast lag, and broadcast closure each terminally stop the watch without stale retry bytes; pane close and daemon shutdown cancel registered watches; a newer same-pane delivery aborts the older single flight before it retries; an unmarked event merely claiming a reporting `AgentType` cannot arm a replacement-payload retry into a hookless byte sink.
 - **Does not assert:** TUI-owned automatic seed/orchestrator delivery (covered by `prompt/pane-input/028`) or finer same-agent generation tracking without `SessionEnd` (provisional behavior intentionally not pinned).
-- **Platform coverage:** mac+linux.
+- **Platform coverage:** mac+linux+windows.
 
 ##### scheduler/dispatch/017 — Cap-exhaustion notices reach a hookless card that exists only in the attached TUI's broadcast state.
 - **Layer:** L1 (in-process production delivery-notice sink, daemon/AppState split, attached-client broadcast consumer, and real registry-owned `/bin/cat` PTY).
@@ -3688,32 +3688,32 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/dispatch/018 — User typing after a detached automatic payload disarms the next retry.
-- **Layer:** L1 (in-process detached spawn confirmation task with a real registry-owned `/bin/cat` byte-observation PTY).
+- **Layer:** L1 (in-process detached spawn confirmation task with a real registry-owned byte-observation PTY: `/bin/cat` on Unix, `more.com` on Windows).
 - **Agent:** none.
 - **Asserts:** attempt 1 is applied and physically reaches the pane before any automatic-write timestamp exists; an unsent user draft after attempt 1 prevents attempt 2 from appending its replacement payload or submitting the draft, and independently a draft after attempt 2 prevents attempt 3's submit-only probe, each proven by an unchanged PTY byte snapshot.
 - **Does not assert:** TUI-owned seed delivery (covered by `prompt/pane-input/032`) or the internal location of the clock comparison.
-- **Platform coverage:** mac+linux.
+- **Platform coverage:** mac+linux+windows.
 
 ##### scheduler/dispatch/019 — Releasing an attached user's pane writer cannot expose unstamped input to an automatic retry.
-- **Layer:** L1 (in-process production registry guard with a real `/bin/cat` byte-observation PTY and a deterministic writer-lock handoff).
+- **Layer:** L1 (in-process production registry guard with a real byte-observation PTY — `/bin/cat` on Unix, `more.com` on Windows — and a deterministic writer-lock handoff).
 - **Agent:** none.
 - **Asserts:** while an attached input writer holds the pane lock, an automatic replacement is queued behind it; the user's unsent draft is physically present before the writer is released; the queued replacement then owns the exact write-to-clock handoff window and must be refused with no snapshot change before the test allows the user-input clock stamp to run.
 - **Does not assert:** socket frame parsing or scheduler timing; the test directly forces the ordering produced inside the attach STREAM_IN handler after a successful write and flush.
-- **Platform coverage:** mac+linux.
+- **Platform coverage:** mac+linux+windows.
 
 ##### scheduler/dispatch/020 — Automatic payload guards distinguish submitted turns from unsent drafts across delivery overlap, guarded writes, paste, and newline controls.
-- **Layer:** L1 (in-process production guarded submits with real `/bin/cat` byte-observation PTYs).
+- **Layer:** L1 (in-process production guarded submits with real byte-observation PTYs: `/bin/cat` on Unix, `more.com` on Windows).
 - **Agent:** none.
 - **Asserts:** after delivery A and a completed user turn, a later delivery B's first attempt carrying the same fixed pointer text is applied and physically writes; user input invalidates delivery A even when a different guarded submit B intervenes; production-shaped bracketed paste, Ctrl+J, and Claude Alt+Enter frames leave drafts unsent and therefore do not let replacements append or submit bytes; a genuine plain Enter drains the completed turn and admits a later automatic payload; and when two active deliveries write the same payload, superseding A after B's write does not let B's retry append to or submit a later user draft.
 - **Does not assert:** the internal representation of delivery identity, payload hashes, record lists, paste parsing strategy, or which guard rejects the unsafe writes; every safety assertion compares PTY bytes before and after the attempted retry.
-- **Platform coverage:** mac+linux.
+- **Platform coverage:** mac+linux+windows.
 
 ##### scheduler/dispatch/021 — A detached writer-held user-input refusal is visibly reported.
-- **Layer:** L1 (in-process detached confirmation loop with paused time, a held production pane writer, a real `/bin/cat` byte-observation PTY, and the delivery-notice sink).
+- **Layer:** L1 (in-process detached confirmation loop with paused time, a held production pane writer, a real byte-observation PTY — `/bin/cat` on Unix, `more.com` on Windows — and the delivery-notice sink).
 - **Agent:** none.
 - **Asserts:** paused time deterministically completes the confirmation window while the writer is held, user input is stamped only after the caller's precheck has run and before the writer-held backstop proceeds, and that backstop refusal publishes one durable `DeliveryNotice` instead of becoming a log-only `target went stale` stop.
 - **Does not assert:** the notice sink's daemon-to-TUI rendering (covered by `scheduler/dispatch/017`) or exact log wording.
-- **Platform coverage:** mac+linux.
+- **Platform coverage:** mac+linux+windows.
 
 #### scheduler/pi
 
