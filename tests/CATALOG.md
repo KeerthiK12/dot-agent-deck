@@ -990,10 +990,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** an unauthenticated unmarked producer claim on the TUI path — deliberately not pinned because it is indistinguishable from `prompt/pane-input/025`'s accepted slow-launcher recovery and blocking it would re-open #424 for launchers with no bootstrap event; the detached path is pinned by `scheduler/dispatch/016`. It also does not assert authentication of the delivery-notice metadata key, which grants no privilege.
 - **Platform coverage:** mac+linux+windows.
 
-##### prompt/pane-input/032 — User typing after automatic payload attempts disarms the TUI's submit-only probe.
+##### prompt/pane-input/032 — User typing after a TUI automatic payload disarms the next retry.
 - **Layer:** L1 (in-process seed consumer driving the production registry guard and a real `/bin/cat` byte-observation PTY).
 - **Agent:** none.
-- **Asserts:** after attempts 1 and 2 reach the pane, advancing the registry's user-input clock before attempt 3 results in no additional PTY output, observably proving that no submit CR was sent into the user's unsent editor contents.
+- **Asserts:** attempt 1 physically reaches the pane before any automatic-write timestamp exists; an unsent user draft after attempt 1 prevents attempt 2 from appending its replacement payload or submitting the draft, and independently a draft after attempt 2 prevents attempt 3's submit-only probe, each proven by an unchanged PTY byte snapshot.
 - **Does not assert:** the fix's internal clock-comparison location or the detached spawn watcher (covered by `scheduler/dispatch/018`).
 - **Platform coverage:** mac+linux.
 
@@ -3680,10 +3680,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the cap counter's publication branch itself (the existing `abandonment_reports_state_and_never_writes_into_the_pane` unit test fills all 256 slots and proves that the 257th publishes this notice).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/018 — User typing after the replacement payload disarms the detached submit-only probe.
+##### scheduler/dispatch/018 — User typing after a detached automatic payload disarms the next retry.
 - **Layer:** L1 (in-process detached spawn confirmation task with a real registry-owned `/bin/cat` byte-observation PTY).
 - **Agent:** none.
-- **Asserts:** attempt 2 first reaches the pane, then advancing the registry's user-input clock before attempt 3 produces no additional PTY output, observably proving that no blind submit CR was sent into the user's unsent editor contents.
+- **Asserts:** attempt 1 is applied and physically reaches the pane before any automatic-write timestamp exists; an unsent user draft after attempt 1 prevents attempt 2 from appending its replacement payload or submitting the draft, and independently a draft after attempt 2 prevents attempt 3's submit-only probe, each proven by an unchanged PTY byte snapshot.
 - **Does not assert:** TUI-owned seed delivery (covered by `prompt/pane-input/032`) or the internal location of the clock comparison.
 - **Platform coverage:** mac+linux.
 

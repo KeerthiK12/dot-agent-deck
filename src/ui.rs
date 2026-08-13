@@ -30205,6 +30205,24 @@ mod tests {
                 .snapshot(&self.agent_id)
                 .expect("TUI byte-observation snapshot")
         }
+
+        fn type_user_draft(&self, pane_id: &str, draft: &str) {
+            let handle = self
+                .registry
+                .subscribe(&self.agent_id)
+                .expect("attach TUI byte-observation target");
+            self.runtime.block_on(async {
+                use std::io::Write as _;
+
+                let mut writer = handle.writer.lock().await;
+                writer
+                    .write_all(draft.as_bytes())
+                    .expect("write unsent TUI user draft");
+                writer.flush().expect("flush unsent TUI user draft");
+            });
+            self.registry.note_user_input(pane_id);
+            std::thread::sleep(std::time::Duration::from_millis(75));
+        }
     }
 
     #[cfg(unix)]
@@ -30286,13 +30304,74 @@ mod tests {
         }
     }
 
-    /// Scenario: Let a TUI seed reach its reporting pane twice, record an unrelated user keystroke while the retry is pending, then make the submit-only probe due. No further submit CR may reach the pane, so the user's unsent editor contents remain untouched.
+    /// Scenario: Let a TUI seed reach its reporting pane, type an unsent user draft before the replacement payload is due, and independently type another draft after the replacement but before the submit-only probe. In both timelines the next automatic attempt must send no bytes, so it neither appends its payload nor submits the user's draft.
     #[cfg(unix)]
     #[spec("prompt/pane-input/032")]
     #[test]
     fn pane_input_032_user_input_disarms_submit_only_probe() {
         const PANE_ID: &str = "user-draft-safety-pane";
         const PROMPT: &str = "automatic prompt before the user's draft";
+        const USER_DRAFT: &str = "user draft deliberately left unsent";
+
+        const REPLACEMENT_PANE_ID: &str = "user-draft-before-replacement-pane";
+        const REPLACEMENT_PROMPT: &str = "automatic prompt before replacement guard";
+        const REPLACEMENT_DRAFT: &str = "draft before replacement payload";
+
+        let replacement_controller =
+            Arc::new(RegistryBackedPaneController::new(REPLACEMENT_PANE_ID));
+        let replacement_pane: Arc<dyn PaneController> = replacement_controller.clone();
+        let mut replacement_ui = default_ui();
+        replacement_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt(REPLACEMENT_PANE_ID, REPLACEMENT_PROMPT));
+        let replacement_snapshot =
+            ready_prompt_snapshot(REPLACEMENT_PANE_ID, &replacement_controller.agent_id);
+
+        process_pending_seed_prompts(
+            &mut replacement_ui,
+            &replacement_pane,
+            &replacement_snapshot,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        let after_initial_delivery = replacement_controller.snapshot();
+        assert!(
+            after_initial_delivery
+                .windows(REPLACEMENT_PROMPT.len())
+                .any(|window| window == REPLACEMENT_PROMPT.as_bytes()),
+            "precondition: attempt 1 must reach the TUI pane before any automatic-write timestamp exists; output={:?}",
+            String::from_utf8_lossy(&after_initial_delivery)
+        );
+
+        replacement_controller.type_user_draft(REPLACEMENT_PANE_ID, REPLACEMENT_DRAFT);
+        let before_replacement = replacement_controller.snapshot();
+        assert!(
+            before_replacement
+                .windows(REPLACEMENT_DRAFT.len())
+                .any(|window| window == REPLACEMENT_DRAFT.as_bytes()),
+            "precondition: the unsent user draft must physically reach the TUI PTY; output={:?}",
+            String::from_utf8_lossy(&before_replacement)
+        );
+        replacement_ui
+            .send_retry_backoff
+            .get_mut(REPLACEMENT_PANE_ID)
+            .expect("first write arms replacement payload")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(
+            &mut replacement_ui,
+            &replacement_pane,
+            &replacement_snapshot,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        let after_replacement = replacement_controller.snapshot();
+
+        replacement_controller.registry.shutdown_all();
+        assert_eq!(
+            after_replacement,
+            before_replacement,
+            "TUI attempt 2 must append no replacement payload and send no submit CR after user input; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_replacement),
+            String::from_utf8_lossy(&after_replacement)
+        );
 
         let controller = Arc::new(RegistryBackedPaneController::new(PANE_ID));
         let pane: Arc<dyn PaneController> = controller.clone();
@@ -30309,7 +30388,7 @@ mod tests {
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         std::thread::sleep(std::time::Duration::from_millis(75));
 
-        controller.registry.note_user_input(PANE_ID);
+        controller.type_user_draft(PANE_ID, USER_DRAFT);
         let before_probe = controller.snapshot();
         ui.send_retry_backoff
             .get_mut(PANE_ID)

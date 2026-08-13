@@ -1938,6 +1938,27 @@ mod tests {
             .expect("spawn byte-observation target")
     }
 
+    async fn type_user_draft(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+        pane_id: &str,
+        draft: &str,
+    ) {
+        use std::io::Write as _;
+
+        let handle = registry
+            .subscribe(agent_id)
+            .expect("attach detached byte-observation target");
+        let mut writer = handle.writer.lock().await;
+        writer
+            .write_all(draft.as_bytes())
+            .expect("write unsent detached user draft");
+        writer.flush().expect("flush unsent detached user draft");
+        drop(writer);
+        registry.note_user_input(pane_id);
+        tokio::time::sleep(Duration::from_millis(75)).await;
+    }
+
     /// Issue #424 D2 (both reviewers): a lagged PRE-WRITE / gap drain is
     /// terminal.
     ///
@@ -2332,12 +2353,94 @@ mod tests {
         );
     }
 
-    /// Scenario: Let a detached confirmation perform its one replacement-payload retry, then record a user keystroke on that pane before the submit-only probe is due. The probe must send no CR, preserving the user's choice to leave the new editor contents unsent.
+    /// Scenario: Deliver a detached spawn prompt, type an unsent user draft before the replacement payload is due, and independently type another draft after the replacement but before the submit-only probe. In both timelines the next automatic attempt must send no bytes, so it neither appends its payload nor submits the user's draft.
     #[spec("scheduler/dispatch/018")]
     #[tokio::test]
     async fn dispatch_018_user_input_disarms_detached_submit_probe() {
         const PANE_ID: &str = "detached-user-draft-pane";
         const PROMPT: &str = "AUTOMATIC-PROMPT-BEFORE-USER-DRAFT";
+        const USER_DRAFT: &str = "detached draft deliberately left unsent";
+
+        const REPLACEMENT_PANE_ID: &str = "detached-draft-before-replacement-pane";
+        const REPLACEMENT_PROMPT: &str = "AUTOMATIC-PROMPT-BEFORE-REPLACEMENT-GUARD";
+        const REPLACEMENT_DRAFT: &str = "detached draft before replacement payload";
+
+        let replacement_registry = Arc::new(AgentPtyRegistry::new());
+        let replacement_agent = spawn_byte_target(&replacement_registry, REPLACEMENT_PANE_ID);
+        let initial = replacement_registry
+            .write_and_submit_guarded(
+                REPLACEMENT_PANE_ID,
+                REPLACEMENT_PROMPT,
+                Some(&replacement_agent),
+                || async { true },
+            )
+            .await
+            .expect("attempt 1 guarded delivery");
+        assert_eq!(
+            initial,
+            GuardedSend::Applied,
+            "attempt 1 must never be refused before an automatic write timestamp exists"
+        );
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_initial_delivery = replacement_registry
+            .snapshot(&replacement_agent)
+            .expect("initial detached delivery snapshot");
+        assert!(
+            after_initial_delivery
+                .windows(REPLACEMENT_PROMPT.len())
+                .any(|window| window == REPLACEMENT_PROMPT.as_bytes()),
+            "precondition: attempt 1 must physically reach the detached pane; output={:?}",
+            String::from_utf8_lossy(&after_initial_delivery)
+        );
+
+        type_user_draft(
+            &replacement_registry,
+            &replacement_agent,
+            REPLACEMENT_PANE_ID,
+            REPLACEMENT_DRAFT,
+        )
+        .await;
+        let before_replacement = replacement_registry
+            .snapshot(&replacement_agent)
+            .expect("pre-replacement detached snapshot");
+        assert!(
+            before_replacement
+                .windows(REPLACEMENT_DRAFT.len())
+                .any(|window| window == REPLACEMENT_DRAFT.as_bytes()),
+            "precondition: the unsent user draft must physically reach the detached PTY; output={:?}",
+            String::from_utf8_lossy(&before_replacement)
+        );
+
+        let (replacement_tx, replacement_rx) = broadcast::channel(8);
+        let replacement_confirmation = tokio::spawn(confirm_prompt_delivery(
+            replacement_registry.clone(),
+            replacement_rx,
+            ConfirmationTask {
+                pane_id: REPLACEMENT_PANE_ID.into(),
+                agent_id: replacement_agent.clone(),
+                prompt: REPLACEMENT_PROMPT.into(),
+                delivery_id: "detached-replacement-user-draft-safety".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let after_replacement = replacement_registry
+            .snapshot(&replacement_agent)
+            .expect("post-replacement detached snapshot");
+
+        replacement_confirmation.abort();
+        let _ = replacement_confirmation.await;
+        drop(replacement_tx);
+        replacement_registry.shutdown_all();
+        assert_eq!(
+            after_replacement,
+            before_replacement,
+            "detached attempt 2 must append no replacement payload and send no submit CR after user input; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_replacement),
+            String::from_utf8_lossy(&after_replacement)
+        );
 
         let registry = Arc::new(AgentPtyRegistry::new());
         let agent_id = spawn_byte_target(&registry, PANE_ID);
@@ -2367,7 +2470,7 @@ mod tests {
             "precondition: attempt 2 must have reached the byte target before the user types"
         );
 
-        registry.note_user_input(PANE_ID);
+        type_user_draft(&registry, &agent_id, PANE_ID, USER_DRAFT).await;
         let before_probe = registry
             .snapshot(&agent_id)
             .expect("pre-probe pane snapshot");
