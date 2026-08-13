@@ -3701,10 +3701,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** socket frame parsing or scheduler timing; the test directly forces the ordering produced inside the attach STREAM_IN handler after a successful write and flush.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/020 — Automatic payload guards preserve unsent drafts across delivery overlap, independent guarded writes, and bracketed multiline paste.
+##### scheduler/dispatch/020 — Automatic payload guards distinguish submitted turns from unsent drafts across delivery overlap, guarded writes, paste, and newline controls.
 - **Layer:** L1 (in-process production guarded submits with real `/bin/cat` byte-observation PTYs).
 - **Agent:** none.
-- **Asserts:** after delivery A and a completed user turn, a later delivery B's first attempt carrying the same fixed pointer text is applied and physically writes; user input invalidates delivery A even when a different guarded submit B intervenes; a production-shaped `ESC[200~…\n…ESC[201~` multiline draft does not let a replacement append and submit bytes; and when two active deliveries write the same payload, superseding A after B's write does not let B's retry append to or submit a later user draft.
+- **Asserts:** after delivery A and a completed user turn, a later delivery B's first attempt carrying the same fixed pointer text is applied and physically writes; user input invalidates delivery A even when a different guarded submit B intervenes; production-shaped bracketed paste, Ctrl+J, and Claude Alt+Enter frames leave drafts unsent and therefore do not let replacements append or submit bytes; a genuine plain Enter drains the completed turn and admits a later automatic payload; and when two active deliveries write the same payload, superseding A after B's write does not let B's retry append to or submit a later user draft.
 - **Does not assert:** the internal representation of delivery identity, payload hashes, record lists, paste parsing strategy, or which guard rejects the unsafe writes; every safety assertion compares PTY bytes before and after the attempted retry.
 - **Platform coverage:** mac+linux.
 

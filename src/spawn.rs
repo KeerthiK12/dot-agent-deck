@@ -2085,6 +2085,7 @@ async fn deliver_on_idle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use spec::spec;
 
     fn prompt_watch_event(
@@ -2121,11 +2122,11 @@ mod tests {
             .expect("spawn byte-observation target")
     }
 
-    async fn type_user_draft(
+    async fn type_user_bytes(
         registry: &AgentPtyRegistry,
         agent_id: &str,
         pane_id: &str,
-        draft: &str,
+        bytes: &[u8],
     ) {
         use std::io::Write as _;
 
@@ -2134,12 +2135,70 @@ mod tests {
             .expect("attach detached byte-observation target");
         let mut writer = handle.writer.lock().await;
         writer
-            .write_all(draft.as_bytes())
-            .expect("write unsent detached user draft");
-        writer.flush().expect("flush unsent detached user draft");
+            .write_all(bytes)
+            .expect("write detached user input bytes");
+        writer.flush().expect("flush detached user input bytes");
         drop(writer);
         registry.note_user_input(pane_id);
         tokio::time::sleep(Duration::from_millis(75)).await;
+    }
+
+    async fn type_user_draft(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+        pane_id: &str,
+        draft: &str,
+    ) {
+        type_user_bytes(registry, agent_id, pane_id, draft.as_bytes()).await;
+    }
+
+    struct UserFrameRetry {
+        outcome: GuardedSend,
+        before: Vec<u8>,
+        after: Vec<u8>,
+    }
+
+    async fn retry_after_user_frame(
+        pane_id: &str,
+        prompt: &str,
+        draft: &str,
+        frame: &[u8],
+    ) -> UserFrameRetry {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, pane_id);
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(pane_id, prompt, Some(&agent_id), || async { true })
+                .await
+                .expect("delivery before user newline control"),
+            GuardedSend::Applied
+        );
+        type_user_draft(&registry, &agent_id, pane_id, draft).await;
+        type_user_bytes(&registry, &agent_id, pane_id, frame).await;
+        let before = registry
+            .snapshot(&agent_id)
+            .expect("before newline-control retry snapshot");
+        assert!(
+            before
+                .windows(draft.len())
+                .any(|window| window == draft.as_bytes()),
+            "precondition: the unsent draft must physically reach the PTY before the retry; output={:?}",
+            String::from_utf8_lossy(&before)
+        );
+        let outcome = registry
+            .write_and_submit_guarded(pane_id, prompt, Some(&agent_id), || async { true })
+            .await
+            .expect("replacement after user newline control");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after = registry
+            .snapshot(&agent_id)
+            .expect("after newline-control retry snapshot");
+        registry.shutdown_all();
+        UserFrameRetry {
+            outcome,
+            before,
+            after,
+        }
     }
 
     /// Issue #424 D2 (both reviewers): a lagged PRE-WRITE / gap drain is
@@ -2754,7 +2813,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Exercise later, overlapping, and retried automatic deliveries against real byte-observation PTYs, including a bracketed multiline paste and two active same-text owners. Completed work may admit a later first write, but no retry may append to or submit a user's unsent draft after another delivery or paste changes the pane.
+    /// Scenario: Exercise later, overlapping, and retried automatic deliveries against real byte-observation PTYs, including bracketed paste, production-encoded Ctrl+J and Alt+Enter newlines, plain Enter, and two active same-text owners. Completed work and a submitted turn may admit a later write, but non-submitting editor controls must leave an automatic retry unable to append to or submit the user's draft.
     #[spec("scheduler/dispatch/020")]
     #[tokio::test]
     async fn dispatch_020_payload_guards_are_scoped_to_one_delivery() {
@@ -2883,6 +2942,53 @@ mod tests {
             .snapshot(&paste_agent)
             .expect("after bracketed-paste retry snapshot");
 
+        let ctrl_j_frame = crate::ui::keyevent_to_bytes_for_test(&KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL,
+        ))
+        .expect("production Ctrl+J encoding");
+        let ctrl_j_retry = retry_after_user_frame(
+            "ctrl-j-unsent-draft-pane",
+            "automatic payload before Ctrl+J",
+            "draft extended with a Ctrl+J newline",
+            &ctrl_j_frame,
+        )
+        .await;
+
+        let alt_enter_frame = crate::ui::keyevent_to_bytes_for_test(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::ALT,
+        ))
+        .expect("production Alt+Enter encoding");
+        let alt_enter_retry = retry_after_user_frame(
+            "alt-enter-unsent-draft-pane",
+            "automatic payload before Alt+Enter",
+            "Claude draft extended with an Alt+Enter newline",
+            &alt_enter_frame,
+        )
+        .await;
+
+        let plain_enter_frame = crate::ui::keyevent_to_bytes_for_test(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))
+        .expect("production plain Enter encoding");
+        let plain_enter_retry = retry_after_user_frame(
+            "plain-enter-submitted-pane",
+            "automatic payload before plain Enter",
+            "user turn completed with plain Enter",
+            &plain_enter_frame,
+        )
+        .await;
+        assert!(
+            plain_enter_retry.outcome == GuardedSend::Applied
+                && plain_enter_retry.after.len() > plain_enter_retry.before.len(),
+            "positive control: a genuine plain Enter must drain the completed turn and admit the later automatic payload; outcome={:?}, before={:?}, after={:?}",
+            plain_enter_retry.outcome,
+            String::from_utf8_lossy(&plain_enter_retry.before),
+            String::from_utf8_lossy(&plain_enter_retry.after)
+        );
+
         const OVERLAP_PANE: &str = "overlapping-same-payload-pane";
         const OVERLAP_PROMPT: &str = "same payload owned by two active deliveries";
         const OVERLAP_DRAFT: &str = "user draft after delivery A was superseded";
@@ -2961,14 +3067,22 @@ mod tests {
                 && delivery_a_retry == GuardedSend::Stale
                 && after_delivery_a_retry == before_delivery_a_retry
                 && after_paste_retry == before_paste_retry
+                && ctrl_j_retry.after == ctrl_j_retry.before
+                && alt_enter_retry.after == alt_enter_retry.before
                 && after_overlap_retry == before_overlap_retry,
-            "payload safety must be scoped by logical delivery and preserve unsent drafts: later_same_payload={{outcome: {delivery_b:?}, before_len: {}, after_len: {}}}; older_retry_after_different_submit={{outcome: {delivery_a_retry:?}, before_len: {}, after_len: {}}}; bracketed_multiline_paste={{outcome: {paste_retry:?}, before: {:?}, after: {:?}}}; overlapping_same_payload={{outcome: {overlap_retry:?}, before: {:?}, after: {:?}}}",
+            "payload safety must be scoped by logical delivery and preserve unsent drafts: later_same_payload={{outcome: {delivery_b:?}, before_len: {}, after_len: {}}}; older_retry_after_different_submit={{outcome: {delivery_a_retry:?}, before_len: {}, after_len: {}}}; bracketed_multiline_paste={{outcome: {paste_retry:?}, before: {:?}, after: {:?}}}; ctrl_j_newline={{outcome: {:?}, before: {:?}, after: {:?}}}; alt_enter_newline={{outcome: {:?}, before: {:?}, after: {:?}}}; overlapping_same_payload={{outcome: {overlap_retry:?}, before: {:?}, after: {:?}}}",
             before_delivery_b.len(),
             after_delivery_b.len(),
             before_delivery_a_retry.len(),
             after_delivery_a_retry.len(),
             String::from_utf8_lossy(&before_paste_retry),
             String::from_utf8_lossy(&after_paste_retry),
+            ctrl_j_retry.outcome,
+            String::from_utf8_lossy(&ctrl_j_retry.before),
+            String::from_utf8_lossy(&ctrl_j_retry.after),
+            alt_enter_retry.outcome,
+            String::from_utf8_lossy(&alt_enter_retry.before),
+            String::from_utf8_lossy(&alt_enter_retry.after),
             String::from_utf8_lossy(&before_overlap_retry),
             String::from_utf8_lossy(&after_overlap_retry)
         );

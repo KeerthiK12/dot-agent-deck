@@ -5210,6 +5210,11 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn keyevent_to_bytes_for_test(key: &KeyEvent) -> Option<Vec<u8>> {
+    keyevent_to_bytes(key)
+}
+
 /// Compute the row offset between widget-relative coordinates and vt100 screen
 /// coordinates. Must match the viewport calculation in `terminal_widget.rs`.
 fn screen_row_offset(screen: &vt100::Screen, pane_rect: Rect) -> u16 {
