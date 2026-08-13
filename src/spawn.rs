@@ -47,7 +47,7 @@ use chrono::{DateTime, Utc};
 
 use crate::agent_pty::{
     AgentPtyError, AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, DeliveryNotice, GuardedSend,
-    SpawnOptions, TabMembership, command_needs_shell_wrap,
+    GuardedSendDetail, SpawnOptions, TabMembership, command_needs_shell_wrap,
 };
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
 use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
@@ -882,6 +882,22 @@ async fn deliver(
     // dispatch prompt into a replacement.
     match guarded_submit(registry, pane_id, agent_id, prompt, deadline).await {
         GuardedOutcome::Written => {}
+        // Issue #424 H3/H5: the FIRST write of this delivery was refused because
+        // the pane's input box already holds bytes of ours that the user has
+        // typed since. No confirmation task exists yet, so this used to be a
+        // `warn!` into a subscriber that `init_logging_from_env` installs only
+        // when `DOT_AGENT_DECK_LOG` is set — a prompt lost with nothing on the
+        // card to say so, which is the shape of the issue itself. Report it.
+        GuardedOutcome::RefusedUserInput => {
+            report_user_input_stop(
+                registry,
+                pane_id,
+                agent_id,
+                &delivery_id,
+                generation.as_ref(),
+            );
+            return;
+        }
         GuardedOutcome::Refused(reason) => {
             tracing::warn!(
                 pane_id,
@@ -953,12 +969,18 @@ async fn deliver(
         }
         // No event bus at all (a direct caller without one). Nothing can ever
         // report back, so the write is final.
-        None => log_prompt_unconfirmable(
-            DELIVERY_LOG_PATH,
-            pane_id,
-            &delivery_id,
-            "no hook-event bus for this delivery",
-        ),
+        None => {
+            log_prompt_unconfirmable(
+                DELIVERY_LOG_PATH,
+                pane_id,
+                &delivery_id,
+                "no hook-event bus for this delivery",
+            );
+            // Issue #424 H3: final means final — no retry will consult this
+            // delivery's payload record, so release it here rather than leaving
+            // it to refuse a later delivery of the same text until the TTL.
+            registry.note_payload_settled(pane_id, prompt);
+        }
     }
 }
 
@@ -968,13 +990,24 @@ fn remaining_before(deadline: Instant) -> Duration {
 }
 
 /// The outcome of one identity-guarded submission attempt, flattening
-/// [`GuardedSend`] into the three answers this path acts on.
+/// [`GuardedSend`] into the answers this path acts on.
 enum GuardedOutcome {
     /// Bytes reached the exact expected agent.
     Written,
     /// The target refused the write and NOTHING was written — or the write was
     /// partial and must not be repeated. Terminal either way.
     Refused(&'static str),
+    /// Issue #424 H5 (reviewer MEDIUM): refused by the WRITER-HELD backstop
+    /// because the user typed after this loop's own pre-check.
+    ///
+    /// Terminal like any other refusal, but not interchangeable with one: it is
+    /// the only stop this path promises to REPORT on the pane's card, and the
+    /// promise used to be broken exactly in the race the backstop exists for.
+    /// The caller checks the user-input clock before every attempt precisely so
+    /// it can report; a keystroke landing between that check and the guarded
+    /// acquisition came back as a bare `Stale`, was logged as "target went
+    /// stale", and published nothing. See [`GuardedSendDetail`].
+    RefusedUserInput,
     /// Transport error before/around the write.
     Failed(AgentPtyError),
 }
@@ -1016,17 +1049,25 @@ async fn guarded_submit(
     deadline: Instant,
 ) -> GuardedOutcome {
     let closing = Arc::clone(registry);
-    let send = registry.write_and_submit_guarded(pane_id, prompt, Some(agent_id), || async move {
-        !closing.is_pane_closing(pane_id)
-    });
+    // Issue #424 H5: the DETAILED form, because this is the path that owes the
+    // user a terminal report and cannot produce one from a flattened `Stale`.
+    let send = registry.write_and_submit_guarded_detailed(
+        pane_id,
+        prompt,
+        Some(agent_id),
+        || async move { !closing.is_pane_closing(pane_id) },
+    );
     match tokio::time::timeout(remaining_before(deadline), send).await {
         Err(_) => GuardedOutcome::Refused("deadline elapsed while writing"),
         Ok(Err(e)) => GuardedOutcome::Failed(e),
-        Ok(Ok(GuardedSend::Applied)) => GuardedOutcome::Written,
-        Ok(Ok(GuardedSend::WrongSession)) => GuardedOutcome::Refused("agent-replaced"),
-        Ok(Ok(GuardedSend::Stale)) => GuardedOutcome::Refused("target went stale"),
-        Ok(Ok(GuardedSend::NoLiveTarget)) => GuardedOutcome::Refused("no live target"),
-        Ok(Ok(GuardedSend::Ambiguous)) => GuardedOutcome::Refused("ambiguous partial write"),
+        Ok(Ok(GuardedSendDetail::RefusedUserInput)) => GuardedOutcome::RefusedUserInput,
+        Ok(Ok(GuardedSendDetail::Outcome(outcome))) => match outcome {
+            GuardedSend::Applied => GuardedOutcome::Written,
+            GuardedSend::WrongSession => GuardedOutcome::Refused("agent-replaced"),
+            GuardedSend::Stale => GuardedOutcome::Refused("target went stale"),
+            GuardedSend::NoLiveTarget => GuardedOutcome::Refused("no live target"),
+            GuardedSend::Ambiguous => GuardedOutcome::Refused("ambiguous partial write"),
+        },
     }
 }
 
@@ -1156,6 +1197,20 @@ async fn confirm_prompt_delivery(
         can_report_prompts,
         deadline,
     } = task;
+    // Issue #424 H3 (both reviewers): this delivery OWNS the payload record its
+    // first write left on the pane, and owns releasing it. However this task
+    // ends — confirmed, accumulated, abandoned, target changed, lagged, closed,
+    // refused, deadline — the record goes with it, so a later scheduled fire or
+    // delegate hand-off carrying the SAME fixed text is a first write rather
+    // than a repeat of a finished delivery's. That wrong refusal is #424 itself:
+    // it lands before any byte is written, on a path whose only reaction is a
+    // `warn!`. Released by `Drop` rather than at each of the eight exits,
+    // because the one that gets forgotten is the one that reintroduces it.
+    let _payload_record = PayloadRecordRelease {
+        registry: &registry,
+        pane_id: &pane_id,
+        prompt: &prompt,
+    };
     let mut attempt: u32 = 1;
     let mut armed = can_report_prompts;
     // Issue #424 F4: whether a producer identifying itself AFTER the write may
@@ -1350,22 +1405,13 @@ async fn confirm_prompt_delivery(
             registry.user_typed_since_automatic_write(&pane_id)
         };
         if would_send_user_draft {
-            log_prompt_stopped(
-                DELIVERY_LOG_PATH,
+            report_user_input_stop(
+                &registry,
                 &pane_id,
+                &agent_id,
                 &delivery_id,
-                "user-input-since-write",
+                generation.as_ref(),
             );
-            registry.publish_delivery_notice(DeliveryNotice {
-                pane_id: pane_id.clone(),
-                agent_id: agent_id.clone(),
-                delivery_id: delivery_id.clone(),
-                session_id: generation.as_ref().map(|(id, _)| id.clone()),
-                detail: "a spawn-time prompt was written into this pane and never confirmed, but \
-                         you have typed into the pane since, so it was neither written again nor \
-                         submitted for you; the prompt may still be sitting unsent in the agent's \
-                         input box, above whatever you typed",
-            });
             return;
         }
         let payload = if writes_payload { prompt.as_str() } else { "" };
@@ -1379,6 +1425,20 @@ async fn confirm_prompt_delivery(
                 &delivery_id,
                 attempt,
             ),
+            // Issue #424 H5: the user typed between the pre-check above and the
+            // writer-held backstop. Same terminal outcome, same report — the
+            // race the pre-check cannot cover is exactly the one the backstop
+            // covers, and it must not be the one that reports nothing.
+            GuardedOutcome::RefusedUserInput => {
+                report_user_input_stop(
+                    &registry,
+                    &pane_id,
+                    &agent_id,
+                    &delivery_id,
+                    generation.as_ref(),
+                );
+                return;
+            }
             // The pane is gone (closed, exited, rebound) or the write must not
             // be repeated — stop rather than burn the deadline retrying.
             GuardedOutcome::Refused(reason) => {
@@ -1396,6 +1456,61 @@ async fn confirm_prompt_delivery(
             }
         }
     }
+}
+
+/// Issue #424 H3: releases one delivery's payload record when its confirmation
+/// task ends, whichever of the many ways it ends. See the guard's construction
+/// in [`confirm_prompt_delivery`].
+///
+/// Concurrency note: two deliveries writing the SAME bytes into one pane at the
+/// same time share one record, so the first to finish releases it for both. That
+/// direction fails OPEN — it can admit a repeat, never refuse a first write —
+/// which is deliberately the right way round for a guard whose closed-side
+/// failure is the silent prompt loss #424 reports.
+struct PayloadRecordRelease<'a> {
+    registry: &'a Arc<AgentPtyRegistry>,
+    pane_id: &'a str,
+    prompt: &'a str,
+}
+
+impl Drop for PayloadRecordRelease<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .note_payload_settled(self.pane_id, self.prompt);
+    }
+}
+
+/// Issue #424 F1/H5: stop this delivery because the pane's input box is no
+/// longer ours to submit, and REPORT it on the pane's card.
+///
+/// Reached from three places that are the same stop seen at different instants:
+/// the confirmation loop's own pre-check, the writer-held backstop's refusal a
+/// few microseconds later, and the first detached write. One function so they
+/// cannot drift into reporting differently — the backstop's silence was the
+/// whole of the finding.
+fn report_user_input_stop(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    agent_id: &str,
+    delivery_id: &str,
+    generation: Option<&(String, DateTime<Utc>)>,
+) {
+    log_prompt_stopped(
+        DELIVERY_LOG_PATH,
+        pane_id,
+        delivery_id,
+        "user-input-since-write",
+    );
+    registry.publish_delivery_notice(DeliveryNotice {
+        pane_id: pane_id.to_string(),
+        agent_id: agent_id.to_string(),
+        delivery_id: delivery_id.to_string(),
+        session_id: generation.map(|(id, _)| id.clone()),
+        detail: "a spawn-time prompt was written into this pane and never confirmed, but \
+                 you have typed into the pane since, so it was neither written again nor \
+                 submitted for you; the prompt may still be sitting unsent in the agent's \
+                 input box, above whatever you typed",
+    });
 }
 
 /// Issue #424 §4 / reviewer finding on diagnosability: abandon an unconfirmed

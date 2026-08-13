@@ -524,6 +524,34 @@ pub struct AppState {
     /// can neither restore a stale id nor clear a newer one, and a delayed
     /// prior-generation `SessionEnd` cannot wipe the current generation.
     pane_hook_session: HashMap<String, (String, DateTime<Utc>)>,
+    /// Issue #424 F2 / H4 (auditor HIGH): how many times each pane's established
+    /// hook generation has been CLOSED — ended, or superseded by a different one.
+    ///
+    /// [`Self::pane_hook_session`] answers "which conversation is this pane in
+    /// NOW", which is all the daemon's send guard needs because it consumes
+    /// every event in order. The TUI does not: it samples a snapshot once per
+    /// render pass, and `apply_event` REMOVES the ended session and its history
+    /// on `SessionEnd`, so a generation that both starts and ends between two
+    /// passes leaves the snapshot indistinguishable from one where it never
+    /// existed. An unbound delivery written before the burst then finds no
+    /// witness to compare against, adopts the successor, and types the revoked
+    /// task into it — the exact sequence the per-frame witness on
+    /// `PromptDelivery::observed_generation` could not see, because production
+    /// offers no guarantee of a render pass while the short-lived generation is
+    /// alive.
+    ///
+    /// A COUNTER rather than a retained id because what has to survive is the
+    /// *transition*, not the identity: "a conversation this delivery could have
+    /// been writing into has ended since we wrote" is the whole question, and a
+    /// count answers it across any number of unobserved rollovers. Establishing
+    /// a generation where the pane had none is NOT a closure — that is the
+    /// launcher case at the centre of #424, where the first genuine
+    /// `SessionStart` after our write is the conversation we are still trying to
+    /// reach, not evidence that we missed one.
+    ///
+    /// Monotonic per pane, `u64`, in memory only; it grows by one per real
+    /// conversation rollover, which no daemon lifetime can exhaust.
+    pane_generation_closures: HashMap<String, u64>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -2921,14 +2949,29 @@ impl AppState {
         let before = pane_id
             .as_ref()
             .and_then(|pane| self.pane_hook_session.get(pane).cloned());
+        // Issue #424 H4: the closure COUNT is the same fact seen over time, so it
+        // is restored for the same reason the entry is. A report that bumped it
+        // would read to an in-flight TUI delivery as "a conversation ended while
+        // you were writing" and abandon a delivery nothing endangered.
+        let closures_before = pane_id
+            .as_ref()
+            .and_then(|pane| self.pane_generation_closures.get(pane).copied());
         self.apply_event(event);
         if let Some(pane) = pane_id {
             match before {
                 Some(entry) => {
-                    self.pane_hook_session.insert(pane, entry);
+                    self.pane_hook_session.insert(pane.clone(), entry);
                 }
                 None => {
                     self.pane_hook_session.remove(&pane);
+                }
+            }
+            match closures_before {
+                Some(count) => {
+                    self.pane_generation_closures.insert(pane, count);
+                }
+                None => {
+                    self.pane_generation_closures.remove(&pane);
                 }
             }
         }
@@ -3003,6 +3046,33 @@ impl AppState {
     /// [`latch_generation`] applies daemon-side.
     pub fn pane_hook_session_entry(&self, pane_id: &str) -> Option<(String, DateTime<Utc>)> {
         self.pane_hook_session.get(pane_id).cloned()
+    }
+
+    /// Issue #424 H4: record that `pane_id`'s established generation just closed.
+    /// See [`Self::pane_generation_closures`].
+    fn note_generation_closed(&mut self, pane_id: &str) {
+        let entry = self
+            .pane_generation_closures
+            .entry(pane_id.to_string())
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    /// Issue #424 H4: how many conversations have ended (or been superseded) on
+    /// `pane_id` over this daemon's lifetime.
+    ///
+    /// The value itself is meaningless; only the DIFFERENCE between two readings
+    /// matters. `crate::ui` samples it immediately before a delivery's first
+    /// write and compares on every later frame: any increase means a
+    /// conversation this delivery's bytes could have been sitting in has ended,
+    /// whether or not a render pass ever saw it exist. See
+    /// [`Self::pane_generation_closures`] for why the snapshot alone cannot
+    /// answer that.
+    pub fn pane_generation_closures(&self, pane_id: &str) -> u64 {
+        self.pane_generation_closures
+            .get(pane_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// PRD #20 Greptile finding #3: the write-semantics of the newest live
@@ -4034,6 +4104,12 @@ impl AppState {
                     })
             {
                 self.pane_hook_session.remove(pane_id);
+                // Issue #424 H4: the conversation this pane was in is over. The
+                // session and its journal are removed below, so this counter is
+                // the only thing left to tell a TUI pass that sampled the
+                // snapshot afterwards that there WAS one. See
+                // [`Self::pane_generation_closures`].
+                self.note_generation_closed(pane_id);
             }
             // Preserve started_at for the pane so a restarted session keeps its position.
             //
@@ -4139,6 +4215,32 @@ impl AppState {
                 }
             };
             if advance {
+                // Issue #424 H4: a DIFFERENT conversation ANNOUNCING itself over
+                // this pane closes the one it replaces, exactly as a `SessionEnd`
+                // would — the rollover may simply have skipped the end, or its
+                // end may have been consumed between two render passes.
+                //
+                // Two exclusions, both the discriminator [`latch_generation`] and
+                // `crate::ui`'s witness already apply, for their reasons:
+                //
+                // * only an ANNOUNCEMENT counts. This map advances on any frame
+                //   carrying a pane id, so a pane whose ordinary events drift
+                //   through session ids (`prompt/pane-input/026`, and the #532
+                //   wrapped-agent alternation) would otherwise report a rolling
+                //   series of ended conversations and abandon deliveries nothing
+                //   endangered.
+                // * establishing a generation where the pane had NONE is not a
+                //   closure. That is the launcher case #424 exists for: the first
+                //   genuine announcement after our write is the conversation we
+                //   are still trying to reach, not one we missed.
+                if announces_generation
+                    && self
+                        .pane_hook_session
+                        .get(pane_id)
+                        .is_some_and(|(current, _)| *current != incoming_session_id)
+                {
+                    self.note_generation_closed(pane_id);
+                }
                 self.pane_hook_session
                     .insert(pane_id.clone(), (incoming_session_id.clone(), incoming_ts));
             }

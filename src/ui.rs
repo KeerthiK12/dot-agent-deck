@@ -1644,6 +1644,26 @@ struct PromptDelivery {
     /// that laundered a `/clear` into an authorization, and `prompt/pane-input/026`
     /// for the drifting-session-id pane it would abandon.
     observed_generation: Option<String>,
+    /// Issue #424 H4 (auditor HIGH): the pane's generation-CLOSURE count at the
+    /// instant of the FIRST write. `None` until then — nothing is written, so
+    /// nothing can have been revoked.
+    ///
+    /// [`Self::observed_generation`] is a witness the TUI has to SEE to record,
+    /// and production offers no guarantee of a render pass while a short-lived
+    /// generation exists. `SessionStart(R)`, `SessionEnd(R)` and
+    /// `SessionStart(R2)` can all land between two passes; `AppState::apply_event`
+    /// removes R's session and its journal on the end, so by the next pass there
+    /// is no witness to acquire and no trace that R was ever there. The delivery
+    /// then adopts R2 and types the revoked task into it.
+    ///
+    /// A count read from the snapshot needs no pass to have been taken at the
+    /// right moment: `AppState` maintains it as it consumes the events, in order,
+    /// exactly as the daemon's own latch does — see
+    /// [`crate::state::AppState::pane_generation_closures`]. The witness is kept
+    /// alongside it because the two answer different questions: the witness is
+    /// the identity of a generation this delivery saw, the count is the number of
+    /// conversations it MISSED.
+    closures_at_write: Option<u64>,
     delivery_id: String,
     /// Issue #424 (reviewer blocker 2): which WIRE-IDENTITY epoch this delivery
     /// is on.
@@ -3193,6 +3213,7 @@ fn process_pending_seed_prompts(
                     expected_agent_id: pane.pane_agent_id(&sp.pane_id),
                     expected_session_id: snapshot.pane_hook_session_id(&sp.pane_id),
                     observed_generation: None,
+                    closures_at_write: None,
                     // PRD #20 finding #3: globally-unique id (process nonce +
                     // global counter), not a per-process `seed-<pane>-N`.
                     delivery_id: mint_delivery_id(&sp.pane_id),
@@ -3244,6 +3265,11 @@ fn process_pending_seed_prompts(
             // write, so everything already in the pane's journal is pre-existing
             // history by construction.
             let watermark = pane_event_watermark(snapshot, &sp.pane_id);
+            // Issue #424 H4: and the generation-closure count, for the same
+            // reason and at the same instant — every rollover after this point is
+            // one this delivery's bytes were sitting through. See
+            // [`PromptDelivery::closures_at_write`].
+            let closures = snapshot.pane_generation_closures(&sp.pane_id);
             match pane.write_and_submit_to_pane_with_identity(
                 &sp.pane_id,
                 if writes_payload { &sp.prompt } else { "" },
@@ -3263,6 +3289,9 @@ fn process_pending_seed_prompts(
                     delivery.attempts = attempt;
                     if delivery.watermark.is_none() {
                         delivery.watermark = watermark;
+                    }
+                    if delivery.closures_at_write.is_none() {
+                        delivery.closures_at_write = Some(closures);
                     }
                     if writes_payload {
                         log_prompt_written("seed", &sp.pane_id, &delivery_id, attempt);
@@ -3401,6 +3430,7 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
             expected_agent_id,
             expected_session_id: None,
             observed_generation: None,
+            closures_at_write: None,
             // PRD #20 finding #3: globally-unique id (process nonce + global
             // counter) so a TUI restart can't collide with the daemon's still-live
             // dedup ledger.
@@ -3568,6 +3598,19 @@ enum SubmissionEvidence {
 fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &PromptDelivery) -> bool {
     if delivery.attempts == 0 {
         return false;
+    }
+    // Issue #424 H4 (auditor HIGH): a conversation has ENDED on this pane since
+    // our bytes went in. Checked before anything that compares identities,
+    // because in the sequence this closes there is no identity left to compare:
+    // a whole `SessionStart(R)` / `SessionEnd(R)` / `SessionStart(R2)` burst can
+    // land between two render passes, and `AppState::apply_event` removes R's
+    // session and journal on its end, so the next pass sees only R2 and would
+    // otherwise witness it, adopt it, and send the revoked task into it. See
+    // [`PromptDelivery::closures_at_write`].
+    if let Some(at_write) = delivery.closures_at_write
+        && snapshot.pane_generation_closures(pane_id) > at_write
+    {
+        return true;
     }
     // Issue #424 F2: an unbound delivery is not automatically unchanged. If a
     // generation was SEEN after our bytes and is now gone or replaced, the
@@ -4263,6 +4306,9 @@ fn deliver_orchestrator_prompt(
     // Reviewer finding B2/#3: the watermark, read immediately before the write so
     // everything already in the pane's journal is pre-existing history.
     let watermark = pane_event_watermark(snapshot, &start_pane_id);
+    // Issue #424 H4: and the generation-closure count, at the same instant and
+    // for the same reason. See [`PromptDelivery::closures_at_write`].
+    let closures = snapshot.pane_generation_closures(&start_pane_id);
     match pane.write_and_submit_to_pane_with_identity(
         &start_pane_id,
         &prompt_text,
@@ -4280,6 +4326,9 @@ fn deliver_orchestrator_prompt(
                 delivery.attempts = attempt;
                 if delivery.watermark.is_none() {
                     delivery.watermark = watermark;
+                }
+                if delivery.closures_at_write.is_none() {
+                    delivery.closures_at_write = Some(closures);
                 }
                 delivery.can_report_prompts |= capability == ConfirmationCapability::Reports;
             }
@@ -31403,6 +31452,7 @@ mod tests {
             expected_agent_id: Some("epoch-agent".into()),
             expected_session_id: None,
             observed_generation: None,
+            closures_at_write: None,
             delivery_id: "delivery-7".into(),
             attempts: 0,
             watermark: None,
@@ -31508,6 +31558,7 @@ mod tests {
             expected_agent_id: Some("legacy-hook-agent".into()),
             expected_session_id: None,
             observed_generation: None,
+            closures_at_write: None,
             delivery_id: "legacy-1".into(),
             attempts: 1,
             watermark: pane_event_watermark(&snapshot, PANE_ID),

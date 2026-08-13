@@ -2217,13 +2217,26 @@ async fn handle_attach_stream(
                     break;
                 }
                 let _ = w.flush();
-                drop(w);
                 // PRD #127 M2.2: a STREAM_IN frame is a *user* keystroke —
                 // stamp the pane's deliver-on-idle debounce clock so a
                 // concurrent scheduled reuse fire queues its prompt instead of
                 // interrupting active typing. Keyed by `pane_id_env` (the same
                 // key the reuse path delivers to).
+                //
+                // Issue #424 H1 (both reviewers): stamped BEFORE the writer is
+                // released, and the `write_all` above stamps it too (the pane
+                // writer observes every non-daemon byte — see
+                // `crate::agent_pty::PaneWriter`). This used to drop the writer
+                // first and stamp afterwards, and a guarded automatic sender
+                // queued on that writer acquired it inside the gap, read the
+                // stale clock, and submitted the draft that was already
+                // physically in the input box. Both halves are deliberate: the
+                // writer-level observation is what makes the stamp atomic with
+                // respect to handoff, and this call keeps the frame-level
+                // contract (including the zero-byte frame the auditor noted)
+                // exactly as it was.
                 registry.note_user_input(&pane_id);
+                drop(w);
             }
             Ok(Some((KIND_DETACH, _))) => {
                 // Explicit M2.5 detach: client signalled intent to leave the
