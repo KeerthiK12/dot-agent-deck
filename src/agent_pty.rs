@@ -1976,36 +1976,53 @@ const MAX_PAYLOAD_RECORDS_PER_PANE: usize = 8;
 /// that prefix once and disambiguates on the fifth.
 const PASTE_MARKER_PREFIX: &[u8] = b"\x1b[20";
 
-/// Issue #424 S1 (both reviewers): where one pane's user-input stream is, with
-/// respect to bracketed paste.
+/// Issue #424 S1 (both reviewers): where one pane's user-input stream is, as far
+/// as the submit-drain needs to know.
 ///
-/// The submit-drain has to answer "did the user SUBMIT the input box", and the
-/// only evidence the daemon has is the bytes it forwards. Treating any CR/LF as
-/// a submission gets the real TUI's multi-line paste exactly backwards: it
-/// forwards `ESC[200~…\n…ESC[201~` when the child advertises bracketed paste,
-/// those newlines are EDITOR CONTENT, and an agent TUI in paste mode stores them
-/// without submitting anything. A byte-level drain therefore cleared the payload
-/// records of a box that still held our payload AND the user's fresh draft,
-/// after which the replacement no longer recognized itself as a repeat and
-/// submitted payload + draft + payload as one turn — the precise unsafe outcome
-/// the guard exists to prevent.
+/// The drain has to answer "did the user SUBMIT the input box", and the only
+/// evidence the daemon has is the bytes it forwards. Two separate things make
+/// "scan for a CR or an LF" the wrong answer, and each one produced the same
+/// unsafe outcome: the records of a box that still held our payload AND the
+/// user's fresh draft were cleared, after which the replacement no longer
+/// recognized itself as a repeat and submitted payload + draft + payload as one
+/// turn — the precise outcome the guard exists to prevent.
 ///
-/// The state is carried ACROSS calls because a paste arrives as however many
-/// writes the client happens to make; a marker split across two of them still
-/// matches. Interleaving from two attached clients can leave `in_paste` stuck
-/// true, which suppresses drains — that direction only refuses a later
-/// same-payload delivery (reported, and bounded by [`PAYLOAD_RECORD_TTL`]),
-/// never admits a doubled one.
+/// **Framing.** The real TUI forwards `ESC[200~…\n…ESC[201~` when the child
+/// advertises bracketed paste. Those newlines are EDITOR CONTENT, and an agent
+/// TUI in paste mode stores them without submitting anything. That is what
+/// `matched` / `is_start` / `in_paste` track.
+///
+/// **The keypress behind the byte.** Outside a paste, whether a byte submits is
+/// not this module's call to make: it is fixed by the deck's own forwarding
+/// contract, so it is asked of [`crate::ui::user_byte_submits_input_box`], which
+/// sits next to the encoder that produced the byte. `Ctrl+J` is forwarded as
+/// exactly an LF and `Alt+Enter` as exactly `ESC` `CR`, both of which are
+/// NEWLINE keys the user pressed to keep typing — reading them as submissions is
+/// how a plain draft, with no paste and no attacker anywhere near it, reached
+/// the doubled-submit above.
+///
+/// The state is carried ACROSS calls because a paste — and equally an
+/// `Alt+Enter` — arrives as however many writes the client happens to make; a
+/// marker or a two-byte frame split between two of them still matches.
+/// Interleaving from two attached clients can leave `in_paste` stuck true or
+/// misattribute one client's ESC to another's CR, and both of those suppress
+/// drains — that direction only refuses a later same-payload delivery (reported,
+/// and bounded by [`PAYLOAD_RECORD_TTL`]), never admits a doubled one.
 #[derive(Default)]
-struct BracketedPaste {
+struct UserInputStream {
     /// How many bytes of a paste marker have matched so far.
     matched: usize,
     /// Once the fifth byte disambiguates, whether it is the START marker.
     is_start: bool,
     in_paste: bool,
+    /// The byte before the one being fed, which is all
+    /// [`crate::ui::user_byte_submits_input_box`] needs to tell a plain `Enter`
+    /// from the ESC-prefixed `Alt+Enter`. `None` only at the very start of the
+    /// stream, where no prefix can have been sent.
+    preceding: Option<u8>,
 }
 
-impl BracketedPaste {
+impl UserInputStream {
     /// Feed the user's bytes; `true` if any of them submits the input box.
     ///
     /// Every byte is fed, deliberately: this is a state machine, so a
@@ -2019,8 +2036,12 @@ impl BracketedPaste {
         submitted
     }
 
-    /// Feed one byte; `true` if it is a terminator OUTSIDE a bracketed paste.
+    /// Feed one byte; `true` if it submits, OUTSIDE a bracketed paste.
     fn feed_byte(&mut self, byte: u8) -> bool {
+        // Unconditional, and before the marker matcher's early returns: every
+        // byte is somebody's predecessor, including the ones consumed as part
+        // of a paste marker.
+        let preceding = self.preceding.replace(byte);
         loop {
             if self.matched < PASTE_MARKER_PREFIX.len() {
                 if PASTE_MARKER_PREFIX[self.matched] == byte {
@@ -2045,7 +2066,7 @@ impl BracketedPaste {
             // marker byte repeats its own prefix, so one retry is enough.
             self.matched = 0;
         }
-        !self.in_paste && (byte == b'\r' || byte == b'\n')
+        !self.in_paste && crate::ui::user_byte_submits_input_box(preceding, byte)
     }
 }
 
@@ -2083,10 +2104,10 @@ struct PaneInputState {
     user_input_at: HashMap<String, Instant>,
     /// Issue #424 F1: what THIS daemon's guarded sends put into each pane.
     automatic: HashMap<String, AutomaticWrite>,
-    /// Issue #424 S1: where each pane's user-input stream is with respect to
-    /// bracketed paste, so a newline inside a paste is not read as a submission.
-    /// See [`BracketedPaste`].
-    paste: HashMap<String, BracketedPaste>,
+    /// Issue #424 S1: where each pane's user-input stream is, so that neither a
+    /// newline inside a paste nor a newline KEY is read as a submission. See
+    /// [`UserInputStream`].
+    input: HashMap<String, UserInputStream>,
 }
 
 /// A pane id the clocks deliberately ignore: empty, or one of the
@@ -2117,17 +2138,20 @@ impl PaneInputState {
     /// a byte. The user-input clock still advances, so the blind probe stays
     /// refused: the box the probe wanted to submit is gone either way.
     ///
-    /// Issue #424 S1: "a terminator" is decided by [`BracketedPaste`], not by
-    /// scanning for a raw CR/LF. A multi-line paste carries newlines the agent's
-    /// editor STORES, and reading those as a submission drained the records of a
-    /// box that still held both our payload and the user's draft.
+    /// Issue #424 S1: "a submission" is decided by [`UserInputStream`] — paste
+    /// framing here, the keypress behind the byte in
+    /// [`crate::ui::user_byte_submits_input_box`] — and never by scanning for a
+    /// raw CR/LF. A multi-line paste carries newlines the agent's editor STORES,
+    /// and so do the `Ctrl+J` and `Alt+Enter` the deck deliberately forwards as
+    /// newline keys; reading any of them as a submission drained the records of
+    /// a box that still held both our payload and the user's draft.
     fn note_user_bytes(&mut self, pane_id_env: &str, bytes: &[u8]) {
         if is_sentinel_pane_id(pane_id_env) || bytes.is_empty() {
             return;
         }
         self.note_user_input(pane_id_env);
         let submitted = self
-            .paste
+            .input
             .entry(pane_id_env.to_string())
             .or_default()
             .feed(bytes);
@@ -2200,7 +2224,7 @@ impl PaneInputState {
     /// records could only refuse the newcomer's first delivery.
     fn forget_pane(&mut self, pane_id_env: &str) {
         self.automatic.remove(pane_id_env);
-        self.paste.remove(pane_id_env);
+        self.input.remove(pane_id_env);
     }
 
     fn last_user_input_at(&self, pane_id_env: &str) -> Option<Instant> {
@@ -3339,10 +3363,11 @@ impl AgentPtyRegistry {
     /// living forever, so the same fixed text delivered again later is a first
     /// write, not a repeat. It stops being a repeat when any of these happens:
     ///
-    /// * **the user submits.** A terminator through [`PaneWriter`] drains the
+    /// * **the user submits.** A submission through [`PaneWriter`] drains the
     ///   input box, so nothing of ours is left in it to double
-    ///   ([`PaneInputState::note_user_bytes`] — decided by [`BracketedPaste`],
-    ///   because a newline inside a paste is editor content, not a submission).
+    ///   ([`PaneInputState::note_user_bytes`] — decided by [`UserInputStream`],
+    ///   because a newline inside a paste is editor content, and a newline KEY
+    ///   is the user carrying on typing).
     /// * **the delivery reaches a terminal outcome.** The detached confirmation
     ///   loop releases each write it made when it confirms, abandons or stops,
     ///   and every one-shot caller — the delegate pointer, the idle-worker
@@ -5479,6 +5504,142 @@ mod tests {
 
     // PRD #42 M1: the `pid_to_pgid` boundary-check unit tests moved with the
     // function to `crate::platform::proc` (see `src/platform/proc/unix.rs`).
+
+    /// Issue #424 S1: the submit drain and the key forwarder must agree, and
+    /// this is the seam that makes them.
+    ///
+    /// PRD #227's acceptance matrix is a fact about REAL AGENTS that no unit
+    /// test can re-measure. What it can do is make sure the drain never quietly
+    /// stops honouring it: every row here is driven through the production
+    /// encoder (`ui::keyevent_to_bytes`) rather than a hand-written byte
+    /// literal, so re-encoding any of these keys — the exact change PRD #227
+    /// itself made to `Enter` + SHIFT — fails here instead of silently turning a
+    /// newline key back into a false drain.
+    ///
+    /// Both directions are pinned. Only claiming the newline keys do not submit
+    /// would be satisfied by a drain that never fires at all, which would trade
+    /// this bug for the fail-closed one (an ordinary later delivery of the same
+    /// fixed pointer text refused as a repeat forever), so plain `Enter` and
+    /// `Ctrl+M` are asserted to submit in the same breath.
+    #[test]
+    fn keyevent_submit_classification_matches_prd_227_matrix() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // (key, submits?, why) — the four rows of
+        // `prds/done/227-modifier-aware-pane-key-forwarding.md:36-43`.
+        let matrix = [
+            (
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                true,
+                "plain Enter is `CR`: submit on pi and claude alike",
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+                true,
+                "Ctrl+M is the caret rule's own `CR` — the same byte, the same submit",
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+                false,
+                "Ctrl+J is `LF`: a newline for every supported agent",
+            ),
+            (
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+                false,
+                "Alt+Enter is `ESC CR`: a newline for claude, a submit for pi, so ambiguous",
+            ),
+            (
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+                false,
+                "Shift+Enter is `ESC[13;2u`: the encoding verified as a newline on all four agents",
+            ),
+            (
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                false,
+                "Ctrl+Enter takes the same CSI-u path",
+            ),
+        ];
+
+        for (key, expected, why) in matrix {
+            let frame = crate::ui::keyevent_to_bytes_for_test(&key)
+                .unwrap_or_else(|| panic!("production encoding for {key:?}"));
+            // A fresh stream per row, then the same row again split at every
+            // byte boundary: a client is free to deliver `ESC` and `CR` in two
+            // separate writes, and the classification must not depend on how
+            // the frame was chopped up.
+            for split in 0..=frame.len() {
+                let mut stream = UserInputStream::default();
+                let mut submitted = stream.feed(&frame[..split]);
+                submitted |= stream.feed(&frame[split..]);
+                assert_eq!(
+                    submitted,
+                    expected,
+                    "{why}; frame={:?} split at {split}",
+                    String::from_utf8_lossy(&frame)
+                );
+            }
+        }
+    }
+
+    /// Issue #424 S1: the drain reads a keypress out of a stream, so the bytes
+    /// around it are part of the question.
+    ///
+    /// The rows above are each a lone frame. These are the contexts that decide
+    /// whether the one-byte lookback is enough: a `CR` typed at the end of real
+    /// draft text still submits, the `ESC` that opened a paste marker must not
+    /// leak onto a later `CR`, and a newline key inside bracketed paste is
+    /// content twice over.
+    #[test]
+    fn submit_classification_holds_across_surrounding_stream_bytes() {
+        // (bytes, submits?, why)
+        let cases: [(&[u8], bool, &str); 7] = [
+            (
+                b"draft text\r",
+                true,
+                "the ordinary case: a user finishes a line and presses Enter",
+            ),
+            (
+                b"draft text\x1b\r",
+                false,
+                "Alt+Enter after a draft is still Alt+Enter",
+            ),
+            (
+                b"draft\x1b\rmore\r",
+                true,
+                "an Alt+Enter newline followed by more typing and a real Enter",
+            ),
+            (
+                b"\x1b[200~pasted\rline\x1b[201~",
+                false,
+                "a CR inside bracketed paste is editor content",
+            ),
+            (
+                b"\x1b[200~pasted\x1b[201~\r",
+                true,
+                "the Enter AFTER a paste closes submits, and the marker's own `~` is its predecessor",
+            ),
+            (
+                b"\x1b[13;2u\r",
+                true,
+                "the CSI-u newline ends in `u`, so it cannot mask a following Enter",
+            ),
+            (
+                b"\x1b\x1b\r",
+                false,
+                "an unproducible double ESC resolves the way every ambiguity must: no drain",
+            ),
+        ];
+
+        for (bytes, expected, why) in cases {
+            let mut stream = UserInputStream::default();
+            assert_eq!(
+                stream.feed(bytes),
+                expected,
+                "{why}; bytes={:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
 
     /// Issue #493 at the synchronous seam: an empty registry must answer
     /// `Some(vec![])`, not `None`.

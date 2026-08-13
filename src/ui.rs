@@ -5210,6 +5210,45 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
+/// Issue #424 S1: does this user-input byte SUBMIT the agent's input box, given
+/// the byte that immediately preceded it in the same stream?
+///
+/// This lives beside [`keyevent_to_bytes`] because it is that function read
+/// backwards. The daemon's submit drain
+/// (`PaneInputState::note_user_bytes`) never sees a `KeyEvent` — it sees only
+/// the bytes this encoder produced — so it has to recover which keypress made
+/// them. It used to answer "any CR or LF", which contradicts the encoder
+/// directly above it and the acceptance matrix that shaped it
+/// (`prds/done/227-modifier-aware-pane-key-forwarding.md:36-43`: real agents,
+/// tmux-rendered screens, submit vs. newline distinguished by whether the draft
+/// stayed in one input box):
+///
+/// | frame | what produces it, above | pi | claude |
+/// |---|---|---|---|
+/// | `ESC[13;{m}u` | `Enter` + SHIFT/CONTROL (`:5153`) | newline | newline |
+/// | `LF` | `Ctrl+J`, via [`ctrl_c0_byte`] (`:5109`) | newline | newline |
+/// | `ESC` `CR` | `Enter` + ALT, kept in its historical form on purpose (`:5143`, `:5206`) | submit | **newline** |
+/// | `CR` | plain `Enter` (`:5169`) — and `Ctrl+M`, the same byte by the caret rule | submit | submit |
+///
+/// Exactly one row submits on every supported agent, and it is the only one
+/// this returns `true` for. `ESC` `CR` is the row that matters: it is a genuine
+/// AMBIGUITY rather than an oversight, and it resolves the way every unknown
+/// here has to. A *missed* drain fails CLOSED — a later same-payload delivery is
+/// refused, which is reported and bounded by the record TTL. A *false* drain
+/// fails OPEN — the replacement stops recognizing itself as a repeat and
+/// submits the user's half-typed draft sandwiched between two copies of the
+/// payload. `ESC[13;{m}u` needs no arm at all: it carries neither byte.
+///
+/// `keyevent_submit_classification_matches_prd_227_matrix` (in `agent_pty`)
+/// pins every row against the real encoder and the real stream scanner, so a
+/// change to the forwarding contract cannot silently desynchronize the drain.
+pub(crate) fn user_byte_submits_input_box(preceding: Option<u8>, byte: u8) -> bool {
+    /// The ESC the ALT prefix adds at `:5207`.
+    const ESC: u8 = 0x1b;
+
+    byte == b'\r' && preceding != Some(ESC)
+}
+
 #[cfg(test)]
 pub(crate) fn keyevent_to_bytes_for_test(key: &KeyEvent) -> Option<Vec<u8>> {
     keyevent_to_bytes(key)
