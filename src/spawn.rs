@@ -2701,7 +2701,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Complete one automatic delivery, then start a later same-text delivery after user input; independently, interleave a different automatic submit between user input and an older delivery's replacement. The later first attempt must be admitted, while the invalidated older replacement must be refused.
+    /// Scenario: Exercise later, overlapping, and retried automatic deliveries against real byte-observation PTYs, including a bracketed multiline paste and two active same-text owners. Completed work may admit a later first write, but no retry may append to or submit a user's unsent draft after another delivery or paste changes the pane.
     #[spec("scheduler/dispatch/020")]
     #[tokio::test]
     async fn dispatch_020_payload_guards_are_scoped_to_one_delivery() {
@@ -2790,18 +2790,134 @@ mod tests {
             .snapshot(&replaced_agent)
             .expect("after delivery A retry snapshot");
 
+        const PASTE_PANE: &str = "bracketed-multiline-draft-pane";
+        const PASTE_PROMPT: &str = "automatic payload before bracketed paste";
+        const BRACKETED_DRAFT: &str =
+            "\x1b[200~first line of an unsent draft\nsecond line of an unsent draft\x1b[201~";
+        let paste_registry = Arc::new(AgentPtyRegistry::new());
+        let paste_agent = spawn_byte_target(&paste_registry, PASTE_PANE);
+        assert_eq!(
+            paste_registry
+                .write_and_submit_guarded(PASTE_PANE, PASTE_PROMPT, Some(&paste_agent), || async {
+                    true
+                },)
+                .await
+                .expect("delivery before bracketed paste"),
+            GuardedSend::Applied
+        );
+        type_user_draft(&paste_registry, &paste_agent, PASTE_PANE, BRACKETED_DRAFT).await;
+        let before_paste_retry = paste_registry
+            .snapshot(&paste_agent)
+            .expect("before bracketed-paste retry snapshot");
+        assert!(
+            before_paste_retry
+                .windows(b"first line of an unsent draft".len())
+                .any(|window| window == b"first line of an unsent draft")
+                && before_paste_retry
+                    .windows(b"second line".len())
+                    .any(|window| window == b"second line"),
+            "precondition: the production-shaped bracketed multiline paste must physically reach the PTY; output={:?}",
+            String::from_utf8_lossy(&before_paste_retry)
+        );
+        let paste_retry = paste_registry
+            .write_and_submit_guarded(PASTE_PANE, PASTE_PROMPT, Some(&paste_agent), || async {
+                true
+            })
+            .await
+            .expect("replacement after bracketed paste");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_paste_retry = paste_registry
+            .snapshot(&paste_agent)
+            .expect("after bracketed-paste retry snapshot");
+
+        const OVERLAP_PANE: &str = "overlapping-same-payload-pane";
+        const OVERLAP_PROMPT: &str = "same payload owned by two active deliveries";
+        const OVERLAP_DRAFT: &str = "user draft after delivery A was superseded";
+        let overlap_registry = Arc::new(AgentPtyRegistry::new());
+        let overlap_agent = spawn_byte_target(&overlap_registry, OVERLAP_PANE);
+        assert_eq!(
+            overlap_registry
+                .write_and_submit_guarded(
+                    OVERLAP_PANE,
+                    OVERLAP_PROMPT,
+                    Some(&overlap_agent),
+                    || async { true },
+                )
+                .await
+                .expect("overlapping delivery A first write"),
+            GuardedSend::Applied
+        );
+        let delivery_a_release = PayloadRecordRelease {
+            registry: &overlap_registry,
+            pane_id: OVERLAP_PANE,
+            prompt: OVERLAP_PROMPT,
+        };
+        assert_eq!(
+            overlap_registry
+                .write_and_submit_guarded(
+                    OVERLAP_PANE,
+                    OVERLAP_PROMPT,
+                    Some(&overlap_agent),
+                    || async { true },
+                )
+                .await
+                .expect("overlapping delivery B first write"),
+            GuardedSend::Applied
+        );
+        let delivery_b_release = PayloadRecordRelease {
+            registry: &overlap_registry,
+            pane_id: OVERLAP_PANE,
+            prompt: OVERLAP_PROMPT,
+        };
+        // The production single-flight replacement aborts A after B has
+        // refreshed its same-byte write. Dropping A's real release owner here
+        // forces that ordering without leaving it to task-scheduler timing.
+        drop(delivery_a_release);
+        type_user_draft(
+            &overlap_registry,
+            &overlap_agent,
+            OVERLAP_PANE,
+            OVERLAP_DRAFT,
+        )
+        .await;
+        let before_overlap_retry = overlap_registry
+            .snapshot(&overlap_agent)
+            .expect("before surviving delivery retry snapshot");
+        let overlap_retry = overlap_registry
+            .write_and_submit_guarded(
+                OVERLAP_PANE,
+                OVERLAP_PROMPT,
+                Some(&overlap_agent),
+                || async { true },
+            )
+            .await
+            .expect("surviving delivery B replacement");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_overlap_retry = overlap_registry
+            .snapshot(&overlap_agent)
+            .expect("after surviving delivery retry snapshot");
+        drop(delivery_b_release);
+
         same_registry.shutdown_all();
         replaced_registry.shutdown_all();
+        paste_registry.shutdown_all();
+        overlap_registry.shutdown_all();
         assert!(
             delivery_b == GuardedSend::Applied
                 && after_delivery_b.len() > before_delivery_b.len()
                 && delivery_a_retry == GuardedSend::Stale
-                && after_delivery_a_retry == before_delivery_a_retry,
-            "payload safety must be scoped by logical delivery: later_same_payload={{outcome: {delivery_b:?}, before_len: {}, after_len: {}}}; older_retry_after_different_submit={{outcome: {delivery_a_retry:?}, before_len: {}, after_len: {}}}",
+                && after_delivery_a_retry == before_delivery_a_retry
+                && after_paste_retry == before_paste_retry
+                && after_overlap_retry == before_overlap_retry,
+            "payload safety must be scoped by logical delivery and preserve unsent drafts: later_same_payload={{outcome: {delivery_b:?}, before_len: {}, after_len: {}}}; older_retry_after_different_submit={{outcome: {delivery_a_retry:?}, before_len: {}, after_len: {}}}; bracketed_multiline_paste={{outcome: {paste_retry:?}, before: {:?}, after: {:?}}}; overlapping_same_payload={{outcome: {overlap_retry:?}, before: {:?}, after: {:?}}}",
             before_delivery_b.len(),
             after_delivery_b.len(),
             before_delivery_a_retry.len(),
-            after_delivery_a_retry.len()
+            after_delivery_a_retry.len(),
+            String::from_utf8_lossy(&before_paste_retry),
+            String::from_utf8_lossy(&after_paste_retry),
+            String::from_utf8_lossy(&before_overlap_retry),
+            String::from_utf8_lossy(&after_overlap_retry)
         );
     }
 

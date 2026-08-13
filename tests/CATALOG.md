@@ -976,10 +976,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the detached scheduler/dispatch confirmation task or a real agent's `/clear` command; it pins the same observable identity/generation contract at the TUI controller seam.
 - **Platform coverage:** mac+linux+windows.
 
-##### prompt/pane-input/030 — An unbound launcher delivery may bind a live generation before retry, but cannot follow a generation through its end into a successor.
-- **Layer:** L1 (in-process seed consumer with a payload/identity-recording `PaneController` and hook-derived generation state).
+##### prompt/pane-input/030 — An unbound launcher delivery may bind a live generation before retry, but cannot follow a generation through its end into a successor, even when the first applied write's response was lost.
+- **Layer:** L1 (in-process seed and orchestrator consumers with a payload/identity-recording `PaneController`, a first-response-loss mode, and hook-derived generation state).
 - **Agent:** none.
-- **Asserts:** the first write into a pane with no announced hook session declares no generation; once the real agent's `SessionStart` arrives and remains current, the next retry binds and retains it and a third attempt uses a distinct submit-only probe; separately, both seed and orchestrator TUI write sites send no bytes into a successor when a generation is observed and then ends, or when its complete start/end plus the successor start burst between two render passes.
+- **Asserts:** the first write into a pane with no announced hook session declares no generation; once the real agent's `SessionStart` arrives and remains current, the next retry binds and retains it and a third attempt uses a distinct submit-only probe; separately, both seed and orchestrator TUI write sites send no bytes into a successor when a generation is observed and then ends, when its complete start/end plus the successor start burst between two render passes, or when that burst follows a physically applied first write whose RPC response was lost.
 - **Does not assert:** the daemon-side confirmation task's own latch (covered by `scheduler/dispatch/016`) or the PTY bytes an empty payload produces (covered by the registry's submit path).
 - **Platform coverage:** mac+linux+windows.
 
@@ -2313,6 +2313,13 @@ without depending on the config struct API.
 - **Does not assert:** exact model phrasing, a universal OpenCode startup-time distribution from one host, the deterministic race (covered by `/012`), or work-done delivery.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS; local real-agent tier).
 - **Cost note:** one short GPT-4o-mini worker turn per observation.
+
+##### orchestration/delegate/016 — Work-done completion does not make the next same-pointer delegate disappear after the user types an unsent draft.
+- **Layer:** fast synthetic PTY integration (real `handle_delegate` and `handle_work_done`, managed worker and orchestrator PTYs, and production silence-watch accounting; no socket or LLM).
+- **Agent:** none (`cat` worker stand-in plus a raw no-echo orchestrator observer).
+- **Asserts:** delegation A's fixed `worker-task-coder.md` pointer physically reaches the worker, real work-done handling retires A, an unsent user draft then physically reaches the same pane, and delegation B produces another observable copy of the same pointer; independently, a late completion for an older of two live delegations leaves the newer delivery's no-event notice armed.
+- **Does not assert:** the payload guard's records or refusal reason, exact task-file contents, or which safe mechanism admits B; the outcome is solely that B is physically delivered after A completed.
+- **Platform coverage:** mac+linux.
 
 #### orchestration/identity
 
@@ -3694,11 +3701,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** socket frame parsing or scheduler timing; the test directly forces the ordering produced inside the attach STREAM_IN handler after a successful write and flush.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/020 — Automatic payload guards are scoped to one logical delivery rather than stale pane-global byte history.
+##### scheduler/dispatch/020 — Automatic payload guards preserve unsent drafts across delivery overlap, independent guarded writes, and bracketed multiline paste.
 - **Layer:** L1 (in-process production guarded submits with real `/bin/cat` byte-observation PTYs).
 - **Agent:** none.
-- **Asserts:** after delivery A and a completed user turn, a later delivery B's first attempt carrying the same fixed pointer text is applied and physically writes; independently, user input invalidates delivery A even when a different guarded submit B replaces the pane's last-payload record, so A's replacement is refused with no new bytes.
-- **Does not assert:** the internal representation of delivery identity or accidental digest collisions.
+- **Asserts:** after delivery A and a completed user turn, a later delivery B's first attempt carrying the same fixed pointer text is applied and physically writes; user input invalidates delivery A even when a different guarded submit B intervenes; a production-shaped `ESC[200~…\n…ESC[201~` multiline draft does not let a replacement append and submit bytes; and when two active deliveries write the same payload, superseding A after B's write does not let B's retry append to or submit a later user draft.
+- **Does not assert:** the internal representation of delivery identity, payload hashes, record lists, paste parsing strategy, or which guard rejects the unsafe writes; every safety assertion compares PTY bytes before and after the attempted retry.
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/dispatch/021 — A detached writer-held user-input refusal is visibly reported.

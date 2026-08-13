@@ -30153,6 +30153,16 @@ mod tests {
     #[derive(Default)]
     struct RecordingPaneController {
         writes: Arc<std::sync::Mutex<Vec<RecordedWrite>>>,
+        lose_first_response: bool,
+    }
+
+    impl RecordingPaneController {
+        fn losing_first_response() -> Self {
+            Self {
+                writes: Arc::default(),
+                lose_first_response: true,
+            }
+        }
     }
 
     impl PaneController for RecordingPaneController {
@@ -30198,11 +30208,19 @@ mod tests {
             expected_session_id: Option<&str>,
             delivery_id: Option<&str>,
         ) -> Result<crate::event::SendResult, PaneError> {
-            self.writes.lock().unwrap().push((
+            let mut writes = self.writes.lock().unwrap();
+            writes.push((
                 text.to_string(),
                 expected_session_id.map(str::to_string),
                 delivery_id.map(str::to_string),
             ));
+            let first_write = writes.len() == 1;
+            drop(writes);
+            if self.lose_first_response && first_write {
+                return Err(PaneError::CommandFailed(
+                    "injected lost response after physical write".into(),
+                ));
+            }
             Ok(crate::event::SendResult::Applied)
         }
         fn name(&self) -> &str {
@@ -30457,7 +30475,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Write seed and orchestrator prompts into launcher panes with no hook generation, then let a genuine generation arrive during backoff. A live generation may be bound before retry, but neither an observed end nor a whole start/end/successor burst between render passes may let either TUI path follow the delivery into a successor; a later safe attempt probes submission rather than retyping.
+    /// Scenario: Write seed and orchestrator prompts into launcher panes with no hook generation, including writes whose successful daemon response is lost, then let generations arrive or roll over during backoff. A live generation may be bound before retry, but neither an observed end nor a whole start/end/successor burst may let either TUI path write into a successor; a later safe attempt probes submission rather than retyping.
     #[spec("prompt/pane-input/030")]
     #[test]
     fn pane_input_030_late_generation_binds_before_the_retry_that_enters_it() {
@@ -30820,6 +30838,128 @@ mod tests {
         assert!(
             burst_seed_write_count == 1 && burst_role_write_count == 1,
             "a whole generation that starts and ends between render passes must revoke both unbound TUI deliveries before either can bind its successor; seed_writes={burst_seed_write_count}, orchestrator_writes={burst_role_write_count}"
+        );
+
+        // A transport error is not proof that the daemon did not apply the
+        // write. Force the first request to record a physical write and then
+        // lose its response, so the whole closure burst lands while the TUI's
+        // ordinary success counters still say zero.
+        const LOST_SEED_PANE: &str = "lost-response-seed-generation-burst";
+        const LOST_SEED_AGENT: &str = "lost-response-seed-agent";
+        let lost_seed_controller = Arc::new(RecordingPaneController::losing_first_response());
+        let lost_seed_writes = lost_seed_controller.writes.clone();
+        let lost_seed_pane: Arc<dyn PaneController> = lost_seed_controller;
+        let mut lost_seed_ui = default_ui();
+        lost_seed_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt(LOST_SEED_PANE, PROMPT));
+        let mut lost_seed_snapshot = ready_prompt_snapshot(LOST_SEED_PANE, LOST_SEED_AGENT);
+
+        process_pending_seed_prompts(&mut lost_seed_ui, &lost_seed_pane, &lost_seed_snapshot);
+        apply_generation_event(
+            &mut lost_seed_snapshot,
+            LOST_SEED_PANE,
+            LOST_SEED_AGENT,
+            "lost-seed-generation-entirely-between-passes",
+            EventType::SessionStart,
+        );
+        apply_generation_event(
+            &mut lost_seed_snapshot,
+            LOST_SEED_PANE,
+            LOST_SEED_AGENT,
+            "lost-seed-generation-entirely-between-passes",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut lost_seed_snapshot,
+            LOST_SEED_PANE,
+            LOST_SEED_AGENT,
+            "lost-seed-successor-after-missed-generation",
+            EventType::SessionStart,
+        );
+        lost_seed_ui
+            .send_retry_backoff
+            .get_mut(LOST_SEED_PANE)
+            .expect("lost seed response keeps transport retry state")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut lost_seed_ui, &lost_seed_pane, &lost_seed_snapshot);
+        let lost_seed_records = lost_seed_writes.lock().unwrap().clone();
+
+        const LOST_ROLE_PANE: &str = "lost-response-role-generation-burst";
+        const LOST_ROLE_AGENT: &str = "lost-response-role-agent";
+        let lost_role_controller = Arc::new(RecordingPaneController::losing_first_response());
+        let lost_role_writes = lost_role_controller.writes.clone();
+        let lost_role_pane: Arc<dyn PaneController> = lost_role_controller;
+        let lost_started = std::time::Instant::now();
+        let lost_tab_id: TabId = 30032;
+        let mut lost_role_ui = default_ui();
+        lost_role_ui
+            .orchestration_created_at
+            .insert(lost_tab_id, lost_started);
+        lost_role_ui.orchestration_ready_since.insert(
+            lost_tab_id,
+            lost_started
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut lost_role_snapshot = ready_prompt_snapshot(LOST_ROLE_PANE, LOST_ROLE_AGENT);
+        let lost_role_panes = [LOST_ROLE_PANE.to_string()];
+        let mut lost_role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut lost_role_prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut lost_role_ui,
+            lost_role_pane.as_ref(),
+            &lost_role_snapshot,
+            lost_started,
+            lost_tab_id,
+            &lost_role_panes,
+            0,
+            &mut lost_role_statuses,
+            &mut lost_role_prompt,
+        );
+        apply_generation_event(
+            &mut lost_role_snapshot,
+            LOST_ROLE_PANE,
+            LOST_ROLE_AGENT,
+            "lost-role-generation-entirely-between-passes",
+            EventType::SessionStart,
+        );
+        apply_generation_event(
+            &mut lost_role_snapshot,
+            LOST_ROLE_PANE,
+            LOST_ROLE_AGENT,
+            "lost-role-generation-entirely-between-passes",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut lost_role_snapshot,
+            LOST_ROLE_PANE,
+            LOST_ROLE_AGENT,
+            "lost-role-successor-after-missed-generation",
+            EventType::SessionStart,
+        );
+        lost_role_ui
+            .send_retry_backoff
+            .get_mut(LOST_ROLE_PANE)
+            .expect("lost role response keeps transport retry state")
+            .next_attempt_at = lost_started;
+        deliver_orchestrator_prompt(
+            &mut lost_role_ui,
+            lost_role_pane.as_ref(),
+            &lost_role_snapshot,
+            lost_started + std::time::Duration::from_millis(1),
+            lost_tab_id,
+            &lost_role_panes,
+            0,
+            &mut lost_role_statuses,
+            &mut lost_role_prompt,
+        );
+        let lost_role_records = lost_role_writes.lock().unwrap().clone();
+
+        assert!(
+            lost_seed_records.len() == 1 && lost_role_records.len() == 1,
+            "a physically applied write whose response was lost must retain its pre-RPC closure baseline on both TUI paths and never write the old task into a successor; seed_writes={lost_seed_records:?}, orchestrator_writes={lost_role_records:?}"
         );
     }
 
