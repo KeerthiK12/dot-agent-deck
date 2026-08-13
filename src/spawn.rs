@@ -1335,7 +1335,21 @@ async fn confirm_prompt_delivery(
         // else to try — retyping the payload into a pane someone is typing in is
         // strictly worse than stopping — so it is terminal, and the notice tells
         // the user their pane holds an automatic prompt they never submitted.
-        if !writes_payload && registry.user_typed_since_automatic_write(&pane_id) {
+        //
+        // Issue #424 F1, replacement-payload half: the SAME stop applies to the
+        // one bounded replacement payload (attempt 2). Left unguarded it was the
+        // worse half of the finding — the probe merely submits the user's draft,
+        // whereas the replacement APPENDS our prompt to that draft and submits
+        // the pair as a single turn. The registry asks the byte-keyed question
+        // ("would this repeat what we already put in that box?"); this loop asks
+        // the same one, for the same reason it asks the probe's, so the stop is
+        // reported rather than surfacing as a bare `target went stale`.
+        let would_send_user_draft = if writes_payload {
+            registry.user_typed_since_writing_payload(&pane_id, &prompt)
+        } else {
+            registry.user_typed_since_automatic_write(&pane_id)
+        };
+        if would_send_user_draft {
             log_prompt_stopped(
                 DELIVERY_LOG_PATH,
                 &pane_id,
@@ -1348,8 +1362,9 @@ async fn confirm_prompt_delivery(
                 delivery_id: delivery_id.clone(),
                 session_id: generation.as_ref().map(|(id, _)| id.clone()),
                 detail: "a spawn-time prompt was written into this pane and never confirmed, but \
-                         you have typed into the pane since, so it was NOT submitted for you; \
-                         the prompt may still be sitting unsent in the agent's input box",
+                         you have typed into the pane since, so it was neither written again nor \
+                         submitted for you; the prompt may still be sitting unsent in the agent's \
+                         input box, above whatever you typed",
             });
             return;
         }
