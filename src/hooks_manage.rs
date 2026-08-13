@@ -173,9 +173,16 @@ fn shell_quote_if_needed(path: &str) -> String {
 /// a conservative safe set; otherwise return it unchanged. `~` is NOT special
 /// to `cmd.exe` (unlike POSIX, where it triggers home-directory expansion), so
 /// it is in the safe set here — a real Windows temp path such as
-/// `C:\Users\RUNNER~1\...\dot-agent-deck` needs no quoting at all. `%` and `!`
-/// ARE `cmd.exe`-special (variable expansion) and are deliberately left out of
-/// the safe set, unlike the POSIX helper above.
+/// `C:\Users\RUNNER~1\...\dot-agent-deck` needs no quoting at all.
+///
+/// `%` and `!` are excluded from the safe set, but excluding them does NOT
+/// resolve them — the same species of over-claiming comment corrected as H3
+/// on [`read_settings_lenient`] above. `cmd.exe` expands `%VAR%` even *inside*
+/// double quotes, and `!VAR!` under delayed expansion; wrapping the path in
+/// quotes here changes neither. What quoting actually buys is limited to
+/// spaces and the other characters outside the safe set — a path containing a
+/// literal `%` or `!` is written through with that character unresolved,
+/// quoted or not.
 #[cfg(windows)]
 fn shell_quote_if_needed(path: &str) -> String {
     fn is_safe(b: u8) -> bool {
