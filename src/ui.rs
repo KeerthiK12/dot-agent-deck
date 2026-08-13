@@ -1648,6 +1648,17 @@ struct PromptDelivery {
     /// instant of the FIRST write. `None` until then — nothing is written, so
     /// nothing can have been revoked.
     ///
+    /// Issue #424 S4 (reviewer HIGH): stamped immediately BEFORE the RPC that
+    /// may write, on both TUI paths, and never afterwards. A transport error is
+    /// not proof that the daemon did not apply the write, so a baseline stored
+    /// only in the `Applied`/`Queued` arm was missing from exactly the delivery
+    /// that needed it: `attempts` stayed 0, an entire generation burst passed
+    /// unnoticed, and the eventual success then stored the ALREADY-INCREMENTED
+    /// count as its baseline — laundering the missed closure permanently. It
+    /// therefore doubles as the "a write may have occurred" witness
+    /// [`delivery_target_changed`] gates on, which the attempt counter cannot be
+    /// because a lost response leaves it at zero.
+    ///
     /// [`Self::observed_generation`] is a witness the TUI has to SEE to record,
     /// and production offers no guarantee of a render pass while a short-lived
     /// generation exists. `SessionStart(R)`, `SessionEnd(R)` and
@@ -3270,6 +3281,22 @@ fn process_pending_seed_prompts(
             // one this delivery's bytes were sitting through. See
             // [`PromptDelivery::closures_at_write`].
             let closures = snapshot.pane_generation_closures(&sp.pane_id);
+            // Issue #424 S4 (reviewer HIGH): PERSISTED BEFORE THE RPC, not in
+            // the success arm. A transport error is not proof that the daemon
+            // did not apply the write — the lost-response case the delivery
+            // ledger exists to tolerate — and storing the baseline only on
+            // success left `closures_at_write` at `None` for exactly that write.
+            // A whole `SessionStart`/`SessionEnd`/`SessionStart` burst then
+            // passed unnoticed, the ordinary bind adopted the successor, and the
+            // eventual success stored the already-incremented count, laundering
+            // the missed closure permanently. Being `Some` is also this
+            // delivery's "a write may have occurred" witness — see
+            // [`delivery_target_changed`].
+            if let Some(delivery) = deliveries.get_mut(&sp.pane_id)
+                && delivery.closures_at_write.is_none()
+            {
+                delivery.closures_at_write = Some(closures);
+            }
             match pane.write_and_submit_to_pane_with_identity(
                 &sp.pane_id,
                 if writes_payload { &sp.prompt } else { "" },
@@ -3289,9 +3316,6 @@ fn process_pending_seed_prompts(
                     delivery.attempts = attempt;
                     if delivery.watermark.is_none() {
                         delivery.watermark = watermark;
-                    }
-                    if delivery.closures_at_write.is_none() {
-                        delivery.closures_at_write = Some(closures);
                     }
                     if writes_payload {
                         log_prompt_written("seed", &sp.pane_id, &delivery_id, attempt);
@@ -3596,7 +3620,17 @@ enum SubmissionEvidence {
 /// fix belongs at `pane_hook_session`, which should not treat a non-announcing
 /// frame from a second producer as a generation.
 fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &PromptDelivery) -> bool {
-    if delivery.attempts == 0 {
+    // Issue #424 S4 (reviewer HIGH): "nothing has been written" is
+    // `attempts == 0` AND no baseline, not `attempts == 0` alone. A daemon can
+    // apply a write and lose the response, which leaves `attempts` at 0 with
+    // bytes physically in the pane; gating on the counter alone made this
+    // return `false` for exactly that delivery, so the whole burst below went
+    // unnoticed and the ordinary bind adopted the successor. The baseline is
+    // stamped immediately BEFORE the RPC, so `Some` means "a write may have
+    // occurred" — the witness this check needs — and `None` still means the
+    // untouched delivery it always meant. See
+    // [`PromptDelivery::closures_at_write`].
+    if delivery.attempts == 0 && delivery.closures_at_write.is_none() {
         return false;
     }
     // Issue #424 H4 (auditor HIGH): a conversation has ENDED on this pane since
@@ -4309,6 +4343,15 @@ fn deliver_orchestrator_prompt(
     // Issue #424 H4: and the generation-closure count, at the same instant and
     // for the same reason. See [`PromptDelivery::closures_at_write`].
     let closures = snapshot.pane_generation_closures(&start_pane_id);
+    // Issue #424 S4 (reviewer HIGH): persisted BEFORE the RPC on this path too —
+    // a daemon that applied the write and lost the response leaves `attempts` at
+    // 0, and a baseline stored only on success is a baseline the lost write
+    // never got. See the seed path's twin.
+    if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str())
+        && delivery.closures_at_write.is_none()
+    {
+        delivery.closures_at_write = Some(closures);
+    }
     match pane.write_and_submit_to_pane_with_identity(
         &start_pane_id,
         &prompt_text,
@@ -4326,9 +4369,6 @@ fn deliver_orchestrator_prompt(
                 delivery.attempts = attempt;
                 if delivery.watermark.is_none() {
                     delivery.watermark = watermark;
-                }
-                if delivery.closures_at_write.is_none() {
-                    delivery.closures_at_write = Some(closures);
                 }
                 delivery.can_report_prompts |= capability == ConfirmationCapability::Reports;
             }

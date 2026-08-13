@@ -1197,6 +1197,17 @@ async fn confirm_prompt_delivery(
         can_report_prompts,
         deadline,
     } = task;
+    // Issue #424 S1/S2 (both reviewers): THIS delivery's own clock — the
+    // delivery-scoped half of the user-draft rule, and the only half that needs
+    // no shared bookkeeping at all: *a delivery stops retrying once user input
+    // reaches its pane after its own write.* Nothing is keyed by pane, nothing
+    // is keyed by bytes, nothing has to be released, and no other delivery can
+    // disarm it. Sampled here rather than carried in [`ConfirmationTask`]
+    // because this task is spawned immediately after the first write, so this
+    // instant IS that write plus a scheduling hop; input landing inside that hop
+    // is caught by the byte-keyed record below, whose timestamp is the write
+    // itself. See `would_send_user_draft`.
+    let watch_started_at = Instant::now();
     // Issue #424 H3 (both reviewers): this delivery OWNS the payload record its
     // first write left on the pane, and owns releasing it. However this task
     // ends — confirmed, accumulated, abandoned, target changed, lagged, closed,
@@ -1206,11 +1217,17 @@ async fn confirm_prompt_delivery(
     // it lands before any byte is written, on a path whose only reaction is a
     // `warn!`. Released by `Drop` rather than at each of the eight exits,
     // because the one that gets forgotten is the one that reintroduces it.
-    let _payload_record = PayloadRecordRelease {
+    //
+    // Issue #424 S2: ONE HOLDER PER PAYLOAD WRITE. A record is now per write
+    // rather than per distinct payload, so that a delivery sharing its bytes
+    // with a concurrent one cannot release the other's guard — which means this
+    // delivery must hold (and drop) as many as it wrote. The replacement
+    // payload's holder is pushed below, at the write that creates it.
+    let mut payload_records = vec![PayloadRecordRelease {
         registry: &registry,
         pane_id: &pane_id,
         prompt: &prompt,
-    };
+    }];
     let mut attempt: u32 = 1;
     let mut armed = can_report_prompts;
     // Issue #424 F4: whether a producer identifying itself AFTER the write may
@@ -1399,11 +1416,31 @@ async fn confirm_prompt_delivery(
         // ("would this repeat what we already put in that box?"); this loop asks
         // the same one, for the same reason it asks the probe's, so the stop is
         // reported rather than surfacing as a bare `target went stale`.
-        let would_send_user_draft = if writes_payload {
-            registry.user_typed_since_writing_payload(&pane_id, &prompt)
-        } else {
-            registry.user_typed_since_automatic_write(&pane_id)
-        };
+        //
+        // Issue #424 S1/S2 (both reviewers): the FIRST of the two questions
+        // below is this delivery's OWN — has user input reached this pane since
+        // MY first write — and it is the one that actually decides. It carries
+        // no pane-keyed state, no digest, nothing to release and nothing another
+        // delivery can disarm, so none of the shared-bookkeeping failures the
+        // reviewers found (a paste falsely draining the records, a concurrent
+        // same-byte delivery releasing this one's guard) can reach it. The
+        // registry's byte-keyed question is kept as the SECOND line: it is the
+        // only form of the rule the writer-held backstop can enforce for the two
+        // TUI paths, whose deliveries live in a different process with no way to
+        // hand their own clock across the wire. What this gives up is a retry
+        // after the user submits their own turn — the byte-keyed record can tell
+        // that the box was emptied, a timestamp cannot — and giving it up is the
+        // safe direction: the delivery stops and REPORTS, with the prompt
+        // visible in the box.
+        let user_typed_since_our_own_write = registry
+            .last_user_input_at(&pane_id)
+            .is_some_and(|typed| typed > watch_started_at);
+        let would_send_user_draft = user_typed_since_our_own_write
+            || if writes_payload {
+                registry.user_typed_since_writing_payload(&pane_id, &prompt)
+            } else {
+                registry.user_typed_since_automatic_write(&pane_id)
+            };
         if would_send_user_draft {
             report_user_input_stop(
                 &registry,
@@ -1417,6 +1454,15 @@ async fn confirm_prompt_delivery(
         let payload = if writes_payload { prompt.as_str() } else { "" };
         match guarded_submit(&registry, &pane_id, &agent_id, payload, deadline).await {
             GuardedOutcome::Written if writes_payload => {
+                // Issue #424 S2: the replacement left a SECOND record of these
+                // bytes on the pane. Take a holder for it here, at the write
+                // that created it, so this delivery releases exactly what it
+                // wrote and leaves nothing behind to refuse a later one.
+                payload_records.push(PayloadRecordRelease {
+                    registry: &registry,
+                    pane_id: &pane_id,
+                    prompt: &prompt,
+                });
                 log_prompt_written(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt)
             }
             GuardedOutcome::Written => crate::prompt_delivery::log_prompt_probe_submitted(
@@ -1458,15 +1504,15 @@ async fn confirm_prompt_delivery(
     }
 }
 
-/// Issue #424 H3: releases one delivery's payload record when its confirmation
-/// task ends, whichever of the many ways it ends. See the guard's construction
-/// in [`confirm_prompt_delivery`].
+/// Issue #424 H3: releases ONE payload write's record when its confirmation task
+/// ends, whichever of the many ways it ends. See the holders' construction in
+/// [`confirm_prompt_delivery`].
 ///
-/// Concurrency note: two deliveries writing the SAME bytes into one pane at the
-/// same time share one record, so the first to finish releases it for both. That
-/// direction fails OPEN — it can admit a repeat, never refuse a first write —
-/// which is deliberately the right way round for a guard whose closed-side
-/// failure is the silent prompt loss #424 reports.
+/// Issue #424 S2: one holder per write, not per delivery. Records are per write,
+/// so a delivery that wrote its payload twice holds two of these; and a delivery
+/// sharing its bytes with a concurrent one releases only its own unit of guard
+/// rather than disarming the other, which is what let a survivor's replacement
+/// land on top of an unsent draft and submit both.
 struct PayloadRecordRelease<'a> {
     registry: &'a Arc<AgentPtyRegistry>,
     pane_id: &'a str,
@@ -1648,6 +1694,13 @@ fn spawn_confirmation_task(
                      watching its maximum number of unconfirmed deliveries, so this one is NOT \
                      being confirmed or retried; check whether the pane acted on its task",
         });
+        // Issue #424 H3 (reviewer's additional lifecycle gap): this delivery
+        // ends HERE, before `confirm_prompt_delivery` — and therefore before its
+        // RAII holder — ever exists, so the record its first write left has no
+        // owner and would survive to the TTL, refusing an unrelated later
+        // delivery of the same bytes. It will never be retried either, so
+        // release it on the same terminal path that reports it.
+        registry.note_payload_settled(&task.pane_id, &task.prompt);
         return;
     }
     // Held across `tokio::spawn`, which is synchronous — no await, so a `std`

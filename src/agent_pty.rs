@@ -1907,8 +1907,8 @@ struct AutomaticWrite {
     /// fires inside the 60 s confirmation window, so that interleaving is
     /// ordinary, not hypothetical.
     submitted_at: Option<Instant>,
-    /// Every distinct payload a guarded send has put into this pane's input box
-    /// and has no reason to believe has left it, newest last.
+    /// ONE ENTRY PER GUARDED PAYLOAD WRITE that no delivery has released yet,
+    /// oldest first — a multiset, not a set.
     ///
     /// Issue #424 H3 (both reviewers): this used to be a single "last payload"
     /// slot, which failed in BOTH directions. An independent guarded submit of
@@ -1916,10 +1916,19 @@ struct AutomaticWrite {
     /// longer matched anything and was admitted — a different automatic submit
     /// launched exactly the laundering a notice would have. And the slot was
     /// never cleared, so once the user typed, that payload was refused into that
-    /// pane forever, which is the prompt-loss half of #424 itself. Keyed per
-    /// payload and cleared on the lifecycle points in
-    /// [`PaneInputState::note_user_bytes`] / [`PaneInputState::forget_payload`] /
-    /// [`PaneInputState::forget_pane`], plus the [`PAYLOAD_RECORD_TTL`] backstop.
+    /// pane forever, which is the prompt-loss half of #424 itself.
+    ///
+    /// Issue #424 S2 (both reviewers): keying it per DISTINCT payload was still
+    /// not delivery-scoped. Two deliveries writing the SAME bytes into one pane
+    /// deduplicated into one entry, so the first of them to finish released the
+    /// other's guard as well — after which the survivor's replacement was
+    /// admitted on top of an unsent draft and submitted both. One entry per
+    /// WRITE, released one at a time, gives each delivery its own unit of guard
+    /// without needing a delivery id at a seam that has none: N live writes of
+    /// the same bytes need N releases before the bytes stop being guarded.
+    /// Cleared on the lifecycle points in [`PaneInputState::note_user_bytes`] /
+    /// [`PaneInputState::forget_payload`] / [`PaneInputState::forget_pane`],
+    /// plus the [`PAYLOAD_RECORD_TTL`] backstop.
     payloads: Vec<PayloadWrite>,
 }
 
@@ -1935,6 +1944,15 @@ struct AutomaticWrite {
 struct PayloadWrite {
     digest: u64,
     at: Instant,
+    /// The user has SUBMITTED this pane's input box since these bytes were
+    /// written, so they are no longer sitting in it.
+    ///
+    /// Issue #424 S2: the entry is MARKED rather than removed. It guards
+    /// nothing from here on, but it stays until its own delivery releases it,
+    /// so that release consumes THIS entry instead of silently consuming a
+    /// later delivery's live one — the same shared-ownership fail-open the
+    /// per-write multiset exists to close.
+    drained: bool,
 }
 
 /// Issue #424 H3: how long a payload record can still be guarding a live
@@ -1946,12 +1964,90 @@ struct PayloadWrite {
 /// (a TUI-confirmed one) from bricking its own payload.
 const PAYLOAD_RECORD_TTL: Duration = crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE;
 
-/// Issue #424 H3: how many distinct in-flight payloads one pane may have on
+/// Issue #424 H3: how many unreleased payload writes one pane may have on
 /// record. Deliveries into a single pane are serialized by the writer and
 /// bounded by the deadline above, so this is a runaway backstop rather than an
 /// operational limit; the OLDEST record is evicted, which can only ever admit a
 /// repeat, never refuse a first write.
 const MAX_PAYLOAD_RECORDS_PER_PANE: usize = 8;
+
+/// Issue #424 S1: the bytes an xterm-style client sends around a bracketed
+/// paste. Both markers share the first four bytes, so the scanner below matches
+/// that prefix once and disambiguates on the fifth.
+const PASTE_MARKER_PREFIX: &[u8] = b"\x1b[20";
+
+/// Issue #424 S1 (both reviewers): where one pane's user-input stream is, with
+/// respect to bracketed paste.
+///
+/// The submit-drain has to answer "did the user SUBMIT the input box", and the
+/// only evidence the daemon has is the bytes it forwards. Treating any CR/LF as
+/// a submission gets the real TUI's multi-line paste exactly backwards: it
+/// forwards `ESC[200~…\n…ESC[201~` when the child advertises bracketed paste,
+/// those newlines are EDITOR CONTENT, and an agent TUI in paste mode stores them
+/// without submitting anything. A byte-level drain therefore cleared the payload
+/// records of a box that still held our payload AND the user's fresh draft,
+/// after which the replacement no longer recognized itself as a repeat and
+/// submitted payload + draft + payload as one turn — the precise unsafe outcome
+/// the guard exists to prevent.
+///
+/// The state is carried ACROSS calls because a paste arrives as however many
+/// writes the client happens to make; a marker split across two of them still
+/// matches. Interleaving from two attached clients can leave `in_paste` stuck
+/// true, which suppresses drains — that direction only refuses a later
+/// same-payload delivery (reported, and bounded by [`PAYLOAD_RECORD_TTL`]),
+/// never admits a doubled one.
+#[derive(Default)]
+struct BracketedPaste {
+    /// How many bytes of a paste marker have matched so far.
+    matched: usize,
+    /// Once the fifth byte disambiguates, whether it is the START marker.
+    is_start: bool,
+    in_paste: bool,
+}
+
+impl BracketedPaste {
+    /// Feed the user's bytes; `true` if any of them submits the input box.
+    ///
+    /// Every byte is fed, deliberately: this is a state machine, so a
+    /// short-circuiting `any` would stop tracking paste state at the first
+    /// terminator and mis-read the rest of the buffer.
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        let mut submitted = false;
+        for byte in bytes {
+            submitted |= self.feed_byte(*byte);
+        }
+        submitted
+    }
+
+    /// Feed one byte; `true` if it is a terminator OUTSIDE a bracketed paste.
+    fn feed_byte(&mut self, byte: u8) -> bool {
+        loop {
+            if self.matched < PASTE_MARKER_PREFIX.len() {
+                if PASTE_MARKER_PREFIX[self.matched] == byte {
+                    self.matched += 1;
+                    return false;
+                }
+            } else if self.matched == PASTE_MARKER_PREFIX.len() {
+                if byte == b'0' || byte == b'1' {
+                    self.is_start = byte == b'0';
+                    self.matched += 1;
+                    return false;
+                }
+            } else if byte == b'~' {
+                self.in_paste = self.is_start;
+                self.matched = 0;
+                return false;
+            }
+            if self.matched == 0 {
+                break;
+            }
+            // Not a marker after all. Restart the match at this byte — no
+            // marker byte repeats its own prefix, so one retry is enough.
+            self.matched = 0;
+        }
+        !self.in_paste && (byte == b'\r' || byte == b'\n')
+    }
+}
 
 /// Hash the exact bytes a guarded send hands the PTY. In-process comparison
 /// only — never persisted, never sent on the wire — so `DefaultHasher`'s
@@ -1987,6 +2083,10 @@ struct PaneInputState {
     user_input_at: HashMap<String, Instant>,
     /// Issue #424 F1: what THIS daemon's guarded sends put into each pane.
     automatic: HashMap<String, AutomaticWrite>,
+    /// Issue #424 S1: where each pane's user-input stream is with respect to
+    /// bracketed paste, so a newline inside a paste is not read as a submission.
+    /// See [`BracketedPaste`].
+    paste: HashMap<String, BracketedPaste>,
 }
 
 /// A pane id the clocks deliberately ignore: empty, or one of the
@@ -2010,21 +2110,31 @@ impl PaneInputState {
     ///
     /// Issue #424 H3: a terminator SUBMITS the input box. Whatever we had put
     /// there is now the agent's problem and not ours, so every payload record
-    /// for this pane is dropped — which is what lets an ordinary later delivery
-    /// of the same fixed text (a delegate worker pointer is deliberately the
-    /// same one-line path across hand-offs) be admitted instead of matching a
-    /// finished delivery's digest and being refused before writing a byte. The
-    /// user-input clock still advances, so the blind probe stays refused: the
-    /// box the probe wanted to submit is gone either way.
+    /// for this pane stops guarding — which is what lets an ordinary later
+    /// delivery of the same fixed text (a delegate worker pointer is
+    /// deliberately the same one-line path across hand-offs) be admitted instead
+    /// of matching a finished delivery's digest and being refused before writing
+    /// a byte. The user-input clock still advances, so the blind probe stays
+    /// refused: the box the probe wanted to submit is gone either way.
+    ///
+    /// Issue #424 S1: "a terminator" is decided by [`BracketedPaste`], not by
+    /// scanning for a raw CR/LF. A multi-line paste carries newlines the agent's
+    /// editor STORES, and reading those as a submission drained the records of a
+    /// box that still held both our payload and the user's draft.
     fn note_user_bytes(&mut self, pane_id_env: &str, bytes: &[u8]) {
         if is_sentinel_pane_id(pane_id_env) || bytes.is_empty() {
             return;
         }
         self.note_user_input(pane_id_env);
-        if bytes.iter().any(|b| *b == b'\r' || *b == b'\n')
-            && let Some(entry) = self.automatic.get_mut(pane_id_env)
-        {
-            entry.payloads.clear();
+        let submitted = self
+            .paste
+            .entry(pane_id_env.to_string())
+            .or_default()
+            .feed(bytes);
+        if submitted && let Some(entry) = self.automatic.get_mut(pane_id_env) {
+            for written in &mut entry.payloads {
+                written.drained = true;
+            }
         }
     }
 
@@ -2043,21 +2153,45 @@ impl PaneInputState {
         if payload.is_empty() {
             return;
         }
-        let digest = payload_digest(payload);
-        entry.payloads.retain(|w| w.digest != digest);
-        entry.payloads.push(PayloadWrite { digest, at });
+        // Housekeeping: an entry past the TTL can no longer refuse anything
+        // (`user_typed_since_writing` ignores it), so it is only occupying a
+        // slot the cap below would otherwise spend evicting a live one.
+        entry
+            .payloads
+            .retain(|written| at.duration_since(written.at) < PAYLOAD_RECORD_TTL);
+        // Issue #424 S2: PUSHED, never merged into an equal-digest entry. Two
+        // deliveries writing the same bytes need two releases, or the first to
+        // finish silently disarms the second — see [`AutomaticWrite::payloads`].
+        entry.payloads.push(PayloadWrite {
+            digest: payload_digest(payload),
+            at,
+            drained: false,
+        });
         while entry.payloads.len() > MAX_PAYLOAD_RECORDS_PER_PANE {
             entry.payloads.remove(0);
         }
     }
 
-    /// Drop one payload's record for `pane_id_env` — the delivery that wrote it
-    /// has reached a terminal outcome, so it is no longer a retry this guard has
-    /// anything to protect.
+    /// Release ONE record of `payload` for `pane_id_env` — a delivery that wrote
+    /// those bytes has reached a terminal outcome, so its unit of guard is no
+    /// longer protecting a retry and must not refuse an unrelated future
+    /// delivery of the same text.
+    ///
+    /// Issue #424 S2: exactly one, the OLDEST — the entry this delivery is most
+    /// likely to have written, and the one a submitted-then-rewritten payload
+    /// leaves behind as [`PayloadWrite::drained`]. Removing every equal-digest
+    /// entry (what this did) disarmed a CONCURRENT delivery's guard, after which
+    /// its replacement was admitted on top of an unsent draft and submitted
+    /// both.
     fn forget_payload(&mut self, pane_id_env: &str, payload: &[u8]) {
         let digest = payload_digest(payload);
-        if let Some(entry) = self.automatic.get_mut(pane_id_env) {
-            entry.payloads.retain(|w| w.digest != digest);
+        if let Some(entry) = self.automatic.get_mut(pane_id_env)
+            && let Some(index) = entry
+                .payloads
+                .iter()
+                .position(|written| written.digest == digest)
+        {
+            entry.payloads.remove(index);
         }
     }
 
@@ -2066,6 +2200,7 @@ impl PaneInputState {
     /// records could only refuse the newcomer's first delivery.
     fn forget_pane(&mut self, pane_id_env: &str) {
         self.automatic.remove(pane_id_env);
+        self.paste.remove(pane_id_env);
     }
 
     fn last_user_input_at(&self, pane_id_env: &str) -> Option<Instant> {
@@ -2102,7 +2237,11 @@ impl PaneInputState {
         let now = Instant::now();
         self.automatic.get(pane_id_env).is_some_and(|entry| {
             entry.payloads.iter().any(|written| {
-                written.digest == digest
+                // Issue #424 S2: a DRAINED entry is retained for its owner to
+                // release but no longer describes the input box — the user
+                // submitted, so those bytes left it.
+                !written.drained
+                    && written.digest == digest
                     && typed > written.at
                     && now.duration_since(written.at) < PAYLOAD_RECORD_TTL
             })
@@ -3192,18 +3331,23 @@ impl AgentPtyRegistry {
     ///
     /// Issue #424 H3 (both reviewers): the bytes are the right MATERIAL to
     /// compare, but they are not by themselves a delivery identity. The record
-    /// is per PAYLOAD rather than a single last-payload slot, so an independent
+    /// is per WRITE rather than a single last-payload slot, so an independent
     /// guarded submit of different bytes can no longer evict an older delivery's
-    /// record and launder its replacement in; and it is SCOPED TO THE LIFETIME
-    /// of the delivery that wrote it rather than living forever, so the same
-    /// fixed text delivered again later is a first write, not a repeat. It stops
-    /// being a repeat when any of these happens:
+    /// record and launder its replacement in, and two deliveries carrying the
+    /// same bytes hold two units of guard rather than sharing one (S2); and it
+    /// is SCOPED TO THE LIFETIME of the delivery that wrote it rather than
+    /// living forever, so the same fixed text delivered again later is a first
+    /// write, not a repeat. It stops being a repeat when any of these happens:
     ///
     /// * **the user submits.** A terminator through [`PaneWriter`] drains the
     ///   input box, so nothing of ours is left in it to double
-    ///   ([`PaneInputState::note_user_bytes`]).
+    ///   ([`PaneInputState::note_user_bytes`] — decided by [`BracketedPaste`],
+    ///   because a newline inside a paste is editor content, not a submission).
     /// * **the delivery reaches a terminal outcome.** The detached confirmation
-    ///   loop drops the record when it confirms, abandons or stops
+    ///   loop releases each write it made when it confirms, abandons or stops,
+    ///   and every one-shot caller — the delegate pointer, the idle-worker
+    ///   report, a `deliver` with no event bus — releases as soon as its write
+    ///   returns, because nothing will ever retry it
     ///   ([`Self::note_payload_settled`]).
     /// * **a different agent takes the pane.** A respawn into the same
     ///   `pane_id_env` is a new input box ([`Self::forget_pane_input`]).
@@ -3241,12 +3385,16 @@ impl AgentPtyRegistry {
             .user_typed_since_writing(pane_id_env, payload)
     }
 
-    /// Issue #424 H3: this delivery of `text` into `pane_id_env` is over —
-    /// confirmed, abandoned or stopped — so its payload record is no longer
-    /// protecting a retry and must not refuse an unrelated future delivery of
-    /// the same bytes. Called on every terminal outcome of the detached
-    /// confirmation loop; see [`Self::user_typed_since_writing_payload`] for the
-    /// full lifecycle.
+    /// Issue #424 H3: ONE write of `text` into `pane_id_env` is over —
+    /// confirmed, abandoned, stopped, or final the moment it returned — so its
+    /// payload record is no longer protecting a retry and must not refuse an
+    /// unrelated future delivery of the same bytes.
+    ///
+    /// Called once per PAYLOAD WRITE the caller made, not once per delivery: the
+    /// detached confirmation loop's first write and its one bounded replacement
+    /// each leave their own record. Issue #424 S2 — a call releases exactly one
+    /// record, so a concurrent delivery of the same bytes keeps its own. See
+    /// [`Self::user_typed_since_writing_payload`] for the full lifecycle.
     pub fn note_payload_settled(&self, pane_id_env: &str, text: &str) {
         let Ok(payload) = encode_pane_payload(text) else {
             return;

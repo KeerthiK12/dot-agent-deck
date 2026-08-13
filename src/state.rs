@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{RwLock, broadcast};
 use tracing::warn;
 
-use crate::agent_pty::AgentPtyRegistry;
+use crate::agent_pty::{AgentPtyRegistry, GuardedSendDetail};
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
@@ -1254,6 +1254,19 @@ fn arm_idle_worker_watch(
                 },
             )
             .await;
+        // Issue #424 S3: one-shot, exactly like the delegate pointer in
+        // `dispatch_one_owned` — the outstanding-delegation record is consumed
+        // either way and nothing retries this prompt — so the payload record its
+        // write left guards nothing and must not survive to refuse a later
+        // report of the same text into the same orchestrator. The idle text is
+        // composed from the role and a coarse elapsed time, so two reports
+        // repeating byte for byte is ordinary, not exotic.
+        if matches!(
+            outcome,
+            Ok(crate::agent_pty::GuardedSend::Applied | crate::agent_pty::GuardedSend::Ambiguous)
+        ) {
+            registry.note_payload_settled(&orchestrator_pane_id, &prompt);
+        }
         match outcome {
             Ok(crate::agent_pty::GuardedSend::Applied) => tracing::info!(
                 worker_pane_id = %worker_pane_id,
@@ -2790,8 +2803,14 @@ async fn dispatch_one_owned(
     let revalidate_registry = Arc::clone(&registry);
     let revalidate_pane = pane_id.clone();
     let expected_orchestration = orchestration.clone();
+    // Issue #424 S3 (auditor HIGH): the DETAILED outcome, because this path owes
+    // the user a report. A write refused because they typed into the worker pane
+    // flattens to `Stale`, whose only reaction here was a `warn!` into a
+    // subscriber `init_logging_from_env` installs solely when
+    // `DOT_AGENT_DECK_LOG` is set — a delegated task lost with nothing on the
+    // card to say so, which is the shape of issue #424 itself.
     let outcome = registry
-        .write_and_submit_guarded(
+        .write_and_submit_guarded_detailed(
             &pane_id,
             &one_liner,
             expected_worker_agent_id.as_deref(),
@@ -2812,8 +2831,8 @@ async fn dispatch_one_owned(
         // `Ambiguous` is a partial write: some bytes reached the authorized
         // worker, so the delegate may or may not have landed — exactly the
         // question the silent-worker watch answers. Keep it armed.
-        Ok(crate::agent_pty::GuardedSend::Applied) => true,
-        Ok(crate::agent_pty::GuardedSend::Ambiguous) => {
+        Ok(GuardedSendDetail::Outcome(crate::agent_pty::GuardedSend::Applied)) => true,
+        Ok(GuardedSendDetail::Outcome(crate::agent_pty::GuardedSend::Ambiguous)) => {
             warn!(
                 pane_id = %pane_id,
                 role = %target_role,
@@ -2821,7 +2840,29 @@ async fn dispatch_one_owned(
             );
             true
         }
-        Ok(refused) => {
+        Ok(GuardedSendDetail::RefusedUserInput) => {
+            warn!(
+                pane_id = %pane_id,
+                role = %target_role,
+                expected_agent_id = ?expected_worker_agent_id,
+                "delegate: the worker's input box holds bytes of ours the user has typed \
+                 since, so the task pointer was neither written nor submitted"
+            );
+            if let Some(agent_id) = expected_worker_agent_id.as_deref() {
+                registry.publish_delivery_notice(crate::agent_pty::DeliveryNotice {
+                    pane_id: pane_id.clone(),
+                    agent_id: agent_id.to_string(),
+                    delivery_id: crate::prompt_delivery::mint_delivery_id(&pane_id),
+                    session_id: None,
+                    detail: "a delegated task pointer was not written into this pane: it \
+                             would have repeated bytes an earlier delivery left in the \
+                             input box, which you have typed into since, so submitting \
+                             would have sent your unsent draft too",
+                });
+            }
+            false
+        }
+        Ok(GuardedSendDetail::Outcome(refused)) => {
             warn!(
                 pane_id = %pane_id,
                 role = %target_role,
@@ -2841,6 +2882,19 @@ async fn dispatch_one_owned(
             false
         }
     };
+    // Issue #424 S3 (auditor HIGH): this path is ONE-SHOT — nothing above
+    // retries the pointer, and `Ambiguous` says so explicitly — so the record
+    // that write left on the pane guards no retry and can only refuse a LATER
+    // delivery of the same bytes. That is not hypothetical: the worker pointer
+    // is deliberately the same fixed one-liner across hand-offs, so the next
+    // delegation to a worker the user has typed into was refused before writing
+    // a byte, logged only, with its silence watch cancelled. Released here, at
+    // the write, rather than left to the 60 s TTL. Only when something was
+    // actually written — a refusal created no record, and releasing then would
+    // consume a concurrent delivery's.
+    if delivered {
+        registry.note_payload_settled(&pane_id, &one_liner);
+    }
     let Some((watch, armed, rx)) = silence else {
         return;
     };
