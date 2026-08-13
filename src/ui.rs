@@ -29615,6 +29615,34 @@ mod tests {
         });
     }
 
+    fn apply_generation_event(
+        snapshot: &mut AppState,
+        pane_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        event_type: EventType,
+    ) {
+        snapshot.apply_event(AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+    }
+
     fn ready_seed_prompt(pane_id: &str, prompt: &str) -> PendingSeedPrompt {
         PendingSeedPrompt {
             pane_id: pane_id.to_string(),
@@ -30044,7 +30072,169 @@ mod tests {
         }
     }
 
-    /// Scenario: Write a seed into a launcher pane that has announced no hook generation, let the real agent's SessionStart arrive afterwards, then release two retries. The second attempt must bind and carry that genuine generation instead of declaring none, and the third must probe submission with an empty payload rather than typing the seed a third time.
+    /// A TUI-facing controller whose submissions go through the production
+    /// registry guard and land on a real byte-observation PTY. This lets the
+    /// consumer test assert what physically reached the pane after the daemon's
+    /// user-input clock advanced, without coupling the assertion to where the
+    /// safety check is implemented.
+    #[cfg(unix)]
+    struct RegistryBackedPaneController {
+        registry: Arc<crate::agent_pty::AgentPtyRegistry>,
+        agent_id: String,
+        runtime: tokio::runtime::Runtime,
+    }
+
+    #[cfg(unix)]
+    impl RegistryBackedPaneController {
+        fn new(pane_id: &str) -> Self {
+            let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+            let agent_id = registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane_id.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn TUI byte-observation target");
+            Self {
+                registry,
+                agent_id,
+                runtime: tokio::runtime::Runtime::new().expect("test runtime"),
+            }
+        }
+
+        fn snapshot(&self) -> Vec<u8> {
+            self.registry
+                .snapshot(&self.agent_id)
+                .expect("TUI byte-observation snapshot")
+        }
+    }
+
+    #[cfg(unix)]
+    impl PaneController for RegistryBackedPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
+            Some(self.agent_id.clone())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            pane_id: &str,
+            text: &str,
+            expected_agent_id: Option<&str>,
+            _expected_session_id: Option<&str>,
+            _delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            let outcome = self
+                .runtime
+                .block_on(self.registry.write_and_submit_guarded(
+                    pane_id,
+                    text,
+                    expected_agent_id,
+                    || async { true },
+                ))
+                .map_err(|error| PaneError::CommandFailed(error.to_string()))?;
+            Ok(match outcome {
+                crate::agent_pty::GuardedSend::Applied => crate::event::SendResult::Applied,
+                crate::agent_pty::GuardedSend::WrongSession => {
+                    crate::event::SendResult::WrongSession
+                }
+                crate::agent_pty::GuardedSend::Stale => crate::event::SendResult::Stale,
+                crate::agent_pty::GuardedSend::NoLiveTarget => {
+                    crate::event::SendResult::NoLiveTarget
+                }
+                crate::agent_pty::GuardedSend::Ambiguous => crate::event::SendResult::Ambiguous,
+            })
+        }
+        fn name(&self) -> &str {
+            "registry-backed"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Scenario: Let a TUI seed reach its reporting pane twice, record an unrelated user keystroke while the retry is pending, then make the submit-only probe due. No further submit CR may reach the pane, so the user's unsent editor contents remain untouched.
+    #[cfg(unix)]
+    #[spec("prompt/pane-input/032")]
+    #[test]
+    fn pane_input_032_user_input_disarms_submit_only_probe() {
+        const PANE_ID: &str = "user-draft-safety-pane";
+        const PROMPT: &str = "automatic prompt before the user's draft";
+
+        let controller = Arc::new(RegistryBackedPaneController::new(PANE_ID));
+        let pane: Arc<dyn PaneController> = controller.clone();
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        let snapshot = ready_prompt_snapshot(PANE_ID, &controller.agent_id);
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("first write arms replacement attempt")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        std::thread::sleep(std::time::Duration::from_millis(75));
+
+        controller.registry.note_user_input(PANE_ID);
+        let before_probe = controller.snapshot();
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("second write arms submit-only probe")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        let after_probe = controller.snapshot();
+
+        controller.registry.shutdown_all();
+        assert_eq!(
+            after_probe,
+            before_probe,
+            "a TUI retry must send no submit CR after the registry recorded user input; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_probe),
+            String::from_utf8_lossy(&after_probe)
+        );
+    }
+
+    /// Scenario: Write seed and orchestrator prompts into launcher panes with no hook generation, then let a genuine generation arrive during backoff. A live generation may be bound before retry, but if that generation ends first neither TUI path may follow the delivery into its successor; a later safe attempt probes submission rather than retyping.
     #[spec("prompt/pane-input/030")]
     #[test]
     fn pane_input_030_late_generation_binds_before_the_retry_that_enters_it() {
@@ -30150,9 +30340,145 @@ mod tests {
                 "a probe's payload differs, so it needs its own ledger identity"
             );
         }
+
+        // Auditor E2: the generation can appear while attempt 1 is held in
+        // backoff and disappear again before attempt 2. `expected_session_id`
+        // is still None in that sequence, but observing the generation and its
+        // end must nevertheless revoke the unbound delivery. A successor is
+        // present at retry time to catch the especially dangerous false rebind.
+        const HELD_SEED_PANE: &str = "held-ended-seed-generation";
+        const HELD_SEED_AGENT: &str = "held-ended-seed-agent";
+        let held_seed_controller = Arc::new(RecordingPaneController::default());
+        let held_seed_writes = held_seed_controller.writes.clone();
+        let held_seed_pane: Arc<dyn PaneController> = held_seed_controller;
+        let mut held_seed_ui = default_ui();
+        held_seed_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt(HELD_SEED_PANE, PROMPT));
+        let mut held_seed_snapshot = ready_prompt_snapshot(HELD_SEED_PANE, HELD_SEED_AGENT);
+
+        process_pending_seed_prompts(&mut held_seed_ui, &held_seed_pane, &held_seed_snapshot);
+        apply_generation_event(
+            &mut held_seed_snapshot,
+            HELD_SEED_PANE,
+            HELD_SEED_AGENT,
+            "generation-seen-during-seed-backoff",
+            EventType::SessionStart,
+        );
+        process_pending_seed_prompts(&mut held_seed_ui, &held_seed_pane, &held_seed_snapshot);
+        apply_generation_event(
+            &mut held_seed_snapshot,
+            HELD_SEED_PANE,
+            HELD_SEED_AGENT,
+            "generation-seen-during-seed-backoff",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut held_seed_snapshot,
+            HELD_SEED_PANE,
+            HELD_SEED_AGENT,
+            "seed-successor-generation",
+            EventType::SessionStart,
+        );
+        held_seed_ui
+            .send_retry_backoff
+            .get_mut(HELD_SEED_PANE)
+            .expect("held seed keeps its retry state")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut held_seed_ui, &held_seed_pane, &held_seed_snapshot);
+        let held_seed_write_count = held_seed_writes.lock().unwrap().len();
+
+        // The orchestrator twin must remember the same observed transition.
+        const HELD_ROLE_PANE: &str = "held-ended-orchestrator-generation";
+        const HELD_ROLE_AGENT: &str = "held-ended-orchestrator-agent";
+        let held_role_controller = Arc::new(RecordingPaneController::default());
+        let held_role_writes = held_role_controller.writes.clone();
+        let held_role_pane: Arc<dyn PaneController> = held_role_controller;
+        let started = std::time::Instant::now();
+        let tab_id: TabId = 30030;
+        let mut held_role_ui = default_ui();
+        held_role_ui
+            .orchestration_created_at
+            .insert(tab_id, started);
+        held_role_ui.orchestration_ready_since.insert(
+            tab_id,
+            started
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut held_role_snapshot = ready_prompt_snapshot(HELD_ROLE_PANE, HELD_ROLE_AGENT);
+        let role_panes = [HELD_ROLE_PANE.to_string()];
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut role_prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut held_role_ui,
+            held_role_pane.as_ref(),
+            &held_role_snapshot,
+            started,
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        apply_generation_event(
+            &mut held_role_snapshot,
+            HELD_ROLE_PANE,
+            HELD_ROLE_AGENT,
+            "generation-seen-during-role-backoff",
+            EventType::SessionStart,
+        );
+        deliver_orchestrator_prompt(
+            &mut held_role_ui,
+            held_role_pane.as_ref(),
+            &held_role_snapshot,
+            started + std::time::Duration::from_millis(1),
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        apply_generation_event(
+            &mut held_role_snapshot,
+            HELD_ROLE_PANE,
+            HELD_ROLE_AGENT,
+            "generation-seen-during-role-backoff",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut held_role_snapshot,
+            HELD_ROLE_PANE,
+            HELD_ROLE_AGENT,
+            "role-successor-generation",
+            EventType::SessionStart,
+        );
+        held_role_ui
+            .send_retry_backoff
+            .get_mut(HELD_ROLE_PANE)
+            .expect("held role keeps its retry state")
+            .next_attempt_at = started;
+        deliver_orchestrator_prompt(
+            &mut held_role_ui,
+            held_role_pane.as_ref(),
+            &held_role_snapshot,
+            started + std::time::Duration::from_millis(2),
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        let held_role_write_count = held_role_writes.lock().unwrap().len();
+
+        assert!(
+            held_seed_write_count == 1 && held_role_write_count == 1,
+            "an unbound delivery that observed a generation and its end must not follow into a successor on either TUI path; seed_writes={held_seed_write_count}, orchestrator_writes={held_role_write_count}"
+        );
     }
 
-    /// Scenario: Write a seed, then let the pane produce only untagged hook frames alongside identified events the daemon synthesized itself (a shell-activity frame and a delivery notice). The synthetic events must not be read as proof of a tagged reporting channel, so the delivery stays held and is never retyped.
+    /// Scenario: Write seeds to targets with no usable prompt-reporting channel, then supply either daemon-synthetic evidence beside an untagged legacy hook or a forged unmarked reporting-agent SessionStart. Neither producer claim may arm a second physical write into a target that cannot actually confirm submission.
     #[spec("prompt/pane-input/031")]
     #[test]
     fn pane_input_031_daemon_synthetic_events_are_not_a_reporting_channel() {
@@ -30241,6 +30567,52 @@ mod tests {
             "D4: events the daemon wrote itself prove only that the DAEMON can \
              tag an event; they must not re-arm retyping through a channel that \
              still cannot confirm anything"
+        );
+
+        // Auditor E4: provenance is producer input too. Omitting the
+        // `wrapper_fork` marker from an otherwise identical forged start must
+        // not turn a hookless timeout-fallback target into a reporting one.
+        const FORGED_PANE: &str = "unmarked-forged-capability-pane";
+        const FORGED_AGENT: &str = "unmarked-forged-capability-agent";
+        let forged_controller = Arc::new(IdentityGuardPaneController::new(FORGED_AGENT));
+        let forged_pane: Arc<dyn PaneController> = forged_controller.clone();
+        let mut forged_ui = default_ui();
+        let mut pending = ready_seed_prompt(FORGED_PANE, "one hookless seed");
+        pending.created_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(11))
+            .expect("timeout fallback timestamp");
+        pending.ready_since = None;
+        forged_ui.pending_seed_prompts.push(pending);
+        let mut forged_snapshot = AppState::default();
+        forged_snapshot.register_pane(FORGED_PANE.to_string());
+
+        process_pending_seed_prompts(&mut forged_ui, &forged_pane, &forged_snapshot);
+        assert_eq!(
+            forged_controller.writes_for(FORGED_AGENT),
+            1,
+            "the timeout fallback performs the one provisional write"
+        );
+        apply_generation_event(
+            &mut forged_snapshot,
+            FORGED_PANE,
+            FORGED_AGENT,
+            "forged-unmarked-generation",
+            EventType::SessionStart,
+        );
+        forged_ui
+            .pending_seed_prompts
+            .first_mut()
+            .expect("forged delivery remains provisional")
+            .ready_since = Some(
+            std::time::Instant::now()
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("forged producer readiness timestamp"),
+        );
+        process_pending_seed_prompts(&mut forged_ui, &forged_pane, &forged_snapshot);
+        assert_eq!(
+            forged_controller.writes_for(FORGED_AGENT),
+            1,
+            "an unauthenticated unmarked producer claim must not arm a retry for a hookless target"
         );
     }
 

@@ -976,19 +976,26 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the detached scheduler/dispatch confirmation task or a real agent's `/clear` command; it pins the same observable identity/generation contract at the TUI controller seam.
 - **Platform coverage:** mac+linux+windows.
 
-##### prompt/pane-input/030 — A delivery first written into a launcher pane with no generation binds the genuine one before the retry that enters it, then probes submission instead of retyping.
+##### prompt/pane-input/030 — An unbound launcher delivery may bind a live generation before retry, but cannot follow a generation through its end into a successor.
 - **Layer:** L1 (in-process seed consumer with a payload/identity-recording `PaneController` and hook-derived generation state).
 - **Agent:** none.
-- **Asserts:** the first write into a pane with no announced hook session declares no generation; once the real agent's `SessionStart` arrives, the next retry both binds and sends that generation and retains it; the third attempt writes an empty payload under the same bound generation and a distinct wire delivery id.
+- **Asserts:** the first write into a pane with no announced hook session declares no generation; once the real agent's `SessionStart` arrives and remains current, the next retry binds and retains it and a third attempt uses a distinct submit-only probe; separately, if a generation appears during backoff and ends before retry, both the seed and orchestrator TUI write sites send no bytes into its successor.
 - **Does not assert:** the daemon-side confirmation task's own latch (covered by `scheduler/dispatch/016`) or the PTY bytes an empty payload produces (covered by the registry's submit path).
 - **Platform coverage:** mac+linux+windows.
 
-##### prompt/pane-input/031 — Events the daemon synthesizes for a pane are not evidence that the pane's producer can report a submitted prompt.
+##### prompt/pane-input/031 — Neither daemon-synthetic events nor unauthenticated producer claims prove a usable prompt-reporting channel.
 - **Layer:** L1 (in-process seed consumer with a payload-recording `PaneController` and synthetic hook-derived snapshots).
 - **Agent:** none.
-- **Asserts:** identified daemon-authored shell-activity and delivery-notice events landing after the write, alongside a real but untagged legacy hook frame, leave the delivery held — no second physical write.
-- **Does not assert:** which producers can report prompts by agent type (covered by `prompt/pane-input/024`), nor authentication of the delivery-notice metadata key, which grants no privilege.
+- **Asserts:** identified daemon-authored shell-activity and delivery-notice events landing after the write, alongside a real but untagged legacy hook frame, leave the delivery held; an unmarked forged `SessionStart` that merely declares a reporting agent type likewise cannot arm a second physical write into a hookless target.
+- **Does not assert:** authentication of the delivery-notice metadata key, which grants no privilege, or the detached spawn watcher (covered by `scheduler/dispatch/016`).
 - **Platform coverage:** mac+linux+windows.
+
+##### prompt/pane-input/032 — User typing after automatic payload attempts disarms the TUI's submit-only probe.
+- **Layer:** L1 (in-process seed consumer driving the production registry guard and a real `/bin/cat` byte-observation PTY).
+- **Agent:** none.
+- **Asserts:** after attempts 1 and 2 reach the pane, advancing the registry's user-input clock before attempt 3 results in no additional PTY output, observably proving that no submit CR was sent into the user's unsent editor contents.
+- **Does not assert:** the fix's internal clock-comparison location or the detached spawn watcher (covered by `scheduler/dispatch/018`).
+- **Platform coverage:** mac+linux.
 
 #### prompt/quit
 
@@ -3659,11 +3666,25 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** exact model response phrasing, ordering between the three agents, or a fixed boot duration.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/016 — Detached prompt retries stop whenever their target or evidence stream is terminal, cancelled, or superseded.
+##### scheduler/dispatch/016 — Detached prompt retries stop on terminal targets/evidence and do not arm from an unauthenticated producer claim.
 - **Layer:** L1 (in-process detached spawn confirmation task with real registry-owned shell PTYs and synthetic hook events).
 - **Agent:** none (real `/bin/sh` PTYs are byte-observation targets, not agent stand-ins).
-- **Asserts:** replacement, a bound `SessionEnd`, broadcast lag, and broadcast closure each terminally stop the watch without stale retry bytes; pane close and daemon shutdown cancel registered watches; a newer same-pane delivery aborts the older single flight before it retries.
+- **Asserts:** replacement, a bound `SessionEnd`, broadcast lag, and broadcast closure each terminally stop the watch without stale retry bytes; pane close and daemon shutdown cancel registered watches; a newer same-pane delivery aborts the older single flight before it retries; an unmarked event merely claiming a reporting `AgentType` cannot arm a replacement-payload retry into a hookless byte sink.
 - **Does not assert:** TUI-owned automatic seed/orchestrator delivery (covered by `prompt/pane-input/028`) or finer same-agent generation tracking without `SessionEnd` (provisional behavior intentionally not pinned).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/017 — Cap-exhaustion notices reach a hookless card that exists only in the attached TUI's broadcast state.
+- **Layer:** L1 (in-process production delivery-notice sink, daemon/AppState split, attached-client broadcast consumer, and real registry-owned `/bin/cat` PTY).
+- **Agent:** none.
+- **Asserts:** a `surface_spawned_pane`-shaped `SessionStart` makes the card visible only in the attached client's state while daemon state stays empty; publishing the exact 257th-delivery cap notice through the production sink broadcasts an `Error` that visibly marks that existing client card.
+- **Does not assert:** the cap counter's publication branch itself (the existing `abandonment_reports_state_and_never_writes_into_the_pane` unit test fills all 256 slots and proves that the 257th publishes this notice).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/018 — User typing after the replacement payload disarms the detached submit-only probe.
+- **Layer:** L1 (in-process detached spawn confirmation task with a real registry-owned `/bin/cat` byte-observation PTY).
+- **Agent:** none.
+- **Asserts:** attempt 2 first reaches the pane, then advancing the registry's user-input clock before attempt 3 produces no additional PTY output, observably proving that no blind submit CR was sent into the user's unsent editor contents.
+- **Does not assert:** TUI-owned seed delivery (covered by `prompt/pane-input/032`) or the internal location of the clock comparison.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/pi

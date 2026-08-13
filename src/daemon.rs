@@ -2017,11 +2017,108 @@ mod orphan_watchdog_tests {
 #[cfg(all(test, unix))]
 mod hook_ingestion_tests {
     use super::*;
-    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, DeliveryNotice, SpawnOptions};
     use crate::event::AgentType;
+    use spec::spec;
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{UnixListener, UnixStream};
+
+    /// Scenario: Surface a hookless scheduled pane only through the daemon's live broadcast, leaving daemon AppState intentionally empty, then publish the exact delivery notice used when the 256-watch cap rejects the next confirmation. The already-visible attached-TUI card must receive an Error event through the production sink.
+    #[spec("scheduler/dispatch/017")]
+    #[tokio::test]
+    async fn dispatch_017_cap_notice_reaches_broadcast_only_card() {
+        const PANE_ID: &str = "broadcast-only-cap-card";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn hookless scheduled pane");
+        let daemon_state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut attached_rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        install_delivery_notice_sink(&registry, daemon_state.clone(), event_tx.clone());
+
+        // This is the topology produced by `surface_spawned_pane`: the attached
+        // client sees and applies the card, while the daemon never applies the
+        // synthetic start to its own AppState.
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            crate::event::DISPLAY_NAME_METADATA_KEY.to_string(),
+            "cap-card".to_string(),
+        );
+        event_tx
+            .send(BroadcastMsg::Event(AgentEvent {
+                session_id: PANE_ID.to_string(),
+                agent_type: AgentType::None,
+                event_type: crate::event::EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: Some("/tmp/broadcast-only-cap-card".to_string()),
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(PANE_ID.to_string()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }))
+            .expect("surface broadcast-only card");
+        let BroadcastMsg::Event(surface) = attached_rx.recv().await.expect("surface event") else {
+            panic!("expected card surface event");
+        };
+        let mut attached_state = crate::state::AppState::default();
+        attached_state.register_pane(PANE_ID.to_string());
+        attached_state.apply_event(surface);
+        assert!(
+            attached_state
+                .sessions
+                .values()
+                .any(|session| session.pane_id.as_deref() == Some(PANE_ID)),
+            "precondition: the attached TUI already has a visible card"
+        );
+        assert!(
+            daemon_state.read().await.sessions.is_empty(),
+            "precondition: the broadcast-only card is absent from daemon AppState"
+        );
+
+        registry.publish_delivery_notice(DeliveryNotice {
+            pane_id: PANE_ID.to_string(),
+            agent_id: agent_id.clone(),
+            delivery_id: "cap-exhausted-257".to_string(),
+            session_id: None,
+            detail: "a spawn-time prompt was written into this pane but the daemon is already watching its maximum number of unconfirmed deliveries, so this one is NOT being confirmed or retried; check whether the pane acted on its task",
+        });
+        let report = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                if let BroadcastMsg::Event(event) = attached_rx
+                    .recv()
+                    .await
+                    .expect("delivery-notice broadcast channel")
+                    && event.event_type == crate::event::EventType::Error
+                {
+                    break event;
+                }
+            }
+        })
+        .await;
+        registry.shutdown_all();
+        let report = report.expect(
+            "the production delivery-notice sink must broadcast cap exhaustion to the already-visible card",
+        );
+        attached_state.apply_event(report);
+        assert!(
+            attached_state.sessions.values().any(|session| {
+                session.pane_id.as_deref() == Some(PANE_ID)
+                    && session.status == crate::state::SessionStatus::Error
+            }),
+            "the attached TUI's broadcast-only card must visibly become Error"
+        );
+    }
 
     /// Scenario: the "No agent on reconnect" fix at the daemon layer. Spawn a
     /// shell agent (so the spawn-time `from_command` guess is `None` — the

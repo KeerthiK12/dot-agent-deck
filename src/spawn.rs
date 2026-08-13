@@ -1909,7 +1909,7 @@ mod tests {
         assert!(capability, "an identified Claude frame proves the channel");
     }
 
-    /// Scenario: Hold detached spawn prompts in confirmation backoff while their pane is replaced, generation ends, event stream lags or closes, pane closes, daemon shuts down, or a newer prompt supersedes the watch. Every terminal/cancelled watch must finish without stale retry bytes, and the newer same-pane watch must be the only flight left.
+    /// Scenario: Hold detached spawn prompts in confirmation backoff while their pane is replaced, generation ends, event stream lags or closes, pane closes, daemon shuts down, a newer prompt supersedes the watch, or an unmarked event merely claims a reporting producer. Every terminal, cancelled, or unauthenticated-capability watch must finish without stale retry bytes.
     #[spec("scheduler/dispatch/016")]
     #[serial_test::serial(prompt_confirmation_tasks)]
     #[tokio::test]
@@ -2202,6 +2202,109 @@ mod tests {
         );
         drop(managed_tx);
         managed_registry.shutdown_all();
+
+        // Auditor E4: the target is a hookless byte sink. A producer-controlled
+        // event that merely declares a reporting AgentType, with no
+        // `wrapper_fork` marker to trip the narrow exclusion, must not arm the
+        // detached retry loop.
+        const FORGED_PANE: &str = "unmarked-forged-detached-pane";
+        const FORGED_PROMPT: &str = "UNMARKED-FORGED-RETRY-MUST-NOT-LAND";
+        let forged_registry = Arc::new(AgentPtyRegistry::new());
+        let forged_agent = spawn_byte_target(&forged_registry, FORGED_PANE);
+        let (forged_tx, forged_rx) = broadcast::channel(8);
+        let forged_confirmation = tokio::spawn(confirm_prompt_delivery(
+            forged_registry.clone(),
+            forged_rx,
+            ConfirmationTask {
+                pane_id: FORGED_PANE.into(),
+                agent_id: forged_agent.clone(),
+                prompt: FORGED_PROMPT.into(),
+                delivery_id: "unmarked-forged-capability".into(),
+                generation: None,
+                can_report_prompts: false,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+        forged_tx
+            .send(BroadcastMsg::Event(prompt_watch_event(
+                FORGED_PANE,
+                &forged_agent,
+                "forged-unmarked-session",
+                EventType::SessionStart,
+            )))
+            .expect("send unmarked forged capability claim");
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let forged_output = forged_registry
+            .snapshot(&forged_agent)
+            .expect("forged capability target snapshot");
+        forged_confirmation.abort();
+        let _ = forged_confirmation.await;
+        drop(forged_tx);
+        forged_registry.shutdown_all();
+        assert!(
+            !forged_output
+                .windows(FORGED_PROMPT.len())
+                .any(|window| window == FORGED_PROMPT.as_bytes()),
+            "an unmarked producer assertion must not arm a full replacement payload on a hookless target; output={:?}",
+            String::from_utf8_lossy(&forged_output)
+        );
+    }
+
+    /// Scenario: Let a detached confirmation perform its one replacement-payload retry, then record a user keystroke on that pane before the submit-only probe is due. The probe must send no CR, preserving the user's choice to leave the new editor contents unsent.
+    #[spec("scheduler/dispatch/018")]
+    #[tokio::test]
+    async fn dispatch_018_user_input_disarms_detached_submit_probe() {
+        const PANE_ID: &str = "detached-user-draft-pane";
+        const PROMPT: &str = "AUTOMATIC-PROMPT-BEFORE-USER-DRAFT";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
+        let (event_tx, event_rx) = broadcast::channel(8);
+        let confirmation = tokio::spawn(confirm_prompt_delivery(
+            registry.clone(),
+            event_rx,
+            ConfirmationTask {
+                pane_id: PANE_ID.into(),
+                agent_id: agent_id.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: "detached-user-draft-safety".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(4),
+            },
+        ));
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let before_user_input = registry
+            .snapshot(&agent_id)
+            .expect("replacement payload snapshot");
+        assert!(
+            before_user_input
+                .windows(PROMPT.len())
+                .any(|window| window == PROMPT.as_bytes()),
+            "precondition: attempt 2 must have reached the byte target before the user types"
+        );
+
+        registry.note_user_input(PANE_ID);
+        let before_probe = registry
+            .snapshot(&agent_id)
+            .expect("pre-probe pane snapshot");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let after_probe = registry
+            .snapshot(&agent_id)
+            .expect("post-probe pane snapshot");
+
+        confirmation.abort();
+        let _ = confirmation.await;
+        drop(event_tx);
+        registry.shutdown_all();
+        assert_eq!(
+            after_probe,
+            before_probe,
+            "a detached retry must send no submit CR after user input was recorded; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_probe),
+            String::from_utf8_lossy(&after_probe)
+        );
     }
 
     /// Scenario: Abandon a spawn prompt against its exact pane owner, then replace that owner and exhaust the 256-watch cap for a new delivery. Abandonment must report state without pane bytes, a stale report must not mark the replacement, and the 257th delivery must visibly report that it is unwatched.

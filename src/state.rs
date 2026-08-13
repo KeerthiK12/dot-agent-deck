@@ -4391,6 +4391,27 @@ mod tests {
         );
         state.apply_event(boot);
         assert_eq!(state.pane_hook_session_id("pane").as_deref(), Some("real"));
+
+        // Auditor E3: the launcher frame can arrive AFTER a genuine successor,
+        // name the delivery's old generation, and carry a far-future producer
+        // timestamp. It is still boot provenance, never authority to roll the
+        // pane's conversation backward.
+        state.apply_event(frame("successor", EventType::SessionStart, 6));
+        assert_eq!(
+            state.pane_hook_session_id("pane").as_deref(),
+            Some("successor")
+        );
+        let mut late_boot = frame("real", EventType::SessionStart, 20_000);
+        late_boot.metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+        state.apply_event(late_boot);
+        assert_eq!(
+            state.pane_hook_session_id("pane").as_deref(),
+            Some("successor"),
+            "a far-future launcher-origin start naming the old session must not roll a genuine successor backward"
+        );
     }
 
     /// Issue #424 D3: a daemon-authored delivery report annotates a card and
