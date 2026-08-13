@@ -30573,7 +30573,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Write seeds to targets with no usable prompt-reporting channel, then supply either daemon-synthetic evidence beside an untagged legacy hook or a forged unmarked reporting-agent SessionStart. Neither producer claim may arm a second physical write into a target that cannot actually confirm submission.
+    /// Scenario: Write a seed to a target with no usable prompt-reporting channel, then supply daemon-synthetic evidence beside an untagged legacy hook. Those events must not arm a second physical write into a target that cannot actually confirm submission.
     #[spec("prompt/pane-input/031")]
     #[test]
     fn pane_input_031_daemon_synthetic_events_are_not_a_reporting_channel() {
@@ -30662,52 +30662,6 @@ mod tests {
             "D4: events the daemon wrote itself prove only that the DAEMON can \
              tag an event; they must not re-arm retyping through a channel that \
              still cannot confirm anything"
-        );
-
-        // Auditor E4: provenance is producer input too. Omitting the
-        // `wrapper_fork` marker from an otherwise identical forged start must
-        // not turn a hookless timeout-fallback target into a reporting one.
-        const FORGED_PANE: &str = "unmarked-forged-capability-pane";
-        const FORGED_AGENT: &str = "unmarked-forged-capability-agent";
-        let forged_controller = Arc::new(IdentityGuardPaneController::new(FORGED_AGENT));
-        let forged_pane: Arc<dyn PaneController> = forged_controller.clone();
-        let mut forged_ui = default_ui();
-        let mut pending = ready_seed_prompt(FORGED_PANE, "one hookless seed");
-        pending.created_at = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(11))
-            .expect("timeout fallback timestamp");
-        pending.ready_since = None;
-        forged_ui.pending_seed_prompts.push(pending);
-        let mut forged_snapshot = AppState::default();
-        forged_snapshot.register_pane(FORGED_PANE.to_string());
-
-        process_pending_seed_prompts(&mut forged_ui, &forged_pane, &forged_snapshot);
-        assert_eq!(
-            forged_controller.writes_for(FORGED_AGENT),
-            1,
-            "the timeout fallback performs the one provisional write"
-        );
-        apply_generation_event(
-            &mut forged_snapshot,
-            FORGED_PANE,
-            FORGED_AGENT,
-            "forged-unmarked-generation",
-            EventType::SessionStart,
-        );
-        forged_ui
-            .pending_seed_prompts
-            .first_mut()
-            .expect("forged delivery remains provisional")
-            .ready_since = Some(
-            std::time::Instant::now()
-                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
-                .expect("forged producer readiness timestamp"),
-        );
-        process_pending_seed_prompts(&mut forged_ui, &forged_pane, &forged_snapshot);
-        assert_eq!(
-            forged_controller.writes_for(FORGED_AGENT),
-            1,
-            "an unauthenticated unmarked producer claim must not arm a retry for a hookless target"
         );
     }
 

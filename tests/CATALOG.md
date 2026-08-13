@@ -983,11 +983,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the daemon-side confirmation task's own latch (covered by `scheduler/dispatch/016`) or the PTY bytes an empty payload produces (covered by the registry's submit path).
 - **Platform coverage:** mac+linux+windows.
 
-##### prompt/pane-input/031 — Neither daemon-synthetic events nor unauthenticated producer claims prove a usable prompt-reporting channel.
+##### prompt/pane-input/031 — Daemon-synthetic events do not prove a usable prompt-reporting channel.
 - **Layer:** L1 (in-process seed consumer with a payload-recording `PaneController` and synthetic hook-derived snapshots).
 - **Agent:** none.
-- **Asserts:** identified daemon-authored shell-activity and delivery-notice events landing after the write, alongside a real but untagged legacy hook frame, leave the delivery held; an unmarked forged `SessionStart` that merely declares a reporting agent type likewise cannot arm a second physical write into a hookless target.
-- **Does not assert:** authentication of the delivery-notice metadata key, which grants no privilege, or the detached spawn watcher (covered by `scheduler/dispatch/016`).
+- **Asserts:** identified daemon-authored shell-activity and delivery-notice events landing after the write, alongside a real but untagged legacy hook frame, leave the delivery held.
+- **Does not assert:** an unauthenticated unmarked producer claim on the TUI path — deliberately not pinned because it is indistinguishable from `prompt/pane-input/025`'s accepted slow-launcher recovery and blocking it would re-open #424 for launchers with no bootstrap event; the detached path is pinned by `scheduler/dispatch/016`. It also does not assert authentication of the delivery-notice metadata key, which grants no privilege.
 - **Platform coverage:** mac+linux+windows.
 
 ##### prompt/pane-input/032 — User typing after automatic payload attempts disarms the TUI's submit-only probe.
