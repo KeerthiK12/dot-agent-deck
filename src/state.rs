@@ -4408,6 +4408,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     /// Issue #424 D2: `AppState`'s pane generation must not be pinnable by a
     /// producer-chosen timestamp either.
@@ -5940,6 +5941,114 @@ mod tests {
             compose_delegate_silence_notice(std::time::Duration::from_secs(30))
                 .contains("within 30 seconds"),
             "a whole-second window must not be rendered as milliseconds"
+        );
+    }
+
+    /// Scenario: Write an automatic payload, let the user type an unsent draft, and then let the production silent-worker watch write its daemon notice before a submit-only probe. The notice must not make the blind probe submit the user's draft or the accumulated notice.
+    #[cfg(unix)]
+    #[spec("scheduler/idle-worker/015")]
+    #[tokio::test]
+    async fn idle_worker_015_notice_cannot_rearm_a_submit_only_probe() {
+        use std::io::Write as _;
+
+        const ORCHESTRATOR_PANE: &str = "notice-launder-orchestrator";
+        const WORKER_PANE: &str = "notice-launder-worker";
+        const PROMPT: &str = "automatic payload awaiting submit confirmation";
+        const USER_DRAFT: &str = "user draft deliberately left unsent";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let orchestrator_agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    ORCHESTRATOR_PANE.to_string(),
+                )],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn orchestrator byte-observation target");
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(
+                    ORCHESTRATOR_PANE,
+                    PROMPT,
+                    Some(&orchestrator_agent),
+                    || async { true },
+                )
+                .await
+                .expect("initial automatic payload"),
+            crate::agent_pty::GuardedSend::Applied
+        );
+
+        let handle = registry
+            .subscribe(&orchestrator_agent)
+            .expect("attach orchestrator byte-observation target");
+        let mut writer = handle.writer.lock().await;
+        writer
+            .write_all(USER_DRAFT.as_bytes())
+            .expect("write unsent user draft");
+        writer.flush().expect("flush unsent user draft");
+        drop(writer);
+        registry.note_user_input(ORCHESTRATOR_PANE);
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+
+        let (event_tx, _) = broadcast::channel(8);
+        let armed = registry
+            .arm_silence_watch(WORKER_PANE, ORCHESTRATOR_PANE)
+            .expect("arm production silent-worker watch");
+        arm_delegate_silence_watch(
+            registry.clone(),
+            event_tx.subscribe(),
+            SilenceWatch {
+                window: std::time::Duration::from_millis(10),
+                target: SilenceReportTarget {
+                    pane_id: ORCHESTRATOR_PANE.to_string(),
+                    agent_id: Some(orchestrator_agent.clone()),
+                    orchestration: None,
+                },
+            },
+            armed,
+            WORKER_PANE.to_string(),
+            "notice-launder-worker-agent".to_string(),
+            "worker".to_string(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        let before_probe = registry
+            .snapshot(&orchestrator_agent)
+            .expect("snapshot after silent-worker notice");
+        let notice = compose_delegate_silence_notice(std::time::Duration::from_millis(10));
+        assert!(
+            before_probe
+                .windows(notice.len())
+                .any(|window| window == notice.as_bytes()),
+            "precondition: the production silent-worker caller must land its Notice after the user's draft; output={:?}",
+            String::from_utf8_lossy(&before_probe)
+        );
+
+        let probe = registry
+            .write_and_submit_guarded(ORCHESTRATOR_PANE, "", Some(&orchestrator_agent), || async {
+                true
+            })
+            .await
+            .expect("submit-only probe after silent-worker notice");
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        let after_probe = registry
+            .snapshot(&orchestrator_agent)
+            .expect("snapshot after submit-only probe");
+
+        drop(event_tx);
+        registry.shutdown_all();
+        assert_eq!(
+            probe,
+            crate::agent_pty::GuardedSend::Stale,
+            "a Notice cannot make user input older than the automatic-write clock for a later blind probe"
+        );
+        assert_eq!(
+            after_probe,
+            before_probe,
+            "the probe must not submit the user's draft plus the silent-worker notice; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_probe),
+            String::from_utf8_lossy(&after_probe)
         );
     }
 

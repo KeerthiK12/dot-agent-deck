@@ -2507,6 +2507,275 @@ mod tests {
         );
     }
 
+    /// Scenario: Queue an automatic replacement behind the same writer that is forwarding an attached user's unsent draft, then release the writer without stamping the user-input clock. The queued retry must not append or submit anything before that clock stamp can run.
+    #[spec("scheduler/dispatch/019")]
+    #[tokio::test]
+    async fn dispatch_019_writer_release_does_not_expose_unstamped_user_input() {
+        use std::io::Write as _;
+
+        const PANE_ID: &str = "writer-release-clock-race-pane";
+        const PROMPT: &str = "automatic payload already delivered once";
+        const USER_DRAFT: &str = "attached user draft left unsent";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .await
+                .expect("initial guarded delivery"),
+            GuardedSend::Applied
+        );
+
+        let handle = registry
+            .subscribe(&agent_id)
+            .expect("attach byte-observation target");
+        let mut user_writer = handle.writer.lock().await;
+        let retry_registry = registry.clone();
+        let retry_agent = agent_id.clone();
+        let retry = tokio::spawn(async move {
+            retry_registry
+                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&retry_agent), || async { true })
+                .await
+                .expect("queued guarded replacement")
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !retry.is_finished(),
+            "precondition: the replacement must be queued behind the attached user's writer"
+        );
+
+        user_writer
+            .write_all(USER_DRAFT.as_bytes())
+            .expect("forward unsent attached user draft");
+        user_writer
+            .flush()
+            .expect("flush unsent attached user draft");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let before_writer_release = registry.snapshot(&agent_id).expect("pre-release snapshot");
+        assert!(
+            before_writer_release
+                .windows(USER_DRAFT.len())
+                .any(|window| window == USER_DRAFT.as_bytes()),
+            "precondition: the user's unsent bytes must already be physically visible before the clock stamp; output={:?}",
+            String::from_utf8_lossy(&before_writer_release)
+        );
+
+        // Exact production ordering under test: STREAM_IN drops the pane writer,
+        // then stamps `user_input_at`. Awaiting the already-queued replacement
+        // before stamping forces it to own that handoff window; there is no
+        // scheduler timing by which this fixture can stamp the clock first.
+        drop(user_writer);
+        let retry_outcome = retry.await.expect("queued replacement task");
+        registry.note_user_input(PANE_ID);
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_clock_stamp = registry.snapshot(&agent_id).expect("post-race snapshot");
+
+        registry.shutdown_all();
+        assert_eq!(
+            retry_outcome,
+            GuardedSend::Stale,
+            "a replacement that acquires the writer after user bytes but before their clock stamp must be refused"
+        );
+        assert_eq!(
+            after_clock_stamp,
+            before_writer_release,
+            "the writer-to-clock handoff must not let a retry append its payload or submit the user's draft; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_writer_release),
+            String::from_utf8_lossy(&after_clock_stamp)
+        );
+    }
+
+    /// Scenario: Complete one automatic delivery, then start a later same-text delivery after user input; independently, interleave a different automatic submit between user input and an older delivery's replacement. The later first attempt must be admitted, while the invalidated older replacement must be refused.
+    #[spec("scheduler/dispatch/020")]
+    #[tokio::test]
+    async fn dispatch_020_payload_guards_are_scoped_to_one_delivery() {
+        const SAME_PANE: &str = "later-same-payload-pane";
+        const SAME_PROMPT: &str = "fixed worker task pointer";
+
+        let same_registry = Arc::new(AgentPtyRegistry::new());
+        let same_agent = spawn_byte_target(&same_registry, SAME_PANE);
+        assert_eq!(
+            same_registry
+                .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, Some(&same_agent), || async {
+                    true
+                })
+                .await
+                .expect("delivery A"),
+            GuardedSend::Applied
+        );
+        type_user_draft(
+            &same_registry,
+            &same_agent,
+            SAME_PANE,
+            "user completed an unrelated turn\r",
+        )
+        .await;
+        let before_delivery_b = same_registry
+            .snapshot(&same_agent)
+            .expect("before delivery B snapshot");
+        let delivery_b = same_registry
+            .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, Some(&same_agent), || async { true })
+            .await
+            .expect("delivery B first attempt");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_delivery_b = same_registry
+            .snapshot(&same_agent)
+            .expect("after delivery B snapshot");
+
+        const REPLACED_PANE: &str = "different-submit-replaces-digest-pane";
+        const DELIVERY_A: &str = "older delivery payload A";
+        const DELIVERY_B: &str = "independent delivery payload B";
+        let replaced_registry = Arc::new(AgentPtyRegistry::new());
+        let replaced_agent = spawn_byte_target(&replaced_registry, REPLACED_PANE);
+        assert_eq!(
+            replaced_registry
+                .write_and_submit_guarded(
+                    REPLACED_PANE,
+                    DELIVERY_A,
+                    Some(&replaced_agent),
+                    || async { true },
+                )
+                .await
+                .expect("delivery A first attempt"),
+            GuardedSend::Applied
+        );
+        type_user_draft(
+            &replaced_registry,
+            &replaced_agent,
+            REPLACED_PANE,
+            "draft that invalidates delivery A",
+        )
+        .await;
+        assert_eq!(
+            replaced_registry
+                .write_and_submit_guarded(
+                    REPLACED_PANE,
+                    DELIVERY_B,
+                    Some(&replaced_agent),
+                    || async { true },
+                )
+                .await
+                .expect("independent delivery B"),
+            GuardedSend::Applied,
+            "precondition: the different guarded submit must replace the pane-global payload slot"
+        );
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let before_delivery_a_retry = replaced_registry
+            .snapshot(&replaced_agent)
+            .expect("before delivery A retry snapshot");
+        let delivery_a_retry = replaced_registry
+            .write_and_submit_guarded(REPLACED_PANE, DELIVERY_A, Some(&replaced_agent), || async {
+                true
+            })
+            .await
+            .expect("delivery A replacement");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_delivery_a_retry = replaced_registry
+            .snapshot(&replaced_agent)
+            .expect("after delivery A retry snapshot");
+
+        same_registry.shutdown_all();
+        replaced_registry.shutdown_all();
+        assert!(
+            delivery_b == GuardedSend::Applied
+                && after_delivery_b.len() > before_delivery_b.len()
+                && delivery_a_retry == GuardedSend::Stale
+                && after_delivery_a_retry == before_delivery_a_retry,
+            "payload safety must be scoped by logical delivery: later_same_payload={{outcome: {delivery_b:?}, before_len: {}, after_len: {}}}; older_retry_after_different_submit={{outcome: {delivery_a_retry:?}, before_len: {}, after_len: {}}}",
+            before_delivery_b.len(),
+            after_delivery_b.len(),
+            before_delivery_a_retry.len(),
+            after_delivery_a_retry.len()
+        );
+    }
+
+    /// Scenario: Hold the pane writer while the detached confirmation loop finishes its user-input precheck, then record user input before releasing the writer to its guarded backstop. The resulting refusal must publish a delivery notice instead of ending as a log-only stop.
+    #[spec("scheduler/dispatch/021")]
+    #[tokio::test]
+    async fn dispatch_021_backstop_user_input_refusal_is_reported() {
+        use std::io::Write as _;
+
+        const PANE_ID: &str = "detached-backstop-report-pane";
+        const PROMPT: &str = "detached prompt awaiting confirmation";
+        const USER_DRAFT: &str = "draft arriving after caller precheck";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .await
+                .expect("initial detached delivery"),
+            GuardedSend::Applied
+        );
+        let notices = Arc::new(Mutex::new(Vec::<DeliveryNotice>::new()));
+        let recorded = notices.clone();
+        registry.set_delivery_notice_sink(Arc::new(move |notice| {
+            recorded.lock().unwrap().push(notice);
+        }));
+
+        let handle = registry
+            .subscribe(&agent_id)
+            .expect("attach byte-observation target");
+        let mut user_writer = handle.writer.lock().await;
+        tokio::time::pause();
+        let (event_tx, event_rx) = broadcast::channel(8);
+        let confirmation = tokio::spawn(confirm_prompt_delivery(
+            registry.clone(),
+            event_rx,
+            ConfirmationTask {
+                pane_id: PANE_ID.into(),
+                agent_id: agent_id.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: "detached-backstop-report".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+
+        // Let the confirmation task install its first 500 ms watch timer before
+        // moving virtual time. After `advance`, the only await it can reach is
+        // the writer we still own, so the caller-side clock precheck has
+        // necessarily completed before this test records the user's input.
+        tokio::task::yield_now().await;
+        tokio::time::advance(unconfirmed_retry_delay(1) + Duration::from_millis(1)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !confirmation.is_finished(),
+            "precondition: after the deterministic backoff the confirmation task must be blocked on the held writer"
+        );
+        user_writer
+            .write_all(USER_DRAFT.as_bytes())
+            .expect("write draft after caller precheck");
+        user_writer
+            .flush()
+            .expect("flush draft after caller precheck");
+        registry.note_user_input(PANE_ID);
+        drop(user_writer);
+        tokio::time::resume();
+        confirmation
+            .await
+            .expect("writer-held backstop must terminate confirmation");
+
+        let notices = notices.lock().unwrap();
+        let notice_details = notices
+            .iter()
+            .map(|notice| notice.detail)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices.len(),
+            1,
+            "a writer-held refusal caused by user input must be durable pane state, not only `target went stale` in a log; notices={notice_details:?}"
+        );
+        drop(notices);
+        drop(event_tx);
+        registry.shutdown_all();
+    }
+
     /// Scenario: Abandon a spawn prompt against its exact pane owner, then replace that owner and exhaust the 256-watch cap for a new delivery. Abandonment must report state without pane bytes, a stale report must not mark the replacement, and the 257th delivery must visibly report that it is unwatched.
     #[serial_test::serial(prompt_confirmation_tasks)]
     #[tokio::test]

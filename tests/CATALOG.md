@@ -979,7 +979,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### prompt/pane-input/030 — An unbound launcher delivery may bind a live generation before retry, but cannot follow a generation through its end into a successor.
 - **Layer:** L1 (in-process seed consumer with a payload/identity-recording `PaneController` and hook-derived generation state).
 - **Agent:** none.
-- **Asserts:** the first write into a pane with no announced hook session declares no generation; once the real agent's `SessionStart` arrives and remains current, the next retry binds and retains it and a third attempt uses a distinct submit-only probe; separately, if a generation appears during backoff and ends before retry, both the seed and orchestrator TUI write sites send no bytes into its successor.
+- **Asserts:** the first write into a pane with no announced hook session declares no generation; once the real agent's `SessionStart` arrives and remains current, the next retry binds and retains it and a third attempt uses a distinct submit-only probe; separately, both seed and orchestrator TUI write sites send no bytes into a successor when a generation is observed and then ends, or when its complete start/end plus the successor start burst between two render passes.
 - **Does not assert:** the daemon-side confirmation task's own latch (covered by `scheduler/dispatch/016`) or the PTY bytes an empty payload produces (covered by the registry's submit path).
 - **Platform coverage:** mac+linux+windows.
 
@@ -3687,6 +3687,27 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** TUI-owned seed delivery (covered by `prompt/pane-input/032`) or the internal location of the clock comparison.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/dispatch/019 — Releasing an attached user's pane writer cannot expose unstamped input to an automatic retry.
+- **Layer:** L1 (in-process production registry guard with a real `/bin/cat` byte-observation PTY and a deterministic writer-lock handoff).
+- **Agent:** none.
+- **Asserts:** while an attached input writer holds the pane lock, an automatic replacement is queued behind it; the user's unsent draft is physically present before the writer is released; the queued replacement then owns the exact write-to-clock handoff window and must be refused with no snapshot change before the test allows the user-input clock stamp to run.
+- **Does not assert:** socket frame parsing or scheduler timing; the test directly forces the ordering produced inside the attach STREAM_IN handler after a successful write and flush.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/020 — Automatic payload guards are scoped to one logical delivery rather than stale pane-global byte history.
+- **Layer:** L1 (in-process production guarded submits with real `/bin/cat` byte-observation PTYs).
+- **Agent:** none.
+- **Asserts:** after delivery A and a completed user turn, a later delivery B's first attempt carrying the same fixed pointer text is applied and physically writes; independently, user input invalidates delivery A even when a different guarded submit B replaces the pane's last-payload record, so A's replacement is refused with no new bytes.
+- **Does not assert:** the internal representation of delivery identity or accidental digest collisions.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/021 — A detached writer-held user-input refusal is visibly reported.
+- **Layer:** L1 (in-process detached confirmation loop with paused time, a held production pane writer, a real `/bin/cat` byte-observation PTY, and the delivery-notice sink).
+- **Agent:** none.
+- **Asserts:** paused time deterministically completes the confirmation window while the writer is held, user input is stamped only after the caller's precheck has run and before the writer-held backstop proceeds, and that backstop refusal publishes one durable `DeliveryNotice` instead of becoming a log-only `target went stale` stop.
+- **Does not assert:** the notice sink's daemon-to-TUI rendering (covered by `scheduler/dispatch/017`) or exact log wording.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/pi
 
 ##### scheduler/pi/001 — A SCHEDULED, UNATTENDED real `pi` job (no TUI client attached) boots and its bundled extension reports the Pi pane's status via `agent-event`, re-broadcast on the daemon's event stream (PRD #201 M4.2).
@@ -3940,6 +3961,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (`cat` worker stand-in; the successor is raw/no-echo so any submitted byte is directly observable in its scrollback).
 - **Asserts:** two preconditions that stop it passing for the wrong reason — the orchestrator pane is NOT in a close transition after the exit (so the close-time sweep is provably not what suppresses the prompt), and the successor owned the pane before the delegation's deadline (so a stray timer had a live target to mis-deliver to) — then that after two further timeout windows the successor's PTY carries its own readiness marker, zero occurrences of the daemon clause, and no fragment of the dead orchestration's role name.
 - **Does not assert:** the pane-reuse-after-`StopAgent` path (covered by `scheduler/idle-worker/008`); the orchestration-membership half of the delivery revalidation (the successor is spawned without `tab_membership`, so that check legitimately abstains and the agent-id gate is what refuses).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/015 — A silent-worker notice cannot launder user input into a later blind submit probe.
+- **Layer:** L1 (in-process production silent-worker watch and guarded notice/submit paths with a real `/bin/cat` byte-observation PTY).
+- **Agent:** none.
+- **Asserts:** an automatic payload lands, the user types an unsent draft, and the real silent-worker watch then writes its fixed daemon notice; a following submit-only probe is refused and leaves the draft-plus-notice snapshot unchanged rather than submitting it.
+- **Does not assert:** the broader idle-worker detection policy or the exact diagnostic prose, only that the production notice caller cannot reauthorize a blind probe.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

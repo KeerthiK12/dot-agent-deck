@@ -30408,7 +30408,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Write seed and orchestrator prompts into launcher panes with no hook generation, then let a genuine generation arrive during backoff. A live generation may be bound before retry, but if that generation ends first neither TUI path may follow the delivery into its successor; a later safe attempt probes submission rather than retyping.
+    /// Scenario: Write seed and orchestrator prompts into launcher panes with no hook generation, then let a genuine generation arrive during backoff. A live generation may be bound before retry, but neither an observed end nor a whole start/end/successor burst between render passes may let either TUI path follow the delivery into a successor; a later safe attempt probes submission rather than retyping.
     #[spec("prompt/pane-input/030")]
     #[test]
     fn pane_input_030_late_generation_binds_before_the_retry_that_enters_it() {
@@ -30649,6 +30649,128 @@ mod tests {
         assert!(
             held_seed_write_count == 1 && held_role_write_count == 1,
             "an unbound delivery that observed a generation and its end must not follow into a successor on either TUI path; seed_writes={held_seed_write_count}, orchestrator_writes={held_role_write_count}"
+        );
+
+        // Auditor round 6: production does not guarantee a render pass while a
+        // short-lived generation exists. Force the entire R start/end/R2 start
+        // burst into AppState between two passes so no fixture-side witness can
+        // serialize the rollover into the favorable ordering above.
+        const BURST_SEED_PANE: &str = "between-pass-seed-generation-burst";
+        const BURST_SEED_AGENT: &str = "between-pass-seed-agent";
+        let burst_seed_controller = Arc::new(RecordingPaneController::default());
+        let burst_seed_writes = burst_seed_controller.writes.clone();
+        let burst_seed_pane: Arc<dyn PaneController> = burst_seed_controller;
+        let mut burst_seed_ui = default_ui();
+        burst_seed_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt(BURST_SEED_PANE, PROMPT));
+        let mut burst_seed_snapshot = ready_prompt_snapshot(BURST_SEED_PANE, BURST_SEED_AGENT);
+
+        process_pending_seed_prompts(&mut burst_seed_ui, &burst_seed_pane, &burst_seed_snapshot);
+        apply_generation_event(
+            &mut burst_seed_snapshot,
+            BURST_SEED_PANE,
+            BURST_SEED_AGENT,
+            "seed-generation-entirely-between-passes",
+            EventType::SessionStart,
+        );
+        apply_generation_event(
+            &mut burst_seed_snapshot,
+            BURST_SEED_PANE,
+            BURST_SEED_AGENT,
+            "seed-generation-entirely-between-passes",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut burst_seed_snapshot,
+            BURST_SEED_PANE,
+            BURST_SEED_AGENT,
+            "seed-successor-after-missed-generation",
+            EventType::SessionStart,
+        );
+        burst_seed_ui
+            .send_retry_backoff
+            .get_mut(BURST_SEED_PANE)
+            .expect("burst seed keeps its retry state")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut burst_seed_ui, &burst_seed_pane, &burst_seed_snapshot);
+        let burst_seed_write_count = burst_seed_writes.lock().unwrap().len();
+
+        const BURST_ROLE_PANE: &str = "between-pass-role-generation-burst";
+        const BURST_ROLE_AGENT: &str = "between-pass-role-agent";
+        let burst_role_controller = Arc::new(RecordingPaneController::default());
+        let burst_role_writes = burst_role_controller.writes.clone();
+        let burst_role_pane: Arc<dyn PaneController> = burst_role_controller;
+        let burst_started = std::time::Instant::now();
+        let burst_tab_id: TabId = 30031;
+        let mut burst_role_ui = default_ui();
+        burst_role_ui
+            .orchestration_created_at
+            .insert(burst_tab_id, burst_started);
+        burst_role_ui.orchestration_ready_since.insert(
+            burst_tab_id,
+            burst_started
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut burst_role_snapshot = ready_prompt_snapshot(BURST_ROLE_PANE, BURST_ROLE_AGENT);
+        let burst_role_panes = [BURST_ROLE_PANE.to_string()];
+        let mut burst_role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut burst_role_prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut burst_role_ui,
+            burst_role_pane.as_ref(),
+            &burst_role_snapshot,
+            burst_started,
+            burst_tab_id,
+            &burst_role_panes,
+            0,
+            &mut burst_role_statuses,
+            &mut burst_role_prompt,
+        );
+        apply_generation_event(
+            &mut burst_role_snapshot,
+            BURST_ROLE_PANE,
+            BURST_ROLE_AGENT,
+            "role-generation-entirely-between-passes",
+            EventType::SessionStart,
+        );
+        apply_generation_event(
+            &mut burst_role_snapshot,
+            BURST_ROLE_PANE,
+            BURST_ROLE_AGENT,
+            "role-generation-entirely-between-passes",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut burst_role_snapshot,
+            BURST_ROLE_PANE,
+            BURST_ROLE_AGENT,
+            "role-successor-after-missed-generation",
+            EventType::SessionStart,
+        );
+        burst_role_ui
+            .send_retry_backoff
+            .get_mut(BURST_ROLE_PANE)
+            .expect("burst role keeps its retry state")
+            .next_attempt_at = burst_started;
+        deliver_orchestrator_prompt(
+            &mut burst_role_ui,
+            burst_role_pane.as_ref(),
+            &burst_role_snapshot,
+            burst_started + std::time::Duration::from_millis(1),
+            burst_tab_id,
+            &burst_role_panes,
+            0,
+            &mut burst_role_statuses,
+            &mut burst_role_prompt,
+        );
+        let burst_role_write_count = burst_role_writes.lock().unwrap().len();
+
+        assert!(
+            burst_seed_write_count == 1 && burst_role_write_count == 1,
+            "a whole generation that starts and ends between render passes must revoke both unbound TUI deliveries before either can bind its successor; seed_writes={burst_seed_write_count}, orchestrator_writes={burst_role_write_count}"
         );
     }
 
