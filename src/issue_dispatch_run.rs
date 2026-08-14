@@ -253,6 +253,10 @@ pub async fn run_issue_dispatch(
     worktrees: &WorktreeRegistry,
     notifier: &dyn Notifier,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
+    // The daemon's `AppState`, so an issue-dispatched ORCHESTRATION's roles are
+    // registered for delegate routing — see
+    // `crate::state::AppState::register_orchestration_role`.
+    state: Option<&crate::state::SharedState>,
 ) {
     // S5 — every derived path (clone, worktree, the spawn's orchestration_cwd)
     // must be absolute: a relative workspace root would double-nest the worktree
@@ -317,6 +321,7 @@ pub async fn run_issue_dispatch(
             worktrees,
             notifier,
             event_tx,
+            state,
         )
         .await
         {
@@ -346,6 +351,10 @@ async fn dispatch_one_issue(
     worktrees: &WorktreeRegistry,
     notifier: &dyn Notifier,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
+    // Threaded to `spawn` so an issue-dispatched ORCHESTRATION's roles land in
+    // the daemon's delegate-routing maps — see
+    // `crate::state::AppState::register_orchestration_role`.
+    state: Option<&crate::state::SharedState>,
 ) -> Result<(), String> {
     let paths = derive_issue_paths(workspace, task_name, issue);
 
@@ -445,7 +454,7 @@ async fn dispatch_one_issue(
         // the orchestrator context is #222's work, not this PR's.
         compose_orchestrator_context: false,
     };
-    if let Err(e) = spawn(req, registry, notifier, event_tx, true).await {
+    if let Err(e) = spawn(req, registry, notifier, event_tx, true, state).await {
         // The spawn failed after the worktree was created/recorded: no agent
         // will ever close to trigger cleanup, so drop the registry entry here.
         // The worktree dir itself is left on disk — the next fire's

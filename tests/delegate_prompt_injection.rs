@@ -1409,6 +1409,33 @@ impl SilenceHarness {
         }
     }
 
+    async fn type_unsent_worker_draft(&self, draft: &str) {
+        use std::io::Write as _;
+
+        let handle = self
+            .registry
+            .subscribe(&self.worker_agent_id)
+            .expect("attach silence-test worker");
+        let mut writer = handle.writer.lock().await;
+        writer
+            .write_all(draft.as_bytes())
+            .expect("write unsent worker draft");
+        writer.flush().expect("flush unsent worker draft");
+        drop(writer);
+        let observed = wait_for_snapshot_needle(
+            &self.registry,
+            &self.worker_agent_id,
+            draft.as_bytes(),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            snapshot_contains(&observed, draft.as_bytes()),
+            "unsent worker draft did not physically reach the PTY; snapshot={:?}",
+            String::from_utf8_lossy(&observed)
+        );
+    }
+
     fn orchestrator_snapshot(&self) -> Vec<u8> {
         self.registry
             .snapshot(&self.orchestrator_agent_id)
@@ -1592,13 +1619,11 @@ fn delegate_silence_notice_does_not_reach_successor_orchestrator() {
         });
 }
 
-/// Scenario: Complete a hookless delegated task through the real `work-done`
-/// handler and prove its silence watch is cancelled. Then delegate twice to one
-/// worker and report only the older task done; the newer silent task must still
-/// produce its own no-event notice.
+/// Scenario: Complete a hookless delegate through the real work-done handler, type an unsent draft, and delegate the same fixed pointer again; the second pointer must still reach the worker. Independently, report only an older task done after two delegates and require the newer silent task's no-event notice to remain armed.
+#[spec("orchestration/delegate/021")]
 #[test]
 #[cfg(unix)]
-fn delegate_work_done_cancels_only_matching_silence_watch() {
+fn delegate_021_work_done_releases_only_its_own_delivery_state() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
@@ -1634,6 +1659,10 @@ fn delegate_work_done_cancels_only_matching_silence_watch() {
                     "timely work-done failed to cancel its no-event watch: {:?}",
                     String::from_utf8_lossy(&snapshot)
                 );
+                harness
+                    .type_unsent_worker_draft("worker draft deliberately left unsent")
+                    .await;
+                harness.redelegate_and_wait_for_another_pointer().await;
             }
 
             let harness = SilenceHarness::new(64).await;

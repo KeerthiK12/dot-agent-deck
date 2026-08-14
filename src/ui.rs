@@ -29,6 +29,13 @@ use crate::keybindings::{Action as KbAction, KeybindingConfig};
 use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
+use crate::prompt_delivery::{
+    AUTOMATIC_PROMPT_DEADLINE, ConfirmationCapability, attempt_delivery_id, attempt_writes_payload,
+    log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed, log_prompt_probe_submitted,
+    log_prompt_stopped, log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written,
+    mint_delivery_id, pane_confirmation_capability, prompt_submission_accumulated,
+    prompt_submission_matches, submission_is_after_watermark, unconfirmed_retry_delay,
+};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
 use crate::tab_layout::fit_tab_labels;
@@ -1588,8 +1595,132 @@ struct SendRetryState {
 #[derive(Clone)]
 struct PromptDelivery {
     expected_agent_id: Option<String>,
+    /// Issue #424 (reviewer finding B2): the daemon-authoritative hook session
+    /// GENERATION this delivery is bound to, captured at the FIRST successful
+    /// write and retained across every attempt.
+    ///
+    /// It used to be `None` always on the orchestrator path and captured only in
+    /// a branch the seed path never reached, so every rotated retry told the
+    /// daemon "any generation will do" — enough to refuse a different registry
+    /// agent, useless against a same-agent `/clear` or thread restart, which is
+    /// precisely the case where the old prompt lands in a NEW conversation.
+    /// `None` here means no generation has been named yet. It is latched ONCE
+    /// and never re-latched, because a generation change after the latch is a
+    /// lost target, not a new address to write to. Two places may perform that
+    /// one latch, for two different reasons:
+    ///
+    /// * [`bind_delivery_generation`], BEFORE the first write — the ordinary
+    ///   case, naming the conversation the bytes are about to enter;
+    /// * [`bind_generation_before_retry`], before a RETRY made by a delivery
+    ///   whose first write went into a pane that had no generation at all (the
+    ///   launcher/10 s-fallback case). Issue #424 D1: leaving that delivery
+    ///   permanently unbound meant every retry told the daemon "any generation
+    ///   will do" for exactly the population this issue exists to repair.
     expected_session_id: Option<String>,
+    /// Issue #424 F2 (auditor HIGH): the pane generation this delivery has SEEN
+    /// while it was written but still unbound — a witness, not a binding.
+    ///
+    /// D1 named the conversation a retry is about to enter, which closed the
+    /// case where the late generation is still current when the retry runs. It
+    /// did not close the counter-sequence: attempt 1 writes while the pane has
+    /// no generation, a genuine `SessionStart(R)` arrives WHILE THE RETRY IS
+    /// BACKED OFF (so the every-frame bind refuses — a write already exists),
+    /// `R` then ends before the retry is due, and by then
+    /// [`delivery_target_changed`] is comparing against `None` and answers
+    /// "unchanged" because nothing was ever bound. The retry either adopts `R`'s
+    /// successor and sends the old task into it, or goes out with no generation
+    /// guard at all.
+    ///
+    /// The daemon-side latch observes `R` and its end sequentially and
+    /// terminates on the second ([`crate::state::latch_generation`]); the TUI
+    /// samples a snapshot per frame and would otherwise forget the transition
+    /// happened. This field is what makes it remember: once a generation has
+    /// been seen after our bytes, its disappearance or replacement is a lost
+    /// target exactly as a bound one's would be.
+    ///
+    /// Deliberately NOT a binding: it is not sent on the wire, does not rotate
+    /// the epoch, and does not claim a conversation the bytes never entered —
+    /// see [`bind_delivery_generation`] for why binding every frame is the thing
+    /// that laundered a `/clear` into an authorization, and `prompt/pane-input/026`
+    /// for the drifting-session-id pane it would abandon.
+    observed_generation: Option<String>,
+    /// Issue #424 H4 (auditor HIGH): the pane's generation-CLOSURE count at the
+    /// instant of the FIRST write. `None` until then — nothing is written, so
+    /// nothing can have been revoked.
+    ///
+    /// Issue #424 S4 (reviewer HIGH): stamped immediately BEFORE the RPC that
+    /// may write, on both TUI paths, and never afterwards. A transport error is
+    /// not proof that the daemon did not apply the write, so a baseline stored
+    /// only in the `Applied`/`Queued` arm was missing from exactly the delivery
+    /// that needed it: `attempts` stayed 0, an entire generation burst passed
+    /// unnoticed, and the eventual success then stored the ALREADY-INCREMENTED
+    /// count as its baseline — laundering the missed closure permanently. It
+    /// therefore doubles as the "a write may have occurred" witness
+    /// [`delivery_target_changed`] gates on, which the attempt counter cannot be
+    /// because a lost response leaves it at zero.
+    ///
+    /// [`Self::observed_generation`] is a witness the TUI has to SEE to record,
+    /// and production offers no guarantee of a render pass while a short-lived
+    /// generation exists. `SessionStart(R)`, `SessionEnd(R)` and
+    /// `SessionStart(R2)` can all land between two passes; `AppState::apply_event`
+    /// removes R's session and its journal on the end, so by the next pass there
+    /// is no witness to acquire and no trace that R was ever there. The delivery
+    /// then adopts R2 and types the revoked task into it.
+    ///
+    /// A count read from the snapshot needs no pass to have been taken at the
+    /// right moment: `AppState` maintains it as it consumes the events, in order,
+    /// exactly as the daemon's own latch does — see
+    /// [`crate::state::AppState::pane_generation_closures`]. The witness is kept
+    /// alongside it because the two answer different questions: the witness is
+    /// the identity of a generation this delivery saw, the count is the number of
+    /// conversations it MISSED.
+    closures_at_write: Option<u64>,
     delivery_id: String,
+    /// Issue #424 (reviewer blocker 2): which WIRE-IDENTITY epoch this delivery
+    /// is on.
+    ///
+    /// The daemon's ledger binds a `delivery_id` to a FINGERPRINT of the target
+    /// identity (agent + session + pane + text) at first admission and refuses a
+    /// later request that reuses the id with a different one. That is right, and
+    /// it collided with two other correct behaviours: after a LOST RESPONSE the
+    /// retry deliberately reuses the same attempt id (so a physically-applied
+    /// write replays instead of double-submitting), while binding the hook
+    /// generation for the first time changes `expected_session_id` — and B11 now
+    /// hashes that. Same id, different fingerprint: a permanent `Conflict` that
+    /// the error branch retried, unchanged, until the deadline.
+    ///
+    /// So an identity change that lands while a wire request may still be
+    /// recorded rotates the EPOCH, which gives the delivery a fresh wire
+    /// identity while leaving the logical id (what logs and local state key on)
+    /// and the attempt number alone. Same-request replay is preserved within an
+    /// epoch; a new epoch is admitted as new work.
+    epoch: u32,
+    /// Issue #424: whether a wire request has been issued in this epoch whose
+    /// outcome may be sitting in the daemon's ledger. Set before every send and
+    /// cleared when the epoch rotates. A CLEAN response is not enough to clear
+    /// it — a delivered outcome is exactly what the ledger caches — so this is
+    /// only about "could the current wire id already be bound to a fingerprint".
+    wire_issued: bool,
+    /// Issue #424: how many PTY submissions this LOGICAL delivery has made. `0`
+    /// means nothing has been written yet, so nothing the pane reports can be
+    /// evidence about it. Each attempt goes on the wire under its own
+    /// [`attempt_delivery_id`] so the daemon's ledger cannot replay a cached
+    /// `Applied` in place of the second physical submission a retry exists for.
+    attempts: u32,
+    /// Issue #424 (reviewer finding B2/#3): the ORDERING watermark — the newest
+    /// timestamp in this pane's own event journal at the instant of the first
+    /// write. A submission at or before it was already history when we wrote and
+    /// is not evidence about this delivery. It does not establish causality —
+    /// see #526 and
+    /// [`submission_is_after_watermark`] for why this replaced a wall-clock
+    /// comparison against our own write time.
+    watermark: Option<DateTime<Utc>>,
+    /// Issue #424 (reviewer findings B3/B4): whether this pane has ever been
+    /// observed to have a producer that can report a submitted prompt. Sticky
+    /// once true — a `SessionEnd` must not disarm a delivery mid-flight — and it
+    /// is what gates RE-SUBMISSION, so a slow launcher arms late and a Pi pane
+    /// never arms at all.
+    can_report_prompts: bool,
 }
 
 /// PRD #20 R20-005: bounded exponential backoff for a retried automatic prompt.
@@ -1605,40 +1736,6 @@ fn send_retry_delay(attempts: u32) -> std::time::Duration {
     const CAP: std::time::Duration = std::time::Duration::from_secs(2);
     let shift = attempts.saturating_sub(1).min(6);
     std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift)).min(CAP)
-}
-
-/// PRD #20 R20-004 (finding #3): hard cap on how long an automatic prompt (a
-/// mode seed or an orchestrator role prompt) is retried before it is abandoned.
-/// The deadline is checked BEFORE the readiness/backoff/delivery branches so it
-/// is actually reachable — the previous code checked it only after the delivery
-/// branch, which always returned first, so a permanent non-delivery
-/// (`wrong-session`, a never-live role) retried one RPC every ~2s forever.
-const AUTOMATIC_PROMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// PRD #20 R20-004 (finding #3): mint a GLOBALLY-UNIQUE delivery id for an
-/// automatic prompt. The old `seed-<pane>-<seq>` restarted its counter at 1 in
-/// EVERY TUI process while the daemon's dedup ledger persists — so a reconnecting
-/// (restarted) TUI could reuse an id the daemon still had cached and have a
-/// genuinely-new prompt silently suppressed (or replayed against conflicting
-/// content). This combines a per-PROCESS nonce (two processes never collide)
-/// with a global monotonic counter (two ids within one process never collide),
-/// keyed by pane for log readability.
-fn mint_delivery_id(pane_id: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nonce = *NONCE.get_or_init(|| {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        std::process::id().hash(&mut h);
-        // Nanos since the epoch disambiguate a pid reused across restarts.
-        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            dur.as_nanos().hash(&mut h);
-        }
-        h.finish()
-    });
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("send-{nonce:016x}-{pane_id}-{seq}")
 }
 
 struct UiState {
@@ -2987,6 +3084,66 @@ fn process_pending_seed_prompts(
     let mut backoff = std::mem::take(&mut ui.send_retry_backoff);
     let mut deliveries = std::mem::take(&mut ui.prompt_delivery);
     prompts.retain_mut(|sp| {
+        // Issue #424: CONFIRMATION FIRST. A previous frame's `Applied`/`Queued`
+        // only proved the PTY accepted bytes, so the seed is still here; if the
+        // agent has since reported submitting it, this delivery is done — clear
+        // the seed and all its retry state. Checked ahead of the backoff gate
+        // because the write that gets confirmed is precisely the one whose
+        // backoff window is still open (`prompt/pane-input/024`, `/026`).
+        if let Some(delivery) = deliveries.get_mut(&sp.pane_id) {
+            // Reviewer blocker 1: the target check runs BEFORE the bind, and
+            // compares the bound generation against the current one. Binding
+            // first overwrote the answer with the question — see
+            // [`delivery_target_changed`] and [`bind_delivery_generation`].
+            //
+            // Reviewer findings B1/B2: the conversation we wrote into is GONE.
+            // Neither retyping into its successor nor accepting that successor's
+            // events as confirmation is safe, so the delivery stops here with a
+            // visible reason.
+            if delivery_target_changed(snapshot, &sp.pane_id, delivery) {
+                log_prompt_stopped(
+                    "seed",
+                    &sp.pane_id,
+                    &delivery.delivery_id,
+                    "delivery-target-changed",
+                );
+                feedback = Some(
+                    "Seed prompt not delivered (the agent's conversation changed); abandoned"
+                        .to_string(),
+                );
+                backoff.remove(&sp.pane_id);
+                deliveries.remove(&sp.pane_id);
+                return false;
+            }
+            bind_delivery_generation(delivery, snapshot, &sp.pane_id);
+            match prompt_submission_evidence(snapshot, &sp.pane_id, &sp.prompt, delivery) {
+                Some(SubmissionEvidence::Confirmed) => {
+                    log_prompt_confirmed(
+                        "seed",
+                        &sp.pane_id,
+                        &delivery.delivery_id,
+                        delivery.attempts,
+                    );
+                    backoff.remove(&sp.pane_id);
+                    deliveries.remove(&sp.pane_id);
+                    return false;
+                }
+                // Issue #424 D5: the seed came back doubled with no separator.
+                // Terminal — see [`SubmissionEvidence::Accumulated`].
+                Some(SubmissionEvidence::Accumulated) => {
+                    log_prompt_accumulated(
+                        "seed",
+                        &sp.pane_id,
+                        &delivery.delivery_id,
+                        delivery.attempts,
+                    );
+                    backoff.remove(&sp.pane_id);
+                    deliveries.remove(&sp.pane_id);
+                    return false;
+                }
+                None => {}
+            }
+        }
         // PRD #20 R20-005 (finding #13): the hard timeout is checked FIRST, before
         // the readiness/backoff/delivery branches — so it is actually reachable.
         // The old code checked it only AFTER the delivery branch (which always
@@ -2994,7 +3151,32 @@ fn process_pending_seed_prompts(
         // non-delivery re-attempted one RPC every ~2s forever. An expired seed is
         // abandoned here with NO further delivery attempt.
         if sp.created_at.elapsed() > AUTOMATIC_PROMPT_DEADLINE {
-            tracing::warn!(pane_id = %sp.pane_id, "seed prompt: timed out; abandoning");
+            // Issue #424: the same warn this always emitted, now carrying the
+            // delivery identity and how many submissions were made — the two
+            // facts that tell "never written" apart from "written N times and
+            // never confirmed" when reading back a lost seed after the fact.
+            let (delivery_id, attempts) = deliveries
+                .get(&sp.pane_id)
+                .map(|delivery| (delivery.delivery_id.clone(), delivery.attempts))
+                .unwrap_or_default();
+            // Reviewer finding B3: a pane that never identified a producer was
+            // never RETRIED either, so its single write reaching the deadline is
+            // not a failure to report — it is a pane nothing could ever report
+            // for. Logged as unconfirmable rather than abandoned so the two are
+            // distinguishable when reading back a lost seed.
+            if attempts > 0
+                && delivery_capability(snapshot, &sp.pane_id, deliveries.get(&sp.pane_id))
+                    != ConfirmationCapability::Reports
+            {
+                log_prompt_unconfirmable(
+                    "seed",
+                    &sp.pane_id,
+                    &delivery_id,
+                    "no producer on this pane can report a submitted prompt",
+                );
+            } else {
+                log_prompt_abandoned("seed", &sp.pane_id, &delivery_id, attempts);
+            }
             backoff.remove(&sp.pane_id);
             deliveries.remove(&sp.pane_id);
             return false;
@@ -3004,6 +3186,9 @@ fn process_pending_seed_prompts(
             s.pane_id.as_deref() == Some(sp.pane_id.as_str()) && s.agent_type != AgentType::None
         });
         // Slow path: no SessionStart after 10s (e.g. opencode) — proceed anyway.
+        // Issue #424 (reviewer finding B3): this still decides WHEN to write,
+        // exactly as before, but no longer decides whether the write is
+        // confirmable. That question is answered by the producer, below.
         let timeout_ready =
             !agent_ready && sp.created_at.elapsed() > std::time::Duration::from_secs(10);
         if agent_ready {
@@ -3038,23 +3223,160 @@ fn process_pending_seed_prompts(
                     // conversation.
                     expected_agent_id: pane.pane_agent_id(&sp.pane_id),
                     expected_session_id: snapshot.pane_hook_session_id(&sp.pane_id),
+                    observed_generation: None,
+                    closures_at_write: None,
                     // PRD #20 finding #3: globally-unique id (process nonce +
                     // global counter), not a per-process `seed-<pane>-N`.
                     delivery_id: mint_delivery_id(&sp.pane_id),
+                    attempts: 0,
+                    watermark: None,
+                    can_report_prompts: false,
+                    epoch: 0,
+                    wire_issued: false,
                 }
             });
             let expected_agent_id = delivery.expected_agent_id.clone();
-            let expected_session_id = delivery.expected_session_id.clone();
             let delivery_id = delivery.delivery_id.clone();
+            let already_written = delivery.attempts > 0;
+            // Reviewer finding B3: read the capability as of THIS frame, not as
+            // of the readiness timeout — a producer that identifies itself at
+            // 10.1 s must still get its retries.
+            let capability = delivery_capability(snapshot, &sp.pane_id, Some(delivery));
+            delivery.can_report_prompts |= capability == ConfirmationCapability::Reports;
+            // Reviewer finding B3: a delivery already written into a pane whose
+            // producer is unknown is HELD, not rewritten. Retyping into a pane
+            // that has given no evidence it can report anything is the failure
+            // mode the retry policy exists to avoid.
+            if already_written && capability != ConfirmationCapability::Reports {
+                return true;
+            }
+            // Issue #424 D1: we are past every hold, so this frame WILL write
+            // into whatever conversation the pane currently has. Name it before
+            // doing so — see [`bind_generation_before_retry`]. Must come before
+            // the epoch and session are read below, because binding can rotate
+            // the epoch.
+            bind_generation_before_retry(delivery, snapshot, &sp.pane_id);
+            let expected_session_id = delivery.expected_session_id.clone();
+            let epoch = delivery.epoch;
+            // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT
+            // rides its own wire id, or the daemon's ledger would replay the
+            // first `Applied` and this retry would never reach the PTY at all.
+            let attempt = delivery.attempts.saturating_add(1);
+            // Issue #424 D5: after the one bounded replacement payload, later
+            // attempts probe SUBMISSION rather than typing the seed in again —
+            // same identity guards, same terminal-outcome classification, empty
+            // payload. See [`crate::prompt_delivery::attempt_writes_payload`].
+            let writes_payload = attempt_writes_payload(attempt);
+            let wire_delivery_id = wire_attempt_id(&delivery_id, epoch, attempt, !writes_payload);
+            // Reviewer blocker 2: from here on, a request under this wire id may
+            // be recorded in the daemon's ledger, so a later identity change has
+            // to rotate the epoch rather than reuse it.
+            delivery.wire_issued = true;
+            // Reviewer finding B2/#3: read the watermark IMMEDIATELY before the
+            // write, so everything already in the pane's journal is pre-existing
+            // history by construction.
+            let watermark = pane_event_watermark(snapshot, &sp.pane_id);
+            // Issue #424 H4: and the generation-closure count, for the same
+            // reason and at the same instant — every rollover after this point is
+            // one this delivery's bytes were sitting through. See
+            // [`PromptDelivery::closures_at_write`].
+            let closures = snapshot.pane_generation_closures(&sp.pane_id);
+            // Issue #424 S4 (reviewer HIGH): PERSISTED BEFORE THE RPC, not in
+            // the success arm. A transport error is not proof that the daemon
+            // did not apply the write — the lost-response case the delivery
+            // ledger exists to tolerate — and storing the baseline only on
+            // success left `closures_at_write` at `None` for exactly that write.
+            // A whole `SessionStart`/`SessionEnd`/`SessionStart` burst then
+            // passed unnoticed, the ordinary bind adopted the successor, and the
+            // eventual success stored the already-incremented count, laundering
+            // the missed closure permanently. Being `Some` is also this
+            // delivery's "a write may have occurred" witness — see
+            // [`delivery_target_changed`].
+            if let Some(delivery) = deliveries.get_mut(&sp.pane_id)
+                && delivery.closures_at_write.is_none()
+            {
+                delivery.closures_at_write = Some(closures);
+            }
             match pane.write_and_submit_to_pane_with_identity(
                 &sp.pane_id,
-                &sp.prompt,
+                if writes_payload { &sp.prompt } else { "" },
                 expected_agent_id.as_deref(),
                 expected_session_id.as_deref(),
-                Some(&delivery_id),
+                Some(&wire_delivery_id),
             ) {
-                // Delivered (or accepted for delivery): drop the seed + its state.
+                // Issue #424: the PTY accepted the bytes — that is ALL this
+                // means. Whether the agent's TUI was in submit-CR-aware mode
+                // when the CR landed is not knowable here, so the seed, its
+                // identity and its retry are RETAINED until the agent reports
+                // submitting it (checked at the top of this closure).
                 Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
+                    let delivery = deliveries
+                        .get_mut(&sp.pane_id)
+                        .expect("delivery inserted above");
+                    delivery.attempts = attempt;
+                    if delivery.watermark.is_none() {
+                        delivery.watermark = watermark;
+                    }
+                    if writes_payload {
+                        log_prompt_written("seed", &sp.pane_id, &delivery_id, attempt);
+                    } else {
+                        log_prompt_probe_submitted("seed", &sp.pane_id, &delivery_id, attempt);
+                    }
+                    match capability {
+                        // A recognized producer that structurally cannot report
+                        // a submitted prompt (Pi). Retrying could never be
+                        // confirmed — only retyped — so the write is final.
+                        ConfirmationCapability::CannotReport => {
+                            log_prompt_unconfirmable(
+                                "seed",
+                                &sp.pane_id,
+                                &delivery_id,
+                                "this agent cannot report a submitted prompt",
+                            );
+                            backoff.remove(&sp.pane_id);
+                            deliveries.remove(&sp.pane_id);
+                            return false;
+                        }
+                        // Reviewer finding B3: nothing has identified itself
+                        // yet. Hold the write PROVISIONAL — retained, so a
+                        // producer that signals at 10.1 s still arms retries and
+                        // a confirmation still finalizes — but do NOT retype
+                        // into a pane that has given no reason to think a second
+                        // copy would help. This is where the old code finalized
+                        // and threw the prompt away, which is what excluded the
+                        // slow-launcher class from the whole fix.
+                        ConfirmationCapability::Unknown => {
+                            backoff.remove(&sp.pane_id);
+                            return true;
+                        }
+                        ConfirmationCapability::Reports => {
+                            log_prompt_unconfirmed("seed", &sp.pane_id, &delivery_id, attempt);
+                            schedule_unconfirmed_retry(&mut backoff, &sp.pane_id, now, attempt);
+                            return true;
+                        }
+                    }
+                }
+                // Issue #424 (tester's finding, C2): a TERMINAL outcome is
+                // terminal HERE too. This arm used to funnel every non-success
+                // result into `schedule_send_retry`, so a `WrongSession` on a
+                // provisional delivery — the pane changed hands, the
+                // identity-aware controller refused before writing — left the
+                // stale seed alive and retrying until the deadline instead of
+                // stopping, and an `Ambiguous` could be retried after a PARTIAL
+                // write, which is the one thing that variant exists to forbid.
+                // The orchestrator path already did this
+                // ([`is_terminal_send_result`]); only the seed path did not.
+                Ok(other) if seed_result_is_terminal(other, already_written) => {
+                    log_prompt_stopped(
+                        "seed",
+                        &sp.pane_id,
+                        &delivery_id,
+                        describe_send_result(other),
+                    );
+                    feedback = Some(format!(
+                        "Seed prompt not delivered ({}); abandoned",
+                        describe_send_result(other)
+                    ));
                     backoff.remove(&sp.pane_id);
                     deliveries.remove(&sp.pane_id);
                     return false;
@@ -3114,22 +3436,577 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
     // The daemon-side agent id currently bound to this pane (the registry key,
     // == the client's stream-backend `agent_id`). This is the reliable identity:
     // a respawn/rebind rolls it over, so the daemon's guard catches a stale
-    // delivery to a replacement. We deliberately do NOT capture a session id:
-    // the UI's session view carries placeholder sessions with UI-minted ids that
-    // don't match the daemon's hook-derived session state, so comparing them
-    // daemon-side would spuriously reject EVERY delivery. The agent-id guard
-    // already covers the respawn case; the session axis stays daemon-internal
-    // (exercised by the protocol tests that set up daemon state directly).
+    // delivery to a replacement.
+    //
+    // The hook GENERATION is deliberately left `None` HERE, not abandoned: at
+    // capture time (tab creation) no agent exists yet, so there is nothing to
+    // bind to, and the UI's own placeholder session ids are UI-minted values the
+    // daemon would reject on sight. It is bound instead at the first write, from
+    // `AppState::pane_hook_session_id` — which IS the daemon-derived generation,
+    // fed by the same hook events the daemon applies — by
+    // [`bind_delivery_generation`]. Reviewer finding B2: leaving it `None`
+    // through delivery is what let a same-agent `/clear` between enqueue and
+    // write put the old prompt into the new conversation.
     let expected_agent_id = pane.pane_agent_id(pane_id);
     ui.prompt_delivery.insert(
         pane_id.to_string(),
         PromptDelivery {
             expected_agent_id,
             expected_session_id: None,
+            observed_generation: None,
+            closures_at_write: None,
             // PRD #20 finding #3: globally-unique id (process nonce + global
             // counter) so a TUI restart can't collide with the daemon's still-live
             // dedup ledger.
             delivery_id: mint_delivery_id(pane_id),
+            attempts: 0,
+            watermark: None,
+            can_report_prompts: false,
+            epoch: 0,
+            wire_issued: false,
+        },
+    );
+}
+
+/// Issue #424: whether `snapshot` shows the agent in `pane_id` having actually
+/// SUBMITTED `expected` — the only honest evidence that a written prompt was
+/// delivered rather than swallowed by a still-booting agent TUI.
+///
+/// Reads the pane's sessions' `recent_events` rather than `last_user_prompt`
+/// because the latter is a single overwritable slot: a prompt the human types a
+/// frame after the seed lands would erase the evidence before the delivery loop
+/// next runs, turning a real delivery into a spurious re-submission.
+///
+/// FOUR axes must all match, because any one of them alone produces a false
+/// confirmation that reinstates the bug in a new shape:
+///
+/// * the PANE — the same text submitted in a sibling pane says nothing about
+///   this delivery (`prompt/pane-input/026`);
+/// * the IDENTITY — reviewer finding B2/#2 and auditor B6. The event must carry
+///   a non-optional `agent_id` that matches every identity we hold: the
+///   delivery's `expected_agent_id` when the controller could supply one, and
+///   the owning session's. `PromptDelivery` already stored the expected agent
+///   and this never consulted it, while the daemon-side watcher accepted an
+///   agent-less event on the pane alone. The hook socket is owner-only but any
+///   same-user process can write to it, so an event that cannot say who it came
+///   from is unusable evidence — accepting it cleared every scrap of retry state
+///   and re-created #424's silent loss in a shape no log would explain;
+/// * the TEXT — an unrelated prompt the human typed into the target pane is not
+///   our prompt arriving, and comparison goes through
+///   [`prompt_submission_matches`] so a seed longer than `USER_PROMPT_MAX_LEN`
+///   still matches its truncated report, and a CR-swallowed newline-separated
+///   doubled submission counts as delivered rather than leaving the retry armed;
+/// * the WATERMARK — an event already in the pane's journal when we wrote is
+///   pre-existing history. `attempts == 0` (nothing written yet) can never
+///   confirm.
+///
+/// The GENERATION is enforced separately, by [`delivery_target_changed`], and
+/// not as a field on the event: `AppState::apply_event` REMAPS an incoming
+/// event's `session_id` onto the stable card id for UI continuity, so the id
+/// stored in `recent_events` is not the hook generation and cannot be compared
+/// against one. What the snapshot does hold authoritatively is the pane's
+/// CURRENT generation, so the delivery is stopped outright the moment that
+/// differs from the bound one — which makes "the generation is unchanged" a
+/// precondition of ever reaching this function.
+fn prompt_submission_evidence(
+    snapshot: &AppState,
+    pane_id: &str,
+    expected: &str,
+    delivery: &PromptDelivery,
+) -> Option<SubmissionEvidence> {
+    if delivery.attempts == 0 {
+        return None;
+    }
+    let mut evidence = None;
+    for session in snapshot
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+    {
+        for event in &session.recent_events {
+            let Some(reported_agent) = event.agent_id.as_deref() else {
+                continue;
+            };
+            let identity_matches = delivery
+                .expected_agent_id
+                .as_deref()
+                .is_none_or(|expected_agent| expected_agent == reported_agent)
+                && session
+                    .agent_id
+                    .as_deref()
+                    .is_none_or(|owner| owner == reported_agent);
+            if !identity_matches
+                || !submission_is_after_watermark(event.timestamp, delivery.watermark)
+            {
+                continue;
+            }
+            let Some(reported) = event.user_prompt.as_deref() else {
+                continue;
+            };
+            if prompt_submission_matches(expected, reported) {
+                // A clean confirmation anywhere in the journal wins outright:
+                // accumulation elsewhere does not make a real delivery dirty.
+                return Some(SubmissionEvidence::Confirmed);
+            }
+            if prompt_submission_accumulated(expected, reported) {
+                evidence = Some(SubmissionEvidence::Accumulated);
+            }
+        }
+    }
+    evidence
+}
+
+/// Issue #424 D5: what a pane's journal says about a written prompt, once
+/// identity and watermark have already been satisfied.
+///
+/// Two outcomes, kept apart because they authorize different things and because
+/// a log has to be able to tell them apart afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionEvidence {
+    /// The agent reported submitting our prompt — verbatim, truncated, or as
+    /// newline-separated copies ([`prompt_submission_matches`]). The delivery is
+    /// real.
+    Confirmed,
+    /// The agent reported our prompt submitted as repeated copies run together
+    /// with no separator ([`prompt_submission_accumulated`]). A payload had been
+    /// sitting in the input box and a later write appended to it, so what the
+    /// agent is acting on is a corrupted turn rather than the task as written.
+    ///
+    /// Terminal all the same: it is proof the bytes were submitted, and typing a
+    /// third copy into an agent already working is the direction that runs a
+    /// dispatch task twice. See [`prompt_submission_accumulated`] for why this is
+    /// a safety net rather than the remedy.
+    Accumulated,
+}
+
+/// Issue #424 (reviewer findings B1/B2, reviewer blocker 1): is the
+/// conversation this delivery was written into GONE?
+///
+/// True once something has been written, a generation was bound, and the pane's
+/// CURRENT generation is no longer that one — whether because the pane has none
+/// at all (what `AppState::apply_event` leaves behind for a `SessionEnd`) or
+/// because a different one has taken over. The bytes went into a conversation
+/// that no longer exists: a retry could only land in a successor, and a matching
+/// event from that successor could only falsely confirm a delivery that never
+/// landed.
+///
+/// Two things had to change together here, and neither works alone:
+///
+/// * this used to test only for a TRANSIENT `None`. The render loop samples the
+///   final `AppState` of a frame, while the event subscriber applies frames
+///   independently, so a rapid `/clear` whose `SessionEnd` and successor
+///   `SessionStart` both land between two renders never shows a `None` at all —
+///   the check simply never fired for the case it was written for;
+/// * [`bind_delivery_generation`] used to run FIRST and overwrite the bound
+///   generation with the current one, so by the time this ran, old and current
+///   were equal by construction. Comparing them is meaningless unless the bind
+///   is the one-shot it now is.
+///
+/// The comparison is against the generation THIS delivery bound, so a pane that
+/// never had one (`expected_session_id == None`) is not "changed" — it is
+/// unbound, and its first generation is the initial bind, not a rollover. That
+/// is the same one-handoff shape [`crate::state::latch_generation`] applies on
+/// the daemon side.
+///
+/// **Known residual (issue #532).** A pane hosting a wrapped agent has TWO
+/// producers under one registry agent id — `dot-agent-deck wrap` emits under
+/// `{pane}-session`, the wrapped agent's native hooks under their own id — and
+/// `AppState::pane_hook_session` tracks whichever event is newest, so the pane's
+/// "current generation" alternates between them. This check then reads that
+/// alternation as a lost target and abandons. The daemon's own send guard
+/// already refuses the same shape (it requires an EXACT match against the
+/// current generation), so this makes an existing intermittent refusal
+/// deterministic one frame earlier rather than introducing a new failure; the
+/// fix belongs at `pane_hook_session`, which should not treat a non-announcing
+/// frame from a second producer as a generation.
+fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &PromptDelivery) -> bool {
+    // Issue #424 S4 (reviewer HIGH): "nothing has been written" is
+    // `attempts == 0` AND no baseline, not `attempts == 0` alone. A daemon can
+    // apply a write and lose the response, which leaves `attempts` at 0 with
+    // bytes physically in the pane; gating on the counter alone made this
+    // return `false` for exactly that delivery, so the whole burst below went
+    // unnoticed and the ordinary bind adopted the successor. The baseline is
+    // stamped immediately BEFORE the RPC, so `Some` means "a write may have
+    // occurred" — the witness this check needs — and `None` still means the
+    // untouched delivery it always meant. See
+    // [`PromptDelivery::closures_at_write`].
+    if delivery.attempts == 0 && delivery.closures_at_write.is_none() {
+        return false;
+    }
+    // Issue #424 H4 (auditor HIGH): a conversation has ENDED on this pane since
+    // our bytes went in. Checked before anything that compares identities,
+    // because in the sequence this closes there is no identity left to compare:
+    // a whole `SessionStart(R)` / `SessionEnd(R)` / `SessionStart(R2)` burst can
+    // land between two render passes, and `AppState::apply_event` removes R's
+    // session and journal on its end, so the next pass sees only R2 and would
+    // otherwise witness it, adopt it, and send the revoked task into it. See
+    // [`PromptDelivery::closures_at_write`].
+    if let Some(at_write) = delivery.closures_at_write
+        && snapshot.pane_generation_closures(pane_id) > at_write
+    {
+        return true;
+    }
+    // Issue #424 F2: an unbound delivery is not automatically unchanged. If a
+    // generation was SEEN after our bytes and is now gone or replaced, the
+    // conversation those bytes could have entered is over — the same transition
+    // the daemon's latch consumes sequentially, retained across frames here.
+    // See [`PromptDelivery::observed_generation`].
+    let reference = delivery
+        .expected_session_id
+        .as_deref()
+        .or(delivery.observed_generation.as_deref());
+    let Some(reference) = reference else {
+        return false;
+    };
+    snapshot
+        .pane_hook_session_id(pane_id)
+        .is_none_or(|current| current != reference)
+}
+
+/// Issue #424: bind the parts of a delivery's identity that are only knowable
+/// from the live snapshot — the hook generation, and whether this pane's
+/// producer can report a submitted prompt at all.
+///
+/// Called every frame AFTER the target check, so a pane that identifies itself
+/// late (the `devbox run claude …` launcher class from issue #424 §3, which
+/// signals readiness well after the 10 s fallback) arms its retries on that
+/// signal instead of having had its prompt finalized and thrown away at 10 s.
+///
+/// The generation is bound EXACTLY ONCE, and only BEFORE the first write.
+///
+/// Both halves matter and for different reasons:
+///
+/// * **Once.** Re-binding every frame is what let a `/clear` be laundered into
+///   an authorization: the successor generation was copied into
+///   `expected_session_id` before both the target check and the send, so the
+///   daemon's guard compared the successor against itself, matched, and
+///   delivered the revoked task into the new conversation (reviewer blocker 1).
+///   After the one bind, a differing generation is
+///   [`delivery_target_changed`]'s business.
+/// * **Before the first write.** The generation guard exists to answer "is the
+///   conversation THE BYTES WENT INTO still here". A generation that only
+///   appears after the write is not that conversation — we never addressed it —
+///   so adopting it retroactively claims a target this delivery never had, and
+///   any later generation on that pane then reads as a lost target. That is not
+///   hypothetical: the snapshot's `pane_hook_session` advances on ANY event
+///   carrying a pane id, including one from a producer that never announced a
+///   session, so a pane whose events carry drifting session ids would abandon
+///   deliveries it never endangered (`prompt/pane-input/026`).
+///
+/// A prompt written into a pane that had NO generation — the 10 s-fallback
+/// launcher case — therefore stays UNBOUND for as long as it is merely being
+/// held. It is not left unbound forever, though: see
+/// [`bind_generation_before_retry`], which is the other half of this policy and
+/// the one that keeps a launcher delivery from retrying with no generation guard
+/// at all.
+///
+/// Capability is sticky so a `SessionEnd` cannot disarm a delivery mid-flight,
+/// and is refreshed on EVERY frame — that half is what lets a late-identifying
+/// producer still arm its retries.
+fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, pane_id: &str) {
+    if delivery.expected_session_id.is_none()
+        && delivery.attempts == 0
+        && let Some(current) = snapshot.pane_hook_session_id(pane_id)
+    {
+        adopt_generation(delivery, current);
+    }
+    // Issue #424 F2: a generation that appears after our write cannot be bound —
+    // we never addressed it — but it must not be forgotten either. Witnessed
+    // here, on the same every-frame pass, so its later end/replacement reaches
+    // [`delivery_target_changed`] instead of vanishing between two snapshots.
+    // First witness only: what matters is the transition away from the
+    // conversation that existed while our bytes sat there.
+    //
+    // ANNOUNCED generations only, which is the same discriminator
+    // [`crate::state::latch_generation`] applies and the reason this is not the
+    // every-frame bind in disguise: `AppState::pane_hook_session` advances on
+    // any frame carrying a pane id, so a pane whose ordinary events drift
+    // through session ids (`prompt/pane-input/026`) would otherwise acquire a
+    // witness it never announced and abandon a delivery nothing endangered.
+    if delivery.expected_session_id.is_none()
+        && delivery.attempts > 0
+        && delivery.observed_generation.is_none()
+        && let Some(announced) = pane_announced_generation(snapshot, pane_id)
+    {
+        delivery.observed_generation = Some(announced);
+    }
+    if !delivery.can_report_prompts {
+        delivery.can_report_prompts = pane_confirmation_capability(
+            snapshot
+                .sessions
+                .values()
+                .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+                .map(|session| &session.agent_type),
+        ) == ConfirmationCapability::Reports;
+    }
+}
+
+/// Issue #424 D1 (both reviewers): bind the pane's CURRENT generation
+/// immediately before a retry that is about to be sent INTO that generation.
+///
+/// [`bind_delivery_generation`] refuses to claim a target retroactively, and that
+/// is right as far as it goes — a generation that appeared after our bytes is not
+/// the conversation they went into. What it did not justify is what happened
+/// next. In the launcher case at the centre of #424 the 10 s fallback writes
+/// while no hook generation exists and a normal `Applied` sets `attempts = 1`;
+/// when the genuine `SessionStart` then arrives, `delivery_target_changed`
+/// answers false (still unbound) and the one-shot bind is refused (a write
+/// exists), so `expected_session_id` stayed `None` FOREVER. Capability became
+/// `Reports`, attempt 2 went into the now-genuine generation while still
+/// declaring no generation at all, and if it was swallowed and the user then
+/// cleared or switched conversation, attempt 3 carried no session guard and could
+/// inject the old task into the successor under the same registry agent. Exact
+/// agent identity does not separate two conversations owned by one process.
+///
+/// So the refusal is narrowed to what it can actually defend: we do not claim a
+/// target for a write already made, but we do NAME the conversation we are about
+/// to write into, at the moment we write into it. From then on the delivery is
+/// pinned exactly like any other and [`delivery_target_changed`] guards it. This
+/// is the same late adoption `crate::state::latch_generation` performs on the
+/// daemon side; without it the "one pinned policy across all three paths" claim
+/// is false.
+///
+/// Deliberately called ONLY at the write site, never on the every-frame pass. A
+/// delivery being HELD (capability `Unknown`, no retry in flight) is not writing
+/// into anything, so binding it would re-introduce exactly the retroactive claim
+/// `bind_delivery_generation` refuses — and would make an unrelated later
+/// generation read as a lost target for a delivery that was never endangered.
+///
+/// The `prompt/pane-input/026` counter-example that argued against binding late
+/// does not reach this: it concerned a pane whose ORDINARY frames carry drifting
+/// session ids, and the daemon-side latch now treats only a `SessionStart` as an
+/// announcement. The residual that does remain is #532's wrapped-agent
+/// alternation, which `AppState::pane_hook_session` still tracks across two
+/// producers; that shows up as an abandoned delivery — the safe direction — and
+/// is already documented on [`delivery_target_changed`].
+fn bind_generation_before_retry(delivery: &mut PromptDelivery, snapshot: &AppState, pane_id: &str) {
+    if delivery.attempts == 0 || delivery.expected_session_id.is_some() {
+        return;
+    }
+    if let Some(current) = snapshot.pane_hook_session_id(pane_id) {
+        adopt_generation(delivery, current);
+    }
+}
+
+/// Record `generation` as this delivery's bound target, rotating the WIRE epoch
+/// when a request may already be recorded under the current attempt id.
+///
+/// Reviewer blocker 2: binding changes the delivery FINGERPRINT, and the daemon's
+/// ledger refuses a reused id carrying a different one — a permanent `Conflict`
+/// the error branch would retry unchanged until the deadline. See
+/// [`PromptDelivery::epoch`]. Shared by both bind sites so the rotation cannot be
+/// remembered in one and forgotten in the other.
+fn adopt_generation(delivery: &mut PromptDelivery, generation: String) {
+    delivery.expected_session_id = Some(generation);
+    if delivery.wire_issued {
+        delivery.epoch = delivery.epoch.saturating_add(1);
+        delivery.wire_issued = false;
+    }
+}
+
+/// Issue #424 (reviewer blocker 2): the wire id for `attempt` of a delivery,
+/// including its epoch. Epoch 0 — every delivery whose identity never changed
+/// mid-flight, i.e. the overwhelming majority — produces exactly the id
+/// [`attempt_delivery_id`] always produced.
+///
+/// Issue #424 D5: a SUBMIT-ONLY PROBE gets its own id shape. The ledger binds an
+/// id to a fingerprint of the target identity AND THE TEXT at first admission, so
+/// a probe's empty payload is a different fingerprint by construction; giving it a
+/// visibly different id keeps a probe and a payload attempt from ever being
+/// confused in a log or in the ledger, rather than relying on the attempt counter
+/// alone to keep them apart.
+fn wire_attempt_id(delivery_id: &str, epoch: u32, attempt: u32, probe: bool) -> String {
+    let base = match epoch {
+        0 => delivery_id.to_string(),
+        _ => format!("{delivery_id}#e{epoch}"),
+    };
+    let base = if probe { format!("{base}#probe") } else { base };
+    attempt_delivery_id(&base, attempt)
+}
+
+/// Issue #424 (reviewer finding B3): the pane's confirmation capability as of
+/// this frame, treating a delivery that has ALREADY seen a reporting producer as
+/// permanently capable.
+///
+/// Reviewer finding B6 also lands here. [`prompt_submission_confirmed`] requires
+/// the confirming event to carry a non-optional `agent_id`, so a pane where NO
+/// identity exists anywhere — no controller-reported agent id on the delivery
+/// and none on any of the pane's sessions, the fully-untagged pre-F9 hook world
+/// — can never produce a confirmation this build will accept. Arming retries
+/// there would retype the prompt until the deadline for structural reasons,
+/// which is the same failure B4 describes for Pi. So it is classified
+/// [`ConfirmationCapability::CannotReport`]: written once, never retyped. This
+/// is what "classify events that cannot supply an identity as unconfirmable"
+/// means on the write side.
+fn delivery_capability(
+    snapshot: &AppState,
+    pane_id: &str,
+    delivery: Option<&PromptDelivery>,
+) -> ConfirmationCapability {
+    // Reviewer MEDIUM (C6): the mixed legacy-hook shape. A perfectly ordinary
+    // daemon-backed pane can have a known controller/registry agent id AND a
+    // reporting `AgentType`, while an older pre-F9 hook binary emits events that
+    // carry no `agent_id` at all. Every input to the checks below then says
+    // "Reports", and `prompt_submission_confirmed` rejects every actual event as
+    // unusable evidence — so the delivery retypes the prompt until the deadline
+    // through a channel that is structurally incapable of confirming it. That is
+    // the same failure B4 describes for Pi, arriving by a different route, and
+    // `crate::state` deliberately supports untagged hooks for backward
+    // compatibility, so it is a real shape rather than an impossible one.
+    //
+    // Capability is therefore answered by the EVIDENCE CHANNEL, not by the type
+    // alone — and this comes first, ahead of the sticky flag, because the sticky
+    // flag is set from the type. `Unknown` rather than `CannotReport`: within a
+    // session this is permanent, but the honest answer is "nothing that could
+    // confirm has been seen", and `Unknown` holds the prompt provisional (no
+    // retyping) while staying recoverable the moment one identified event
+    // arrives. Finalizing here would throw the prompt away on the strength of a
+    // hook binary's age.
+    if delivery.is_some_and(|d| evidence_channel_is_unidentified(snapshot, pane_id, d)) {
+        return ConfirmationCapability::Unknown;
+    }
+    if delivery.is_some_and(|d| d.can_report_prompts) {
+        return ConfirmationCapability::Reports;
+    }
+    let pane_sessions = || {
+        snapshot
+            .sessions
+            .values()
+            .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+    };
+    let identity_known = delivery.is_some_and(|d| d.expected_agent_id.is_some())
+        || pane_sessions().any(|session| session.agent_id.is_some());
+    if !identity_known {
+        // A pane with no session at all has not answered the question yet — it
+        // is the boot-time state of every launcher, so it must stay `Unknown`
+        // (held, not finalized) or B3 comes straight back.
+        return if pane_sessions().next().is_some() {
+            ConfirmationCapability::CannotReport
+        } else {
+            ConfirmationCapability::Unknown
+        };
+    }
+    pane_confirmation_capability(pane_sessions().map(|session| &session.agent_type))
+}
+
+/// Issue #424 (reviewer MEDIUM, C6): has this pane produced evidence since our
+/// write that [`prompt_submission_confirmed`] could never accept, and nothing
+/// else?
+///
+/// True only when all three hold: the delivery has actually written; the pane's
+/// journal holds at least one PRODUCER event newer than the delivery's
+/// watermark; and NONE of those events carries an `agent_id`. One identified
+/// post-write producer event settles the question the other way immediately, so a
+/// pane that is merely quiet, or that has some untagged frames among tagged ones,
+/// is never classified here.
+///
+/// The watermark bound matters: a pane's journal routinely opens with an
+/// untagged frame the daemon itself synthesized (`spawn::surface_spawned_pane`
+/// emits `agent_id: None` on purpose so a real hook supersedes it), and reading
+/// that as proof of an untagged channel would opt every scheduler-spawned pane
+/// out of the recovery this issue exists for.
+///
+/// Issue #424 D4 (both reviewers): DAEMON-SYNTHETIC events are excluded from the
+/// channel entirely — not counted as identified evidence, and not counted as
+/// untagged evidence either. The shell-activity monitor's `ShellBusy`/`ShellIdle`
+/// and this issue's own delivery notice are identified because they must land on
+/// the right card, and none of them proves that a NATIVE hook on this pane can
+/// report a submitted prompt. Letting one of them answer the question the other
+/// way is what defeated C6: a mixed legacy-hook pane whose real events are all
+/// untagged fell back to sticky `Reports` on the strength of an event the daemon
+/// wrote itself, and resumed retyping through a channel that can never confirm.
+/// See [`crate::event::AgentEvent::is_daemon_synthetic`].
+fn evidence_channel_is_unidentified(
+    snapshot: &AppState,
+    pane_id: &str,
+    delivery: &PromptDelivery,
+) -> bool {
+    if delivery.attempts == 0 {
+        return false;
+    }
+    let mut saw_post_write_evidence = false;
+    for session in snapshot
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+    {
+        for event in session.recent_events.iter().filter(|event| {
+            submission_is_after_watermark(event.timestamp, delivery.watermark)
+                && !event.is_daemon_synthetic()
+        }) {
+            if event.agent_id.is_some() {
+                return false;
+            }
+            saw_post_write_evidence = true;
+        }
+    }
+    saw_post_write_evidence
+}
+
+/// Issue #424 F2: the pane's current hook generation, but only when this pane
+/// has actually ANNOUNCED it — a genuine (non-launcher-origin) `SessionStart`
+/// naming it sits in the pane's own journal.
+///
+/// The discriminator is [`crate::state::latch_generation`]'s, for its reasons: a
+/// `SessionStart` is self-describing and authoritative, and anything else is
+/// inference. `AppState::pane_hook_session` deliberately advances on ANY frame
+/// carrying a pane id — good for the send guard, useless as evidence that a
+/// conversation began — so reading it raw would make a pane whose ordinary
+/// events drift through session ids look like a rolling series of
+/// conversations. That pane is `prompt/pane-input/026`, and it is also the #532
+/// wrapped-agent alternation.
+///
+/// Matched by TIMESTAMP rather than by session id, because the two are not the
+/// same string by the time they reach here: `AppState::apply_event`'s reuse
+/// guard remaps a same-agent `SessionStart` onto the existing card's id for UI
+/// continuity, while the generation map deliberately records the ORIGINAL,
+/// pre-remap id. Asking whether the pane's newest genuine `SessionStart` is what
+/// ESTABLISHED the current generation compares the two facts that survive that
+/// remap.
+fn pane_announced_generation(snapshot: &AppState, pane_id: &str) -> Option<String> {
+    let (current, established_at) = snapshot.pane_hook_session_entry(pane_id)?;
+    let announced_at = snapshot
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+        .flat_map(|session| session.recent_events.iter())
+        .filter(|event| {
+            event.event_type == EventType::SessionStart && !event.is_wrapper_fork_session_start()
+        })
+        .map(|event| event.timestamp)
+        .max()?;
+    (announced_at >= established_at).then_some(current)
+}
+
+/// Issue #424 (reviewer finding B2/#3): the ordering watermark for `pane_id` —
+/// the newest timestamp in its own event journal right now. Captured immediately
+/// before the first write; see [`submission_is_after_watermark`], which
+/// documents why this is ordering rather than causality (#526).
+fn pane_event_watermark(snapshot: &AppState, pane_id: &str) -> Option<DateTime<Utc>> {
+    snapshot
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+        .flat_map(|session| session.recent_events.iter().map(|event| event.timestamp))
+        .max()
+}
+
+/// Issue #424: record that an automatic prompt for `pane_id` was WRITTEN but is
+/// not yet confirmed — arming the re-submission after
+/// [`unconfirmed_retry_delay`]. Distinct from [`schedule_send_retry`], which
+/// backs off a target that REFUSED delivery; see that helper's docs for why the
+/// two schedules differ.
+fn schedule_unconfirmed_retry(
+    backoff: &mut HashMap<String, SendRetryState>,
+    pane_id: &str,
+    now: std::time::Instant,
+    attempts: u32,
+) {
+    backoff.insert(
+        pane_id.to_string(),
+        SendRetryState {
+            next_attempt_at: now + unconfirmed_retry_delay(attempts),
+            attempts,
         },
     );
 }
@@ -3153,6 +4030,35 @@ fn is_terminal_send_result(result: SendResult) -> bool {
     )
 }
 
+/// Issue #424 (tester's finding, C2): [`is_terminal_send_result`] for the SEED
+/// path, where "already written" changes the answer for two of the three
+/// variants.
+///
+/// * `Ambiguous` is terminal unconditionally. It means bytes may have LANDED
+///   from a partial write, and the no-blind-retry rule that variant exists for
+///   does not depend on what came before it.
+/// * `WrongSession` / `Unknown` are terminal once a PROVISIONAL WRITE EXISTS.
+///   The delivery is then bound to a specific agent's conversation, and a
+///   refusal proves that target is gone: the only thing a retry could reach is a
+///   stranger (`prompt/pane-input/028`). Before the first write nothing has been
+///   injected anywhere, so the same refusal is an ordinary non-delivery — the
+///   pane is still settling, the seed is retained under backoff and bounded by
+///   the deadline, which is what `prompt/pane-input/006` pins.
+///
+/// The orchestrator path deliberately does NOT share this nuance: its role
+/// prompt is abandoned on the first terminal outcome
+/// (`deliver_orchestrator_prompt_bounds_deadline_and_terminal_outcomes`), and
+/// abandoning there also finalizes a tab's role state, so the two paths differ
+/// on the pre-write case only. The half that carries the safety property — never
+/// retry a bound delivery into a target that refused it — is identical on both.
+fn seed_result_is_terminal(result: SendResult, already_written: bool) -> bool {
+    match result {
+        SendResult::Ambiguous => true,
+        SendResult::WrongSession | SendResult::Unknown => already_written,
+        _ => false,
+    }
+}
+
 /// PRD #20 R20-005 (finding #13): abandon an orchestrator role prompt — clear
 /// its prompt (so the render-loop gate stops re-entering), drop its retry/
 /// delivery/ready-since state, and surface `msg`. Used on the deadline and on a
@@ -3170,6 +4076,32 @@ fn abandon_orchestrator_prompt(
     ui.prompt_delivery.remove(start_pane_id);
     ui.orchestration_ready_since.remove(&tab_id);
     ui.status_message = Some((msg, now));
+}
+
+/// Issue #424: finalize an orchestrator role prompt whose delivery is now
+/// CONFIRMED — the start role becomes `Working`, the tab is marked prompted (so
+/// the render-loop gate stops re-entering), and every scrap of provisional
+/// delivery state is dropped.
+///
+/// Extracted from the old `Applied`/`Queued` arm, which ran this the moment the
+/// PTY accepted bytes. That is precisely the defect issue #424 reports: it made
+/// "swallowed by a booting TUI" and "delivered and acted upon" indistinguishable,
+/// and threw away the retry state that could have recovered the first case. The
+/// body is unchanged; what changed is what has to be true before it runs.
+fn finalize_orchestrator_prompt(
+    ui: &mut UiState,
+    tab_id: TabId,
+    start_pane_id: &str,
+    start_role_index: usize,
+    role_statuses: &mut [OrchestrationRoleStatus],
+    orchestrator_prompt: &mut Option<String>,
+) {
+    *orchestrator_prompt = None;
+    role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
+    ui.orchestration_prompted.insert(tab_id);
+    ui.send_retry_backoff.remove(start_pane_id);
+    ui.prompt_delivery.remove(start_pane_id);
+    ui.orchestration_ready_since.remove(&tab_id);
 }
 
 /// PRD #20 R20-003/004/005 (findings #5, #13): deliver (or retry, or abandon) an
@@ -3194,6 +4126,69 @@ fn deliver_orchestrator_prompt(
 ) {
     let start_pane_id = role_pane_ids[start_role_index].clone();
 
+    // Issue #424: CONFIRMATION FIRST. A previous frame's `Applied`/`Queued`
+    // proved only that the PTY accepted bytes, so the prompt is still here and
+    // the role is still not `Working`; if the orchestrator has since reported
+    // submitting it, the delivery is real and everything finalizes now. Checked
+    // ahead of the backoff gate because the write being confirmed is exactly the
+    // one whose backoff window is still open (`prompt/pane-input/023`).
+    if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+        let delivery_id = delivery.delivery_id.clone();
+        let attempts = delivery.attempts;
+        // Reviewer blocker 1: target check BEFORE the bind, comparing bound
+        // against current — see the seed path's twin and
+        // [`delivery_target_changed`].
+        //
+        // Reviewer findings B1/B2: the conversation we wrote into is GONE.
+        // Neither retyping into its successor nor accepting that successor's
+        // events as confirmation is safe.
+        if delivery_target_changed(snapshot, &start_pane_id, delivery) {
+            log_prompt_stopped(
+                "orchestrator",
+                &start_pane_id,
+                &delivery_id,
+                "delivery-target-changed",
+            );
+            abandon_orchestrator_prompt(
+                ui,
+                tab_id,
+                &start_pane_id,
+                orchestrator_prompt,
+                now,
+                "Orchestrator prompt not delivered (the agent's conversation changed); abandoned"
+                    .to_string(),
+            );
+            return;
+        }
+        bind_delivery_generation(delivery, snapshot, &start_pane_id);
+        let evidence = orchestrator_prompt.as_deref().and_then(|expected| {
+            prompt_submission_evidence(snapshot, &start_pane_id, expected, delivery)
+        });
+        if let Some(evidence) = evidence {
+            match evidence {
+                SubmissionEvidence::Confirmed => {
+                    log_prompt_confirmed("orchestrator", &start_pane_id, &delivery_id, attempts)
+                }
+                // Issue #424 D5: the role prompt came back doubled with no
+                // separator. The orchestrator HAS submitted it, so the role is
+                // genuinely working and finalizing is honest; what must stop is
+                // the retry that would type a third copy into it.
+                SubmissionEvidence::Accumulated => {
+                    log_prompt_accumulated("orchestrator", &start_pane_id, &delivery_id, attempts)
+                }
+            }
+            finalize_orchestrator_prompt(
+                ui,
+                tab_id,
+                &start_pane_id,
+                start_role_index,
+                role_statuses,
+                orchestrator_prompt,
+            );
+            return;
+        }
+    }
+
     // PRD #20 R20-005 (finding #13): DEADLINE FIRST — before the readiness /
     // backoff / delivery branches — so the hard timeout is actually reachable.
     // The old block had no orchestrator deadline at all, so a permanent
@@ -3203,7 +4198,45 @@ fn deliver_orchestrator_prompt(
         .get(&tab_id)
         .is_some_and(|t| now.duration_since(*t) > AUTOMATIC_PROMPT_DEADLINE)
     {
-        tracing::warn!(pane_id = %start_pane_id, "orchestrator prompt: timed out; abandoning");
+        // Issue #424: the same warn this always emitted, now carrying the
+        // delivery identity and how many submissions were made — the two facts
+        // that tell "never written" apart from "written N times and never
+        // confirmed" when reading back a lost prompt after the fact.
+        let (delivery_id, attempts) = ui
+            .prompt_delivery
+            .get(start_pane_id.as_str())
+            .map(|delivery| (delivery.delivery_id.clone(), delivery.attempts))
+            .unwrap_or_default();
+        // Reviewer finding B3: a pane whose producer never identified itself was
+        // never RETRIED either, so its single write reaching the deadline is not
+        // a delivery failure — it is a pane nothing could ever report for, which
+        // is the case the old `timeout_ready` carve-out finalized at 10 s. The
+        // role still finalizes, just on an explicit capability answer rather
+        // than on how fast a signal happened to arrive.
+        if attempts > 0
+            && delivery_capability(
+                snapshot,
+                &start_pane_id,
+                ui.prompt_delivery.get(start_pane_id.as_str()),
+            ) != ConfirmationCapability::Reports
+        {
+            log_prompt_unconfirmable(
+                "orchestrator",
+                &start_pane_id,
+                &delivery_id,
+                "no producer on this pane can report a submitted prompt",
+            );
+            finalize_orchestrator_prompt(
+                ui,
+                tab_id,
+                &start_pane_id,
+                start_role_index,
+                role_statuses,
+                orchestrator_prompt,
+            );
+            return;
+        }
+        log_prompt_abandoned("orchestrator", &start_pane_id, &delivery_id, attempts);
         abandon_orchestrator_prompt(
             ui,
             tab_id,
@@ -3244,33 +4277,146 @@ fn deliver_orchestrator_prompt(
     if !ui.prompt_delivery.contains_key(start_pane_id.as_str()) {
         capture_prompt_delivery(ui, &start_pane_id, pane);
     }
-    let (expected_agent_id, expected_session_id, delivery_id) =
+    // Reviewer finding B2: bind the hook GENERATION before the write. Captured
+    // at tab creation this would be `None` (no agent exists yet) and stay
+    // `None` forever, which is what left every orchestrator retry telling the
+    // daemon "any generation will do".
+    if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+        bind_delivery_generation(delivery, snapshot, &start_pane_id);
+    }
+    // Reviewer finding B3: the capability answer as of THIS frame.
+    let capability = delivery_capability(
+        snapshot,
+        &start_pane_id,
+        ui.prompt_delivery.get(start_pane_id.as_str()),
+    );
+    let (expected_agent_id, delivery_id, attempt) =
         match ui.prompt_delivery.get(start_pane_id.as_str()) {
             Some(d) => (
                 d.expected_agent_id.clone(),
-                d.expected_session_id.clone(),
                 Some(d.delivery_id.clone()),
+                d.attempts.saturating_add(1),
             ),
-            None => (None, None, None),
+            None => (None, None, 1),
         };
-    let prompt_text = orchestrator_prompt
+    // Reviewer finding B3: a prompt already written into a pane whose producer
+    // is unknown is HELD, never rewritten — see the seed path's twin gate.
+    if attempt > 1 && capability != ConfirmationCapability::Reports {
+        return;
+    }
+    // Issue #424 D1: past every hold, so this frame WILL write into whatever
+    // conversation the pane currently has. Name it first, and read the epoch
+    // AFTER — binding can rotate it. See [`bind_generation_before_retry`].
+    let (expected_session_id, epoch) = match ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+        Some(delivery) => {
+            bind_generation_before_retry(delivery, snapshot, &start_pane_id);
+            (delivery.expected_session_id.clone(), delivery.epoch)
+        }
+        None => (None, 0),
+    };
+    // Issue #424 D5: after the one bounded replacement payload, later attempts
+    // probe SUBMISSION rather than typing the role prompt in again. See
+    // [`crate::prompt_delivery::attempt_writes_payload`].
+    let writes_payload = attempt_writes_payload(attempt);
+    // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT rides
+    // its own wire id, or the daemon's ledger replays the first `Applied` and a
+    // retry never reaches the PTY at all. See [`attempt_delivery_id`].
+    let wire_delivery_id = delivery_id
         .as_deref()
-        .unwrap_or_default()
-        .to_string();
+        .map(|id| wire_attempt_id(id, epoch, attempt, !writes_payload));
+    // Reviewer blocker 2: a request under this wire id may now be recorded in
+    // the daemon's ledger — see [`PromptDelivery::epoch`].
+    if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+        delivery.wire_issued = true;
+    }
+    let prompt_text = if writes_payload {
+        orchestrator_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        String::new()
+    };
+    // Reviewer finding B2/#3: the watermark, read immediately before the write so
+    // everything already in the pane's journal is pre-existing history.
+    let watermark = pane_event_watermark(snapshot, &start_pane_id);
+    // Issue #424 H4: and the generation-closure count, at the same instant and
+    // for the same reason. See [`PromptDelivery::closures_at_write`].
+    let closures = snapshot.pane_generation_closures(&start_pane_id);
+    // Issue #424 S4 (reviewer HIGH): persisted BEFORE the RPC on this path too —
+    // a daemon that applied the write and lost the response leaves `attempts` at
+    // 0, and a baseline stored only on success is a baseline the lost write
+    // never got. See the seed path's twin.
+    if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str())
+        && delivery.closures_at_write.is_none()
+    {
+        delivery.closures_at_write = Some(closures);
+    }
     match pane.write_and_submit_to_pane_with_identity(
         &start_pane_id,
         &prompt_text,
         expected_agent_id.as_deref(),
         expected_session_id.as_deref(),
-        delivery_id.as_deref(),
+        wire_delivery_id.as_deref(),
     ) {
+        // Issue #424: the PTY accepted the bytes — that is ALL this means. The
+        // prompt, the role's non-`Working` status, the delivery identity and the
+        // retry are RETAINED until the orchestrator reports submitting it
+        // (checked at the top of this function).
         Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
-            *orchestrator_prompt = None;
-            role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
-            ui.orchestration_prompted.insert(tab_id);
-            ui.send_retry_backoff.remove(start_pane_id.as_str());
-            ui.prompt_delivery.remove(start_pane_id.as_str());
-            ui.orchestration_ready_since.remove(&tab_id);
+            let logged_id = delivery_id.clone().unwrap_or_default();
+            if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+                delivery.attempts = attempt;
+                if delivery.watermark.is_none() {
+                    delivery.watermark = watermark;
+                }
+                delivery.can_report_prompts |= capability == ConfirmationCapability::Reports;
+            }
+            if writes_payload {
+                log_prompt_written("orchestrator", &start_pane_id, &logged_id, attempt);
+            } else {
+                log_prompt_probe_submitted("orchestrator", &start_pane_id, &logged_id, attempt);
+            }
+            match capability {
+                // A recognized producer that structurally cannot report a
+                // submitted prompt (Pi). Retrying could never be confirmed —
+                // only retyped — so the write is final and the role finalizes.
+                ConfirmationCapability::CannotReport => {
+                    log_prompt_unconfirmable(
+                        "orchestrator",
+                        &start_pane_id,
+                        &logged_id,
+                        "this agent cannot report a submitted prompt",
+                    );
+                    finalize_orchestrator_prompt(
+                        ui,
+                        tab_id,
+                        &start_pane_id,
+                        start_role_index,
+                        role_statuses,
+                        orchestrator_prompt,
+                    );
+                }
+                // Reviewer finding B3: nothing has identified itself yet. Hold
+                // the write PROVISIONAL — so a producer signalling at 10.1 s
+                // still arms retries and a confirmation still finalizes — but do
+                // NOT retype into a pane that has given no reason to think a
+                // second copy would help. This is where the old code finalized
+                // the role and threw the prompt away, which is what excluded the
+                // slow-launcher class from the whole fix.
+                ConfirmationCapability::Unknown => {
+                    ui.send_retry_backoff.remove(start_pane_id.as_str());
+                }
+                ConfirmationCapability::Reports => {
+                    log_prompt_unconfirmed("orchestrator", &start_pane_id, &logged_id, attempt);
+                    schedule_unconfirmed_retry(
+                        &mut ui.send_retry_backoff,
+                        &start_pane_id,
+                        now,
+                        attempt,
+                    );
+                }
+            }
         }
         // PRD #20 finding #13: a TERMINAL outcome is abandoned (no forever
         // retry); a RETRYABLE liveness transition is retried under backoff,
@@ -4062,6 +5208,50 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
         (false, b) => b,
         (true, None) => None,
     }
+}
+
+/// Issue #424 S1: does this user-input byte SUBMIT the agent's input box, given
+/// the byte that immediately preceded it in the same stream?
+///
+/// This lives beside [`keyevent_to_bytes`] because it is that function read
+/// backwards. The daemon's submit drain
+/// (`PaneInputState::note_user_bytes`) never sees a `KeyEvent` — it sees only
+/// the bytes this encoder produced — so it has to recover which keypress made
+/// them. It used to answer "any CR or LF", which contradicts the encoder
+/// directly above it and the acceptance matrix that shaped it
+/// (`prds/done/227-modifier-aware-pane-key-forwarding.md:36-43`: real agents,
+/// tmux-rendered screens, submit vs. newline distinguished by whether the draft
+/// stayed in one input box):
+///
+/// | frame | what produces it, above | pi | claude |
+/// |---|---|---|---|
+/// | `ESC[13;{m}u` | `Enter` + SHIFT/CONTROL (`:5153`) | newline | newline |
+/// | `LF` | `Ctrl+J`, via [`ctrl_c0_byte`] (`:5109`) | newline | newline |
+/// | `ESC` `CR` | `Enter` + ALT, kept in its historical form on purpose (`:5143`, `:5206`) | submit | **newline** |
+/// | `CR` | plain `Enter` (`:5169`) — and `Ctrl+M`, the same byte by the caret rule | submit | submit |
+///
+/// Exactly one row submits on every supported agent, and it is the only one
+/// this returns `true` for. `ESC` `CR` is the row that matters: it is a genuine
+/// AMBIGUITY rather than an oversight, and it resolves the way every unknown
+/// here has to. A *missed* drain fails CLOSED — a later same-payload delivery is
+/// refused, which is reported and bounded by the record TTL. A *false* drain
+/// fails OPEN — the replacement stops recognizing itself as a repeat and
+/// submits the user's half-typed draft sandwiched between two copies of the
+/// payload. `ESC[13;{m}u` needs no arm at all: it carries neither byte.
+///
+/// `keyevent_submit_classification_matches_prd_227_matrix` (in `agent_pty`)
+/// pins every row against the real encoder and the real stream scanner, so a
+/// change to the forwarding contract cannot silently desynchronize the drain.
+pub(crate) fn user_byte_submits_input_box(preceding: Option<u8>, byte: u8) -> bool {
+    /// The ESC the ALT prefix adds at `:5207`.
+    const ESC: u8 = 0x1b;
+
+    byte == b'\r' && preceding != Some(ESC)
+}
+
+#[cfg(test)]
+pub(crate) fn keyevent_to_bytes_for_test(key: &KeyEvent) -> Option<Vec<u8>> {
+    keyevent_to_bytes(key)
 }
 
 /// Compute the row offset between widget-relative coordinates and vt100 screen
@@ -28311,6 +29501,8 @@ mod tests {
 
     #[derive(Debug, Clone, Copy)]
     enum InjectedSendOutcome {
+        Applied,
+        Queued,
         Error,
         HistoryOnly,
         NoLiveTarget,
@@ -28378,6 +29570,8 @@ mod tests {
         ) -> Result<crate::event::SendResult, PaneError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             match self.outcome {
+                InjectedSendOutcome::Applied => Ok(crate::event::SendResult::Applied),
+                InjectedSendOutcome::Queued => Ok(crate::event::SendResult::Queued),
                 InjectedSendOutcome::Error => Err(PaneError::CommandFailed(
                     "injected transport failure".into(),
                 )),
@@ -28416,6 +29610,2272 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    #[derive(Default)]
+    struct CachingLedgerState {
+        cached: HashMap<String, crate::event::SendResult>,
+        request_ids: Vec<String>,
+        physical_writes: usize,
+        first_response_lost: bool,
+    }
+
+    /// A controller-shaped delivery ledger: the first physical write is cached
+    /// as `Applied` but its response is lost, the duplicate request replays the
+    /// cache without writing, and the next distinct id performs a second write
+    /// whose partial result is terminal `Ambiguous`.
+    struct CachingLedgerPaneController {
+        state: Arc<std::sync::Mutex<CachingLedgerState>>,
+    }
+
+    impl CachingLedgerPaneController {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(std::sync::Mutex::new(CachingLedgerState::default())),
+            }
+        }
+    }
+
+    impl PaneController for CachingLedgerPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _expected_agent_id: Option<&str>,
+            _expected_session_id: Option<&str>,
+            delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            let delivery_id = delivery_id.expect("automatic delivery must carry an attempt id");
+            let mut state = self.state.lock().unwrap();
+            state.request_ids.push(delivery_id.to_string());
+            if let Some(cached) = state.cached.get(delivery_id).copied() {
+                return Ok(cached);
+            }
+
+            state.physical_writes += 1;
+            let result = if state.physical_writes == 1 {
+                crate::event::SendResult::Applied
+            } else {
+                crate::event::SendResult::Ambiguous
+            };
+            state.cached.insert(delivery_id.to_string(), result);
+            if !state.first_response_lost {
+                state.first_response_lost = true;
+                return Err(PaneError::CommandFailed(
+                    "injected lost response after the ledger cached Applied".into(),
+                ));
+            }
+            Ok(result)
+        }
+        fn name(&self) -> &str {
+            "caching-ledger"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct IdentityGuardPaneController {
+        current_agent: std::sync::Mutex<String>,
+        writes: std::sync::Mutex<HashMap<String, Vec<String>>>,
+    }
+
+    impl IdentityGuardPaneController {
+        fn new(agent_id: &str) -> Self {
+            Self {
+                current_agent: std::sync::Mutex::new(agent_id.to_string()),
+                writes: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn rebind(&self, agent_id: &str) {
+            *self.current_agent.lock().unwrap() = agent_id.to_string();
+        }
+
+        fn writes_for(&self, agent_id: &str) -> usize {
+            self.writes
+                .lock()
+                .unwrap()
+                .get(agent_id)
+                .map_or(0, Vec::len)
+        }
+    }
+
+    impl PaneController for IdentityGuardPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
+            Some(self.current_agent.lock().unwrap().clone())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            _pane_id: &str,
+            text: &str,
+            expected_agent_id: Option<&str>,
+            _expected_session_id: Option<&str>,
+            _delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            let current = self.current_agent.lock().unwrap().clone();
+            if expected_agent_id.is_some_and(|expected| expected != current) {
+                return Ok(crate::event::SendResult::WrongSession);
+            }
+            self.writes
+                .lock()
+                .unwrap()
+                .entry(current)
+                .or_default()
+                .push(text.to_string());
+            Ok(crate::event::SendResult::Applied)
+        }
+        fn name(&self) -> &str {
+            "identity-guard"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn ready_prompt_snapshot(pane_id: &str, agent_id: &str) -> AppState {
+        let mut snapshot = AppState::default();
+        snapshot.register_pane(pane_id.to_string());
+        snapshot.insert_placeholder_session(
+            pane_id.to_string(),
+            None,
+            Some(AgentType::Codex),
+            Some(agent_id.to_string()),
+        );
+        snapshot
+    }
+
+    fn apply_prompt_confirmation(
+        snapshot: &mut AppState,
+        pane_id: &str,
+        agent_id: &str,
+        prompt: &str,
+    ) {
+        snapshot.apply_event(AgentEvent {
+            session_id: format!("confirmed-{pane_id}"),
+            agent_type: AgentType::Codex,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: Some(prompt.to_string()),
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+    }
+
+    fn apply_generation_event(
+        snapshot: &mut AppState,
+        pane_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        event_type: EventType,
+    ) {
+        snapshot.apply_event(AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+    }
+
+    fn ready_seed_prompt(pane_id: &str, prompt: &str) -> PendingSeedPrompt {
+        PendingSeedPrompt {
+            pane_id: pane_id.to_string(),
+            prompt: prompt.to_string(),
+            created_at: std::time::Instant::now(),
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("ready timestamp"),
+            ),
+        }
+    }
+
+    /// Scenario: Write an orchestrator's spawn-time prompt to a ready pane and have the controller report Applied or Queued without an agent hook. The prompt, identity, retry, and non-Working role must remain provisional until a matching UserPromptSubmit-derived event arrives, after which all delivery state clears and the role becomes Working.
+    #[spec("prompt/pane-input/023")]
+    #[test]
+    fn pane_input_023_orchestrator_write_is_provisional_until_confirmation() {
+        const PANE_ID: &str = "provisional-orchestrator-pane";
+        const AGENT_ID: &str = "provisional-orchestrator-agent";
+        const PROMPT: &str = "Read the orchestrator seed and begin";
+
+        for outcome in [InjectedSendOutcome::Applied, InjectedSendOutcome::Queued] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn PaneController> =
+                Arc::new(SendResultPaneController::new(outcome, attempts.clone()));
+            let now = std::time::Instant::now();
+            let tab_id: TabId = match outcome {
+                InjectedSendOutcome::Applied => 23,
+                InjectedSendOutcome::Queued => 230,
+                _ => unreachable!(),
+            };
+            let mut ui = default_ui();
+            ui.orchestration_created_at.insert(tab_id, now);
+            ui.orchestration_ready_since.insert(
+                tab_id,
+                now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("ready timestamp"),
+            );
+            let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+            let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+            let mut prompt = Some(PROMPT.to_string());
+
+            deliver_orchestrator_prompt(
+                &mut ui,
+                pane.as_ref(),
+                &snapshot,
+                now,
+                tab_id,
+                &[PANE_ID.to_string()],
+                0,
+                &mut role_statuses,
+                &mut prompt,
+            );
+
+            assert_eq!(
+                prompt.as_deref(),
+                Some(PROMPT),
+                "{outcome:?} means only that the PTY accepted bytes; the orchestrator prompt must remain provisional until UserPromptSubmit confirms it"
+            );
+            assert!(
+                ui.prompt_delivery.contains_key(PANE_ID),
+                "{outcome:?} must retain the delivery identity while confirmation is pending"
+            );
+            assert!(
+                ui.send_retry_backoff.contains_key(PANE_ID),
+                "{outcome:?} must arm retry backoff while confirmation is pending"
+            );
+            assert_ne!(
+                role_statuses[0],
+                OrchestrationRoleStatus::Working,
+                "a PTY write alone must not finalize the orchestrator role as Working"
+            );
+            assert!(
+                !ui.orchestration_prompted.contains(&tab_id),
+                "a PTY write alone must not mark the orchestration prompt confirmed"
+            );
+
+            apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+            deliver_orchestrator_prompt(
+                &mut ui,
+                pane.as_ref(),
+                &snapshot,
+                now.checked_add(std::time::Duration::from_millis(1))
+                    .expect("confirmation timestamp"),
+                tab_id,
+                &[PANE_ID.to_string()],
+                0,
+                &mut role_statuses,
+                &mut prompt,
+            );
+
+            assert!(
+                prompt.is_none(),
+                "the matching UserPromptSubmit event must finalize the orchestrator prompt"
+            );
+            assert!(
+                !ui.prompt_delivery.contains_key(PANE_ID)
+                    && !ui.send_retry_backoff.contains_key(PANE_ID),
+                "confirmation must clear delivery identity and retry state"
+            );
+            assert_eq!(role_statuses, [OrchestrationRoleStatus::Working]);
+            assert!(ui.orchestration_prompted.contains(&tab_id));
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "confirmation should finalize the first write without another PTY submission"
+            );
+        }
+    }
+
+    /// Scenario: Queue seed prompts for reporting, non-reporting, and unidentifiable consumers, including swallowed-CR duplicate submissions joined by a newline or no separator. Reporting panes stay provisional until matching submission evidence arrives, while Pi and identity-less panes write once without arming retries, and every doubled submitted seed clears retry state before a third write.
+    #[spec("prompt/pane-input/024")]
+    #[test]
+    fn pane_input_024_seed_write_is_provisional_until_confirmation() {
+        const PANE_ID: &str = "provisional-seed-pane";
+        const AGENT_ID: &str = "provisional-seed-agent";
+        const PROMPT: &str = "Read the dispatch seed and begin";
+
+        for outcome in [InjectedSendOutcome::Applied, InjectedSendOutcome::Queued] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn PaneController> =
+                Arc::new(SendResultPaneController::new(outcome, attempts.clone()));
+            let mut ui = default_ui();
+            ui.pending_seed_prompts.push(PendingSeedPrompt {
+                pane_id: PANE_ID.to_string(),
+                prompt: PROMPT.to_string(),
+                created_at: std::time::Instant::now(),
+                ready_since: Some(
+                    std::time::Instant::now()
+                        .checked_sub(
+                            SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1),
+                        )
+                        .expect("ready timestamp"),
+                ),
+            });
+            let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+            assert_eq!(
+                ui.pending_seed_prompts
+                    .first()
+                    .map(|pending| pending.prompt.as_str()),
+                Some(PROMPT),
+                "{outcome:?} means only that the PTY accepted bytes; the seed prompt must remain provisional until UserPromptSubmit confirms it"
+            );
+            assert!(ui.prompt_delivery.contains_key(PANE_ID));
+            assert!(
+                ui.send_retry_backoff.contains_key(PANE_ID),
+                "an unconfirmed {outcome:?} seed write must arm retry backoff"
+            );
+
+            apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+            assert!(
+                ui.pending_seed_prompts.is_empty(),
+                "the matching UserPromptSubmit event must finalize the seed prompt"
+            );
+            assert!(
+                !ui.prompt_delivery.contains_key(PANE_ID)
+                    && !ui.send_retry_backoff.contains_key(PANE_ID),
+                "confirmation must clear the seed's delivery identity and retry state"
+            );
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "confirmation should finalize the first seed write without another PTY submission"
+            );
+        }
+
+        // Reviewer B4: a real Pi-shaped status event identifies the pane and
+        // agent but can never carry `user_prompt`. It must settle the write as
+        // unconfirmable instead of arming an endless sequence of retypes.
+        let pi_attempts = Arc::new(AtomicUsize::new(0));
+        let pi_pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            pi_attempts.clone(),
+        ));
+        let mut pi_ui = default_ui();
+        pi_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt("pi-status-pane", "one Pi seed"));
+        let mut pi_snapshot = AppState::default();
+        pi_snapshot.register_pane("pi-status-pane".to_string());
+        pi_snapshot.apply_event(AgentEvent {
+            session_id: "pi-status-session".into(),
+            agent_type: AgentType::Pi,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("pi-status-pane".into()),
+            agent_id: Some("pi-status-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+        process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
+        process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
+        assert!(
+            pi_ui.pending_seed_prompts.is_empty()
+                && !pi_ui.prompt_delivery.contains_key("pi-status-pane")
+                && !pi_ui.send_retry_backoff.contains_key("pi-status-pane")
+                && pi_attempts.load(Ordering::SeqCst) == 1,
+            "one Pi status event cannot prove prompt-reporting capability or arm repeated writes"
+        );
+
+        // No identity anywhere is also structurally unconfirmable: even a
+        // reporting producer's text would be rejected as wildcard evidence.
+        let unidentified_attempts = Arc::new(AtomicUsize::new(0));
+        let unidentified_pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            unidentified_attempts.clone(),
+        ));
+        let mut unidentified_ui = default_ui();
+        unidentified_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt("unidentified-pane", "one anonymous seed"));
+        let mut unidentified_snapshot = AppState::default();
+        unidentified_snapshot.register_pane("unidentified-pane".to_string());
+        unidentified_snapshot.insert_placeholder_session(
+            "unidentified-pane".to_string(),
+            None,
+            Some(AgentType::Codex),
+            None,
+        );
+        process_pending_seed_prompts(
+            &mut unidentified_ui,
+            &unidentified_pane,
+            &unidentified_snapshot,
+        );
+        process_pending_seed_prompts(
+            &mut unidentified_ui,
+            &unidentified_pane,
+            &unidentified_snapshot,
+        );
+        assert!(
+            unidentified_ui.pending_seed_prompts.is_empty()
+                && unidentified_attempts.load(Ordering::SeqCst) == 1,
+            "a pane with no identity anywhere must be written once and never retyped"
+        );
+
+        // Reviewer B5 plus the real `/015` failure: a swallowed CR can leave
+        // the first seed in the input as either `seed\nseed` or bare
+        // `seedseed` (observed as the `waitUse` seam). Both are terminal
+        // delivery evidence, for short and hook-truncated long reports, so even
+        // a retry made immediately eligible after the event must not write a
+        // third copy.
+        let field_seed = "Use Bash to verify seed-confirm-alpha-7f31.txt exists in the current directory then print its exact filename and wait";
+        let seeds = [
+            ("short", field_seed.to_string()),
+            (
+                "long",
+                format!(
+                    "{field_seed} {}",
+                    "keep the exact sentinel-bearing task unchanged; ".repeat(4)
+                ),
+            ),
+        ];
+        assert!(
+            seeds[1].1.len() > crate::prompt_delivery::USER_PROMPT_MAX_LEN,
+            "the long fixture must exercise hook truncation"
+        );
+        let mut doubled_outcomes = Vec::new();
+        for (length, seed) in seeds {
+            for (separator_name, separator) in [("newline", "\n"), ("bare", "")] {
+                let doubled_attempts = Arc::new(AtomicUsize::new(0));
+                let doubled_pane: Arc<dyn PaneController> =
+                    Arc::new(SendResultPaneController::new(
+                        InjectedSendOutcome::Applied,
+                        doubled_attempts.clone(),
+                    ));
+                let mut doubled_ui = default_ui();
+                doubled_ui
+                    .pending_seed_prompts
+                    .push(ready_seed_prompt("doubled-seed-pane", &seed));
+                let mut doubled_snapshot =
+                    ready_prompt_snapshot("doubled-seed-pane", "doubled-seed-agent");
+
+                process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
+                doubled_ui
+                    .send_retry_backoff
+                    .get_mut("doubled-seed-pane")
+                    .expect("first unconfirmed write arms retry")
+                    .next_attempt_at = std::time::Instant::now();
+                process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
+                assert_eq!(doubled_attempts.load(Ordering::SeqCst), 2);
+
+                let doubled = format!("{seed}{separator}{seed}");
+                let reported = crate::prompt_delivery::truncate_on_char_boundary(
+                    &doubled,
+                    crate::prompt_delivery::USER_PROMPT_MAX_LEN,
+                );
+                apply_prompt_confirmation(
+                    &mut doubled_snapshot,
+                    "doubled-seed-pane",
+                    "doubled-seed-agent",
+                    &reported,
+                );
+                doubled_ui
+                    .send_retry_backoff
+                    .get_mut("doubled-seed-pane")
+                    .expect("second unconfirmed write keeps retry armed")
+                    .next_attempt_at = std::time::Instant::now();
+                process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
+                process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
+                doubled_outcomes.push((
+                    format!("{length}-{separator_name}"),
+                    doubled_ui.pending_seed_prompts.is_empty(),
+                    !doubled_ui.prompt_delivery.contains_key("doubled-seed-pane")
+                        && !doubled_ui
+                            .send_retry_backoff
+                            .contains_key("doubled-seed-pane"),
+                    doubled_attempts.load(Ordering::SeqCst),
+                ));
+            }
+        }
+        assert!(
+            doubled_outcomes
+                .iter()
+                .all(|(_, delivered, retry_cleared, attempts)| {
+                    *delivered && *retry_cleared && *attempts == 2
+                }),
+            "every reported doubled seed must be delivered with retry state cleared and no third write; outcomes={doubled_outcomes:#?}"
+        );
+
+        let repeated = "bounded repetition";
+        assert!(prompt_submission_matches(
+            repeated,
+            &std::iter::repeat_n(repeated, 16)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        assert!(
+            !prompt_submission_matches(
+                repeated,
+                &std::iter::repeat_n(repeated, 17)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            "the recovery shape is deliberately bounded to 16 copies"
+        );
+        assert!(!prompt_submission_matches(
+            repeated,
+            &format!("{repeated}\nsomething else")
+        ));
+    }
+
+    /// A controller that records the exact payload and bound session of every
+    /// identity-bearing write, which is what the D1/D5 policies are stated in
+    /// terms of. Deliberately separate from `SendResultPaneController` so
+    /// nothing existing changes shape.
+    /// One recorded identity-bearing write: the payload, the generation it was
+    /// bound to, and the wire delivery id.
+    type RecordedWrite = (String, Option<String>, Option<String>);
+
+    #[derive(Default)]
+    struct RecordingPaneController {
+        writes: Arc<std::sync::Mutex<Vec<RecordedWrite>>>,
+        lose_first_response: bool,
+    }
+
+    impl RecordingPaneController {
+        fn losing_first_response() -> Self {
+            Self {
+                writes: Arc::default(),
+                lose_first_response: true,
+            }
+        }
+    }
+
+    impl PaneController for RecordingPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            _pane_id: &str,
+            text: &str,
+            _expected_agent_id: Option<&str>,
+            expected_session_id: Option<&str>,
+            delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            let mut writes = self.writes.lock().unwrap();
+            writes.push((
+                text.to_string(),
+                expected_session_id.map(str::to_string),
+                delivery_id.map(str::to_string),
+            ));
+            let first_write = writes.len() == 1;
+            drop(writes);
+            if self.lose_first_response && first_write {
+                return Err(PaneError::CommandFailed(
+                    "injected lost response after physical write".into(),
+                ));
+            }
+            Ok(crate::event::SendResult::Applied)
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A TUI-facing controller whose submissions go through the production
+    /// registry guard and land on a real byte-observation PTY. This lets the
+    /// consumer test assert what physically reached the pane after the daemon's
+    /// user-input clock advanced, without coupling the assertion to where the
+    /// safety check is implemented.
+    #[cfg(unix)]
+    struct RegistryBackedPaneController {
+        registry: Arc<crate::agent_pty::AgentPtyRegistry>,
+        agent_id: String,
+        runtime: tokio::runtime::Runtime,
+    }
+
+    #[cfg(unix)]
+    impl RegistryBackedPaneController {
+        fn new(pane_id: &str) -> Self {
+            let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+            let agent_id = registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane_id.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn TUI byte-observation target");
+            Self {
+                registry,
+                agent_id,
+                runtime: tokio::runtime::Runtime::new().expect("test runtime"),
+            }
+        }
+
+        fn snapshot(&self) -> Vec<u8> {
+            self.registry
+                .snapshot(&self.agent_id)
+                .expect("TUI byte-observation snapshot")
+        }
+
+        fn type_user_draft(&self, pane_id: &str, draft: &str) {
+            let handle = self
+                .registry
+                .subscribe(&self.agent_id)
+                .expect("attach TUI byte-observation target");
+            self.runtime.block_on(async {
+                use std::io::Write as _;
+
+                let mut writer = handle.writer.lock().await;
+                writer
+                    .write_all(draft.as_bytes())
+                    .expect("write unsent TUI user draft");
+                writer.flush().expect("flush unsent TUI user draft");
+            });
+            self.registry.note_user_input(pane_id);
+            std::thread::sleep(std::time::Duration::from_millis(75));
+        }
+    }
+
+    #[cfg(unix)]
+    impl PaneController for RegistryBackedPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
+            Some(self.agent_id.clone())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            pane_id: &str,
+            text: &str,
+            expected_agent_id: Option<&str>,
+            _expected_session_id: Option<&str>,
+            _delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            let outcome = self
+                .runtime
+                .block_on(self.registry.write_and_submit_guarded(
+                    pane_id,
+                    text,
+                    expected_agent_id,
+                    || async { true },
+                ))
+                .map_err(|error| PaneError::CommandFailed(error.to_string()))?;
+            Ok(match outcome {
+                crate::agent_pty::GuardedSend::Applied => crate::event::SendResult::Applied,
+                crate::agent_pty::GuardedSend::WrongSession => {
+                    crate::event::SendResult::WrongSession
+                }
+                crate::agent_pty::GuardedSend::Stale => crate::event::SendResult::Stale,
+                crate::agent_pty::GuardedSend::NoLiveTarget => {
+                    crate::event::SendResult::NoLiveTarget
+                }
+                crate::agent_pty::GuardedSend::Ambiguous => crate::event::SendResult::Ambiguous,
+            })
+        }
+        fn name(&self) -> &str {
+            "registry-backed"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Scenario: Let a TUI seed reach its reporting pane, type an unsent user draft before the replacement payload is due, and independently type another draft after the replacement but before the submit-only probe. In both timelines the next automatic attempt must send no bytes, so it neither appends its payload nor submits the user's draft.
+    #[cfg(unix)]
+    #[spec("prompt/pane-input/032")]
+    #[test]
+    fn pane_input_032_user_input_disarms_submit_only_probe() {
+        const PANE_ID: &str = "user-draft-safety-pane";
+        const PROMPT: &str = "automatic prompt before the user's draft";
+        const USER_DRAFT: &str = "user draft deliberately left unsent";
+
+        const REPLACEMENT_PANE_ID: &str = "user-draft-before-replacement-pane";
+        const REPLACEMENT_PROMPT: &str = "automatic prompt before replacement guard";
+        const REPLACEMENT_DRAFT: &str = "draft before replacement payload";
+
+        let replacement_controller =
+            Arc::new(RegistryBackedPaneController::new(REPLACEMENT_PANE_ID));
+        let replacement_pane: Arc<dyn PaneController> = replacement_controller.clone();
+        let mut replacement_ui = default_ui();
+        replacement_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt(REPLACEMENT_PANE_ID, REPLACEMENT_PROMPT));
+        let replacement_snapshot =
+            ready_prompt_snapshot(REPLACEMENT_PANE_ID, &replacement_controller.agent_id);
+
+        process_pending_seed_prompts(
+            &mut replacement_ui,
+            &replacement_pane,
+            &replacement_snapshot,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        let after_initial_delivery = replacement_controller.snapshot();
+        assert!(
+            after_initial_delivery
+                .windows(REPLACEMENT_PROMPT.len())
+                .any(|window| window == REPLACEMENT_PROMPT.as_bytes()),
+            "precondition: attempt 1 must reach the TUI pane before any automatic-write timestamp exists; output={:?}",
+            String::from_utf8_lossy(&after_initial_delivery)
+        );
+
+        replacement_controller.type_user_draft(REPLACEMENT_PANE_ID, REPLACEMENT_DRAFT);
+        let before_replacement = replacement_controller.snapshot();
+        assert!(
+            before_replacement
+                .windows(REPLACEMENT_DRAFT.len())
+                .any(|window| window == REPLACEMENT_DRAFT.as_bytes()),
+            "precondition: the unsent user draft must physically reach the TUI PTY; output={:?}",
+            String::from_utf8_lossy(&before_replacement)
+        );
+        replacement_ui
+            .send_retry_backoff
+            .get_mut(REPLACEMENT_PANE_ID)
+            .expect("first write arms replacement payload")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(
+            &mut replacement_ui,
+            &replacement_pane,
+            &replacement_snapshot,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        let after_replacement = replacement_controller.snapshot();
+
+        replacement_controller.registry.shutdown_all();
+        assert_eq!(
+            after_replacement,
+            before_replacement,
+            "TUI attempt 2 must append no replacement payload and send no submit CR after user input; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_replacement),
+            String::from_utf8_lossy(&after_replacement)
+        );
+
+        let controller = Arc::new(RegistryBackedPaneController::new(PANE_ID));
+        let pane: Arc<dyn PaneController> = controller.clone();
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        let snapshot = ready_prompt_snapshot(PANE_ID, &controller.agent_id);
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("first write arms replacement attempt")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        std::thread::sleep(std::time::Duration::from_millis(75));
+
+        controller.type_user_draft(PANE_ID, USER_DRAFT);
+        let before_probe = controller.snapshot();
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("second write arms submit-only probe")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        let after_probe = controller.snapshot();
+
+        controller.registry.shutdown_all();
+        assert_eq!(
+            after_probe,
+            before_probe,
+            "a TUI retry must send no submit CR after the registry recorded user input; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_probe),
+            String::from_utf8_lossy(&after_probe)
+        );
+    }
+
+    /// Scenario: Write seed and orchestrator prompts into launcher panes with no hook generation, including writes whose successful daemon response is lost, then let generations arrive or roll over during backoff. A live generation may be bound before retry, but neither an observed end nor a whole start/end/successor burst may let either TUI path write into a successor; a later safe attempt probes submission rather than retyping.
+    #[spec("prompt/pane-input/030")]
+    #[test]
+    fn pane_input_030_late_generation_binds_before_the_retry_that_enters_it() {
+        const PANE_ID: &str = "late-generation-pane";
+        const AGENT_ID: &str = "late-generation-agent";
+        const PROMPT: &str = "Read the dispatch seed and begin";
+
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        // The launcher shape: identity and a reporting agent type are known, but
+        // nothing has announced a conversation yet.
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        assert_eq!(
+            snapshot.pane_hook_session_id(PANE_ID),
+            None,
+            "precondition: the fallback writes into a pane with no generation"
+        );
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].0, PROMPT);
+            assert_eq!(
+                writes[0].1, None,
+                "the first write has no generation to name, and must not invent one"
+            );
+        }
+
+        // The real agent finally announces itself — the 10.1 s launcher case.
+        snapshot.apply_event(AgentEvent {
+            session_id: "genuine-generation".into(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE_ID.into()),
+            agent_id: Some(AGENT_ID.into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("an unconfirmed write arms retry")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 2, "the retry must reach the pane");
+            assert_eq!(
+                writes[1].1.as_deref(),
+                Some("genuine-generation"),
+                "D1: a retry sent INTO a generation must declare it, or a later \
+                 /clear can take the same prompt with no session guard at all"
+            );
+            assert_eq!(
+                writes[1].0, PROMPT,
+                "attempt 2 is the one bounded replacement payload"
+            );
+        }
+        assert_eq!(
+            ui.prompt_delivery
+                .get(PANE_ID)
+                .and_then(|d| d.expected_session_id.clone())
+                .as_deref(),
+            Some("genuine-generation"),
+            "the binding must be retained, not merely sent once"
+        );
+
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("still unconfirmed")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 3);
+            assert_eq!(
+                writes[2].0, "",
+                "D5: by attempt 3 a payload may be sitting in the input box, so \
+                 the attempt probes submission instead of appending another copy"
+            );
+            assert_eq!(
+                writes[2].1.as_deref(),
+                Some("genuine-generation"),
+                "a probe carries the same identity guards as any other attempt"
+            );
+            assert_ne!(
+                writes[2].2, writes[1].2,
+                "a probe's payload differs, so it needs its own ledger identity"
+            );
+        }
+
+        // Auditor E2: the generation can appear while attempt 1 is held in
+        // backoff and disappear again before attempt 2. `expected_session_id`
+        // is still None in that sequence, but observing the generation and its
+        // end must nevertheless revoke the unbound delivery. A successor is
+        // present at retry time to catch the especially dangerous false rebind.
+        const HELD_SEED_PANE: &str = "held-ended-seed-generation";
+        const HELD_SEED_AGENT: &str = "held-ended-seed-agent";
+        let held_seed_controller = Arc::new(RecordingPaneController::default());
+        let held_seed_writes = held_seed_controller.writes.clone();
+        let held_seed_pane: Arc<dyn PaneController> = held_seed_controller;
+        let mut held_seed_ui = default_ui();
+        held_seed_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt(HELD_SEED_PANE, PROMPT));
+        let mut held_seed_snapshot = ready_prompt_snapshot(HELD_SEED_PANE, HELD_SEED_AGENT);
+
+        process_pending_seed_prompts(&mut held_seed_ui, &held_seed_pane, &held_seed_snapshot);
+        apply_generation_event(
+            &mut held_seed_snapshot,
+            HELD_SEED_PANE,
+            HELD_SEED_AGENT,
+            "generation-seen-during-seed-backoff",
+            EventType::SessionStart,
+        );
+        process_pending_seed_prompts(&mut held_seed_ui, &held_seed_pane, &held_seed_snapshot);
+        apply_generation_event(
+            &mut held_seed_snapshot,
+            HELD_SEED_PANE,
+            HELD_SEED_AGENT,
+            "generation-seen-during-seed-backoff",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut held_seed_snapshot,
+            HELD_SEED_PANE,
+            HELD_SEED_AGENT,
+            "seed-successor-generation",
+            EventType::SessionStart,
+        );
+        held_seed_ui
+            .send_retry_backoff
+            .get_mut(HELD_SEED_PANE)
+            .expect("held seed keeps its retry state")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut held_seed_ui, &held_seed_pane, &held_seed_snapshot);
+        let held_seed_write_count = held_seed_writes.lock().unwrap().len();
+
+        // The orchestrator twin must remember the same observed transition.
+        const HELD_ROLE_PANE: &str = "held-ended-orchestrator-generation";
+        const HELD_ROLE_AGENT: &str = "held-ended-orchestrator-agent";
+        let held_role_controller = Arc::new(RecordingPaneController::default());
+        let held_role_writes = held_role_controller.writes.clone();
+        let held_role_pane: Arc<dyn PaneController> = held_role_controller;
+        let started = std::time::Instant::now();
+        let tab_id: TabId = 30030;
+        let mut held_role_ui = default_ui();
+        held_role_ui
+            .orchestration_created_at
+            .insert(tab_id, started);
+        held_role_ui.orchestration_ready_since.insert(
+            tab_id,
+            started
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut held_role_snapshot = ready_prompt_snapshot(HELD_ROLE_PANE, HELD_ROLE_AGENT);
+        let role_panes = [HELD_ROLE_PANE.to_string()];
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut role_prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut held_role_ui,
+            held_role_pane.as_ref(),
+            &held_role_snapshot,
+            started,
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        apply_generation_event(
+            &mut held_role_snapshot,
+            HELD_ROLE_PANE,
+            HELD_ROLE_AGENT,
+            "generation-seen-during-role-backoff",
+            EventType::SessionStart,
+        );
+        deliver_orchestrator_prompt(
+            &mut held_role_ui,
+            held_role_pane.as_ref(),
+            &held_role_snapshot,
+            started + std::time::Duration::from_millis(1),
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        apply_generation_event(
+            &mut held_role_snapshot,
+            HELD_ROLE_PANE,
+            HELD_ROLE_AGENT,
+            "generation-seen-during-role-backoff",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut held_role_snapshot,
+            HELD_ROLE_PANE,
+            HELD_ROLE_AGENT,
+            "role-successor-generation",
+            EventType::SessionStart,
+        );
+        held_role_ui
+            .send_retry_backoff
+            .get_mut(HELD_ROLE_PANE)
+            .expect("held role keeps its retry state")
+            .next_attempt_at = started;
+        deliver_orchestrator_prompt(
+            &mut held_role_ui,
+            held_role_pane.as_ref(),
+            &held_role_snapshot,
+            started + std::time::Duration::from_millis(2),
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        let held_role_write_count = held_role_writes.lock().unwrap().len();
+
+        assert!(
+            held_seed_write_count == 1 && held_role_write_count == 1,
+            "an unbound delivery that observed a generation and its end must not follow into a successor on either TUI path; seed_writes={held_seed_write_count}, orchestrator_writes={held_role_write_count}"
+        );
+
+        // Auditor round 6: production does not guarantee a render pass while a
+        // short-lived generation exists. Force the entire R start/end/R2 start
+        // burst into AppState between two passes so no fixture-side witness can
+        // serialize the rollover into the favorable ordering above.
+        const BURST_SEED_PANE: &str = "between-pass-seed-generation-burst";
+        const BURST_SEED_AGENT: &str = "between-pass-seed-agent";
+        let burst_seed_controller = Arc::new(RecordingPaneController::default());
+        let burst_seed_writes = burst_seed_controller.writes.clone();
+        let burst_seed_pane: Arc<dyn PaneController> = burst_seed_controller;
+        let mut burst_seed_ui = default_ui();
+        burst_seed_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt(BURST_SEED_PANE, PROMPT));
+        let mut burst_seed_snapshot = ready_prompt_snapshot(BURST_SEED_PANE, BURST_SEED_AGENT);
+
+        process_pending_seed_prompts(&mut burst_seed_ui, &burst_seed_pane, &burst_seed_snapshot);
+        apply_generation_event(
+            &mut burst_seed_snapshot,
+            BURST_SEED_PANE,
+            BURST_SEED_AGENT,
+            "seed-generation-entirely-between-passes",
+            EventType::SessionStart,
+        );
+        apply_generation_event(
+            &mut burst_seed_snapshot,
+            BURST_SEED_PANE,
+            BURST_SEED_AGENT,
+            "seed-generation-entirely-between-passes",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut burst_seed_snapshot,
+            BURST_SEED_PANE,
+            BURST_SEED_AGENT,
+            "seed-successor-after-missed-generation",
+            EventType::SessionStart,
+        );
+        burst_seed_ui
+            .send_retry_backoff
+            .get_mut(BURST_SEED_PANE)
+            .expect("burst seed keeps its retry state")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut burst_seed_ui, &burst_seed_pane, &burst_seed_snapshot);
+        let burst_seed_write_count = burst_seed_writes.lock().unwrap().len();
+
+        const BURST_ROLE_PANE: &str = "between-pass-role-generation-burst";
+        const BURST_ROLE_AGENT: &str = "between-pass-role-agent";
+        let burst_role_controller = Arc::new(RecordingPaneController::default());
+        let burst_role_writes = burst_role_controller.writes.clone();
+        let burst_role_pane: Arc<dyn PaneController> = burst_role_controller;
+        let burst_started = std::time::Instant::now();
+        let burst_tab_id: TabId = 30031;
+        let mut burst_role_ui = default_ui();
+        burst_role_ui
+            .orchestration_created_at
+            .insert(burst_tab_id, burst_started);
+        burst_role_ui.orchestration_ready_since.insert(
+            burst_tab_id,
+            burst_started
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut burst_role_snapshot = ready_prompt_snapshot(BURST_ROLE_PANE, BURST_ROLE_AGENT);
+        let burst_role_panes = [BURST_ROLE_PANE.to_string()];
+        let mut burst_role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut burst_role_prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut burst_role_ui,
+            burst_role_pane.as_ref(),
+            &burst_role_snapshot,
+            burst_started,
+            burst_tab_id,
+            &burst_role_panes,
+            0,
+            &mut burst_role_statuses,
+            &mut burst_role_prompt,
+        );
+        apply_generation_event(
+            &mut burst_role_snapshot,
+            BURST_ROLE_PANE,
+            BURST_ROLE_AGENT,
+            "role-generation-entirely-between-passes",
+            EventType::SessionStart,
+        );
+        apply_generation_event(
+            &mut burst_role_snapshot,
+            BURST_ROLE_PANE,
+            BURST_ROLE_AGENT,
+            "role-generation-entirely-between-passes",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut burst_role_snapshot,
+            BURST_ROLE_PANE,
+            BURST_ROLE_AGENT,
+            "role-successor-after-missed-generation",
+            EventType::SessionStart,
+        );
+        burst_role_ui
+            .send_retry_backoff
+            .get_mut(BURST_ROLE_PANE)
+            .expect("burst role keeps its retry state")
+            .next_attempt_at = burst_started;
+        deliver_orchestrator_prompt(
+            &mut burst_role_ui,
+            burst_role_pane.as_ref(),
+            &burst_role_snapshot,
+            burst_started + std::time::Duration::from_millis(1),
+            burst_tab_id,
+            &burst_role_panes,
+            0,
+            &mut burst_role_statuses,
+            &mut burst_role_prompt,
+        );
+        let burst_role_write_count = burst_role_writes.lock().unwrap().len();
+
+        assert!(
+            burst_seed_write_count == 1 && burst_role_write_count == 1,
+            "a whole generation that starts and ends between render passes must revoke both unbound TUI deliveries before either can bind its successor; seed_writes={burst_seed_write_count}, orchestrator_writes={burst_role_write_count}"
+        );
+
+        // A transport error is not proof that the daemon did not apply the
+        // write. Force the first request to record a physical write and then
+        // lose its response, so the whole closure burst lands while the TUI's
+        // ordinary success counters still say zero.
+        const LOST_SEED_PANE: &str = "lost-response-seed-generation-burst";
+        const LOST_SEED_AGENT: &str = "lost-response-seed-agent";
+        let lost_seed_controller = Arc::new(RecordingPaneController::losing_first_response());
+        let lost_seed_writes = lost_seed_controller.writes.clone();
+        let lost_seed_pane: Arc<dyn PaneController> = lost_seed_controller;
+        let mut lost_seed_ui = default_ui();
+        lost_seed_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt(LOST_SEED_PANE, PROMPT));
+        let mut lost_seed_snapshot = ready_prompt_snapshot(LOST_SEED_PANE, LOST_SEED_AGENT);
+
+        process_pending_seed_prompts(&mut lost_seed_ui, &lost_seed_pane, &lost_seed_snapshot);
+        apply_generation_event(
+            &mut lost_seed_snapshot,
+            LOST_SEED_PANE,
+            LOST_SEED_AGENT,
+            "lost-seed-generation-entirely-between-passes",
+            EventType::SessionStart,
+        );
+        apply_generation_event(
+            &mut lost_seed_snapshot,
+            LOST_SEED_PANE,
+            LOST_SEED_AGENT,
+            "lost-seed-generation-entirely-between-passes",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut lost_seed_snapshot,
+            LOST_SEED_PANE,
+            LOST_SEED_AGENT,
+            "lost-seed-successor-after-missed-generation",
+            EventType::SessionStart,
+        );
+        lost_seed_ui
+            .send_retry_backoff
+            .get_mut(LOST_SEED_PANE)
+            .expect("lost seed response keeps transport retry state")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut lost_seed_ui, &lost_seed_pane, &lost_seed_snapshot);
+        let lost_seed_records = lost_seed_writes.lock().unwrap().clone();
+
+        const LOST_ROLE_PANE: &str = "lost-response-role-generation-burst";
+        const LOST_ROLE_AGENT: &str = "lost-response-role-agent";
+        let lost_role_controller = Arc::new(RecordingPaneController::losing_first_response());
+        let lost_role_writes = lost_role_controller.writes.clone();
+        let lost_role_pane: Arc<dyn PaneController> = lost_role_controller;
+        let lost_started = std::time::Instant::now();
+        let lost_tab_id: TabId = 30032;
+        let mut lost_role_ui = default_ui();
+        lost_role_ui
+            .orchestration_created_at
+            .insert(lost_tab_id, lost_started);
+        lost_role_ui.orchestration_ready_since.insert(
+            lost_tab_id,
+            lost_started
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut lost_role_snapshot = ready_prompt_snapshot(LOST_ROLE_PANE, LOST_ROLE_AGENT);
+        let lost_role_panes = [LOST_ROLE_PANE.to_string()];
+        let mut lost_role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut lost_role_prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut lost_role_ui,
+            lost_role_pane.as_ref(),
+            &lost_role_snapshot,
+            lost_started,
+            lost_tab_id,
+            &lost_role_panes,
+            0,
+            &mut lost_role_statuses,
+            &mut lost_role_prompt,
+        );
+        apply_generation_event(
+            &mut lost_role_snapshot,
+            LOST_ROLE_PANE,
+            LOST_ROLE_AGENT,
+            "lost-role-generation-entirely-between-passes",
+            EventType::SessionStart,
+        );
+        apply_generation_event(
+            &mut lost_role_snapshot,
+            LOST_ROLE_PANE,
+            LOST_ROLE_AGENT,
+            "lost-role-generation-entirely-between-passes",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut lost_role_snapshot,
+            LOST_ROLE_PANE,
+            LOST_ROLE_AGENT,
+            "lost-role-successor-after-missed-generation",
+            EventType::SessionStart,
+        );
+        lost_role_ui
+            .send_retry_backoff
+            .get_mut(LOST_ROLE_PANE)
+            .expect("lost role response keeps transport retry state")
+            .next_attempt_at = lost_started;
+        deliver_orchestrator_prompt(
+            &mut lost_role_ui,
+            lost_role_pane.as_ref(),
+            &lost_role_snapshot,
+            lost_started + std::time::Duration::from_millis(1),
+            lost_tab_id,
+            &lost_role_panes,
+            0,
+            &mut lost_role_statuses,
+            &mut lost_role_prompt,
+        );
+        let lost_role_records = lost_role_writes.lock().unwrap().clone();
+
+        assert!(
+            lost_seed_records.len() == 1 && lost_role_records.len() == 1,
+            "a physically applied write whose response was lost must retain its pre-RPC closure baseline on both TUI paths and never write the old task into a successor; seed_writes={lost_seed_records:?}, orchestrator_writes={lost_role_records:?}"
+        );
+    }
+
+    /// Scenario: Write a seed to a target with no usable prompt-reporting channel, then supply daemon-synthetic evidence beside an untagged legacy hook. Those events must not arm a second physical write into a target that cannot actually confirm submission.
+    #[spec("prompt/pane-input/031")]
+    #[test]
+    fn pane_input_031_daemon_synthetic_events_are_not_a_reporting_channel() {
+        const PANE_ID: &str = "synthetic-evidence-pane";
+        const PROMPT: &str = "one legacy-hook seed";
+
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        let mut snapshot = AppState::default();
+        snapshot.register_pane(PANE_ID.to_string());
+        snapshot.insert_placeholder_session(
+            PANE_ID.to_string(),
+            None,
+            Some(AgentType::ClaudeCode),
+            Some("legacy-agent".to_string()),
+        );
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(writes.lock().unwrap().len(), 1);
+
+        let mut synthetic = |event_type: EventType, notice: bool| {
+            let mut metadata = std::collections::HashMap::new();
+            if notice {
+                metadata.insert(
+                    crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+                    "a spawn-time prompt was never confirmed".to_string(),
+                );
+            }
+            snapshot.apply_event(AgentEvent {
+                session_id: "legacy-session".into(),
+                agent_type: AgentType::None,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata,
+                // Identified, because that is how a daemon-authored event lands
+                // on the right card — and exactly what defeated C6.
+                pane_id: Some(PANE_ID.into()),
+                agent_id: Some("legacy-agent".into()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            });
+        };
+        synthetic(EventType::ShellBusy, false);
+        synthetic(EventType::Error, true);
+
+        // ...while the pane's REAL producer speaks through a pre-F9 untagged
+        // hook, which `prompt_submission_confirmed` can never accept.
+        snapshot.apply_event(AgentEvent {
+            session_id: "legacy-session".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE_ID.into()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+
+        ui.send_retry_backoff
+            .entry(PANE_ID.to_string())
+            .or_insert(SendRetryState {
+                next_attempt_at: std::time::Instant::now(),
+                attempts: 1,
+            })
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "D4: events the daemon wrote itself prove only that the DAEMON can \
+             tag an event; they must not re-arm retyping through a channel that \
+             still cannot confirm anything"
+        );
+    }
+
+    /// Scenario: Lose the response after a ledger caches the first physical seed write, retry that same attempt id, then let the unconfirmed-delivery retry rotate to a new id whose physical write is ambiguous. The duplicate must replay without writing, the rotated attempt must reach the writer, and Ambiguous must abandon without another attempt.
+    #[spec("prompt/pane-input/027")]
+    #[test]
+    fn pane_input_027_rotated_attempt_ids_cross_a_caching_ledger() {
+        const PANE_ID: &str = "caching-ledger-pane";
+        const PROMPT: &str = "retry through the delivery ledger";
+
+        let controller = Arc::new(CachingLedgerPaneController::new());
+        let ledger_state = controller.state.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        let snapshot = ready_prompt_snapshot(PANE_ID, "caching-ledger-agent");
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let state = ledger_state.lock().unwrap();
+            assert_eq!(state.physical_writes, 1);
+            assert_eq!(state.request_ids.len(), 1);
+        }
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("lost response schedules a transport retry")
+            .next_attempt_at = std::time::Instant::now();
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let state = ledger_state.lock().unwrap();
+            assert_eq!(
+                state.physical_writes, 1,
+                "a duplicate of the same attempt must replay cached Applied without a second write"
+            );
+            assert_eq!(state.request_ids.len(), 2);
+            assert_eq!(
+                state.request_ids[0], state.request_ids[1],
+                "a lost response retries the exact same physical attempt id"
+            );
+        }
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("cached Applied remains provisional and arms confirmation retry")
+            .next_attempt_at = std::time::Instant::now();
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        let state = ledger_state.lock().unwrap();
+        assert_eq!(
+            state.physical_writes, 2,
+            "the second logical attempt must rotate its id and reach the physical writer"
+        );
+        assert_eq!(state.request_ids.len(), 3);
+        assert_ne!(
+            state.request_ids[1], state.request_ids[2],
+            "an unconfirmed retry must not replay the first attempt's cached Applied"
+        );
+        assert!(
+            state.request_ids[0].ends_with("#a1") && state.request_ids[2].ends_with("#a2"),
+            "wire ids must identify the logical attempts: {:?}",
+            state.request_ids
+        );
+        assert!(ui.pending_seed_prompts.is_empty());
+        assert!(
+            !ui.prompt_delivery.contains_key(PANE_ID)
+                && !ui.send_retry_backoff.contains_key(PANE_ID),
+            "Ambiguous on the rotated attempt is terminal and must abandon all retry state"
+        );
+    }
+
+    /// Scenario: Write an automatic prompt successfully without confirmation, including a launcher that identifies its real producer only after the readiness timeout. Reporting panes must retry under bounded backoff and reach the deadline, while the late producer must retain the provisional first write and arm a retry once SessionStart finally arrives.
+    #[spec("prompt/pane-input/025")]
+    #[test]
+    fn pane_input_025_unconfirmed_retry_deadline_and_late_readiness() {
+        const PANE_ID: &str = "unconfirmed-deadline-pane";
+        const AGENT_ID: &str = "unconfirmed-deadline-agent";
+        const PROMPT: &str = "This prompt is swallowed before submission";
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let created = std::time::Instant::now();
+        let tab_id: TabId = 25;
+        let mut ui = default_ui();
+        ui.orchestration_created_at.insert(tab_id, created);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            created
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            created,
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(
+            prompt.as_deref(),
+            Some(PROMPT),
+            "an Applied-but-unconfirmed write must stay pending for retry"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let retry_at = created
+            .checked_add(std::time::Duration::from_secs(1))
+            .expect("retry timestamp");
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("provisional write must arm retry")
+            .next_attempt_at = retry_at;
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            retry_at,
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "an unconfirmed PTY write must be re-sent after its bounded backoff"
+        );
+        assert_eq!(prompt.as_deref(), Some(PROMPT));
+
+        let past_deadline = created
+            .checked_add(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
+            .expect("deadline timestamp");
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            past_deadline,
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+
+        assert!(prompt.is_none(), "past-deadline prompt must be abandoned");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "deadline abandonment must not perform one final write"
+        );
+        assert!(
+            !ui.prompt_delivery.contains_key(PANE_ID)
+                && !ui.send_retry_backoff.contains_key(PANE_ID),
+            "deadline abandonment must clear all retry state"
+        );
+        assert_ne!(
+            role_statuses[0],
+            OrchestrationRoleStatus::Working,
+            "an unconfirmed prompt must never mark the role Working"
+        );
+        assert!(
+            ui.status_message.as_ref().is_some_and(|(message, _)| {
+                let message = message.to_ascii_lowercase();
+                message.contains("timed out") && message.contains("abandoned")
+            }),
+            "deadline abandonment must surface the existing timeout status, got {:?}",
+            ui.status_message.as_ref().map(|(message, _)| message)
+        );
+
+        // Reviewer B3: the `devbox run claude ...` shape has no identifiable
+        // producer when the 10s fallback writes. That first write must stay
+        // provisional (without retyping), then a late SessionStart must arm a
+        // real retry instead of finding the prompt already finalized.
+        const SLOW_PANE_ID: &str = "slow-launcher-pane";
+        const SLOW_PROMPT: &str = "prompt written before late SessionStart";
+        let slow_attempts = Arc::new(AtomicUsize::new(0));
+        let slow_pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            slow_attempts.clone(),
+        ));
+        let mut slow_ui = default_ui();
+        slow_ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: SLOW_PANE_ID.to_string(),
+            prompt: SLOW_PROMPT.to_string(),
+            created_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(11))
+                .expect("late-launch timestamp"),
+            ready_since: None,
+        });
+        let mut slow_snapshot = AppState::default();
+        slow_snapshot.register_pane(SLOW_PANE_ID.to_string());
+
+        process_pending_seed_prompts(&mut slow_ui, &slow_pane, &slow_snapshot);
+        assert_eq!(slow_attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            slow_ui.pending_seed_prompts.len() == 1
+                && slow_ui.prompt_delivery.contains_key(SLOW_PANE_ID)
+                && !slow_ui.send_retry_backoff.contains_key(SLOW_PANE_ID),
+            "fallback write with unknown capability must stay provisional without immediately retyping"
+        );
+
+        slow_snapshot.apply_event(AgentEvent {
+            session_id: "late-real-session".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(SLOW_PANE_ID.into()),
+            agent_id: Some("slow-launcher-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+        process_pending_seed_prompts(&mut slow_ui, &slow_pane, &slow_snapshot);
+        slow_ui
+            .pending_seed_prompts
+            .first_mut()
+            .expect("late producer keeps the pending prompt")
+            .ready_since = Some(
+            std::time::Instant::now()
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("late readiness buffer timestamp"),
+        );
+        process_pending_seed_prompts(&mut slow_ui, &slow_pane, &slow_snapshot);
+        assert_eq!(
+            slow_attempts.load(Ordering::SeqCst),
+            2,
+            "a late reporting producer must arm the retry that the timeout fallback preserved"
+        );
+        assert!(
+            slow_ui.send_retry_backoff.contains_key(SLOW_PANE_ID),
+            "the late producer's unconfirmed retry remains provisionally watched"
+        );
+    }
+
+    /// Scenario: Keep a seed prompt provisional after its PTY accepts the bytes, then inject matching text without an agent id, from another pane, and from before the write, plus unrelated target-pane text. None may confirm or disarm the retry; only fresh matching text carrying the target identity finalizes it.
+    #[spec("prompt/pane-input/026")]
+    #[test]
+    fn pane_input_026_only_matching_pane_and_prompt_confirm_delivery() {
+        const PANE_ID: &str = "matching-target-pane";
+        const AGENT_ID: &str = "matching-target-agent";
+        const OTHER_PANE_ID: &str = "wrong-confirmation-pane";
+        const OTHER_AGENT_ID: &str = "wrong-confirmation-agent";
+        const PROMPT: &str = "Exact automatic seed text";
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: PANE_ID.to_string(),
+            prompt: PROMPT.to_string(),
+            created_at: std::time::Instant::now(),
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("ready timestamp"),
+            ),
+        });
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        snapshot.register_pane(OTHER_PANE_ID.to_string());
+        snapshot.insert_placeholder_session(
+            OTHER_PANE_ID.to_string(),
+            None,
+            Some(AgentType::Codex),
+            Some(OTHER_AGENT_ID.to_string()),
+        );
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            ui.pending_seed_prompts.len(),
+            1,
+            "the first PTY write must remain provisional"
+        );
+        assert!(ui.send_retry_backoff.contains_key(PANE_ID));
+
+        snapshot.apply_event(AgentEvent {
+            session_id: "identity-less-confirmation".into(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: Some(PROMPT.into()),
+            metadata: Default::default(),
+            pane_id: Some(PANE_ID.into()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            ui.pending_seed_prompts.len(),
+            1,
+            "matching text with no agent identity is unusable evidence"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        apply_prompt_confirmation(&mut snapshot, OTHER_PANE_ID, OTHER_AGENT_ID, PROMPT);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            ui.pending_seed_prompts.len(),
+            1,
+            "the exact prompt text submitted by another pane must not confirm this delivery"
+        );
+        assert!(ui.send_retry_backoff.contains_key(PANE_ID));
+
+        apply_prompt_confirmation(
+            &mut snapshot,
+            PANE_ID,
+            AGENT_ID,
+            "the human typed an unrelated prompt",
+        );
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            ui.pending_seed_prompts.len(),
+            1,
+            "an unrelated human prompt in the target pane must not confirm the automatic delivery"
+        );
+        assert!(
+            ui.prompt_delivery.contains_key(PANE_ID) && ui.send_retry_backoff.contains_key(PANE_ID),
+            "non-matching events must leave delivery identity and retry armed"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "non-matching confirmations must not bypass the active retry backoff"
+        );
+
+        apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert!(
+            ui.pending_seed_prompts.is_empty(),
+            "only matching pane plus matching prompt may confirm the delivery"
+        );
+
+        // The same text in the journal before the write is the exact event the
+        // causal watermark must exclude. A later fresh copy still confirms.
+        let stale_attempts = Arc::new(AtomicUsize::new(0));
+        let stale_pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            stale_attempts.clone(),
+        ));
+        let mut stale_ui = default_ui();
+        stale_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt("stale-history-pane", PROMPT));
+        let mut stale_snapshot = ready_prompt_snapshot("stale-history-pane", "stale-history-agent");
+        apply_prompt_confirmation(
+            &mut stale_snapshot,
+            "stale-history-pane",
+            "stale-history-agent",
+            PROMPT,
+        );
+
+        process_pending_seed_prompts(&mut stale_ui, &stale_pane, &stale_snapshot);
+        process_pending_seed_prompts(&mut stale_ui, &stale_pane, &stale_snapshot);
+        assert!(
+            stale_ui.pending_seed_prompts.len() == 1
+                && stale_ui.prompt_delivery.contains_key("stale-history-pane")
+                && stale_ui
+                    .send_retry_backoff
+                    .contains_key("stale-history-pane"),
+            "matching pre-write history must not confirm a delivery that did not yet exist"
+        );
+        assert_eq!(stale_attempts.load(Ordering::SeqCst), 1);
+
+        apply_prompt_confirmation(
+            &mut stale_snapshot,
+            "stale-history-pane",
+            "stale-history-agent",
+            PROMPT,
+        );
+        process_pending_seed_prompts(&mut stale_ui, &stale_pane, &stale_snapshot);
+        assert!(
+            stale_ui.pending_seed_prompts.is_empty(),
+            "fresh matching evidence after the watermark must still confirm"
+        );
+    }
+
+    /// Scenario: Write a seed to one registry agent, block its retry, then rebind the pane to a replacement; separately end the bound hook session as a same-agent clear. The successor must receive zero bytes in both cases, and each stale delivery must terminate instead of remaining armed.
+    #[spec("prompt/pane-input/028")]
+    #[test]
+    fn pane_input_028_retry_never_reaches_replacement_or_cleared_session() {
+        const PROMPT: &str = "task belonging only to the original conversation";
+
+        let replacement_controller = Arc::new(IdentityGuardPaneController::new("original-agent"));
+        let replacement_pane: Arc<dyn PaneController> = replacement_controller.clone();
+        let mut replacement_ui = default_ui();
+        replacement_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt("rebound-pane", PROMPT));
+        let mut replacement_snapshot = ready_prompt_snapshot("rebound-pane", "original-agent");
+        process_pending_seed_prompts(
+            &mut replacement_ui,
+            &replacement_pane,
+            &replacement_snapshot,
+        );
+        assert_eq!(replacement_controller.writes_for("original-agent"), 1);
+
+        replacement_controller.rebind("replacement-agent");
+        replacement_snapshot.apply_event(AgentEvent {
+            session_id: "replacement-session".into(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("rebound-pane".into()),
+            agent_id: Some("replacement-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+        replacement_ui
+            .send_retry_backoff
+            .get_mut("rebound-pane")
+            .expect("original write arms a retry")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(
+            &mut replacement_ui,
+            &replacement_pane,
+            &replacement_snapshot,
+        );
+        assert_eq!(
+            replacement_controller.writes_for("replacement-agent"),
+            0,
+            "the old delivery must never type into a replacement registry agent"
+        );
+        let replacement_terminal = replacement_ui.pending_seed_prompts.is_empty()
+            && !replacement_ui.prompt_delivery.contains_key("rebound-pane")
+            && !replacement_ui
+                .send_retry_backoff
+                .contains_key("rebound-pane");
+
+        let clear_controller = Arc::new(IdentityGuardPaneController::new("same-agent"));
+        let clear_pane: Arc<dyn PaneController> = clear_controller.clone();
+        let mut clear_ui = default_ui();
+        clear_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt("clear-pane", PROMPT));
+        let mut clear_snapshot = AppState::default();
+        clear_snapshot.register_pane("clear-pane".to_string());
+        clear_snapshot.apply_event(AgentEvent {
+            session_id: "bound-before-clear".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("clear-pane".into()),
+            agent_id: Some("same-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+        process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
+        assert_eq!(clear_controller.writes_for("same-agent"), 1);
+
+        clear_snapshot.apply_event(AgentEvent {
+            session_id: "bound-before-clear".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionEnd,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("clear-pane".into()),
+            agent_id: Some("same-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
+        let clear_writes = clear_controller.writes_for("same-agent");
+        let clear_terminal = clear_ui.pending_seed_prompts.is_empty()
+            && !clear_ui.prompt_delivery.contains_key("clear-pane")
+            && !clear_ui.send_retry_backoff.contains_key("clear-pane");
+        assert!(
+            replacement_terminal && clear_writes == 1 && clear_terminal,
+            "replacement and clear must both terminate without successor bytes; replacement_terminal={replacement_terminal}, replacement_writes={}, clear_terminal={clear_terminal}, clear_writes={clear_writes}",
+            replacement_controller.writes_for("replacement-agent")
+        );
+    }
+
+    /// Issue #424 (reviewer blocker 2, coder-authored): the lost-response +
+    /// late-bind interaction that strands a delivery in a permanent ledger
+    /// conflict. Reusing the attempt id after a lost response is CORRECT (it
+    /// replays a write that physically landed), and binding the generation
+    /// changes the fingerprint that id is bound to — so the wire identity has to
+    /// rotate, or every later retry re-sends the same conflicting request until
+    /// the deadline.
+    #[test]
+    fn late_generation_bind_rotates_the_wire_identity_after_a_lost_response() {
+        const PANE_ID: &str = "epoch-rotation-pane";
+        let delivery = || PromptDelivery {
+            expected_agent_id: Some("epoch-agent".into()),
+            expected_session_id: None,
+            observed_generation: None,
+            closures_at_write: None,
+            delivery_id: "delivery-7".into(),
+            attempts: 0,
+            watermark: None,
+            can_report_prompts: false,
+            epoch: 0,
+            wire_issued: false,
+        };
+        let mut snapshot = AppState::default();
+        snapshot.register_pane(PANE_ID.to_string());
+        snapshot.apply_event(AgentEvent {
+            session_id: "generation-that-appeared-late".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE_ID.into()),
+            agent_id: Some("epoch-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+
+        // The lost-response shape: one wire request issued, no outcome learned,
+        // so `attempts` is still 0 and the next request reuses attempt 1.
+        let mut lost = delivery();
+        lost.wire_issued = true;
+        let before = wire_attempt_id(&lost.delivery_id, lost.epoch, lost.attempts + 1, false);
+        bind_delivery_generation(&mut lost, &snapshot, PANE_ID);
+        let after = wire_attempt_id(&lost.delivery_id, lost.epoch, lost.attempts + 1, false);
+        assert_eq!(
+            lost.expected_session_id.as_deref(),
+            Some("generation-that-appeared-late")
+        );
+        assert_ne!(
+            before, after,
+            "a bind that changes the fingerprint must not reuse the recorded wire id"
+        );
+        assert_ne!(
+            crate::agent_pty::AgentPtyRegistry::delivery_fingerprint(
+                lost.expected_agent_id.as_deref(),
+                None,
+                PANE_ID,
+                "prompt"
+            ),
+            crate::agent_pty::AgentPtyRegistry::delivery_fingerprint(
+                lost.expected_agent_id.as_deref(),
+                lost.expected_session_id.as_deref(),
+                PANE_ID,
+                "prompt"
+            ),
+            "the fixture is only meaningful while the session is part of the fingerprint"
+        );
+        assert!(
+            after.ends_with("#a1"),
+            "rotation must change the delivery identity, not the attempt number: {after}"
+        );
+
+        // With nothing issued, the same bind must NOT rotate: an unrotated id is
+        // what makes a genuine lost-response retry replay instead of writing a
+        // second copy.
+        let mut clean = delivery();
+        let unrotated = wire_attempt_id(&clean.delivery_id, clean.epoch, 1, false);
+        bind_delivery_generation(&mut clean, &snapshot, PANE_ID);
+        assert_eq!(clean.epoch, 0);
+        assert_eq!(
+            wire_attempt_id(&clean.delivery_id, clean.epoch, 1, false),
+            unrotated
+        );
+    }
+
+    /// Scenario: Record an untagged scheduler-style event before a seed write, then an untagged hook event after it, followed by identified evidence. Pre-write history must not disable confirmation, post-write unidentified-only evidence must hold without retrying, and an identified event must recover the reporting channel.
+    #[test]
+    fn untagged_hook_events_are_not_a_confirmation_channel() {
+        const PANE_ID: &str = "legacy-hook-pane";
+        let untagged = |snapshot: &mut AppState, event_type: EventType, prompt: Option<&str>| {
+            snapshot.apply_event(AgentEvent {
+                session_id: "legacy-session".into(),
+                agent_type: AgentType::ClaudeCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: prompt.map(str::to_string),
+                metadata: Default::default(),
+                pane_id: Some(PANE_ID.into()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            });
+        };
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, "legacy-hook-agent");
+        // `surface_spawned_pane` emits this untagged SessionStart shape before
+        // the delivery writes. The watermark must exclude it, or every
+        // scheduler-spawned pane would look like a post-write legacy channel.
+        untagged(&mut snapshot, EventType::SessionStart, None);
+        let mut delivery = PromptDelivery {
+            expected_agent_id: Some("legacy-hook-agent".into()),
+            expected_session_id: None,
+            observed_generation: None,
+            closures_at_write: None,
+            delivery_id: "legacy-1".into(),
+            attempts: 1,
+            watermark: pane_event_watermark(&snapshot, PANE_ID),
+            can_report_prompts: true,
+            epoch: 0,
+            wire_issued: true,
+        };
+        assert_eq!(
+            delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
+            ConfirmationCapability::Reports,
+            "a quiet pane has not yet shown anything about its evidence channel"
+        );
+
+        untagged(
+            &mut snapshot,
+            EventType::Thinking,
+            Some("something the agent submitted"),
+        );
+        assert_eq!(
+            delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
+            ConfirmationCapability::Unknown,
+            "post-write evidence that can never identify its producer is not a channel"
+        );
+
+        // One identified event settles it the other way, and the classification
+        // is recoverable rather than final — a pre-F9 hook is a property of the
+        // binary in the pane, not a verdict on the prompt.
+        apply_prompt_confirmation(&mut snapshot, PANE_ID, "legacy-hook-agent", "unrelated");
+        assert_eq!(
+            delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
+            ConfirmationCapability::Reports
+        );
+
+        // And it never fires before the delivery has written: there is nothing
+        // for the evidence to be about.
+        delivery.attempts = 0;
+        let mut untouched = AppState::default();
+        untouched.register_pane(PANE_ID.to_string());
+        untagged(
+            &mut untouched,
+            EventType::Thinking,
+            Some("pre-write chatter"),
+        );
+        assert!(!evidence_channel_is_unidentified(
+            &untouched, PANE_ID, &delivery
+        ));
+    }
+
+    /// Issue #424 (tester's finding / C2, coder-authored): which seed-path
+    /// outcomes are terminal, and why "already written" is part of the answer.
+    #[test]
+    fn seed_terminal_outcomes_depend_on_whether_a_write_exists() {
+        // A partial write must never be blindly repeated, whatever preceded it.
+        assert!(seed_result_is_terminal(SendResult::Ambiguous, false));
+        assert!(seed_result_is_terminal(SendResult::Ambiguous, true));
+        // A refusal AFTER a provisional write proves the bound target is gone.
+        assert!(seed_result_is_terminal(SendResult::WrongSession, true));
+        assert!(seed_result_is_terminal(SendResult::Unknown, true));
+        // Before any write nothing has been injected anywhere, so the same
+        // refusal is an ordinary non-delivery, retained under backoff and
+        // bounded by the deadline (`prompt/pane-input/006`).
+        assert!(!seed_result_is_terminal(SendResult::WrongSession, false));
+        assert!(!seed_result_is_terminal(SendResult::Unknown, false));
+        // Liveness transitions stay retryable on both sides.
+        for retryable in [
+            SendResult::HistoryOnly,
+            SendResult::Stale,
+            SendResult::NoLiveTarget,
+        ] {
+            assert!(!seed_result_is_terminal(retryable, false));
+            assert!(!seed_result_is_terminal(retryable, true));
+        }
+        // Epoch 0 — every delivery whose identity never moved — keeps exactly
+        // the wire id shape the ledger and the logs already knew.
+        assert_eq!(
+            wire_attempt_id("d", 0, 2, false),
+            attempt_delivery_id("d", 2)
+        );
+        assert_ne!(
+            wire_attempt_id("d", 1, 2, false),
+            attempt_delivery_id("d", 2)
+        );
+        assert!(wire_attempt_id("d", 1, 2, false).ends_with("#a2"));
+        // Issue #424 D5: a submit-only probe carries a different payload, so it
+        // must never share a ledger identity with the payload attempt it follows.
+        assert_ne!(
+            wire_attempt_id("d", 0, 3, true),
+            wire_attempt_id("d", 0, 3, false)
+        );
+        assert!(wire_attempt_id("d", 0, 3, true).ends_with("#a3"));
     }
 
     /// Scenario: Queue mode seed prompts and inject permanent non-delivery through

@@ -229,6 +229,13 @@ pub struct DispatchContext {
     /// rather than read here so [`handle_dispatch`] does not depend on global
     /// config. See [`resolve_single_agent_command`].
     pub default_command: Option<String>,
+    /// The daemon's [`AppState`](crate::state::AppState), so a dispatched
+    /// ORCHESTRATION's role panes are registered in the maps `handle_delegate`
+    /// routes on. Without it the dispatch produces an orchestrator that has been
+    /// handed a delegation protocol it cannot use — see
+    /// [`crate::state::AppState::register_orchestration_role`]. `None` in unit
+    /// tests, which assert on the worktree/spawn result rather than on routing.
+    pub state: Option<crate::state::SharedState>,
 }
 
 /// Translate the wire choice into the spawn-side override.
@@ -351,7 +358,16 @@ pub async fn handle_dispatch(
 
     let notifier = StderrNotifier;
 
-    match spawn(req, &ctx.registry, &notifier, Some(&ctx.event_tx), false).await {
+    match spawn(
+        req,
+        &ctx.registry,
+        &notifier,
+        Some(&ctx.event_tx),
+        false,
+        ctx.state.as_ref(),
+    )
+    .await
+    {
         Ok(handle) => DispatchResult {
             worktree_dir: paths.worktree_dir.clone(),
             success: true,
@@ -831,6 +847,9 @@ mod tests {
             event_tx,
             worktrees: new_worktree_registry(),
             default_command: None,
+            // These unit tests assert on the worktree + spawn shape, not on
+            // delegate routing (`orchestration/dispatch/001` owns that).
+            state: None,
         };
 
         let result = handle_dispatch(
@@ -900,6 +919,9 @@ mod tests {
             event_tx,
             worktrees: new_worktree_registry(),
             default_command: None,
+            // These unit tests assert on the worktree + spawn shape, not on
+            // delegate routing (`orchestration/dispatch/001` owns that).
+            state: None,
         };
         let result = handle_dispatch(
             &ctx,
