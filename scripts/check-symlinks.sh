@@ -67,14 +67,26 @@ tracked_symlinks() {
     done < <(git -C "$repo_root" ls-files -s -z)
 }
 
+# The directory a path ends up at with every symlink in it resolved, or nothing
+# if it cannot be entered. `cd` + `pwd -P` rather than `realpath` (not on macOS)
+# or `readlink -f` (not on older macOS): both are shell builtins, and both sides
+# of a comparison go through the same transformation, so equality means the two
+# spellings name one directory.
+resolved_dir() {
+    (cd "$1" 2>/dev/null && pwd -P)
+}
+
 # Why the on-disk entry is wrong, in the words the reader needs.
 diagnose() {
-    local link="$1" target="$2"
+    local link="$1" target="$2" expected="$3" where
     if [ ! -e "$link" ]; then
         printf 'is missing from the working tree entirely'
     elif [ -f "$link" ] && [ "$(cat "$link")" = "$target" ]; then
         printf 'did not materialise: it is a %s-byte plain file whose content is the literal text "%s"' \
             "$(wc -c <"$link" | tr -d '[:space:]')" "$target"
+    elif [ -d "$expected" ] && [ -d "$link" ]; then
+        where="$(resolved_dir "$link")"
+        printf 'resolves to %s, not to %s' "${where:-nowhere readable}" "$(resolved_dir "$expected")"
     else
         printf 'does not resolve to its target'
     fi
@@ -85,7 +97,7 @@ diagnose() {
 # per offender, so a broken tree names all 35 rather than stopping at the first.
 check_tree() {
     local tree="$1"
-    local path target link expected checked=0 broken=0
+    local path target link expected here checked=0 broken=0
 
     # Without this, a mistyped directory reports all 35 links as dangling — a
     # true statement that points at the wrong problem.
@@ -110,8 +122,16 @@ check_tree() {
         # is the property that matters (an agent must read CLAUDE.md's content,
         # not a file named after it) and which holds however the platform
         # represents the link.
+        #
+        # Both branches assert IDENTITY, not merely the right shape. Checking
+        # that a directory link is a directory would pass a link redirected at
+        # some other existing directory — the whole skills tree could point
+        # somewhere else and the check would still be green (Greptile, #553).
+        # For a file, equal content is the property being protected, so `cmp`
+        # is the right test and a byte-identical file elsewhere is not a defect.
         if [ -d "$expected" ]; then
-            if [ -d "$link" ]; then
+            here="$(resolved_dir "$link")"
+            if [ -n "$here" ] && [ "$here" = "$(resolved_dir "$expected")" ]; then
                 continue
             fi
         else
@@ -120,7 +140,7 @@ check_tree() {
             fi
         fi
 
-        printf '  %s -> %s\n      %s\n' "$path" "$target" "$(diagnose "$link" "$target")"
+        printf '  %s -> %s\n      %s\n' "$path" "$target" "$(diagnose "$link" "$target" "$expected")"
         broken=$((broken + 1))
     done < <(tracked_symlinks)
 
