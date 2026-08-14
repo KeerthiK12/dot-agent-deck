@@ -588,8 +588,15 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let bin = dot_agent_deck::platform::paths::binary_name();
+    assert_ne!(
+        bin, "dot-agent-deck",
+        "this assertion only proves anything when the test binary's own file name differs \
+         from the literal the pre-fix code always emitted"
+    );
     assert!(
-        file_body.contains("## When done") && file_body.contains("dot-agent-deck work-done --task"),
+        file_body.contains("## When done")
+            && file_body.contains(&format!("{bin} work-done --task")),
         "worker task file must carry the work-done footer; got: {file_body:?}"
     );
     assert!(
@@ -1613,10 +1620,10 @@ fn delegate_silence_notice_does_not_reach_successor_orchestrator() {
 }
 
 /// Scenario: Complete a hookless delegate through the real work-done handler, type an unsent draft, and delegate the same fixed pointer again; the second pointer must still reach the worker. Independently, report only an older task done after two delegates and require the newer silent task's no-event notice to remain armed.
-#[spec("orchestration/delegate/016")]
+#[spec("orchestration/delegate/021")]
 #[test]
 #[cfg(unix)]
-fn delegate_016_work_done_releases_only_its_own_delivery_state() {
+fn delegate_021_work_done_releases_only_its_own_delivery_state() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),

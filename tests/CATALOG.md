@@ -2314,7 +2314,42 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS; local real-agent tier).
 - **Cost note:** one short GPT-4o-mini worker turn per observation.
 
-##### orchestration/delegate/016 — Work-done completion does not make the next same-pointer delegate disappear after the user types an unsent draft.
+##### orchestration/delegate/016 — The generated orchestrator context names what `binary_name()` resolves for the running process, not a baked-in literal (issue prageethw/dot-agent-deck#253).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `orchestrator_context::build_orchestrator_context`; no TUI harness, no daemon).
+- **Agent:** none.
+- **Asserts:** with a synthetic role config, the composed context's `delegate` and `work-done` command examples both contain `platform::paths::binary_name()`'s resolution for the running process — under `cargo test` the throwaway test binary is never on `$PATH`, so this is its own absolute `current_exe()` path, never literally `dot-agent-deck` — proving the text is generated from `current_exe()` rather than a hardcoded string.
+- **Does not assert:** the symlink-resolution behavior of `current_exe()` itself (a property of the platform, not this crate); the malformed-`current_exe()` fallback branch (`orchestration/delegate/018`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/delegate/017 — The generated worker task file's `work-done` instruction names what `binary_name()` resolves for the running process, not a baked-in literal (issue prageethw/dot-agent-deck#253).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `state::compose_worker_task_file`; no TUI harness, no daemon).
+- **Agent:** none.
+- **Asserts:** the composed worker task file's `## When done` footer's `--task-file` and inline `--task` command examples both contain `platform::paths::binary_name()`'s resolution for the running process (the `cargo test` test binary's own absolute `current_exe()` path, which is never literally `dot-agent-deck`).
+- **Does not assert:** the malformed-`current_exe()` fallback branch (`orchestration/delegate/018`); the rest of the footer's shell-safety content (covered by the pre-existing `compose_worker_task_file_appends_work_done_footer`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/delegate/018 — The command-name resolver falls back to the crate's default literal only when `current_exe()` itself is unavailable or unusable (issue prageethw/dot-agent-deck#253).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `platform::paths::resolve_binary_name`, the pure seam behind `binary_name`; no TUI harness, no daemon).
+- **Agent:** none.
+- **Asserts:** an `Err` result, a path with no file name (`/`), and (Unix-only) a non-UTF-8 file name all resolve to `DEFAULT_BINARY_NAME` (`env!("CARGO_PKG_NAME")`) rather than panicking or producing an empty string. A well-formed `current_exe()` whose bare file name is merely shell-unsafe or absent from `$PATH` does NOT fall back to this literal — it falls back to the absolute `current_exe()` path instead (`platform::paths::resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_shell_unsafe`/`_not_on_path`, plain `#[test]`s alongside this one, not separately cataloged).
+- **Does not assert:** a real `current_exe()` failure (not reproducible on demand); the happy path (`orchestration/delegate/016`–`017`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/delegate/019 — A same-named binary shadowing the running executable earlier on `$PATH` is rejected by identity, not merely resolved (issue prageethw/dot-agent-deck#253 `$PATH`-identity tightening).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `platform::paths::path_identity_match` and `platform::paths::resolve_binary_name`; no TUI harness, no daemon).
+- **Agent:** none.
+- **Asserts:** with a synthetic `$PATH` value (never the real process-global `PATH`) listing two directories that each hold an executable file sharing one basename — a "shadow" file first, the "real" (`current_exe()`-standing-in) file second — `path_identity_match` reports no match for the shadow-first ordering and a match once the roles are reversed (proving the rejection is genuinely about file identity, not mere absence), and `resolve_binary_name` driven through that shadow-first `$PATH` falls back to the shell-quoted absolute `current_exe()` path rather than emitting the bare name a consuming shell would resolve to the shadowing binary.
+- **Does not assert:** the real process-global `$PATH` (a synthetic value is used throughout); the empty/relative-`$PATH`-entry branch (`platform::paths::is_untrustworthy_path_entry_rejects_empty_and_relative_but_accepts_absolute`, a plain `#[test]` alongside this one, not separately cataloged).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/delegate/020 — The bare-name success branch is reached against a REAL `current_exe()` on a REAL `$PATH` — PR #520's whole motivating scenario, previously untested (prageethw/dot-agent-deck#253 round-4 verification, finding 1).
+- **Layer:** L2 (in-process daemon whose `handle_delegate` fan-out composes the worker task file; a `cat`-stub worker PTY via `AgentPtyRegistry::spawn_agent`, no real agent — the `e2e` tier, no LLM call). Entry point is a sync `#[test]` that `block_on`s an async body (the linkage-check scanner links `#[spec]` to the next PLAIN `fn`, so a `#[tokio::test] async fn` would misbind — same pattern as `chain-smoke/pi/002`).
+- **Agent:** none (`cat` stub; only the generated file is under test).
+- **Asserts:** with the built deck binary's own directory prepended to this process's `$PATH` (the deck's normal on-`PATH` install shape) and `spawn_inprocess_daemon`'s test-current-exe override injecting the real built `dot-agent-deck` binary as `binary_name()`'s effective `current_exe()`, delegating a task writes `.dot-agent-deck/worker-task-coder.md` whose `work-done` instruction names the BARE binary (`dot-agent-deck work-done --task-file …`) — not the quoted absolute-path fallback every other `binary_name()` test in this repo exercises, and not the running libtest binary's own path (the regression this issue's round-4 verification found: without the override, an in-process daemon's `handle_delegate` runs in the TEST process, so `binary_name()` correctly-for-that-process named the libtest binary, and a real worker following the generated command hit libtest's CLI parser instead of the deck's).
+- **Does not assert:** a real agent following the generated command (covered, for the two real-agent arms this regression broke, by `delegate_work_done_chain_claude` and `chain-smoke/pi/002`, both now fixed by the same override); the malformed-`current_exe()` fallback (`orchestration/delegate/018`); the `$PATH`-identity-shadowing rejection (`orchestration/delegate/019`).
+- **Platform coverage:** mac+linux (unix-only PTY/UDS; `spawn_inprocess_daemon` is `#[cfg(unix)]`).
+
+##### orchestration/delegate/021 — Work-done completion does not make the next same-pointer delegate disappear after the user types an unsent draft.
 - **Layer:** fast synthetic PTY integration (real `handle_delegate` and `handle_work_done`, managed worker and orchestrator PTYs, and production silence-watch accounting; no socket or LLM).
 - **Agent:** none (`cat` worker stand-in plus a raw no-echo orchestrator observer).
 - **Asserts:** delegation A's fixed `worker-task-coder.md` pointer physically reaches the worker, real work-done handling retires A, an unsent user draft then physically reaches the same pane, and delegation B produces another observable copy of the same pointer; independently, a late completion for an older of two live delegations leaves the newer delivery's no-event notice armed.
