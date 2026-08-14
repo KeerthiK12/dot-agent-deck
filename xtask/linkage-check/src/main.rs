@@ -55,6 +55,10 @@
 
 mod clean_tmp;
 mod list_tests;
+/// Issue #521: the `/verify-pr` scripts' `KEY=value` output contract. Tests
+/// only — there is no runtime rule here, the scripts enforce themselves.
+#[cfg(test)]
+mod verify_pr_stream;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

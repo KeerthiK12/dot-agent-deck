@@ -14,6 +14,10 @@
 # `../<repo>-<suffix>` path scheme, same validate-then-create ordering, same
 # `KEY=value` / `ERROR=true` output contract, so both read the same way.
 #
+# The output grammar and why every value is sanitised live in `stream.sh`
+# (issue #521). This script emits a PR title, a branch name and git's own error
+# text, all of which a contributor writes.
+#
 # `--baseline` creates a second, detached worktree at the merge-base. Use it to
 # answer "does this check already fail without the PR?" before blaming the PR
 # for a red result.
@@ -24,12 +28,24 @@
 
 set -uo pipefail
 
+stream_lib="$(dirname "${BASH_SOURCE[0]}")/stream.sh"
+# shellcheck source=stream.sh
+if ! . "$stream_lib"; then
+  echo "verify-pr: cannot source ${stream_lib}; the skill directory is incomplete" >&2
+  exit 1
+fi
+
 if [ $# -lt 1 ]; then
-  echo "ERROR=true"
-  echo "MESSAGE=Usage: setup.sh <pr-number> [--force|--baseline]"
+  emit ERROR true
+  emit MESSAGE "Usage: setup.sh <pr-number> [--force|--baseline]"
   exit 0
 fi
 
+# Kept because `shift` is about to consume it: the error message below quotes
+# what the caller actually typed, and under `set -u` reading `$1` after the
+# shift aborted the script mid-record — `ERROR=true` with no `MESSAGE`, which
+# reads as a truncated stream rather than a usage error.
+pr_arg="$1"
 pr="${1#\#}"
 pr="${pr##*/}"
 shift
@@ -41,30 +57,30 @@ for arg in "$@"; do
     --force) force=true ;;
     --baseline) baseline=true ;;
     *)
-      echo "ERROR=true"
-      echo "MESSAGE=Unknown argument '$arg'"
+      emit ERROR true
+      emit MESSAGE "Unknown argument '$arg'"
       exit 0
       ;;
   esac
 done
 
 if ! [[ "$pr" =~ ^[0-9]+$ ]]; then
-  echo "ERROR=true"
-  echo "MESSAGE=Could not parse a PR number from '$1'"
+  emit ERROR true
+  emit MESSAGE "Could not parse a PR number from '$pr_arg'"
   exit 0
 fi
 
 for tool in git gh; do
   if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "ERROR=true"
-    echo "MESSAGE=${tool} is required"
+    emit ERROR true
+    emit MESSAGE "${tool} is required"
     exit 0
   fi
 done
 
 if ! repo_root=$(git rev-parse --show-toplevel 2>&1); then
-  echo "ERROR=true"
-  echo "MESSAGE=Not in a git repository: ${repo_root}"
+  emit ERROR true
+  emit MESSAGE "Not in a git repository: ${repo_root}"
   exit 0
 fi
 repo_name=$(basename "$repo_root")
@@ -81,11 +97,19 @@ git fetch origin "+refs/heads/${default_branch}:refs/remotes/origin/${default_br
 # --- PR metadata -----------------------------------------------------------
 
 # `authorAssociation` is REST-only, not a `gh pr view --json` field.
+#
+# One TSV line, and `map` runs the shared one-line sanitiser over every field
+# so a field added to the array inherits it. Without that, a title containing a
+# newline would end the line early and `read` below would bind the remaining
+# variables to nothing — the same class of defect as the forged records in
+# `scan.sh` (issue #521), landing here as silent truncation instead.
 if ! pr_meta=$(gh pr view "$pr" --json headRefName,headRefOid,baseRefName,author,mergeable,mergeStateStatus,title --jq '
-  "\(.headRefName)\t\(.headRefOid)\t\(.baseRefName)\t\(.author.login)\t\(.mergeable)\t\(.mergeStateStatus)\t\(.title)"
+  [.headRefName, .headRefOid, .baseRefName, .author.login, .mergeable, .mergeStateStatus, .title]
+  | map('"${JQ_ONE_LINE}"' | gsub("\t"; " "))
+  | @tsv
 ' 2>&1); then
-  echo "ERROR=true"
-  echo "MESSAGE=gh pr view $pr failed: ${pr_meta}"
+  emit ERROR true
+  emit MESSAGE "gh pr view $pr failed: ${pr_meta}"
   exit 0
 fi
 
@@ -101,32 +125,32 @@ if [ "$baseline" = true ]; then
   # stale `origin/pr-<n>-head` per PR ever reviewed, which the teardown in
   # SKILL.md does not clean up. FETCH_HEAD is transient.
   if ! git fetch origin "refs/pull/${pr}/head" --quiet 2>&1; then
-    echo "ERROR=true"
-    echo "MESSAGE=Could not fetch refs/pull/${pr}/head"
+    emit ERROR true
+    emit MESSAGE "Could not fetch refs/pull/${pr}/head"
     exit 0
   fi
   merge_base=$(git merge-base "origin/${default_branch}" FETCH_HEAD 2>/dev/null)
   if [ -z "$merge_base" ]; then
-    echo "ERROR=true"
-    echo "MESSAGE=Could not compute a merge-base for PR ${pr}"
+    emit ERROR true
+    emit MESSAGE "Could not compute a merge-base for PR ${pr}"
     exit 0
   fi
   if [ -d "$base_path" ]; then
-    echo "ERROR=true"
-    echo "MESSAGE=Baseline worktree '${base_path}' already exists"
+    emit ERROR true
+    emit MESSAGE "Baseline worktree '${base_path}' already exists"
     exit 0
   fi
   if ! out=$(git worktree add --detach "$base_path" "$merge_base" 2>&1); then
-    echo "ERROR=true"
-    echo "MESSAGE=${out}"
+    emit ERROR true
+    emit MESSAGE "${out}"
     exit 0
   fi
   mkdir -p "${base_path}/target/verify-pr"
-  echo "SUCCESS=true"
-  echo "MODE=baseline"
-  echo "BASELINE_PATH=${base_path}"
-  echo "MERGE_BASE=${merge_base}"
-  echo "NOTE=Run the same failing check here; if it fails at the merge-base too, the PR did not cause it."
+  emit SUCCESS true
+  emit MODE baseline
+  emit BASELINE_PATH "${base_path}"
+  emit MERGE_BASE "${merge_base}"
+  emit NOTE "Run the same failing check here; if it fails at the merge-base too, the PR did not cause it."
   exit 0
 fi
 
@@ -157,9 +181,9 @@ fi
 
 # Only the skill-owned fallback name may be recycled, and only on --force.
 if git show-ref --verify --quiet "refs/heads/${branch_name}" 2>/dev/null && [ "$force" != true ]; then
-  echo "ERROR=true"
-  echo "BRANCH_NAME=${branch_name}"
-  echo "MESSAGE=Branch '${branch_name}' already exists. Pass --force to reset it to PR ${pr}'s current head."
+  emit ERROR true
+  emit BRANCH_NAME "${branch_name}"
+  emit MESSAGE "Branch '${branch_name}' already exists. Pass --force to reset it to PR ${pr}'s current head."
   exit 0
 fi
 
@@ -182,11 +206,12 @@ if git worktree list --porcelain 2>/dev/null | grep -q "^branch refs/heads/${bra
 fi
 
 if [ ${#errors[@]} -gt 0 ]; then
-  echo "ERROR=true"
-  echo "BRANCH_NAME=${branch_name}"
-  echo "WORKTREE_PATH=${worktree_path}"
-  echo "ERRORS:"
-  for err in "${errors[@]}"; do echo "  ${err}"; done
+  emit ERROR true
+  emit BRANCH_NAME "${branch_name}"
+  emit WORKTREE_PATH "${worktree_path}"
+  # Free text: these carry git's own error output, which is multi-line.
+  emit_header ERRORS
+  printf '%s\n' "${errors[@]}" | emit_block
   exit 0
 fi
 
@@ -195,19 +220,19 @@ fi
 # `refs/pull/<n>/head` is served by the BASE repo, so this works for forks with
 # no extra remote — and it pins the review to the exact commit the PR proposes.
 if ! out=$(git fetch origin "+refs/pull/${pr}/head:refs/heads/${branch_name}" 2>&1); then
-  echo "ERROR=true"
-  echo "MESSAGE=Could not fetch refs/pull/${pr}/head into ${branch_name}: ${out}"
+  emit ERROR true
+  emit MESSAGE "Could not fetch refs/pull/${pr}/head into ${branch_name}: ${out}"
   exit 0
 fi
 
 fetched_sha=$(git rev-parse "$branch_name" 2>/dev/null)
 if [ "$fetched_sha" != "$head_sha" ]; then
-  echo "WARNING=Fetched ${fetched_sha} but the API reports head ${head_sha}; the PR may have been pushed to mid-fetch. Re-run with --force."
+  emit WARNING "Fetched ${fetched_sha} but the API reports head ${head_sha}; the PR may have been pushed to mid-fetch. Re-run with --force."
 fi
 
 if ! out=$(git worktree add "$worktree_path" "$branch_name" 2>&1); then
-  echo "ERROR=true"
-  echo "MESSAGE=${out}"
+  emit ERROR true
+  emit MESSAGE "${out}"
   exit 0
 fi
 
@@ -238,28 +263,31 @@ fi
 behind=$(git rev-list --count "${branch_name}..origin/${default_branch}" 2>/dev/null || echo unknown)
 
 {
-  echo "PR_NUMBER=${pr}"
-  echo "PR_TITLE=${title}"
-  echo "PR_AUTHOR=${author}"
-  echo "PR_AUTHOR_ASSOCIATION=${association}"
-  echo "PR_HEAD_SHA=${head_sha}"
-  echo "PR_BASE_BRANCH=${base_branch}"
-  echo "PR_HEAD_BRANCH=${head_branch}"
-  echo "BRANCH_NAME=${branch_name}"
-  echo "WORKTREE_PATH=${worktree_path}"
-  echo "DEFAULT_BRANCH=${default_branch}"
-  echo "MERGE_BASE=${merge_base}"
-  echo "MERGE_RESULT=${merge_result}"
-  echo "COMMITS_BEHIND_MAIN=${behind}"
-  echo "GH_MERGEABLE=${mergeable}"
-  echo "GH_MERGE_STATE=${merge_state}"
+  emit PR_NUMBER "${pr}"
+  emit PR_TITLE "${title}"
+  emit PR_AUTHOR "${author}"
+  emit PR_AUTHOR_ASSOCIATION "${association}"
+  emit PR_HEAD_SHA "${head_sha}"
+  emit PR_BASE_BRANCH "${base_branch}"
+  emit PR_HEAD_BRANCH "${head_branch}"
+  emit BRANCH_NAME "${branch_name}"
+  emit WORKTREE_PATH "${worktree_path}"
+  emit DEFAULT_BRANCH "${default_branch}"
+  emit MERGE_BASE "${merge_base}"
+  emit MERGE_RESULT "${merge_result}"
+  emit COMMITS_BEHIND_MAIN "${behind}"
+  emit GH_MERGEABLE "${mergeable}"
+  emit GH_MERGE_STATE "${merge_state}"
 } | tee "${out_dir}/meta.env"
 
-echo "OUT_DIR=${out_dir}"
+emit OUT_DIR "${out_dir}"
 if [ "$merge_result" = "conflict" ]; then
-  echo "MERGE_CONFLICT_OUTPUT<<EOF"
-  echo "$merge_output"
-  echo "EOF"
-  echo "NOTE=origin/${default_branch} does NOT merge cleanly; the merge was aborted and the worktree sits at the PR head. Checks below therefore describe the head, not what would land."
+  # An indented block rather than the `KEY<<EOF … EOF` shape this used to
+  # print: git names the conflicting paths in that output, and a repo can
+  # contain a file called `EOF` — a delimiter a contributor can write is not a
+  # delimiter. Indentation needs no terminator to be unambiguous.
+  emit_header "MERGE CONFLICT OUTPUT"
+  printf '%s\n' "$merge_output" | emit_block
+  emit NOTE "origin/${default_branch} does NOT merge cleanly; the merge was aborted and the worktree sits at the PR head. Checks below therefore describe the head, not what would land."
 fi
-echo "SUCCESS=true"
+emit SUCCESS true
