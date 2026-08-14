@@ -1877,13 +1877,18 @@ pub(crate) struct SessionStartWait {
     /// This is not capability, and D4's ruling is unchanged: the flag is set
     /// from an event the gate refused to accept as readiness, and the declared
     /// type is used only to WITHHOLD the flag (a wrapped Pi still never arms),
-    /// never as proof. What it is, is STANDING — the one situation in which a
+    /// never as proof. What it is, is STANDING — a situation in which a
     /// producer that identifies itself only AFTER our bytes can legitimately be
     /// this delivery's target, because the launcher CONSUMED those bytes and the
     /// agent behind it is the authorized successor. It is the same single
-    /// handoff [`latch_generation`] already permits for the generation, and the
-    /// only reason the one replacement payload exists at all
+    /// handoff [`latch_generation`] already permits for the generation, and a
+    /// reason the one replacement payload exists at all
     /// ([`crate::prompt_delivery::attempt_writes_payload`]).
+    ///
+    /// Issue #570 adds the OTHER standing of the same kind, for the same
+    /// reason, and it is not this flag: a pane this daemon spawned itself with
+    /// an agent type it selected. See
+    /// [`crate::agent_pty::AgentPtyRegistry::agent_spawned_as_reporting_agent`].
     ///
     /// Recorded even when the window then TIMES OUT, which is the whole point:
     /// `scheduler/dispatch/015`'s bootstrap launcher declares itself, holds the

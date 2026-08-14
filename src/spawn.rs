@@ -1303,14 +1303,31 @@ async fn confirm_prompt_delivery(
     let mut attempt: u32 = 1;
     let mut armed = can_report_prompts;
     // Issue #424 F4: whether a producer identifying itself AFTER the write may
-    // arm this delivery at all. True only when the pane declared a launcher
-    // handoff before we wrote, which is the one shape in which a producer that
-    // appears later is genuinely this delivery's target — the launcher consumed
-    // our bytes and the agent behind it is the authorized successor, the same
-    // single handoff `crate::state::latch_generation` permits for the
-    // generation. Everything else is an unauthenticated claim about a pane our
-    // bytes have already gone into.
-    let accepts_late_producer = registry.agent_declared_launcher_handoff(&agent_id);
+    // arm this delivery at all. True only when something said BEFORE we wrote
+    // what this pane is, so that a producer appearing later is genuinely this
+    // delivery's target rather than an unauthenticated claim about a pane our
+    // bytes have already gone into. Two things can say it:
+    //
+    // * the pane declared a LAUNCHER HANDOFF — the launcher consumed our bytes
+    //   and the agent behind it is the authorized successor, the same single
+    //   handoff `crate::state::latch_generation` permits for the generation;
+    // * issue #570: THE DECK SPAWNED IT, as an agent type the deck itself
+    //   selected. `dispatch --single` execs `default_command`, so on that path
+    //   "is there an agent that reports submitted prompts in this pane" has a
+    //   pre-write answer the deck WROTE rather than observed — and the gate was
+    //   consulting neither of the two facts it had.
+    //
+    // Without the second, a daemon-spawned dispatch loses this delivery outright
+    // whenever the agent's `SessionStart` misses the readiness gate: the field
+    // report in #570 missed it by 37 ms, the write went out unarmed on the
+    // fallback path, the producer announced itself 500 ms later, and the retry
+    // that would have submitted the prompt was refused. That retry is not a
+    // safety net on this path — the paired control in the same log shows attempt
+    // 1 not submitting on the delivery that WORKED, which worked because it
+    // retried — so refusing it is the difference between a dispatch and an agent
+    // sitting in a fresh tab having been asked nothing.
+    let accepts_late_producer = registry.agent_declared_launcher_handoff(&agent_id)
+        || registry.agent_spawned_as_reporting_agent(&agent_id);
     let mut refused_claim_logged = false;
     loop {
         let remaining = remaining_before(deadline);
@@ -1370,10 +1387,11 @@ async fn confirm_prompt_delivery(
             // Issue #424 F4: a producer that identifies itself only after our
             // bytes were written has told us what it CLAIMS to be; it has not
             // told us that our bytes went to it. It arms this delivery only on
-            // the pane's own pre-write launcher declaration — see
-            // `accepts_late_producer` above. Refusals are logged once, so a
-            // delivery that then holds to its deadline is diagnosable rather
-            // than mysterious.
+            // a pre-write statement about the pane — the pane's own launcher
+            // declaration, or (issue #570) the deck's own record of having
+            // spawned a known agent there. See `accepts_late_producer` above.
+            // Refusals are logged once, so a delivery that then holds to its
+            // deadline is diagnosable rather than mysterious.
             PromptWatch::Elapsed { can_report_prompts } => {
                 armed |= can_report_prompts && accepts_late_producer;
                 if can_report_prompts && !armed && !refused_claim_logged {
@@ -1382,9 +1400,10 @@ async fn confirm_prompt_delivery(
                         DELIVERY_LOG_PATH,
                         &pane_id,
                         &delivery_id,
-                        "a producer claimed a reporting agent only after the prompt was written \
-                         and this pane declared no launcher handoff before it; holding the write \
-                         instead of retyping into a target that may never report",
+                        "a producer claimed a reporting agent only after the prompt was written, \
+                         and before it this pane neither declared a launcher handoff nor was \
+                         spawned by this daemon as a known agent; holding the write instead of \
+                         retyping into a target that may never report",
                     );
                 }
             }
@@ -2203,6 +2222,20 @@ mod tests {
     }
 
     fn spawn_byte_target(registry: &AgentPtyRegistry, pane_id: &str) -> String {
+        spawn_typed_byte_target(registry, pane_id, None)
+    }
+
+    /// The same byte-observation target, spawned with the caller-supplied
+    /// [`SpawnOptions::agent_type`] the deck itself decides at the spawn site
+    /// (issue #570). `None` is the hookless pane the deck can vouch for
+    /// nothing about; `Some(ClaudeCode)` is the `default_command = claude`
+    /// dispatch the deck exec'd on purpose. The PTY is a byte sink either way,
+    /// so the two differ in exactly the input under test.
+    fn spawn_typed_byte_target(
+        registry: &AgentPtyRegistry,
+        pane_id: &str,
+        agent_type: Option<AgentType>,
+    ) -> String {
         #[cfg(unix)]
         let command = "/bin/cat";
         #[cfg(windows)]
@@ -2212,6 +2245,7 @@ mod tests {
             .spawn_agent(SpawnOptions {
                 command: Some(command),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                agent_type,
                 ..SpawnOptions::default()
             })
             .expect("spawn byte-observation target")
@@ -2349,7 +2383,7 @@ mod tests {
         assert!(capability, "an identified Claude frame proves the channel");
     }
 
-    /// Scenario: Hold detached spawn prompts in confirmation backoff while their pane is replaced, generation ends, event stream lags or closes, pane closes, daemon shuts down, a newer prompt supersedes the watch, or an unmarked event merely claims a reporting producer. Every terminal, cancelled, or unauthenticated-capability watch must finish without stale retry bytes.
+    /// Scenario: Hold detached spawn prompts in confirmation backoff while their pane is replaced, generation ends, event stream lags or closes, pane closes, daemon shuts down, a newer prompt supersedes the watch, or an unmarked event merely claims a reporting producer. Every terminal, cancelled, or unauthenticated-capability watch must finish without stale retry bytes. Finally, send that same unmarked post-write claim to a pane the deck itself spawned as a reporting agent: there it must arm the retry instead, so the prompt is typed into the pane again rather than held unsubmitted.
     #[spec("scheduler/dispatch/016")]
     #[serial_test::serial(prompt_confirmation_tasks)]
     #[tokio::test]
@@ -2666,6 +2700,60 @@ mod tests {
                 .any(|window| window == FORGED_PROMPT.as_bytes()),
             "an unmarked producer assertion must not arm a full replacement payload on a hookless target; output={:?}",
             String::from_utf8_lossy(&forged_output)
+        );
+
+        // Issue #570: the SAME late unmarked claim, on a pane the DECK ITSELF
+        // spawned with an agent type IT chose — `default_command = claude`, so
+        // `SpawnOptions::agent_type` said ClaudeCode before a byte was written.
+        // That is a pre-write declaration by the deck, not a producer
+        // assertion, and it is the standing the forged case above lacks. The
+        // two panes differ in exactly that one input: same `/bin/cat` byte
+        // sink, same `can_report_prompts: false`, same unmarked post-write
+        // `SessionStart`. Without it a daemon-spawned dispatch whose
+        // `SessionStart` lands after the readiness gate expired is written and
+        // never submitted — no retry ever fires, so nothing types the payload
+        // the agent would have to submit.
+        const SPAWNED_PANE: &str = "deck-spawned-late-claim-pane";
+        const SPAWNED_PROMPT: &str = "DECK-SPAWNED-LATE-CLAIM-MUST-STILL-RETRY";
+        let spawned_registry = Arc::new(AgentPtyRegistry::new());
+        let spawned_agent =
+            spawn_typed_byte_target(&spawned_registry, SPAWNED_PANE, Some(AgentType::ClaudeCode));
+        let (spawned_tx, spawned_rx) = broadcast::channel(8);
+        let spawned_confirmation = tokio::spawn(confirm_prompt_delivery(
+            spawned_registry.clone(),
+            spawned_rx,
+            ConfirmationTask {
+                pane_id: SPAWNED_PANE.into(),
+                agent_id: spawned_agent.clone(),
+                prompt: SPAWNED_PROMPT.into(),
+                delivery_id: "deck-spawned-late-capability".into(),
+                generation: None,
+                can_report_prompts: false,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+        spawned_tx
+            .send(BroadcastMsg::Event(prompt_watch_event(
+                SPAWNED_PANE,
+                &spawned_agent,
+                "late-native-session",
+                EventType::SessionStart,
+            )))
+            .expect("send late native capability claim");
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let spawned_output = spawned_registry
+            .snapshot(&spawned_agent)
+            .expect("deck-spawned target snapshot");
+        spawned_confirmation.abort();
+        let _ = spawned_confirmation.await;
+        drop(spawned_tx);
+        spawned_registry.shutdown_all();
+        assert!(
+            spawned_output
+                .windows(SPAWNED_PROMPT.len())
+                .any(|window| window == SPAWNED_PROMPT.as_bytes()),
+            "a producer identifying itself after the write must still arm the retry on a pane the deck spawned as a reporting agent, or the dispatch prompt is written and never submitted (#570); output={:?}",
+            String::from_utf8_lossy(&spawned_output)
         );
     }
 
