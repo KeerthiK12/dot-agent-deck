@@ -282,6 +282,39 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+      # Issue #552 — the 35 tracked symlinks (AGENTS.md -> CLAUDE.md, the 33
+      # entries under .agents/skills/, docs/img) have to come out of a checkout
+      # as LINKS. Where they do not, git writes each one as a plain text file
+      # containing the target path, so AGENTS.md becomes a 9-byte file reading
+      # "CLAUDE.md" and Codex/OpenCode — which read AGENTS.md for the project's
+      # conventions — silently get no instructions at all. Windows is the only
+      # platform where that happens, which is why the step lives here and not
+      # on the Linux/macOS jobs, where it could only re-prove that Unix creates
+      # symlinks.
+      #
+      # SCOPE, measured on this runner rather than assumed: the image ships
+      # `core.symlinks=true` in its SYSTEM gitconfig
+      # (C:/Program Files/Git/etc/gitconfig, git 2.55.0.windows.3 on
+      # windows-2025-vs2026), so the checkout does produce real links today and
+      # this step is green from its first run. It is therefore a REGRESSION
+      # guard on the runner image and on actions/checkout — not a way to
+      # discover a contributor's own broken clone, which no CI job can see. That
+      # half is covered by CONTRIBUTING.md and by the contributor running the
+      # same script; docs/develop/windows-symlinks.md has the full reasoning.
+      #
+      # The --self-test line is what stops the green from being the vacuous
+      # kind. It materialises the index into a temp dir with
+      # core.symlinks=false — exactly the state a Windows clone lands in — and
+      # asserts the checker rejects that tree, for the materialisation reason
+      # specifically. So on every run the same script is shown failing on a
+      # broken tree seconds before it passes on the real one. Both lines
+      # together take well under a second and need no toolchain, so this sits
+      # ahead of the cargo steps and fails in seconds rather than after a build.
+      - name: Tracked symlinks materialised as links
+        shell: bash
+        run: |
+          scripts/check-symlinks.sh --self-test
+          scripts/check-symlinks.sh
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.97.1
