@@ -91,3 +91,20 @@ JQ_RECORDS_TAIL='
 # The same sanitiser for a bare scalar, e.g. one filename per output line. Use
 # it wherever jq emits free text that a line-based reader will split.
 JQ_ONE_LINE='if . == null then "" else tostring end | gsub("[\\r\\n]"; " ")'
+
+# Reading several values back out of ONE `gh --jq` call: join them with this,
+# and read them with `IFS=$FIELD_SEP read -r a b c`.
+#
+# Unit Separator, NOT a tab. Bash treats tab as IFS *whitespace*, so `read`
+# collapses a run of them and drops leading ones — a single empty field then
+# shifts every value after it into the wrong variable. That is not theoretical:
+# `.author.login` is null for a deleted account, which silently made
+# `PR_AUTHOR` report the value of `mergeable` and emptied `PR_TITLE`
+# (Greptile P1 on #572). A non-whitespace separator delimits exactly once, so
+# empty fields survive as empty fields.
+#
+# `\u001f` and `\t` as jq's own escapes rather than regex ones: jq resolves
+# them to the characters themselves, which both Oniguruma and gojq's Go regexp
+# accept inside a class — `\u` is not a Go regexp escape and would not.
+FIELD_SEP=$'\x1f'
+JQ_FIELDS='map('"$JQ_ONE_LINE"' | gsub("[\u001f\t]"; " ")) | join("\u001f")'

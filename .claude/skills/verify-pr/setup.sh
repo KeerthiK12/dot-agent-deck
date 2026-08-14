@@ -98,22 +98,22 @@ git fetch origin "+refs/heads/${default_branch}:refs/remotes/origin/${default_br
 
 # `authorAssociation` is REST-only, not a `gh pr view --json` field.
 #
-# One TSV line, and `map` runs the shared one-line sanitiser over every field
-# so a field added to the array inherits it. Without that, a title containing a
-# newline would end the line early and `read` below would bind the remaining
-# variables to nothing — the same class of defect as the forged records in
-# `scan.sh` (issue #521), landing here as silent truncation instead.
+# One line, fields joined by `stream.sh`'s `FIELD_SEP`, with the shared
+# sanitiser mapped over every one of them so a field added to the array
+# inherits it. Without that, a title containing a newline would end the line
+# early and `read` below would bind the remaining variables to nothing — the
+# same class of defect as the forged records in `scan.sh` (issue #521), landing
+# here as silent truncation instead. See `FIELD_SEP` for why the separator is
+# not a tab.
 if ! pr_meta=$(gh pr view "$pr" --json headRefName,headRefOid,baseRefName,author,mergeable,mergeStateStatus,title --jq '
   [.headRefName, .headRefOid, .baseRefName, .author.login, .mergeable, .mergeStateStatus, .title]
-  | map('"${JQ_ONE_LINE}"' | gsub("\t"; " "))
-  | @tsv
-' 2>&1); then
+  | '"${JQ_FIELDS}" 2>&1); then
   emit ERROR true
   emit MESSAGE "gh pr view $pr failed: ${pr_meta}"
   exit 0
 fi
 
-IFS=$'\t' read -r head_branch head_sha base_branch author mergeable merge_state title <<<"$pr_meta"
+IFS="$FIELD_SEP" read -r head_branch head_sha base_branch author mergeable merge_state title <<<"$pr_meta"
 association=$(gh api "repos/{owner}/{repo}/pulls/${pr}" --jq '.author_association' 2>/dev/null || echo UNKNOWN)
 
 # --- Baseline mode ---------------------------------------------------------

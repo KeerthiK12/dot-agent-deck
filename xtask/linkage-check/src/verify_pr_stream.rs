@@ -506,10 +506,35 @@ fn scan_gh_error_text_cannot_forge_a_record() {
 /// which is the single place that strips CR/LF. A new field added with a bare
 /// `echo "NEW=$value"` would reintroduce the whole defect silently, so the
 /// grammar is enforced statically rather than trusted to review.
+///
+/// **What this can and cannot see.** It reads text, so it catches the shapes a
+/// record is actually written in — `echo "K=$v"`, `printf 'K=%s\n' "$v"`, and
+/// (since Greptile's P2 on #572) the key appearing anywhere in an `echo` /
+/// `printf` argument rather than only right after the command. It cannot see a
+/// record assembled into a variable and printed later, which is undecidable
+/// from source; that is what the runtime tests above are for, and between them
+/// the two halves cover the ways this has actually gone wrong. Lines
+/// redirected to stderr are exempt: they are diagnostics, not stream output.
+///
+/// A heredoc is banned outright rather than parsed. `setup.sh` used to print
+/// its merge-conflict output as `KEY<<EOF … EOF`, whose terminator a
+/// contributor can write as a filename; nothing here needs one.
 #[test]
 fn verify_pr_scripts_emit_records_only_through_emit() {
-    let re = Regex::new(r#"^\s*(echo|printf)\s+["']?[A-Z][A-Z0-9_]*="#)
+    // A record key anywhere in an `echo`/`printf` command — matched per
+    // pipeline/list segment, because `printf '%s\n' "$meta" | sed -n
+    // 's/^PR_HEAD_SHA=//p'` READS a record and must not be mistaken for one
+    // being written.
+    let raw_record = Regex::new(r#"^\s*(echo|printf)\b.*[A-Z][A-Z0-9_]*="#)
         .expect("raw record emission regex compiles");
+    // `<<` but not `<<<`: a here-STRING is how the file lists are read, and it
+    // writes nothing. The leading `(^|[^<])` is what tells them apart — without
+    // it the regex matches the tail of every `<<<`.
+    let heredoc = Regex::new(r"(^|[^<])<<[^<]").expect("heredoc regex compiles");
+    // The tab hazard behind Greptile's P1: bash treats tab as IFS whitespace,
+    // so an empty field silently shifts every value after it. `stream.sh`'s
+    // `FIELD_SEP` exists precisely so no script does this.
+    let tab_ifs = Regex::new(r"IFS=\$?'?\\t").expect("tab IFS regex compiles");
 
     let dir = skill_dir();
     let mut offenders: Vec<String> = Vec::new();
@@ -525,7 +550,14 @@ fn verify_pr_scripts_emit_records_only_through_emit() {
         }
         let text = std::fs::read_to_string(&path).expect("script is readable");
         for (i, line) in text.lines().enumerate() {
-            if re.is_match(line) {
+            let code = line.split('#').next().unwrap_or("");
+            let stderr_only = code.contains(">&2");
+            let writes_record = code
+                .split(['|', ';', '&'])
+                .any(|segment| raw_record.is_match(segment));
+            let bad =
+                (writes_record && !stderr_only) || heredoc.is_match(code) || tab_ifs.is_match(code);
+            if bad {
                 offenders.push(format!(
                     "{}:{}: {}",
                     path.file_name().unwrap_or_default().to_string_lossy(),
@@ -538,8 +570,9 @@ fn verify_pr_scripts_emit_records_only_through_emit() {
 
     assert!(
         offenders.is_empty(),
-        "these lines write a KEY=value record without going through `emit`, so their \
-         value can carry a newline and forge the next record (issue #521):\n  {}",
+        "these lines write a KEY=value record outside `emit`, use a heredoc whose \
+         terminator a contributor can write, or split on a tab that `read` collapses \
+         (issue #521, Greptile P1/P2 on #572):\n  {}",
         offenders.join("\n  ")
     );
 }
@@ -556,4 +589,44 @@ fn stream_helper_defines_the_choke_point() {
             "stream.sh must define {helper}; it is what every script sources"
         );
     }
+}
+
+/// `setup.sh` reads seven values back out of ONE `gh --jq` call, so the jq side
+/// that joins them and the bash side that splits them have to agree — including
+/// when a field is EMPTY, which `.author.login` is for a deleted account.
+///
+/// With a tab, they did not agree: bash treats tab as IFS whitespace, collapses
+/// the run, and every later value lands in the wrong variable — `PR_AUTHOR`
+/// reported the value of `mergeable` and `PR_TITLE` came out empty. Both halves
+/// live in `stream.sh`, so this drives them together rather than restating the
+/// filter (Greptile P1 on #572).
+#[test]
+fn field_separator_survives_an_empty_field() {
+    if !tool_present("bash") || !tool_present("jq") {
+        eprintln!("SKIP: field-separator test needs both `bash` and `jq` on PATH");
+        return;
+    }
+
+    let script = r#"
+set -uo pipefail
+. "${SKILL_DIR}/stream.sh"
+line=$(printf '%s' '{"a":"first","b":null,"c":"third"}' | jq -r "[.a, .b, .c] | ${JQ_FIELDS}")
+IFS="$FIELD_SEP" read -r a b c <<<"$line"
+printf 'a=[%s] b=[%s] c=[%s]\n' "$a" "$b" "$c"
+"#;
+
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("SKILL_DIR", skill_dir())
+        .output()
+        .expect("run the field-separator probe");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert_eq!(
+        stdout.trim(),
+        "a=[first] b=[] c=[third]",
+        "an empty middle field shifted the values\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
