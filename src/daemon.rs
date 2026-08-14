@@ -563,6 +563,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 reuse_registry.clone(),
                 worktree_registry.clone(),
                 event_tx.clone(),
+                state.clone(),
             ),
         );
     }
@@ -772,6 +773,7 @@ pub(crate) fn schedule_callback_factory(
     reuse: crate::spawn::ReuseRegistry,
     worktrees: crate::issue_dispatch_run::WorktreeRegistry,
     event_tx: broadcast::Sender<BroadcastMsg>,
+    state: crate::state::SharedState,
 ) -> impl FnMut(&crate::config::ScheduledTask) -> crate::scheduler::Callback {
     move |task| {
         make_schedule_callback(
@@ -780,6 +782,7 @@ pub(crate) fn schedule_callback_factory(
             reuse.clone(),
             worktrees.clone(),
             event_tx.clone(),
+            state.clone(),
         )
     }
 }
@@ -798,6 +801,9 @@ fn make_schedule_callback(
     reuse: crate::spawn::ReuseRegistry,
     worktrees: crate::issue_dispatch_run::WorktreeRegistry,
     event_tx: broadcast::Sender<BroadcastMsg>,
+    // So a scheduled fire that opens an ORCHESTRATION registers its roles for
+    // delegate routing, exactly as an interactive or dispatched one does.
+    state: crate::state::SharedState,
 ) -> crate::scheduler::Callback {
     // PRD #120: an `issue_dispatch` task runs the GitHub-dispatch FLOW instead of
     // the single #127 spawn — enumerate the repo's open issues and dispatch one
@@ -821,6 +827,7 @@ fn make_schedule_callback(
             let prompt_template = prompt_template.clone();
             let cfg = cfg.clone();
             let task_command = task_command.clone();
+            let state = state.clone();
             Box::pin(async move {
                 let notifier = crate::scheduler::StderrNotifier;
                 // PRD #120 (flag redesign 2026-06-24): a configured `issue_dispatch`
@@ -845,6 +852,7 @@ fn make_schedule_callback(
                     &worktrees,
                     &notifier,
                     Some(&event_tx),
+                    Some(&state),
                 )
                 .await;
             })
@@ -872,6 +880,7 @@ fn make_schedule_callback(
         // fire so a fresh single-agent card surfaces LIVE to an already-attached
         // TUI (see `crate::spawn::surface_spawned_pane`).
         let event_tx = event_tx.clone();
+        let state = state.clone();
         Box::pin(async move {
             let notifier = crate::scheduler::StderrNotifier;
             let debounce = crate::spawn::reuse_debounce();
@@ -883,6 +892,7 @@ fn make_schedule_callback(
                 &notifier,
                 debounce,
                 Some(&event_tx),
+                Some(&state),
             )
             .await
             {
@@ -1552,11 +1562,24 @@ async fn run_hook_loop(
                                     // `SessionStart` event before writing
                                     // the prompt (event-driven readiness,
                                     // replacing the F9 250ms fixed delay).
-                                    state
+                                    let resp = state
                                         .read()
                                         .await
                                         .handle_delegate(signal, &pty_registry, &event_tx)
                                         .await;
+                                    // Answer on the same connection, like
+                                    // `GetSeed` / `ListTargets`. Delegate used to
+                                    // be fire-and-forget, so a delegation that
+                                    // routed nowhere was invisible to the
+                                    // orchestrator that issued it. Best-effort:
+                                    // a caller that has already gone away (an
+                                    // older CLI, which never reads) just makes
+                                    // this a no-op.
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
                                 }
                                 DaemonMessage::Dispatch(signal) => {
                                     info!(
@@ -1610,6 +1633,11 @@ async fn run_hook_loop(
                                         event_tx: event_tx.clone(),
                                         worktrees: worktree_registry.clone(),
                                         default_command,
+                                        // So a dispatched ORCHESTRATION's roles are
+                                        // registered for delegate routing — without
+                                        // this its orchestrator gets the delegation
+                                        // protocol and no way to use it.
+                                        state: Some(state.clone()),
                                     };
                                     let task = signal.task.as_deref().unwrap_or_default();
                                     let result = dispatch::handle_dispatch(

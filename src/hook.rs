@@ -437,6 +437,47 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     })
 }
 
+/// The total-operation budget for a `delegate`'s reply — the same 5s
+/// [`GET_SEED_REQUEST_TIMEOUT`] gives `get-seed`, and the value that comment
+/// already names as this path's bound.
+///
+/// PR #466 review: `send_and_await_reply` originally connected, wrote and read
+/// with **no** deadline of any kind, and the two platforms were not symmetric
+/// about it. Windows' `IpcClient::connect` seeds a 5s default, so the
+/// "delivered, unverifiable" story held there; Unix' is a bare
+/// `UnixStream::connect` and nothing else, leaving the read unbounded. The
+/// half-close covers only an OLD daemon (its line reader hits EOF, its task
+/// ends, the write half drops). It does not cover a LIVE daemon that accepts
+/// and then answers slowly — and `handle_delegate` runs under
+/// `state.read().await` while tokio's `RwLock` is write-preferring, so a queued
+/// `state.write().await` (including the one this change adds inside `spawn` for
+/// a large orchestration) parks readers behind it. In that window `delegate`
+/// blocked with no ceiling: an orchestrator whose `delegate` hangs is the same
+/// hung orchestration this change set out to remove, reached through another
+/// door.
+pub const DELEGATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send a line to the daemon hook socket and await ONE reply line, classifying
+/// what came back rather than folding every failure into `None`.
+///
+/// [`request_from_socket`]'s `None` cannot distinguish "no daemon" from "old
+/// daemon that does not answer this verb", which is fine for `get-seed` (both
+/// degrade to "no seed") and wrong for `delegate`, where the first is a failure
+/// the orchestrator must see and the second must stay a success or every
+/// delegate against an older daemon starts reporting a phantom error. Only
+/// [`SocketReply::Unreachable`] means the signal was not delivered.
+///
+/// Deliberately the same transport as `get-seed` — [`request_from_socket_at`],
+/// bounded by [`DELEGATE_REPLY_TIMEOUT`] — rather than a second hand-rolled
+/// connect/write/read. An earlier draft of this function was exactly that, and
+/// it carried no deadline; sharing the one implementation gives `delegate` the
+/// total-operation bound, the half-close, the read-exactly-one-line behaviour
+/// PRD #163 M4 needed for Windows, and any future fix to the connect phase
+/// (issue #435) for free.
+pub fn send_and_await_reply(json: &str) -> SocketReply {
+    request_from_socket_inner(json, Some(DELEGATE_REPLY_TIMEOUT))
+}
+
 pub fn send_to_socket(json: &str) -> Option<()> {
     send_to_socket_at(&socket_path(), json)
 }
@@ -470,7 +511,7 @@ fn send_to_socket_at(path: &std::path::Path, json: &str) -> Option<()> {
 /// never touches the `state` lock that `delegate`'s reply path contends on —
 /// it only reads/clears an in-memory entry in `pty_registry` — so it is
 /// strictly cheaper than the `delegate` reply already bounded at
-/// `DELEGATE_REPLY_TIMEOUT` (5s, `src/main.rs`). A caller waiting on
+/// [`DELEGATE_REPLY_TIMEOUT`] (5s, above). A caller waiting on
 /// `get-seed`'s socket has no reason to be given a longer overall budget than
 /// `delegate`'s own reply is allowed, and 5s is still comfortably above the
 /// 300ms reply delay `error/socket/004` exercises, so a merely slow (not
@@ -515,9 +556,11 @@ pub fn request_from_socket(json: &str) -> Option<String> {
 /// Outcome of [`request_from_socket_inner`]/[`request_from_socket_at`] —
 /// richer than [`request_from_socket`]'s `Option<String>` because a caller
 /// that needs to tell "never even reached the daemon" apart from "reached
-/// it, but got no confirmation back" (as the not-yet-submitted `delegate`
-/// wiring will) can report each honestly instead of collapsing both to
-/// `None` the way [`request_from_socket`] does.
+/// it, but got no confirmation back" can report each honestly instead of
+/// collapsing both to `None` the way [`request_from_socket`] does.
+///
+/// That caller is now real: [`send_and_await_reply`], behind
+/// `dot-agent-deck delegate`.
 #[derive(Debug)]
 pub enum SocketReply {
     /// Connected, wrote the request, and read a reply line (possibly empty).
@@ -528,9 +571,17 @@ pub enum SocketReply {
     /// or the total-operation deadline elapsed while a peer kept dribbling
     /// bytes without ever finishing the reply line. The request was still
     /// sent.
+    ///
+    /// For `delegate` this is the pre-response contract: the verb was
+    /// fire-and-forget before the daemon answered it at all, so a daemon that
+    /// does not answer must stay a success — handed to the socket,
+    /// unverifiable — rather than becoming a phantom failure on every
+    /// mixed-version pair. It is deliberately NOT "delivered": a daemon killed
+    /// between accept and read also lands here.
     NoReply,
     /// Could not connect to the daemon, or failed while writing — the
-    /// request was never sent.
+    /// request was never sent. The only case a caller may report as "not
+    /// delivered".
     Unreachable,
 }
 

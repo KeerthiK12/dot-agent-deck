@@ -378,12 +378,20 @@ pub fn orchestrator_role_index(roles: &[RoleSpawn]) -> usize {
 /// scheduler's run-active window — is freed the instant the dispatch WORK is
 /// done; a rapid re-fire after a tab close is then not blocked behind the prior
 /// run's lingering delivery wait. The prompt is still delivered either way.
+///
+/// `state` is the daemon's [`AppState`](crate::state::AppState). It is what makes
+/// a daemon-spawned ORCHESTRATION able to delegate: the role → pane maps
+/// `handle_delegate` routes on are populated from here, exactly as the
+/// `AttachRequest::StartAgent` handler populates them for a `Ctrl+N` one. `None`
+/// (tests, and any caller with no daemon state) spawns as before and simply
+/// registers nothing — a single-agent spawn has no roles to register either way.
 pub async fn spawn(
     req: SpawnRequest,
     registry: &Arc<AgentPtyRegistry>,
     notifier: &dyn Notifier,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
     detach_delivery: bool,
+    state: Option<&crate::state::SharedState>,
 ) -> Result<SpawnHandle, SpawnError> {
     // 1. mkdir -p the working_dir; fail loud via the notifier.
     let dir = Path::new(&req.working_dir);
@@ -529,6 +537,70 @@ pub async fn spawn(
                     pane_id,
                     role_name: Some(role.role_name.clone()),
                 });
+            }
+            // Tell the DAEMON's AppState who these panes are, so the orchestrator
+            // we are about to hand a delegation protocol to can actually use it.
+            //
+            // Without this a dispatched / scheduled orchestration came up
+            // complete and inert: `handle_delegate` looks the sender up in
+            // `pane_role_map`, which only the `StartAgent` handler was filling,
+            // so every `dot-agent-deck delegate` from one of these orchestrators
+            // was dropped with `delegate from unknown pane` and no worker ever
+            // received a task (`orchestration/dispatch/001`).
+            //
+            // Done HERE — synchronously, before `spawn` returns and before the
+            // orchestrator's prompt is delivered below — rather than off the
+            // `OrchestrationSurface` broadcast, so there is no window in which a
+            // fast orchestrator's first delegate can beat its own registration.
+            if let Some(state) = state {
+                // The same `Instance` identity `StartAgent` derives from the
+                // membership these panes were spawned with, so a dispatched
+                // orchestration and a `Ctrl+N` one are scoped by exactly the same
+                // rule and `delegate_targets`' identity equality behaves
+                // identically for both (PRD #140 M2.0).
+                let identity = crate::state::OrchestrationIdentity::Instance {
+                    id: orchestration_id.clone(),
+                    name: name.clone(),
+                };
+                let mut st = state.write().await;
+                for (idx, (role, agent)) in roles.iter().zip(agents.iter()).enumerate() {
+                    st.register_orchestration_role(
+                        &agent.pane_id,
+                        &role.role_name,
+                        // `orch_idx`, NOT `role.is_start_role`. `orch_idx` is
+                        // already this path's authority on which role is the
+                        // orchestrator — it is the pane that receives the
+                        // orchestrator context and the caller's task below — and
+                        // it falls back (role named `orchestrator` → any
+                        // `start = true` → role 0) where `is_start_role` alone
+                        // would be false for EVERY role of an orchestration whose
+                        // toml sets no `start`. Registering on the raw flag would
+                        // leave such an orchestration with a context-bearing
+                        // orchestrator that is still not in
+                        // `orchestrator_pane_ids`, i.e. this same bug for a
+                        // narrower input.
+                        //
+                        // KNOWN, and deliberately not fixed here (PR #466
+                        // review, issue #523): the registrar is shared, but this
+                        // RULE is not. The `AttachRequest::StartAgent` path still
+                        // registers on the raw flag — `tab.rs` sends
+                        // `is_start_role: role.start` in the membership — so for
+                        // a toml whose role is named `orchestrator` but sets no
+                        // `start = true`, a `Ctrl+N` tab still registers no
+                        // orchestrator at all and its delegate is rejected. That
+                        // path is not what this change set out to fix, and
+                        // unifying the rule is not local: `tab.rs` computes a
+                        // THIRD answer of its own (`start_role_index`, the bare
+                        // `position(|r| r.start).unwrap_or(0)`, with no
+                        // name-based fallback) and drives default focus and
+                        // orchestrator-prompt delivery off it, so aligning the
+                        // three is a user-visible TUI change owing its own tests
+                        // — see the issue.
+                        idx == orch_idx,
+                        identity.clone(),
+                        Some(req.working_dir.as_str()),
+                    );
+                }
             }
             // PRD #120: surface this orchestration LIVE to any already-attached
             // TUI. Unlike the single-agent card above (a synthetic
@@ -1081,6 +1153,12 @@ pub fn decide_delivery_capped(
 /// (instead of `spawn` directly) once `new_tab_per_fire` and the reuse registry
 /// are in play. The `spawn` primitive's signature is unchanged — reuse is
 /// daemon-side state layered on top.
+// One more than the lint's threshold, matching `spawn_one` above: these are the
+// daemon-wide handles a fire needs (registry, reuse map, notifier, broadcast,
+// AppState), each independently owned by the daemon. Bundling them into a struct
+// purely to satisfy the count would add an indirection every call site has to
+// build and no reader benefits from.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_or_reuse(
     req: SpawnRequest,
     new_tab_per_fire: bool,
@@ -1089,6 +1167,7 @@ pub async fn spawn_or_reuse(
     notifier: &dyn Notifier,
     debounce: Duration,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
+    state: Option<&crate::state::SharedState>,
 ) -> Result<(), SpawnError> {
     // Snapshot the reuse decision under the lock (don't hold it across awaits).
     let decision = {
@@ -1115,7 +1194,7 @@ pub async fn spawn_or_reuse(
             // #127 single-spawn keeps awaiting delivery (detach_delivery = false):
             // its callback has no rapid-refire-after-close concern and existing
             // tests expect the prior behavior.
-            let handle = spawn(req, registry, notifier, event_tx, false).await?;
+            let handle = spawn(req, registry, notifier, event_tx, false, state).await?;
             // Record the tab for reuse only when the task opts into reuse.
             if !new_tab_per_fire {
                 let entry = ReuseEntry {

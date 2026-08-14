@@ -725,6 +725,93 @@ pub struct ListedOrchestration {
     pub roles: usize,
 }
 
+/// The daemon's reply to a [`DaemonMessage::Delegate`], one JSON line back on
+/// the hook-socket connection (the [`GetSeedResponse`] / [`ListTargetsResponse`]
+/// pattern).
+///
+/// `delegate` used to be fire-and-forget, and that is half of a reported bug: an
+/// orchestration started by `dispatch --orchestration` could not delegate at all,
+/// yet every `dot-agent-deck delegate` it ran printed nothing and exited 0. The
+/// orchestrator therefore announced that its worker was working and waited
+/// forever for a `work-done` that could not arrive. A delegation that reached
+/// nobody has to be distinguishable from one that reached somebody, and the only
+/// place that distinction exists is the daemon.
+///
+/// `error` is a routing failure that stopped the delegate outright (the sender is
+/// not a pane the daemon holds a role for, or is not an orchestrator).
+/// `unresolved_roles` is the partial case: the sender was fine, but one or more
+/// `--to` roles matched no worker pane. They are kept separate so the message can
+/// say which happened, and because they carry different verdicts: `error` means
+/// nothing landed, while `unresolved_roles` alongside a non-empty `delivered` is
+/// a delegate that HALF landed — see the `Delegate` arm of `main.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegateResponse {
+    /// Affirmative discriminator, always [`DELEGATE_RESPONSE_KIND`] on a reply
+    /// this daemon wrote.
+    ///
+    /// PR #466 review: without it, success was *residual* rather than
+    /// affirmative. Every other field is `#[serde(default)]`, so
+    /// `from_str::<DelegateResponse>` succeeds on ANY JSON object — `{}`, or
+    /// another verb's reply such as `{"seed":null}` — and yields empty
+    /// `delivered`, empty `unresolved_roles`, no `error`: indistinguishable
+    /// from a clean success. The one verb whose whole purpose is answering
+    /// "did this land?" answered yes whenever it could not tell. A reply that
+    /// does not carry this marker is now treated exactly like
+    /// [`crate::hook::SocketReply::NoReply`] — a daemon we do not understand,
+    /// which is not proof of failure but is not evidence of success either.
+    ///
+    /// `Option<String>` and `#[serde(default)]` on purpose: the field must
+    /// deserialize to `None` when absent (that is the whole point), while the
+    /// hand-written [`Default`] impl below stamps it on every response the
+    /// daemon builds, including the `..Default::default()` early returns.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Roles whose dispatch was queued to a worker pane.
+    ///
+    /// "Queued to a pane that resolved at delegate time" is the exact claim —
+    /// the fan-out is detached (see [`crate::state::AppState::handle_delegate`]),
+    /// so no synchronous reply can promise the worker read it. A role whose
+    /// worker exited WITHOUT going through the `StopAgent` close path also still
+    /// resolves here, because only that path calls `AppState::unregister_pane`
+    /// (greptile P1 on PR #466, deferred to issue #524 — the liveness of a
+    /// registered pane is not decidable here, since a `clear = true` role's dead
+    /// pane is legitimately respawned by the dispatch rather than being a miss).
+    #[serde(default)]
+    pub delivered: Vec<String>,
+    /// Roles named by `--to` that resolved to no worker pane in this
+    /// orchestration.
+    #[serde(default)]
+    pub unresolved_roles: Vec<String>,
+    /// Set when the delegate could not be routed at all.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The value [`DelegateResponse::kind`] carries on every reply this daemon
+/// writes. Bumping or renaming it would make every older CLI stop trusting the
+/// reply and fall back to "delivered, unverifiable" — a safe degradation, but a
+/// deliberate one.
+pub const DELEGATE_RESPONSE_KIND: &str = "delegate";
+
+impl Default for DelegateResponse {
+    fn default() -> Self {
+        Self {
+            kind: Some(DELEGATE_RESPONSE_KIND.to_string()),
+            delivered: Vec::new(),
+            unresolved_roles: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+impl DelegateResponse {
+    /// Whether this parsed reply positively identifies itself as a delegate
+    /// response. See [`Self::kind`].
+    pub fn is_delegate_reply(&self) -> bool {
+        self.kind.as_deref() == Some(DELEGATE_RESPONSE_KIND)
+    }
+}
+
 /// Signal sent by the orchestrator via `dot-agent-deck delegate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateSignal {
