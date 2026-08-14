@@ -42,7 +42,9 @@
 //! - `docs` — invokes the `xtask-docs` binary's logic (paired-`.md`
 //!   generator). Forwards remaining args.
 //! - `clean-e2e-tmp` — issue #322: reaps stale e2e harness temp dirs left
-//!   behind by SIGKILLed test processes. Dry-run unless `--apply`.
+//!   behind by SIGKILLed test processes. Decides by whether the owning PID
+//!   in the `dad-tests-<pid>-*` name is still alive rather than by age
+//!   (issue #461). Dry-run unless `--apply`.
 //! - `list-tests` — PRD #77 Decision 31: emits a Markdown report of
 //!   every `#[spec]` test created or modified in this branch versus
 //!   `origin/main`, plus per-catalog-entry prose diffs and any
