@@ -129,6 +129,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact `card_height` value per tier (covered by `card_height_001_content_derived_values`); the mid-card blank separator line on Normal/Spacious (intentional content, not a trailing row).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/density/005 — A Spacious idle card shows the flashing-dot indicator over ordinary card content, the same as Normal and Compact (issue #519).
+- **Layer:** L1 (ratatui `TestBackend`, buffer inspection + `insta`).
+- **Agent:** none.
+- **Asserts:** an `Idle` session rendered at Spacious density keeps its ordinary card content — prompt line, dir line, agent-type badge — and carries the `Idle` status badge whose leading dot is inked at the flash-on tick and blank at the flash-off tick, matching the indicator Normal renders for the same session. Pins the fallback that idle cards use in **every** density now that issue #519 removed the Spacious-only ASCII-art overlay, which used to `Clear` this content and paint generated frames over it.
+- **Does not assert:** the removed art path itself (deleted, with no seam left to drive); the flash period, covered by the `flash_dot` unit test.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/card-stats
 
 ##### dashboard/card-stats/001 — A wide card renders its full Last/Tools stats at the bottom-right border.

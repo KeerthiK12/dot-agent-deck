@@ -1,0 +1,14 @@
+---
+source: tests/render_dashboard.rs
+expression: flash_on
+---
+┌ 1 ClaudeCode · example-coder ──────────────────────────────────────── ● Idle ┐
+│Dir:  example-project                                                         │
+│Prmt: first prompt                                                            │
+│      second prompt                                                           │
+│      third prompt                                                            │
+│                                                                              │
+│  Read — src/main.rs                                                          │
+│  Edit — src/ui.rs                                                            │
+│  Bash — cargo test                                                           │
+└───────────────────────────────────────────────────────── Last: 1h  Tools: 12 ┘
