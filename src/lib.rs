@@ -1,6 +1,5 @@
 pub mod agent_pty;
 pub mod agent_registry;
-pub mod ascii_art;
 pub mod build_id;
 pub mod build_version_handshake;
 pub mod codex_hooks_manage;
@@ -27,7 +26,6 @@ pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod keybindings;
-pub mod llm;
 pub mod login_shell;
 pub mod mode_manager;
 pub mod opencode_manage;

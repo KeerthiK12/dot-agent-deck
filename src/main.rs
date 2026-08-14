@@ -72,21 +72,6 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Generate ASCII art from session context via LLM
-    Ascii {
-        /// User prompts / session input context
-        #[arg(long)]
-        input: String,
-        /// Agent response / session output context
-        #[arg(long)]
-        output: String,
-        /// LLM provider (overrides config; e.g., anthropic, openai, ollama)
-        #[arg(long)]
-        provider: Option<String>,
-        /// LLM model (overrides config; e.g., claude-haiku-4-5, gpt-4o-mini)
-        #[arg(long)]
-        model: Option<String>,
-    },
     /// Generate a .dot-agent-deck.toml template in the current or specified directory
     Init {
         /// Target directory (defaults to current directory)
@@ -520,12 +505,12 @@ enum HooksAction {
 enum ConfigAction {
     /// Get a configuration value
     Get {
-        /// Configuration key (e.g., default_command, idle_art.provider)
+        /// Configuration key (e.g., default_command, bell.on_idle)
         key: String,
     },
     /// Set a configuration value
     Set {
-        /// Configuration key (e.g., default_command, idle_art.provider)
+        /// Configuration key (e.g., default_command, bell.on_idle)
         key: String,
         /// Value to set
         value: String,
@@ -752,28 +737,6 @@ fn main() -> ExitCode {
                 }
             }
             ExitCode::SUCCESS
-        }
-        Some(Commands::Ascii {
-            input,
-            output,
-            provider,
-            model,
-        }) => {
-            let config = DashboardConfig::load();
-            let mut idle_art = config.idle_art;
-            if let Some(p) = provider {
-                idle_art.provider = p;
-            }
-            if let Some(m) = model {
-                idle_art.model = m;
-            }
-            match run_ascii(&input, &output, &idle_art) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    ExitCode::FAILURE
-                }
-            }
         }
         Some(Commands::Config { action }) => match action {
             ConfigAction::Get { key } => {
@@ -2161,23 +2124,6 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
-}
-
-#[tokio::main]
-async fn run_ascii(
-    input: &str,
-    output: &str,
-    config: &dot_agent_deck::config::IdleArtConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let result = dot_agent_deck::ascii_art::generate_ascii_art(input, output, config).await?;
-    for (i, frame) in result.frames.iter().enumerate() {
-        if i > 0 {
-            println!("---FRAME---");
-        }
-        print!("{frame}");
-    }
-    println!();
-    Ok(())
 }
 
 #[cfg(test)]
