@@ -60,7 +60,7 @@ Three details are deliberate:
 
 That the check discriminates was confirmed on Windows itself and not only through the self-test's stand-in. On a `windows-latest` runner, a deliberately broken clone (`git clone -c core.symlinks=false`) gave the real thing — a 9-byte `AGENTS.md` written by real git on a real NTFS working tree — and the checker exited 1 naming all 35, while the same script on the same runner exited 0 against the job's own checkout seconds earlier. Both cases, one machine, opposite results.
 
-Both need nothing but git and coreutils. On Linux the pair runs in ~0.4s; on the Windows runner it is ~11s, 8 of which is the self-test writing the whole index out — Windows process spawn dominates, and it is still an order of magnitude cheaper than anything else in that job.
+Both need nothing but git and coreutils. On Linux the pair runs in ~0.45s; on the Windows runner it is 7–11s across runs, two thirds of that the self-test writing the whole index out — Windows process spawn dominates, and it is still an order of magnitude cheaper than anything else in that job.
 
 ## Where it runs, and what CI can and cannot catch
 

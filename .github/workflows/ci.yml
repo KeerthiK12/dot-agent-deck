@@ -309,10 +309,10 @@ jobs:
       # specifically. So on every run the same script is shown failing on a
       # broken tree seconds before it passes on the real one.
       #
-      # ~11s measured here (8s of it the self-test's full index checkout;
-      # Windows process spawn dominates — the same pair is ~0.4s on Linux). It
-      # needs no toolchain, so it sits ahead of the cargo steps: a broken
-      # checkout fails in seconds instead of after a build.
+      # 7-11s across runs here, two thirds of it the self-test's full index
+      # checkout; Windows process spawn dominates, and the same pair is ~0.45s
+      # on Linux. It needs no toolchain, so it sits ahead of the cargo steps: a
+      # broken checkout fails in seconds instead of after a build.
       - name: Tracked symlinks materialised as links
         shell: bash
         run: |
