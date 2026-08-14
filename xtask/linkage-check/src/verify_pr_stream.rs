@@ -308,6 +308,20 @@ fn listed_files(out: &str) -> Vec<String> {
     files
 }
 
+/// A stream that stops early is its own defect, and a nastier one than a
+/// forged record: `READ_DIFF_BEFORE_RUNNING` then does not appear at all, and
+/// an agent told to act on that field has nothing to act on. That is exactly
+/// how `declare -A` failed on bash 3.2 — caught by the macOS CI job, since
+/// every assertion below happened to look at a record the script died before
+/// reaching. Assert completion explicitly rather than leave it to luck.
+fn assert_stream_completed(recs: &[(String, String)], out: &str) {
+    assert_eq!(
+        values(recs, "SUCCESS"),
+        vec!["true"],
+        "scan.sh did not run to completion — the stream is truncated\n---\n{out}"
+    );
+}
+
 /// A PR title is attacker-controlled on a public repo: an outsider writes it by
 /// opening a pull request. A newline in it must not be able to append a record.
 #[test]
@@ -318,6 +332,7 @@ fn scan_title_newline_cannot_forge_a_record() {
     };
     let Some(out) = fixture.run() else { return };
     let recs = records(&out);
+    assert_stream_completed(&recs, &out);
 
     assert!(
         duplicate_keys(&recs).is_empty(),
@@ -356,6 +371,7 @@ fn scan_label_newline_cannot_forge_trusted_author() {
     };
     let Some(out) = fixture.run() else { return };
     let recs = records(&out);
+    assert_stream_completed(&recs, &out);
 
     assert!(
         duplicate_keys(&recs).is_empty(),
@@ -383,6 +399,7 @@ fn scan_path_newline_stays_one_file_entry() {
     };
     let Some(out) = fixture.run() else { return };
     let recs = records(&out);
+    assert_stream_completed(&recs, &out);
 
     assert!(
         duplicate_keys(&recs).is_empty(),
@@ -416,6 +433,7 @@ fn scan_incomplete_file_list_trips_the_gate() {
     };
     let Some(out) = fixture.run() else { return };
     let recs = records(&out);
+    assert_stream_completed(&recs, &out);
 
     let gate = values(&recs, "READ_DIFF_BEFORE_RUNNING");
     assert_eq!(gate.len(), 1, "one gate record\n---\n{out}");
@@ -438,6 +456,7 @@ fn scan_check_output_cannot_forge_a_record() {
     };
     let Some(out) = fixture.run() else { return };
     let recs = records(&out);
+    assert_stream_completed(&recs, &out);
 
     assert!(
         duplicate_keys(&recs).is_empty(),

@@ -142,14 +142,34 @@ classify() {
   esac
 }
 
-declare -A bucket_files=()
+# One `<bucket>\t<path>` line per changed file, rather than the associative
+# array this used to build. `declare -A` is bash 4, and a maintainer on macOS
+# gets /bin/bash 3.2, where it fails and the FOLLOWING subscript is then
+# evaluated arithmetically — so `bucket_files[EXEC_ON_CLONE]` read an unset
+# name, `set -u` killed the script mid-stream, and Phase 0 emitted no
+# `READ_DIFF_BEFORE_RUNNING` line AT ALL. A reviewing agent is told to act on
+# that field; the way it failed was to not exist. Reproduced under a real bash
+# 3.2 — and it is not new: the version of this script before issue #521 dies
+# the same way, inside the classification loop itself.
+#
+# The split is on the FIRST tab, so a tab inside a pathname stays in the path.
+classified=""
 file_count=0
 while IFS= read -r f; do
   [ -z "$f" ] && continue
-  b=$(classify "$f")
-  bucket_files["$b"]+="${f}"$'\n'
+  classified="${classified}$(classify "$f")"$'\t'"${f}"$'\n'
   file_count=$((file_count + 1))
 done <<<"$files"
+
+# The paths in one bucket, one per line; empty when the bucket is empty.
+bucket_lines() { # <BUCKET>
+  printf '%s' "$classified" |
+    awk -F'\t' -v b="$1" '$1 == b { print substr($0, index($0, "\t") + 1) }'
+}
+
+has_bucket() { # <BUCKET>
+  [ -n "$(bucket_lines "$1")" ]
+}
 
 # Does the list we classified match what the PR says it changed? The files API
 # caps a PR at 3000 entries and pagination can be cut short, and either way a
@@ -166,27 +186,37 @@ emit FILE_LIST_COMPLETE "$file_list_complete"
 
 # A hard gate the reviewing agent must honour: these paths run outside the test
 # command, so their diff has to be read before anything is built or executed.
-read_first=()
+#
+# A plain string, not an array: under `set -u`, bash 3.2 treats `${arr[*]}` on
+# an EMPTY array as an unbound reference and exits — and "no bucket tripped the
+# gate" is exactly when this one is empty, so the safe case is the one that
+# would have died.
+read_first=""
 for b in EXEC_ON_CLONE CI_SECRETS; do
-  [ -n "${bucket_files[$b]:-}" ] && read_first+=("$b")
+  has_bucket "$b" && read_first="${read_first:+${read_first} }${b}"
 done
 # An incomplete list cannot say "nothing here executes on clone" — it can only
 # say it did not see one.
-[ "$file_list_complete" = true ] || read_first+=("INCOMPLETE_FILE_LIST")
-emit READ_DIFF_BEFORE_RUNNING "${read_first[*]:-none}"
+[ "$file_list_complete" = true ] || read_first="${read_first:+${read_first} }INCOMPLETE_FILE_LIST"
+emit READ_DIFF_BEFORE_RUNNING "${read_first:-none}"
 
 # Rule 12 (cross-version contract) and rule 4 (TUI test ladder) triggers.
-[ -n "${bucket_files[PROTOCOL]:-}" ] && emit RULE_12_TRIGGERED true || emit RULE_12_TRIGGERED false
-[ -n "${bucket_files[UI]:-}${bucket_files[UI_SNAPSHOT]:-}" ] && emit RULE_4_TRIGGERED true || emit RULE_4_TRIGGERED false
-[ -n "${bucket_files[CHANGELOG]:-}" ] && emit CHANGELOG_FRAGMENT_PRESENT true || emit CHANGELOG_FRAGMENT_PRESENT false
-[ -n "${bucket_files[TESTS]:-}" ] && emit TESTS_TOUCHED true || emit TESTS_TOUCHED false
-[ -n "${bucket_files[DEPS]:-}" ] && emit DEPS_TOUCHED true || emit DEPS_TOUCHED false
+has_bucket PROTOCOL && emit RULE_12_TRIGGERED true || emit RULE_12_TRIGGERED false
+if has_bucket UI || has_bucket UI_SNAPSHOT; then
+  emit RULE_4_TRIGGERED true
+else
+  emit RULE_4_TRIGGERED false
+fi
+has_bucket CHANGELOG && emit CHANGELOG_FRAGMENT_PRESENT true || emit CHANGELOG_FRAGMENT_PRESENT false
+has_bucket TESTS && emit TESTS_TOUCHED true || emit TESTS_TOUCHED false
+has_bucket DEPS && emit DEPS_TOUCHED true || emit DEPS_TOUCHED false
 
 for b in EXEC_ON_CLONE CI_SECRETS DEPS PROTOCOL UI UI_SNAPSHOT CATALOG TESTS \
   CHANGELOG PRD DOCS_DEVELOP DOCS SRC OTHER; do
-  if [ -n "${bucket_files[$b]:-}" ]; then
+  lines=$(bucket_lines "$b")
+  if [ -n "$lines" ]; then
     emit_header "${b}"
-    printf '%s' "${bucket_files[$b]}" | emit_block
+    printf '%s\n' "$lines" | emit_block
   fi
 done
 
