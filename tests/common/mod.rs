@@ -6602,6 +6602,24 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 
     init_test_env();
+
+    // Issue prageethw/dot-agent-deck#253 round-4 verification, finding 1: `handle_delegate` run
+    // through this in-process daemon executes in THIS test process, not the
+    // deck's — so `binary_name()` would (correctly, for that process) name
+    // this libtest binary, and a generated `work-done` command would hand a
+    // real worker `<libtest binary> work-done …`, which libtest reads as a
+    // test-name filter rather than the deck's CLI. Inject the real built
+    // deck binary's path so `binary_name()` names it instead. `#[cfg]`'d
+    // rather than unconditional: this file is also compiled into fast-tier
+    // (non-`e2e`) test binaries such as `daemon_status.rs` and
+    // `delegate_prompt_injection.rs`, where `set_test_current_exe_override`
+    // does not exist in the linked library at all (CLAUDE.md rule 5 — see
+    // that function's doc for why it's `e2e`-gated in the first place).
+    #[cfg(feature = "e2e")]
+    dot_agent_deck::platform::paths::set_test_current_exe_override(std::path::PathBuf::from(env!(
+        "CARGO_BIN_EXE_dot-agent-deck"
+    )));
+
     let (dir, hook_path, attach_path) = {
         let _g = INPROC_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = race_safe_tempdir();

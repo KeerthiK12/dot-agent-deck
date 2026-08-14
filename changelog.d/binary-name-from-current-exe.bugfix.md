@@ -1,0 +1,7 @@
+## Generated `delegate`/`work-done` commands now name the binary you're actually running
+
+The `delegate` and `work-done` command examples the deck writes into orchestrator context and worker task files used to hardcode the literal `dot-agent-deck`, regardless of what the running binary was actually named or where it lived. A renamed build (a browser-download duplicate, a Finder copy, a `target/release` binary not yet on `$PATH`) generated instructions naming a binary that was never the one running, so an agent following them literally ran the wrong program or nothing at all.
+
+The deck now resolves its own name from `current_exe()` and emits that instead. Two gates keep the resolved name usable rather than merely well-formed: it is used bare only when it both looks shell-safe to interpolate unquoted into a generated ```` ```bash ```` block, and resolves via `$PATH` to the SAME file the deck is actually running as (identity, not mere resolvability — a same-named binary earlier on `$PATH` is rejected, not trusted). When either gate fails, the deck falls back to its own absolute `current_exe()` path, shell-quoted, rather than the old hardcoded literal — so the generated command is always runnable, never a guess.
+
+One caveat worth stating plainly: the absolute-path fallback is POSIX-quoted (`shell_quote_if_needed` omits `\` from its safe set), so on Windows every fallback path is single-quoted — correct in git-bash/WSL, inert in `cmd.exe`/PowerShell. A normal on-`PATH` Windows install is unaffected, since it takes the bare-name branch instead.

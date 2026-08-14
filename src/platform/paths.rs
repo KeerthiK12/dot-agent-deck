@@ -285,7 +285,7 @@ pub const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 /// same install.
 ///
 /// Two gates keep the bare file name usable rather than merely well-formed
-/// (issue #253 review/audit, tightened again by a later issue #253 pass once
+/// (issue prageethw/dot-agent-deck#253 review/audit, tightened again by a later issue prageethw/dot-agent-deck#253 pass once
 /// the review/audit gate itself turned out to prove only *resolvability*, not
 /// *identity* — see the `$PATH` identity bullet below for what changed and
 /// why the earlier gate was not enough):
@@ -338,7 +338,59 @@ pub const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 /// resolves to a binary that cannot run produces no error anywhere, only a
 /// signal that silently never arrives.
 pub fn binary_name() -> String {
-    resolve_binary_name(std::env::current_exe(), resolves_on_path)
+    resolve_binary_name(effective_current_exe(), resolves_on_path)
+}
+
+/// `current_exe()`, or — only under the `e2e` feature, and only once
+/// [`set_test_current_exe_override`] has been called — the injected test
+/// override. [`spawn_inprocess_daemon`]'s test harness (`tests/common/mod.rs`)
+/// calls the setter with `env!("CARGO_BIN_EXE_dot-agent-deck")` before driving
+/// `handle_delegate`, because a `handle_delegate` run entirely in-process
+/// makes the CALLING process the libtest binary, not the deck — libtest's own
+/// file name is shell-safe but never on `$PATH`, so without this override
+/// [`binary_name`] would (correctly, for that process) name the libtest
+/// binary itself, and an agent told to run it hits libtest's CLI parser
+/// instead of the deck's (issue prageethw/dot-agent-deck#253 round-4 verification, finding 1).
+///
+/// This mechanism is gated behind the `e2e` Cargo feature rather than a
+/// runtime env var — Greptile's P2 on this issue's round 2 was exactly that a
+/// prior env-var seam (`DOT_AGENT_DECK_TEST_BINARY_ON_PATH`) stayed
+/// "production-active": present, and consultable, in every build. Gating on
+/// `e2e` instead means the override, the setter, and this indirection do not
+/// exist in the compiled artifact at all for a release build or even a plain
+/// `cargo test-fast` run (`e2e` is off for both) — there is no code path for
+/// production to accidentally take, because there is no code.
+#[cfg(feature = "e2e")]
+fn effective_current_exe() -> std::io::Result<PathBuf> {
+    match TEST_CURRENT_EXE_OVERRIDE.get() {
+        Some(path) => Ok(path.clone()),
+        None => std::env::current_exe(),
+    }
+}
+
+#[cfg(not(feature = "e2e"))]
+fn effective_current_exe() -> std::io::Result<PathBuf> {
+    std::env::current_exe()
+}
+
+/// Backing store for [`set_test_current_exe_override`]. A plain [`OnceLock`]
+/// is enough: every call site within a given test process passes the same
+/// compile-time constant (`env!("CARGO_BIN_EXE_dot-agent-deck")`), so a
+/// second `set` call — if it ever happens — is safely redundant, not a race.
+/// `cargo nextest` gives each test its own process, so a value set here can
+/// never leak into a different test's process.
+///
+/// [`OnceLock`]: std::sync::OnceLock
+#[cfg(feature = "e2e")]
+static TEST_CURRENT_EXE_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Test-only: make [`binary_name`] resolve as though `current_exe()` were
+/// `path`, for the remainder of this process. Exists only under the `e2e`
+/// feature (see [`effective_current_exe`]) and nothing under `src/` calls
+/// it — only the e2e test harness does, from `spawn_inprocess_daemon()`.
+#[cfg(feature = "e2e")]
+pub fn set_test_current_exe_override(path: PathBuf) {
+    let _ = TEST_CURRENT_EXE_OVERRIDE.set(path);
 }
 
 /// Pure seam behind [`binary_name`]. `path_identity_matches` is injected so
@@ -368,7 +420,7 @@ fn resolve_binary_name(
 }
 
 /// Whether `name` is safe to interpolate UNQUOTED into the generated `bash`
-/// command examples [`binary_name`] feeds (issue #253 review F2 / audit F1):
+/// command examples [`binary_name`] feeds (issue prageethw/dot-agent-deck#253 review F2 / audit F1):
 /// a conservative ALLOWLIST rather than a denylist, since the failure mode
 /// this guards against is an agent's shell reinterpreting whatever falls
 /// outside it. Rejects an empty name, a leading `-` (would be read as a flag
@@ -387,7 +439,7 @@ fn is_safe_binary_name(name: &str) -> bool {
 
 /// Whether `name`'s `$PATH` lookup identifies the SAME running executable as
 /// `exe_path` — the real resolver [`binary_name`] injects into
-/// [`resolve_binary_name`] (issue #253's identity-verification tightening of
+/// [`resolve_binary_name`] (issue prageethw/dot-agent-deck#253's identity-verification tightening of
 /// the earlier resolvability-only gate; see [`binary_name`]'s doc for why
 /// resolvability alone was insufficient). The lookup walks `$PATH` with
 /// shell-equivalent FIRST-MATCH semantics via [`first_path_match`] — the
@@ -408,7 +460,7 @@ fn is_safe_binary_name(name: &str) -> bool {
 ///   `usable()`, a bare existence probe (`is_file()`) is not enough on its
 ///   own: `binary_name()` feeds an agent's shell a bare command name it is
 ///   expected to *run*, so a readable-but-not-executable regular file of that
-///   name earlier on `$PATH` must not report success (issue #253 review);
+///   name earlier on `$PATH` must not report success (issue prageethw/dot-agent-deck#253 review);
 ///   and
 /// - it canonicalizes to the same file as `exe_path`, symlinks resolved on
 ///   both sides — [`same_binary_identity`].
@@ -433,7 +485,7 @@ fn resolves_on_path(name: &str, exe_path: &Path) -> bool {
 /// Neither can be trusted for an identity comparison made from this process,
 /// because the consuming agent's shell may have a different current
 /// directory than this one — the mechanism the `PATH=.:/usr/bin` case in
-/// issue #253 depends on.
+/// issue prageethw/dot-agent-deck#253 depends on.
 fn is_untrustworthy_path_entry(dir: &Path) -> bool {
     dir.as_os_str().is_empty() || dir.is_relative()
 }
@@ -476,12 +528,12 @@ fn first_path_match(path: &std::ffi::OsStr, name: &str) -> FirstPathMatch {
 }
 
 /// Whether `path` contains an executable `name` at all, regardless of
-/// identity — the resolvability half of the original (issue #253
+/// identity — the resolvability half of the original (issue prageethw/dot-agent-deck#253
 /// review/audit) gate, kept so the exec-bit requirement stays testable in
 /// isolation from the identity comparison [`path_identity_match`] adds on
 /// top of it. Test-only: production code goes through [`path_identity_match`]
 /// exclusively, since resolvability without identity is exactly the gate
-/// issue #253's `$PATH`-identity pass closed.
+/// issue prageethw/dot-agent-deck#253's `$PATH`-identity pass closed.
 #[cfg(test)]
 fn path_contains_executable(path: &std::ffi::OsStr, name: &str) -> bool {
     !matches!(first_path_match(path, name), FirstPathMatch::None)
@@ -549,7 +601,7 @@ fn is_executable_file(candidate: &std::path::Path) -> bool {
 /// outside a conservative safe set; otherwise return it unchanged. Canonical
 /// copy of the identical helper duplicated in `codex_hooks_manage.rs` and
 /// `devin_hooks_manage.rs`, which both call this one rather than defining
-/// their own (issue #253: [`binary_name`]'s absolute-path fallback needed the
+/// their own (issue prageethw/dot-agent-deck#253: [`binary_name`]'s absolute-path fallback needed the
 /// same quoting, so the third call site is what pushed the helper here rather
 /// than re-duplicating it a third time).
 pub(crate) fn shell_quote_if_needed(path: &str) -> String {
@@ -817,7 +869,7 @@ mod tests {
         );
     }
 
-    /// Reviewer F2 / auditor F1, updated for issue #253's Greptile P1: a
+    /// Reviewer F2 / auditor F1, updated for issue prageethw/dot-agent-deck#253's Greptile P1: a
     /// well-formed name that WOULD resolve on `$PATH` must still be rejected
     /// when it is not shell-safe — the shell-safety gate has to reject
     /// independently of the `$PATH` gate, not rely on an unsafe name also
@@ -854,7 +906,7 @@ mod tests {
         );
     }
 
-    /// Reviewer F1 / auditor F1, updated for issue #253's Greptile P1 and
+    /// Reviewer F1 / auditor F1, updated for issue prageethw/dot-agent-deck#253's Greptile P1 and
     /// again for the `$PATH`-identity tightening: a well-formed, shell-safe
     /// name whose `$PATH` lookup does NOT identity-match `current_exe()`
     /// (here: an injected resolver that always reports "no match", standing
@@ -879,7 +931,7 @@ mod tests {
         );
     }
 
-    /// Issue #253 Greptile P1: when `current_exe()` itself is fine but
+    /// Issue prageethw/dot-agent-deck#253 Greptile P1: when `current_exe()` itself is fine but
     /// neither gate is satisfied, the fallback must be the absolute path,
     /// never the generic [`DEFAULT_BINARY_NAME`] literal — an absolute path
     /// is independent of whatever `$PATH` the CONSUMING agent's login shell
@@ -897,7 +949,7 @@ mod tests {
         assert_eq!(fallback, "/opt/build/worker-agent-deck");
     }
 
-    /// Issue #253 Greptile P1 (the smaller half): [`path_contains_executable`]
+    /// Issue prageethw/dot-agent-deck#253 Greptile P1 (the smaller half): [`path_contains_executable`]
     /// (the pure helper behind [`resolves_on_path`]) must require the execute
     /// bit, not just file existence — a readable but non-executable regular
     /// file must not be treated as resolving, since `binary_name()` feeds an
@@ -931,7 +983,7 @@ mod tests {
         );
     }
 
-    /// Issue #253's `$PATH`-identity tightening: an empty or relative `$PATH`
+    /// Issue prageethw/dot-agent-deck#253's `$PATH`-identity tightening: an empty or relative `$PATH`
     /// entry can never be trusted for an identity comparison (a shell
     /// resolves either against ITS OWN current directory, which this process
     /// cannot observe), while an absolute entry can. Pure data, no
@@ -955,7 +1007,7 @@ mod tests {
     /// executable file with the SAME basename but different content — a
     /// "shadow" binary listed first and the "real" (`current_exe()`-standing-in)
     /// binary listed second, reproducing the `PATH=.:/usr/bin`-style shadowing
-    /// issue #253 flags. Drive both the pure `path_identity_match` helper and
+    /// issue prageethw/dot-agent-deck#253 flags. Drive both the pure `path_identity_match` helper and
     /// the full `resolve_binary_name` seam directly with this synthetic `$PATH`
     /// (never the real process-global `PATH`) and assert the shadowing
     /// candidate is rejected — `resolve_binary_name` must fall back to the
