@@ -87,6 +87,13 @@ check_tree() {
     local tree="$1"
     local path target link expected checked=0 broken=0
 
+    # Without this, a mistyped directory reports all 35 links as dangling — a
+    # true statement that points at the wrong problem.
+    if [ ! -d "$tree" ]; then
+        echo "no such directory: $tree" >&2
+        return 2
+    fi
+
     while IFS=$'\t' read -r path target; do
         checked=$((checked + 1))
         link="$tree/$path"
