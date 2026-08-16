@@ -1908,9 +1908,21 @@ mod real_git {
         );
         assert!(failures[0].contains(PRUNE_REMEDY), "{}", failures[0]);
         if git_version() >= GIT_WITH_Z_AND_PRUNABLE {
+            // Read the reason out of git rather than typing it (Greptile P2 on
+            // PR #583): the porcelain `prunable` text is a translated string
+            // too — a literal msgid in the `de` catalog git ships, machine-
+            // readable output notwithstanding — so a hard-coded copy would
+            // make this depend on the contributor's locale. Capturing it here
+            // also asserts something stricter: that whatever git said is
+            // folded in verbatim, not merely that some reason was.
+            let porcelain = sb.git(&clone, &["worktree", "list", "--porcelain"]);
+            let reason = porcelain
+                .lines()
+                .find_map(|line| line.strip_prefix("prunable "))
+                .expect("git >= 2.36 reports a prunable reason for a removed worktree");
             assert!(
-                failures[0].contains("gitdir file points to non-existent location"),
-                "git >= 2.36 reports its own prunable reason and it must be folded in: {}",
+                failures[0].contains(reason),
+                "git's own prunable reason must be folded in verbatim.\n  git said: {reason}\n  message: {}",
                 failures[0]
             );
         }
@@ -2057,13 +2069,47 @@ mod real_git {
     /// than being read as empty output — which `parse_rev_parse` would reject
     /// anyway, but `parse_worktree_entries` would happily read as a repository
     /// with no worktrees at all.
+    ///
+    /// The expected text is **captured from git, not typed in** (Greptile P2
+    /// on PR #583). `fatal: Needed a single revision` is a translated string —
+    /// verified as a literal msgid in the `de` catalog git ships — so a
+    /// contributor whose locale is generated for a translated language would
+    /// fail this test, in the tier everyone runs per task, for a reason that
+    /// has nothing to do with the property under test. Running the same
+    /// command in the same directory and environment `run_git` uses yields
+    /// whatever prose this machine actually produces, which makes the
+    /// assertion locale-proof and version-proof while checking something
+    /// stronger than a substring: that git's message arrives *verbatim*.
     #[test]
     fn run_git_routes_a_non_zero_exit_to_err_with_gits_own_message() {
         let sb = Sandbox::new();
         let origin = sb.origin();
-        let err = run_git(&origin, &["rev-parse", "--verify", "refs/heads/nope"])
-            .expect_err("must not succeed");
-        assert!(err.contains("Needed a single revision"), "{err}");
+        let args = ["rev-parse", "--verify", "refs/heads/nope"];
+
+        let direct = Command::new("git")
+            .args(args)
+            .current_dir(&origin)
+            .output()
+            .expect("git runs");
+        assert!(
+            !direct.status.success(),
+            "fixture precondition: this invocation must fail"
+        );
+        let stderr = String::from_utf8_lossy(&direct.stderr).trim().to_string();
+        assert!(
+            !stderr.is_empty(),
+            "fixture precondition: git must have said something on stderr"
+        );
+
+        let err = run_git(&origin, &args).expect_err("must not succeed");
+        assert!(
+            err.contains(&stderr),
+            "git's own message must be carried through verbatim.\n  git said: {stderr}\n  run_git: {err}"
+        );
+        assert!(
+            err.contains("git rev-parse --verify"),
+            "the failing invocation must be named: {err}"
+        );
     }
 
     /// A directory that is not a repository at all: [`collect`] fails and
@@ -2084,6 +2130,14 @@ mod real_git {
     /// of the states routed to that same skip: `--show-toplevel` fails
     /// outright there. Asserted against real git rather than left as a claim
     /// in a comment.
+    ///
+    /// The assertion is on [`run_git`]'s **own** message rather than on git's
+    /// prose (Greptile P2 on PR #583): `this operation must be run in a work
+    /// tree` is likewise a msgid in git's translation catalogs, so matching it
+    /// would make this fast-tier test depend on the contributor's locale.
+    /// Naming the invocation is also the sharper check — it pins the failure
+    /// to the `rev-parse` call, which is exactly what `failures_from` claims,
+    /// where the prose alone could have come from either invocation.
     #[test]
     fn a_bare_repository_is_a_documented_skip() {
         let sb = Sandbox::new();
@@ -2092,7 +2146,11 @@ mod real_git {
         sb.git(&bare, &["init", "-q", "--bare"]);
 
         let err = collect(&bare).expect_err("a bare repo has no work tree");
-        assert!(err.contains("work tree"), "{err}");
+        assert!(
+            err.starts_with("`git rev-parse "),
+            "`--show-toplevel` is what must fail in a bare repo, so the rev-parse \
+             invocation is the one that must be named: {err}"
+        );
         assert!(run(&bare).is_empty());
     }
 }
