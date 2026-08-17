@@ -129,6 +129,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact `card_height` value per tier (covered by `card_height_001_content_derived_values`); the mid-card blank separator line on Normal/Spacious (intentional content, not a trailing row).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/density/005 — A Spacious idle card shows the flashing-dot indicator over ordinary card content, the same as Normal and Compact (issue #519).
+- **Layer:** L1 (ratatui `TestBackend`, buffer inspection + `insta`).
+- **Agent:** none.
+- **Asserts:** an `Idle` session rendered at Spacious density keeps its ordinary card content — prompt line, dir line, agent-type badge — and carries the `Idle` status badge whose leading dot is inked at the flash-on tick and blank at the flash-off tick, matching the indicator Normal renders for the same session. Pins the fallback that idle cards use in **every** density now that issue #519 removed the Spacious-only ASCII-art overlay, which used to `Clear` this content and paint generated frames over it.
+- **Does not assert:** the removed art path itself (deleted, with no seam left to drive); the flash period, covered by the `flash_dot` unit test.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/card-stats
 
 ##### dashboard/card-stats/001 — A wide card renders its full Last/Tools stats at the bottom-right border.
@@ -4083,10 +4090,8 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 | Doc behavior | Why skipped |
 |---|---|
-| Idle ASCII art rendering on cards ([docs/configuration.md#idle-ascii-art](../docs/configuration.md), [docs/configuration.md#standalone-cli](../docs/configuration.md)) | LLM-driven side feature; lives outside the deck/daemon/PTY surface the harness covers. Reconsider in M4+ if the feature warrants its own catalog section. |
 | `dot-agent-deck connect <remote>` end-to-end SSH flow ([docs/remote-environments.md](../docs/remote-environments.md), [docs/remote-recipes.md](../docs/remote-recipes.md)) | Requires a remote-harness shape that does not exist yet. Catalogued at M4+ when remote testing lands. Local quit-dialog coverage (`prompt/quit/001`–`005`) already pins the Detach / Stop / Cancel behavior; remote attach adds only the daemon-side log distinction. |
 | `dot-agent-deck remote add / list / upgrade / remove` ([docs/remote-environments.md](../docs/remote-environments.md)) | Same — remote-harness territory; the lib already covers the pure-data slices (URL parsing, command construction, error classification) in the kept tests. **Security properties deferred to M4+ end-to-end coverage:** shell-metacharacter quoting on remote-CLI argv assembly (unit-covered by `system_ssh_executor_quotes_arguments_safely`), `remotes.toml` written at mode 0o600 (covered by the now-moved `remotes_toml_written_at_0o600` test — restore at M4+), `DOT_AGENT_DECK_VIA_DAEMON=1` propagation on the remote shell (unit-covered by `build_connect_command_has_t_flag_and_via_daemon_env`). |
-| `dot-agent-deck ascii` CLI subcommand ([docs/configuration.md#standalone-cli](../docs/configuration.md)) | Non-TUI subcommand; tested as a CLI smoke in M4+ if it warrants coverage. |
 | `dot-agent-deck validate` CLI subcommand ([docs/workspace-modes.md#config-validation](../docs/workspace-modes.md)) | Non-TUI; the underlying validator is exhaustively covered by the pure-data `config_validation` tests. |
 | `dot-agent-deck watch` CLI subcommand ([docs/workspace-modes.md#dot-agent-deck-watch](../docs/workspace-modes.md)) | Non-TUI subcommand; an L2 test would only exercise its output formatting against a real shell — low value compared to the deck-rendering surface. |
 | `dot-agent-deck config get` / `config set` ([docs/configuration.md](../docs/configuration.md)) | Non-TUI; the underlying config field reflection is covered by pure-data tests (`*_get_set_field`, `*_get_set_fields`). |
