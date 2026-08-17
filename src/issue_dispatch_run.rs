@@ -923,6 +923,18 @@ pub async fn create_worktree(
         // attach with "already used by worktree at …", and its worktree dir is
         // then present, so the outcome is `AlreadyClaimed` below.)
         if branch_exists && !reuse_existing_branch && attempt == 1 {
+            // …but only when the worktree really IS gone, which is precisely what
+            // the BranchExists message asserts ("its worktree is already gone",
+            // `dispatch.rs`). A directory that is present is a live claim, and
+            // saying otherwise sends the user to `git branch -D` for a worktree
+            // they can see. Serializing creation made this reachable by design
+            // rather than by luck: the loser of a same-name race now always
+            // probes AFTER the winner created the branch, where before it might
+            // have probed first and been classified (correctly) as
+            // `AlreadyClaimed` by the post-add check below.
+            if worktree_dir.exists() {
+                return Ok(WorktreeCreation::AlreadyClaimed);
+            }
             return Ok(WorktreeCreation::BranchExists);
         }
         let result = if branch_exists {
@@ -1501,6 +1513,45 @@ mod tests {
             outcome,
             Ok(WorktreeCreation::Created),
             "once the lock is released the worktree must be created normally"
+        );
+    }
+
+    /// A dispatch whose name is claimed by a LIVE worktree must be told that,
+    /// not that its branch is left over from a dispatch "whose worktree is
+    /// already gone" — the user can see the directory, and the leftover-branch
+    /// message sends them to `git branch -D` for a tree another dispatch is
+    /// working in.
+    ///
+    /// The mirror image of `dispatch.rs`'s
+    /// `second_dispatch_of_a_name_reports_branch_exists_after_cleanup`, which
+    /// pins the same distinction from the other side (dir gone → BranchExists).
+    /// Serializing creation (#541) is what makes this reachable by design rather
+    /// than by luck: the loser of a same-name race now always probes the branch
+    /// AFTER the winner created it.
+    #[tokio::test]
+    async fn create_worktree_reports_a_live_claim_not_a_leftover_branch() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+        let worktree_dir = scratch.path().join("repo-dispatch-claimed");
+
+        assert_eq!(
+            create_worktree(&repo, &worktree_dir, "agent/dispatch-claimed", false).await,
+            Ok(WorktreeCreation::Created),
+            "precondition: the first dispatch claims the name"
+        );
+
+        assert_eq!(
+            create_worktree(&repo, &worktree_dir, "agent/dispatch-claimed", false).await,
+            Ok(WorktreeCreation::AlreadyClaimed),
+            "a second dispatch of a name whose worktree is still THERE is a live \
+             claim; reporting BranchExists would tell the user their worktree is \
+             gone while it is in front of them"
+        );
+        assert!(
+            worktree_dir.exists(),
+            "the live claim must be left untouched at {}",
+            worktree_dir.display()
         );
     }
 
