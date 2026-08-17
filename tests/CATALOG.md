@@ -2281,6 +2281,13 @@ without depending on the config struct API.
 - **Does not assert:** the failed-summary-write branch (deterministic only by sabotaging the coordination path, so it stays fast-tier as `orchestration/work-done/003`); the commission ledger's arithmetic (unit-tested); a real agent reading and acting on the label (an LLM decision, not a rendering fact).
 - **Platform coverage:** mac+linux (unix-only PTY/UDS).
 
+##### orchestration/work-done/005 — A `clear = true` delegate whose respawn FAILS releases its commission, so the next uncommissioned `work-done` from that worker is still reported as unsolicited (issue #448 review, round 2).
+- **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs; `cat` stand-ins).
+- **Agent:** none (raw no-echo `cat` orchestrator observer; the worker's `cat` is deliberately evicted before the delegate).
+- **Asserts:** with the `coder` role at `clear = true` and BOTH delegation watches switched off (`worker_response_timeout_minutes = 0`), evicting the worker pane's live agent makes `respawn_agent_for_pane` fail deterministically with `NotFound`, and the dispatch takes its respawn-error return. The orchestrator first sees the daemon's `⚠ respawn failed for role 'coder'` notice — the test's synchronization edge, so no timing is guessed at — and a subsequent `work-done` from that same worker is then reported with the unsolicited label, with the happy-path pointer ABSENT and no `work-done-coder.md` on disk. Confirmed red with only the release removed: the completion arrives as `Worker coder has completed their task. Read .dot-agent-deck/work-done-coder.md …`, which is #448 and its clobber reproduced through the ledger added to prevent them. Both detectors are off on purpose — the release must be independent of them, exactly as the arming is.
+- **Does not assert:** the guarded-send refusal arm's release (unit-tested arithmetic plus a manual real-binary run; forcing an undelivered guarded send here would depend on the spawned dispatch task winning a race); the pi-native seed return, which is a DELIVERY path and correctly keeps its commission; the readiness-buffer close return, where `begin_pane_close`'s sweep is the discharge.
+- **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).

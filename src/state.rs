@@ -1276,6 +1276,43 @@ fn record_delegation_commission(
     }
 }
 
+/// Issue #448 review (@prageethw, round 2): the counterpart to
+/// [`record_delegation_commission`], and the single place the ledger's
+/// no-delivery invariant is spelled out:
+///
+/// > **Every path that arms a commission and then fails to deliver the task
+/// > pointer must release it.**
+///
+/// A commission is armed in `handle_delegate`'s synchronous fan-out, before the
+/// dispatch task has done anything at all. Every way that task can then end
+/// without the worker receiving a pointer therefore owes a release, or the debt
+/// stands forever: a worker owing a completion for work it was never given. A
+/// later, genuinely uncommissioned `work-done` from that pane spends the phantom
+/// entry, reaches the orchestrator as `Solicited`, and overwrites
+/// `.dot-agent-deck/work-done-<role>.md` — #448 and its summary clobber,
+/// reproduced through the very ledger added to prevent them.
+///
+/// Routed through one helper rather than inlined at each site so the invariant is
+/// checkable by grep instead of by reading 300 lines of `dispatch_one_owned`: the
+/// release sites are exactly the callers of this function. The audit of
+/// `dispatch_one_owned`'s four exits, and why the other two are already correct,
+/// is recorded at the top of that function.
+fn release_undelivered_commission(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    role: &str,
+    reason: &'static str,
+) {
+    if registry.release_delegation_commission(worker_pane_id) {
+        tracing::debug!(
+            pane_id = %worker_pane_id,
+            role = %role,
+            reason,
+            "delegate: released the commission for an undelivered task pointer"
+        );
+    }
+}
+
 /// PRD #126: resolve the timeout, capture the orchestrator's identity, arm the
 /// registry record and spawn its watch — the whole "this worker now owes a
 /// work-done" step of one delegate target. Split out of `handle_delegate` so the
@@ -2246,6 +2283,37 @@ fn write_work_done_summary(
 /// independently so a single pane's failure (a missing role config,
 /// a respawn that couldn't exec the command, a write that hit a
 /// closed PTY) doesn't poison the other panes' dispatches.
+///
+/// # The commission ledger's no-delivery invariant
+///
+/// Issue #448 review (@prageethw, round 2). The commission is armed by the
+/// caller, *before* this function's first poll, so **every exit that leaves
+/// without the worker receiving a task pointer owes a release** — see
+/// [`release_undelivered_commission`], which states the rule and names the
+/// consequence of breaking it. This function has four exits, audited here so the
+/// two that deliberately release nothing read as checked absences rather than as
+/// the two that were simply missed:
+///
+/// 1. **The pi-native `clear = true` return** — releases nothing, correctly. The
+///    pointer IS handed over: it is stashed as the respawned pi's seed for the
+///    extension to pull on `session_start`, with `arm_seed_fallback` as the
+///    PTY-injection safety net. This is a delivery path that skips the inline
+///    injection, not a no-delivery path.
+/// 2. **The respawn-error return** — releases. The previous child is already
+///    disposed of and the replacement never came up, so nothing can be delivered.
+/// 3. **The readiness-buffer close return** — releases nothing, correctly, and
+///    this one is the subtle entry. `begin_pane_close` is what resolves the
+///    future this arm selects on, and it drains every commission touching the
+///    pane under the *same* `delegations` lock hold that drops the close waiter.
+///    The debt is therefore already gone by the time this arm can run, and
+///    `finish_pane_close` sweeps again regardless of whether the close succeeded.
+///    Calling the release here would find nothing and return `false`; the sweep,
+///    not this function, is the discharge.
+/// 4. **The tail, after the guarded send** — releases whenever the send did not
+///    deliver (`WrongSession`, `Stale`, `NoLiveTarget`, `Err`). `Ambiguous` counts
+///    as delivered on purpose: some bytes reached the authorized worker, so a
+///    completion may genuinely be owed and keeping the commission is the
+///    fail-safe direction.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one_owned(
     registry: Arc<AgentPtyRegistry>,
@@ -2379,6 +2447,9 @@ async fn dispatch_one_owned(
                         pane_id.clone(),
                         crate::agent_pty::seed_fallback_grace(),
                     );
+                    // Commission audit exit 1: the pointer is DELIVERED here,
+                    // by seed rather than by injection, so the commission
+                    // stands. See this function's no-delivery invariant.
                     return;
                 }
                 tracing::debug!(
@@ -2486,6 +2557,11 @@ async fn dispatch_one_owned(
                                  readiness buffer; abandoning the dispatch \
                                  without writing the task pointer"
                             );
+                            // Commission audit exit 3: nothing is delivered,
+                            // and nothing is released either — `begin_pane_close`
+                            // drained this pane's commissions under the same lock
+                            // hold that dropped the waiter this arm just woke on.
+                            // See this function's no-delivery invariant.
                             return;
                         }
                         _ = tokio::time::sleep(buffer) => {}
@@ -2543,6 +2619,26 @@ async fn dispatch_one_owned(
                          orchestrator pane scrollback"
                     );
                 }
+                // Issue #448 review (@prageethw, round 2): the respawn
+                // died, so nothing will be delivered on this exit
+                // either — release the commission before taking it.
+                // `respawn_agent_for_pane` disposes of the previous
+                // child BEFORE spawning the replacement, so this arm
+                // leaves the pane with no live agent at all; without
+                // the release the debt outlives the dispatch and the
+                // next completion on that pane id is laundered into a
+                // solicited one. That is the same defect the ledger
+                // exists to remove, arriving through a different door:
+                // the release below covers a refused guarded send but
+                // sits 100+ lines further on, so correctness would
+                // otherwise depend on WHICH arm the dispatch leaves
+                // through.
+                release_undelivered_commission(
+                    &registry,
+                    &pane_id,
+                    &target_role,
+                    "respawn failed for clear=true",
+                );
                 // Skip the post-respawn prompt write — there is
                 // no live worker agent on this pane to receive
                 // it, and the submit-write would just log a
@@ -2648,12 +2744,9 @@ async fn dispatch_one_owned(
             false
         }
     };
-    // Issue #448 review (finding 1): the delegate never reached the worker, so
-    // the orchestrator is owed no completion from it. Release the commission
-    // armed for this target in the synchronous fan-out, or it outlives the
-    // failed delegate and a later, genuinely uncommissioned `work-done` spends
-    // it — arriving as `Solicited` and clobbering the summary file, which is
-    // exactly the pair of defects the ledger was added to prevent.
+    // Commission audit exit 4 (issue #448 review, finding 1): the delegate never
+    // reached the worker, so the orchestrator is owed no completion from it — see
+    // [`release_undelivered_commission`] for what an unreleased debt costs.
     //
     // Released HERE, above the `silence` destructuring, and deliberately not
     // beside the `cancel_silence_watch_if` below it: `silence` is `None`
@@ -2663,11 +2756,12 @@ async fn dispatch_one_owned(
     // correctness depend on a switchable detector is the shape of the original
     // #448 defect; the commission is armed independently of both watches and
     // must be released independently of them too.
-    if !delivered && registry.release_delegation_commission(&pane_id) {
-        tracing::debug!(
-            pane_id = %pane_id,
-            role = %target_role,
-            "delegate: released the commission for an undelivered task pointer"
+    if !delivered {
+        release_undelivered_commission(
+            &registry,
+            &pane_id,
+            &target_role,
+            "the identity gate refused the task pointer",
         );
     }
     let Some((watch, armed, rx)) = silence else {

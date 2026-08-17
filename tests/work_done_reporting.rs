@@ -15,11 +15,16 @@
 //! "this text was submitted" and "this text was NOT submitted" directly
 //! observable. Worker panes are plain `cat`.
 //!
-//! The three cases are the three things the old code could not tell apart:
+//! The first three cases are the three things the old code could not tell apart:
 //! a completion nobody commissioned (#448), a commissioned completion whose
 //! summary file could not be written (#433), and a commissioned completion on a
 //! project that has the idle detector switched OFF — which must still be reported
 //! as the genuine completion it is.
+//!
+//! The fourth (`005`) guards the ledger's own failure mode rather than the old
+//! code's: a delegate that never reached its worker must not leave a commission
+//! standing, or the next uncommissioned completion spends it and #448 returns
+//! through the mechanism added to prevent it.
 
 use std::time::Duration;
 
@@ -216,6 +221,28 @@ impl WorkDoneHarness {
         self.cwd.path().join(".dot-agent-deck/work-done-coder.md")
     }
 
+    /// Take the live agent off the worker pane, leaving the pane registered in
+    /// the role maps with nothing running on it.
+    ///
+    /// This is how `work_done_005` makes a `clear = true` respawn fail
+    /// DETERMINISTICALLY: `respawn_agent_for_pane` locates the pane's current
+    /// agent before it spawns anything, so with no agent to find it returns
+    /// `AgentPtyError::NotFound` without depending on an exec failure, a timing
+    /// window, or a scheduler race.
+    fn evict_worker_agent(&self) {
+        let agent_id = self
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .expect("the worker stub is live before it is evicted");
+        self.registry
+            .close_agent(&agent_id)
+            .expect("close the worker stub");
+        assert!(
+            self.registry.pane_current_agent_id(WORKER_PANE).is_none(),
+            "the worker pane must have no live agent for the respawn to fail"
+        );
+    }
+
     fn orchestrator_snapshot(&self) -> String {
         String::from_utf8_lossy(
             &self
@@ -391,6 +418,78 @@ fn work_done_003_failed_summary_write_inlines_the_report_instead_of_pointing_at_
             snapshot.contains(REPORT_FRAME_NEEDLE) && snapshot.contains(FRESH_SENTINEL),
             "the report is still in memory when the write fails, so it must be inlined rather \
              than lost; snapshot = {snapshot:?}"
+        );
+    });
+}
+
+/// The daemon's own respawn-failure notice, and the test's synchronization edge:
+/// `dispatch_one_owned` writes it into the orchestrator pane immediately before
+/// the error return under audit, so observing it proves the dispatch task has
+/// reached that arm and the test never has to guess at timing.
+const RESPAWN_FAILED_NEEDLE: &str = "respawn failed for role 'coder'";
+
+/// Scenario: On a project whose `coder` role sets `clear = true` and whose idle detector is switched off, evict the worker's live agent so the delegate's respawn fails, then have that same worker report `work-done` — the case of a person tasking it directly afterwards. The orchestrator pane must be told the respawn failed and must then report the completion as one it never commissioned, never pointing at a summary file.
+#[spec("orchestration/work-done/005")]
+#[test]
+fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
+    runtime().block_on(async {
+        // Both detectors OFF (`worker_response_timeout_minutes = 0` disables the
+        // idle watch and the silent-worker watch alike). That is the point of the
+        // test as much as the respawn is: with no watch armed, the release under
+        // audit is the ONLY thing that can discharge the commission, so a fix that
+        // leaned on either detector would fail here.
+        let harness = WorkDoneHarness::new(Some(&format!(
+            "worker_response_timeout_minutes = 0\n\n\
+             [[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
+             [[orchestrations.roles]]\nname = \"{WORKER_ROLE}\"\ncommand = \"cat\"\nclear = true\n"
+        )))
+        .await;
+
+        // With no live agent on the worker pane, `respawn_agent_for_pane` cannot
+        // find one to replace and fails before spawning — the deterministic form
+        // of the production hazard, where the respawn disposes of the previous
+        // child and then cannot bring the replacement up.
+        harness.evict_worker_agent();
+
+        harness.delegate().await;
+        let after_delegate = harness
+            .wait_for_orchestrator(
+                |snapshot| snapshot.contains(RESPAWN_FAILED_NEEDLE),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            after_delegate.contains(RESPAWN_FAILED_NEEDLE),
+            "the dispatch must reach the respawn-error arm for this test to be testing anything; \
+             snapshot = {after_delegate:?}"
+        );
+
+        // The delegate never reached the worker, so a completion arriving now was
+        // asked for by a person, not by the orchestrator.
+        harness
+            .work_done(&format!("A person asked me for this. {FRESH_SENTINEL}"))
+            .await;
+
+        let snapshot = harness
+            .wait_for_orchestrator(
+                |snapshot| snapshot.contains(UNSOLICITED_NEEDLE),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            snapshot.contains(UNSOLICITED_NEEDLE),
+            "a delegate that died on its respawn must release its commission — left standing, it \
+             launders the next uncommissioned completion into a solicited one, which is #448 \
+             through the very ledger added to prevent it; snapshot = {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains(POINTER_NEEDLE),
+            "and the laundered label brings the clobber with it: a solicited completion is \
+             pointed at a summary file this one must never have written; snapshot = {snapshot:?}"
+        );
+        assert!(
+            !harness.summary_path().exists(),
+            "an uncommissioned completion writes no summary file at all"
         );
     });
 }
