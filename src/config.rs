@@ -25,19 +25,6 @@ pub const CONFIG_KEYS: &[(&str, &str)] = &[
         "Bell when session goes idle (default: false)",
     ),
     ("bell.on_error", "Bell on agent error (default: true)"),
-    (
-        "idle_art.enabled",
-        "Enable ASCII art in dashboard idle cards (default: false)",
-    ),
-    (
-        "idle_art.provider",
-        "LLM provider: anthropic (ANTHROPIC_API_KEY), openai (OPENAI_API_KEY), ollama (no key needed) (default: anthropic)",
-    ),
-    ("idle_art.model", "LLM model (default: claude-haiku-4-5)"),
-    (
-        "idle_art.timeout_secs",
-        "Seconds idle before triggering art (default: 300)",
-    ),
 ];
 
 pub fn config_keys_help() -> String {
@@ -107,34 +94,15 @@ impl BellConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct IdleArtConfig {
-    pub enabled: bool,
-    pub provider: String,
-    pub model: String,
-    pub timeout_secs: u64,
-}
-
-const MAX_IDLE_ART_TIMEOUT_SECS: u64 = i64::MAX as u64;
-
-impl Default for IdleArtConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            provider: "anthropic".to_string(),
-            model: "claude-haiku-4-5".to_string(),
-            timeout_secs: 300,
-        }
-    }
-}
-
+/// Issue #519: the removed `[idle_art]` section is deliberately NOT declared
+/// here as an accepted-and-ignored field. `DashboardConfig` sets no
+/// `#[serde(deny_unknown_fields)]`, so serde drops unknown tables silently and
+/// a `config.toml` still carrying `[idle_art]` keeps loading unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DashboardConfig {
     pub default_command: String,
     pub bell: BellConfig,
-    pub idle_art: IdleArtConfig,
     pub auto_config_prompt: bool,
 }
 
@@ -143,7 +111,6 @@ impl Default for DashboardConfig {
         Self {
             default_command: String::new(),
             bell: BellConfig::default(),
-            idle_art: IdleArtConfig::default(),
             auto_config_prompt: true,
         }
     }
@@ -187,10 +154,6 @@ impl DashboardConfig {
             "bell.on_waiting_for_input" => Ok(self.bell.on_waiting_for_input.to_string()),
             "bell.on_idle" => Ok(self.bell.on_idle.to_string()),
             "bell.on_error" => Ok(self.bell.on_error.to_string()),
-            "idle_art.enabled" => Ok(self.idle_art.enabled.to_string()),
-            "idle_art.provider" => Ok(self.idle_art.provider.clone()),
-            "idle_art.model" => Ok(self.idle_art.model.clone()),
-            "idle_art.timeout_secs" => Ok(self.idle_art.timeout_secs.to_string()),
             "auto_config_prompt" => Ok(self.auto_config_prompt.to_string()),
             _ => Err(format!("Unknown config key: {key}\n{}", config_keys_help())),
         }
@@ -219,30 +182,6 @@ impl DashboardConfig {
             }
             "bell.on_error" => {
                 self.bell.on_error = parse_bool(value)?;
-                Ok(())
-            }
-            "idle_art.enabled" => {
-                self.idle_art.enabled = parse_bool(value)?;
-                Ok(())
-            }
-            "idle_art.provider" => {
-                self.idle_art.provider = value.to_string();
-                Ok(())
-            }
-            "idle_art.model" => {
-                self.idle_art.model = value.to_string();
-                Ok(())
-            }
-            "idle_art.timeout_secs" => {
-                let secs: u64 = value
-                    .parse()
-                    .map_err(|_| format!("Invalid number: {value}"))?;
-                if secs > MAX_IDLE_ART_TIMEOUT_SECS {
-                    return Err(format!(
-                        "idle_art.timeout_secs must be <= {MAX_IDLE_ART_TIMEOUT_SECS}"
-                    ));
-                }
-                self.idle_art.timeout_secs = secs;
                 Ok(())
             }
             "auto_config_prompt" => {
@@ -1719,61 +1658,51 @@ command = "vim"
         }
     }
 
+    /// Issue #519: a `config.toml` written before the idle-art removal still
+    /// carries an `[idle_art]` section. `DashboardConfig` sets no
+    /// `#[serde(deny_unknown_fields)]`, so the stale table must be dropped
+    /// silently — a hard parse failure here would print "Invalid config" and
+    /// reset every OTHER key to its default on startup.
     #[test]
-    fn idle_art_config_defaults() {
-        let config = IdleArtConfig::default();
-        assert!(!config.enabled);
-        assert_eq!(config.provider, "anthropic");
-        assert_eq!(config.model, "claude-haiku-4-5");
-        assert_eq!(config.timeout_secs, 300);
-    }
-
-    #[test]
-    fn dashboard_config_without_idle_art() {
-        let dc: DashboardConfig = toml::from_str("").unwrap();
-        assert!(!dc.idle_art.enabled);
-        assert_eq!(dc.idle_art.provider, "anthropic");
-        assert_eq!(dc.idle_art.model, "claude-haiku-4-5");
-    }
-
-    #[test]
-    fn dashboard_config_with_idle_art() {
+    fn dashboard_config_ignores_removed_idle_art_section() {
         let toml_str = r#"
+default_command = "claude"
+auto_config_prompt = false
+
 [idle_art]
 enabled = true
 provider = "openai"
 model = "gpt-4o-mini"
 timeout_secs = 600
 "#;
-        let dc: DashboardConfig = toml::from_str(toml_str).unwrap();
-        assert!(dc.idle_art.enabled);
-        assert_eq!(dc.idle_art.provider, "openai");
-        assert_eq!(dc.idle_art.model, "gpt-4o-mini");
-        assert_eq!(dc.idle_art.timeout_secs, 600);
+        let dc: DashboardConfig =
+            toml::from_str(toml_str).expect("a stale [idle_art] section must not fail the load");
+        assert_eq!(dc.default_command, "claude");
+        assert!(!dc.auto_config_prompt);
     }
 
+    /// Issue #519: the four `idle_art.*` keys are gone from [`CONFIG_KEYS`], so
+    /// `config get` / `config set` now report them as unknown rather than
+    /// accepting a setting nothing reads.
     #[test]
-    fn idle_art_get_set_fields() {
+    fn idle_art_config_keys_are_unknown() {
         let mut dc = DashboardConfig::default();
-        assert_eq!(dc.get_field("idle_art.enabled").unwrap(), "false");
-        assert_eq!(dc.get_field("idle_art.provider").unwrap(), "anthropic");
-        assert_eq!(dc.get_field("idle_art.model").unwrap(), "claude-haiku-4-5");
-        assert_eq!(dc.get_field("idle_art.timeout_secs").unwrap(), "300");
-
-        dc.set_field("idle_art.enabled", "true").unwrap();
-        assert!(dc.idle_art.enabled);
-
-        dc.set_field("idle_art.provider", "ollama").unwrap();
-        assert_eq!(dc.idle_art.provider, "ollama");
-
-        dc.set_field("idle_art.model", "llama3").unwrap();
-        assert_eq!(dc.idle_art.model, "llama3");
-
-        dc.set_field("idle_art.timeout_secs", "120").unwrap();
-        assert_eq!(dc.idle_art.timeout_secs, 120);
-
-        assert!(dc.set_field("idle_art.enabled", "notabool").is_err());
-        assert!(dc.set_field("idle_art.timeout_secs", "notanumber").is_err());
+        for key in [
+            "idle_art.enabled",
+            "idle_art.provider",
+            "idle_art.model",
+            "idle_art.timeout_secs",
+        ] {
+            assert!(dc.get_field(key).is_err(), "get_field({key}) should fail");
+            assert!(
+                dc.set_field(key, "true").is_err(),
+                "set_field({key}) should fail"
+            );
+        }
+        assert!(
+            !CONFIG_KEYS.iter().any(|(k, _)| k.starts_with("idle_art.")),
+            "no idle_art.* key should remain in the `config set --help` listing"
+        );
     }
 
     #[test]

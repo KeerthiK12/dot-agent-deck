@@ -541,6 +541,10 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     pty_registry.set_hook_socket(socket_path.to_path_buf());
     let state = daemon.state;
     let event_tx = daemon.event_tx;
+    // Issue #424: give the spawn-time delivery path a way to REPORT a failed
+    // delivery as state on the pane's card instead of typing a diagnostic line
+    // into the agent's input buffer. See `install_delivery_notice_sink`.
+    install_delivery_notice_sink(&pty_registry, state.clone(), event_tx.clone());
     let client_count = daemon.client_count;
     let idle_shutdown = daemon.idle_shutdown;
     let scheduler = daemon.scheduler;
@@ -563,6 +567,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 reuse_registry.clone(),
                 worktree_registry.clone(),
                 event_tx.clone(),
+                state.clone(),
             ),
         );
     }
@@ -756,6 +761,12 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     if let Some(h) = signal_handle {
         h.abort();
     }
+    // Issue #424 (reviewer finding B9): a spawn-time prompt's confirmation loop
+    // must not outlive the daemon that owns the PTY it re-submits into. The loop
+    // also ends on its own when the broadcast sender drops (`PromptWatch::Closed`),
+    // but that is a race against the next backoff window expiring, and this is
+    // the deterministic half.
+    crate::spawn::cancel_all_prompt_confirmations();
     drop(pty_registry);
 
     result
@@ -772,6 +783,7 @@ pub(crate) fn schedule_callback_factory(
     reuse: crate::spawn::ReuseRegistry,
     worktrees: crate::issue_dispatch_run::WorktreeRegistry,
     event_tx: broadcast::Sender<BroadcastMsg>,
+    state: crate::state::SharedState,
 ) -> impl FnMut(&crate::config::ScheduledTask) -> crate::scheduler::Callback {
     move |task| {
         make_schedule_callback(
@@ -780,6 +792,7 @@ pub(crate) fn schedule_callback_factory(
             reuse.clone(),
             worktrees.clone(),
             event_tx.clone(),
+            state.clone(),
         )
     }
 }
@@ -798,6 +811,9 @@ fn make_schedule_callback(
     reuse: crate::spawn::ReuseRegistry,
     worktrees: crate::issue_dispatch_run::WorktreeRegistry,
     event_tx: broadcast::Sender<BroadcastMsg>,
+    // So a scheduled fire that opens an ORCHESTRATION registers its roles for
+    // delegate routing, exactly as an interactive or dispatched one does.
+    state: crate::state::SharedState,
 ) -> crate::scheduler::Callback {
     // PRD #120: an `issue_dispatch` task runs the GitHub-dispatch FLOW instead of
     // the single #127 spawn — enumerate the repo's open issues and dispatch one
@@ -821,6 +837,7 @@ fn make_schedule_callback(
             let prompt_template = prompt_template.clone();
             let cfg = cfg.clone();
             let task_command = task_command.clone();
+            let state = state.clone();
             Box::pin(async move {
                 let notifier = crate::scheduler::StderrNotifier;
                 // PRD #120 (flag redesign 2026-06-24): a configured `issue_dispatch`
@@ -845,6 +862,7 @@ fn make_schedule_callback(
                     &worktrees,
                     &notifier,
                     Some(&event_tx),
+                    Some(&state),
                 )
                 .await;
             })
@@ -872,6 +890,7 @@ fn make_schedule_callback(
         // fire so a fresh single-agent card surfaces LIVE to an already-attached
         // TUI (see `crate::spawn::surface_spawned_pane`).
         let event_tx = event_tx.clone();
+        let state = state.clone();
         Box::pin(async move {
             let notifier = crate::scheduler::StderrNotifier;
             let debounce = crate::spawn::reuse_debounce();
@@ -883,6 +902,7 @@ fn make_schedule_callback(
                 &notifier,
                 debounce,
                 Some(&event_tx),
+                Some(&state),
             )
             .await
             {
@@ -1043,6 +1063,171 @@ async fn ingest_event(
     let mut state = state.write().await;
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
     state.apply_event(event);
+}
+
+/// Issue #424 (reviewer blocker 3): teach the registry how to turn a
+/// [`DeliveryNotice`] into durable, client-visible STATE.
+///
+/// The spawn-time delivery path runs deep inside `crate::spawn` with only an
+/// `AgentPtyRegistry` in hand, so the daemon installs the ability rather than
+/// the path reaching for it. What lands is ONE synthetic `AgentEvent` pushed
+/// through [`ingest_event`] — the same single ordered operation every real hook
+/// event takes — so the daemon's own `AppState` records it (a client attaching
+/// later still sees it) and every attached client renders it live. The card's
+/// status becomes `Error`; the delivery id stays in the log, where the detail
+/// belongs.
+///
+/// Five properties are deliberate:
+///
+/// * **Identity is re-validated AT INGESTION** (issue #424 D3, both reviewers).
+///   `publish_delivery_notice` checks that the delivery's agent still owns the
+///   pane, but that check happens before an asynchronous handoff: the sink
+///   schedules a detached task which reads state later and ingests later still.
+///   A pane closed and rebound inside that window used to receive the
+///   predecessor's report anyway — and because the stale `Error` carries the
+///   PREDECESSOR agent id with a CURRENT timestamp, `apply_event` could read it
+///   as a superseding generation, retire the successor's card and recreate
+///   predecessor state under it. So the registry owner is re-checked here, and
+///   the whole check → build → broadcast → apply sequence runs under ONE held
+///   write lock, which is also what closes the second (read-to-ingest) race: the
+///   session id the event is stamped with can no longer be resolved from a
+///   snapshot that a genuine `SessionStart` invalidates before the apply.
+/// * **A same-agent conversation successor is refused too.** The registry id
+///   survives a `/clear`, so identity alone would let a predecessor delivery's
+///   late report mark a successor conversation's card. A notice that names the
+///   generation it was written for is dropped unless that generation is still
+///   current; one that names none (an unbound delivery on a launcher pane)
+///   carries no such constraint because there is nothing to compare.
+/// * **The event never moves the pane's GENERATION.** Not by construction from
+///   the stamped id — that was the old argument, and it was wrong in the
+///   read-to-ingest race — but because it is applied through
+///   [`AppState::apply_daemon_report_event`], which snapshots and restores the
+///   pane's generation entry around the apply. It cannot advance it, cannot roll
+///   it back, and cannot establish one on a placeholder-only pane.
+/// * **It addresses the card the CLIENTS have, not only the one the daemon has**
+///   (issue #424 F5). A scheduled/dispatch pane is surfaced to attached TUIs by
+///   `crate::spawn::surface_spawned_pane` through the event broadcast alone, so
+///   the daemon can legitimately hold no `pane_hook_session` and no `sessions`
+///   entry for a pane every attached client is rendering. When neither resolves,
+///   the report is addressed by PANE ID — the `session_id`
+///   `surface_spawned_pane` stamps on that card — instead of being dropped to
+///   the log. It is still never a card for an UNKNOWN pane: the registry
+///   ownership re-check above has already proved the pane is live and belongs to
+///   this delivery's agent.
+/// * **It carries the registry `agent_id`**, so `apply_event`'s reuse guard
+///   lands it on that agent's existing card instead of creating a sibling.
+///
+/// The registry is captured WEAKLY: it owns the sink, so an `Arc` here would be a
+/// reference cycle that keeps the registry (and every PTY it holds) alive for the
+/// process's lifetime.
+fn install_delivery_notice_sink(
+    registry: &Arc<AgentPtyRegistry>,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+) {
+    let weak_registry = Arc::downgrade(registry);
+    registry.set_delivery_notice_sink(std::sync::Arc::new(move |notice| {
+        let state = state.clone();
+        let event_tx = event_tx.clone();
+        let registry = weak_registry.clone();
+        tokio::spawn(async move {
+            // ONE write lock for the whole operation: re-validate, resolve
+            // the target card, broadcast, apply. Nothing sampled here can go
+            // stale before the event lands, which is the difference between
+            // this and the read-then-ingest version it replaces.
+            let mut guard = state.write().await;
+            let Some(registry) = registry.upgrade() else {
+                return;
+            };
+            if registry.pane_current_agent_id(&notice.pane_id).as_deref()
+                != Some(notice.agent_id.as_str())
+            {
+                tracing::debug!(
+                    pane_id = %notice.pane_id,
+                    delivery_id = %notice.delivery_id,
+                    "delivery notice dropped at ingestion; the pane no longer \
+                     belongs to this agent"
+                );
+                return;
+            }
+            let current_generation = guard.pane_hook_session_id(&notice.pane_id);
+            if let Some(bound) = notice.session_id.as_deref()
+                && current_generation.as_deref() != Some(bound)
+            {
+                tracing::debug!(
+                    pane_id = %notice.pane_id,
+                    delivery_id = %notice.delivery_id,
+                    "delivery notice dropped at ingestion; the conversation it \
+                     was written for is no longer current"
+                );
+                return;
+            }
+            let session_id = current_generation
+                .or_else(|| {
+                    guard
+                        .sessions
+                        .values()
+                        .find(|session| session.pane_id.as_deref() == Some(&notice.pane_id))
+                        .map(|session| session.session_id.clone())
+                })
+                // Issue #424 F5 (reviewer blocker): a fresh hookless scheduled /
+                // dispatch pane has a card in every ATTACHED client and none in
+                // the daemon's own `AppState`, because
+                // `crate::spawn::surface_spawned_pane` publishes it through the
+                // event broadcast ONLY and never applies it locally. Resolving
+                // solely from daemon state therefore took the log-only branch for
+                // exactly the population that fills the 256-task cap — hookless
+                // confirmations hold their slots the full deadline — so the one
+                // delivery that most needed the report was the one that could not
+                // receive it, and under the default no-subscriber logging setup
+                // the visible card stayed clean.
+                //
+                // The card those clients are showing is identified by the PANE
+                // ID: that is the `session_id` `surface_spawned_pane` stamps. So
+                // that is what the report is addressed to. This does not weaken
+                // the "never mint a card for an unknown pane" property it
+                // replaces — the immediately preceding check has already proved
+                // this pane is a live registry pane owned by this exact delivery's
+                // agent — and applying it locally as well keeps the daemon's own
+                // state consistent with what it just told every client, so a
+                // client attaching afterwards sees the failure too.
+                .unwrap_or_else(|| {
+                    tracing::debug!(
+                        pane_id = %notice.pane_id,
+                        delivery_id = %notice.delivery_id,
+                        "delivery notice has no daemon-side card; addressing the \
+                         broadcast-surfaced card by pane id"
+                    );
+                    notice.pane_id.clone()
+                });
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(
+                crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+                notice.detail.to_string(),
+            );
+            let event = AgentEvent {
+                session_id,
+                // The daemon is not the agent, and must not claim to be one:
+                // `apply_event` only fills a session's type when it is still
+                // unknown, so `None` cannot overwrite a real agent type.
+                agent_type: crate::event::AgentType::None,
+                event_type: crate::event::EventType::Error,
+                tool_name: None,
+                tool_detail: Some(notice.detail.to_string()),
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(notice.pane_id.clone()),
+                agent_id: Some(notice.agent_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            };
+            let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
+            guard.apply_daemon_report_event(event);
+        });
+    }));
 }
 
 /// PRD #370 M2 / PRD #386 M3: periodically scans every live pane's PTY child
@@ -1552,11 +1737,24 @@ async fn run_hook_loop(
                                     // `SessionStart` event before writing
                                     // the prompt (event-driven readiness,
                                     // replacing the F9 250ms fixed delay).
-                                    state
+                                    let resp = state
                                         .read()
                                         .await
                                         .handle_delegate(signal, &pty_registry, &event_tx)
                                         .await;
+                                    // Answer on the same connection, like
+                                    // `GetSeed` / `ListTargets`. Delegate used to
+                                    // be fire-and-forget, so a delegation that
+                                    // routed nowhere was invisible to the
+                                    // orchestrator that issued it. Best-effort:
+                                    // a caller that has already gone away (an
+                                    // older CLI, which never reads) just makes
+                                    // this a no-op.
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
                                 }
                                 DaemonMessage::Dispatch(signal) => {
                                     info!(
@@ -1610,6 +1808,11 @@ async fn run_hook_loop(
                                         event_tx: event_tx.clone(),
                                         worktrees: worktree_registry.clone(),
                                         default_command,
+                                        // So a dispatched ORCHESTRATION's roles are
+                                        // registered for delegate routing — without
+                                        // this its orchestrator gets the delegation
+                                        // protocol and no way to use it.
+                                        state: Some(state.clone()),
                                     };
                                     let task = signal.task.as_deref().unwrap_or_default();
                                     let result = dispatch::handle_dispatch(
@@ -1872,11 +2075,108 @@ mod orphan_watchdog_tests {
 #[cfg(all(test, unix))]
 mod hook_ingestion_tests {
     use super::*;
-    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, DeliveryNotice, SpawnOptions};
     use crate::event::AgentType;
+    use spec::spec;
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{UnixListener, UnixStream};
+
+    /// Scenario: Surface a hookless scheduled pane only through the daemon's live broadcast, leaving daemon AppState intentionally empty, then publish the exact delivery notice used when the 256-watch cap rejects the next confirmation. The already-visible attached-TUI card must receive an Error event through the production sink.
+    #[spec("scheduler/dispatch/017")]
+    #[tokio::test]
+    async fn dispatch_017_cap_notice_reaches_broadcast_only_card() {
+        const PANE_ID: &str = "broadcast-only-cap-card";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn hookless scheduled pane");
+        let daemon_state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut attached_rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        install_delivery_notice_sink(&registry, daemon_state.clone(), event_tx.clone());
+
+        // This is the topology produced by `surface_spawned_pane`: the attached
+        // client sees and applies the card, while the daemon never applies the
+        // synthetic start to its own AppState.
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            crate::event::DISPLAY_NAME_METADATA_KEY.to_string(),
+            "cap-card".to_string(),
+        );
+        event_tx
+            .send(BroadcastMsg::Event(AgentEvent {
+                session_id: PANE_ID.to_string(),
+                agent_type: AgentType::None,
+                event_type: crate::event::EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: Some("/tmp/broadcast-only-cap-card".to_string()),
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(PANE_ID.to_string()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }))
+            .expect("surface broadcast-only card");
+        let BroadcastMsg::Event(surface) = attached_rx.recv().await.expect("surface event") else {
+            panic!("expected card surface event");
+        };
+        let mut attached_state = crate::state::AppState::default();
+        attached_state.register_pane(PANE_ID.to_string());
+        attached_state.apply_event(surface);
+        assert!(
+            attached_state
+                .sessions
+                .values()
+                .any(|session| session.pane_id.as_deref() == Some(PANE_ID)),
+            "precondition: the attached TUI already has a visible card"
+        );
+        assert!(
+            daemon_state.read().await.sessions.is_empty(),
+            "precondition: the broadcast-only card is absent from daemon AppState"
+        );
+
+        registry.publish_delivery_notice(DeliveryNotice {
+            pane_id: PANE_ID.to_string(),
+            agent_id: agent_id.clone(),
+            delivery_id: "cap-exhausted-257".to_string(),
+            session_id: None,
+            detail: "a spawn-time prompt was written into this pane but the daemon is already watching its maximum number of unconfirmed deliveries, so this one is NOT being confirmed or retried; check whether the pane acted on its task",
+        });
+        let report = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                if let BroadcastMsg::Event(event) = attached_rx
+                    .recv()
+                    .await
+                    .expect("delivery-notice broadcast channel")
+                    && event.event_type == crate::event::EventType::Error
+                {
+                    break event;
+                }
+            }
+        })
+        .await;
+        registry.shutdown_all();
+        let report = report.expect(
+            "the production delivery-notice sink must broadcast cap exhaustion to the already-visible card",
+        );
+        attached_state.apply_event(report);
+        assert!(
+            attached_state.sessions.values().any(|session| {
+                session.pane_id.as_deref() == Some(PANE_ID)
+                    && session.status == crate::state::SessionStatus::Error
+            }),
+            "the attached TUI's broadcast-only card must visibly become Error"
+        );
+    }
 
     /// Scenario: the "No agent on reconnect" fix at the daemon layer. Spawn a
     /// shell agent (so the spawn-time `from_command` guess is `None` — the

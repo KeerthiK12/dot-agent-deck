@@ -1383,18 +1383,17 @@ async fn handle_connection(
                                 cwd: orch_cwd,
                             },
                         };
-                        let mut st = state.write().await;
-                        st.register_pane(pane_id.to_string());
-                        st.pane_role_map
-                            .insert(pane_id.to_string(), role_name.clone());
-                        st.pane_orchestration_map
-                            .insert(pane_id.to_string(), identity);
-                        if let Some(c) = cwd_for_state.clone() {
-                            st.pane_cwd_map.insert(pane_id.to_string(), c);
-                        }
-                        if is_start_role {
-                            st.orchestrator_pane_ids.insert(pane_id.to_string());
-                        }
+                        // Shared with the daemon-internal spawn path
+                        // (`crate::spawn::spawn`) — see
+                        // [`crate::state::AppState::register_orchestration_role`]
+                        // for why this must not be inlined again.
+                        state.write().await.register_orchestration_role(
+                            pane_id,
+                            &role_name,
+                            is_start_role,
+                            identity,
+                            cwd_for_state.as_deref(),
+                        );
                     }
                     write_resp(&mut stream, &AttachResponse::with_id(id)).await?
                 }
@@ -1439,6 +1438,13 @@ async fn handle_connection(
                         "StopAgent: dropped outstanding delegations touching the closing pane"
                     );
                 }
+                // Issue #424 (reviewer finding B9): the same treatment for a
+                // spawn-time prompt still being held provisional on this pane.
+                // Its guarded re-submissions would refuse anyway once the agent
+                // is gone, but a deliberate close should not have to wait out a
+                // backoff window to stop being retried into, and the
+                // abandonment notice has nowhere left to go.
+                crate::spawn::cancel_prompt_confirmation(pane_id);
             }
             // PRD #92 F8 followup (auditor #1): `close_agent` runs the
             // synchronous SIGTERM-with-grace loop in
@@ -1654,6 +1660,7 @@ async fn handle_connection(
                 Some(did) => {
                     let fingerprint = crate::agent_pty::AgentPtyRegistry::delivery_fingerprint(
                         extras.expected_agent_id.as_deref(),
+                        extras.expected_session_id.as_deref(),
                         &pane_id,
                         &text,
                     );
@@ -1784,6 +1791,7 @@ async fn handle_connection(
                     reuse_registry.clone(),
                     worktree_registry.clone(),
                     event_tx.clone(),
+                    state.clone(),
                 ),
             );
             registry.change_notify().notify_one();
@@ -2209,13 +2217,26 @@ async fn handle_attach_stream(
                     break;
                 }
                 let _ = w.flush();
-                drop(w);
                 // PRD #127 M2.2: a STREAM_IN frame is a *user* keystroke —
                 // stamp the pane's deliver-on-idle debounce clock so a
                 // concurrent scheduled reuse fire queues its prompt instead of
                 // interrupting active typing. Keyed by `pane_id_env` (the same
                 // key the reuse path delivers to).
+                //
+                // Issue #424 H1 (both reviewers): stamped BEFORE the writer is
+                // released, and the `write_all` above stamps it too (the pane
+                // writer observes every non-daemon byte — see
+                // `crate::agent_pty::PaneWriter`). This used to drop the writer
+                // first and stamp afterwards, and a guarded automatic sender
+                // queued on that writer acquired it inside the gap, read the
+                // stale clock, and submitted the draft that was already
+                // physically in the input box. Both halves are deliberate: the
+                // writer-level observation is what makes the stamp atomic with
+                // respect to handoff, and this call keeps the frame-level
+                // contract (including the zero-byte frame the auditor noted)
+                // exactly as it was.
                 registry.note_user_input(&pane_id);
+                drop(w);
             }
             Ok(Some((KIND_DETACH, _))) => {
                 // Explicit M2.5 detach: client signalled intent to leave the

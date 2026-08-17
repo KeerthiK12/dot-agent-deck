@@ -52,7 +52,7 @@
       # (the same one release.yml uses) and pins the version here. The
       # dot-ai-tag-release skill bumps this line as part of cutting a tag, and
       # release.yml refuses to release when it disagrees with the tag.
-      version = "0.36.0";
+      version = "0.36.1";
 
       # `<version>-g<short-sha>`, the same shape build.rs composes out of git
       # metadata (build_version_resolve.rs:180-196).
@@ -89,8 +89,7 @@
       #     as an out-of-line `mod` (build.rs:11);
       #   * `src/`, and with it `assets/` and `pi-extension/src/`, which `src/`
       #     pulls in at compile time via `include_str!` (src/config_gen.rs:7,
-      #     src/config_gen.rs:11, src/ascii_art.rs:4,
-      #     src/orchestrator_ext.rs:52-55);
+      #     src/config_gen.rs:11, src/orchestrator_ext.rs:52-55);
       #   * `examples/`, because the three `[[example]]` targets at
       #     Cargo.toml:155-169 name explicit paths and cargo refuses to load a
       #     manifest whose declared target file is absent;
@@ -285,7 +284,7 @@
               example = lib.literalExpression ''
                 {
                   default_command = "claude";
-                  idle_art = { enabled = true; provider = "anthropic"; };
+                  bell = { on_idle = true; };
                 }
               '';
               description = ''

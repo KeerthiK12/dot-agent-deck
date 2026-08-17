@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
+use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::state::SessionStatus;
 use spec::spec;
 
@@ -218,6 +219,184 @@ fn role_diagnostics(deck: &TuiDeck, orch: &str, expected: &[&str]) -> String {
         }
     }
     out
+}
+
+/// The single-line pointer `handle_delegate` writes into the TARGET worker's PTY
+/// (`state::resolve_delegate_task_body`). Role-qualified, and — the load-bearing
+/// property — DAEMON-authored: these bytes exist only if the daemon resolved the
+/// sender as an orchestrator AND the target as one of its workers, so their
+/// arrival in the worker's scrollback *is* the routing decision, observed at the
+/// only place the worker could ever act on it.
+///
+/// This is what makes a `cat` role enough here. `cat` cannot *initiate* a
+/// delegate — which is why `orchestration/dispatch/001` disclaimed the round
+/// trip — but the initiating half is a plain CLI invocation the test can make
+/// itself (see [`run_delegate`]), and `cat` echoes whatever is written to it. The
+/// receiving half is therefore fully observable without spending a token.
+fn worker_pointer(role: &str) -> String {
+    format!("Read .dot-agent-deck/worker-task-{role}.md for your task.")
+}
+
+/// Every live role pane of orchestration `orch` whose cwd's basename satisfies
+/// `dir_is`, as `role name → DOT_AGENT_DECK_PANE_ID`.
+///
+/// Scoping by CWD is what keeps the DISPATCHED orchestration and the
+/// normally-started CONTROL apart. Both are `demo-orch` with byte-identical role
+/// names, and `role_states` (which keys on role name alone) would silently
+/// collapse them into one entry — so the two tabs differ only in where their
+/// roles run: the dispatched one in the sibling worktree, the control in the
+/// fixture dir itself. Matching on the basename rather than the full path avoids
+/// depending on whether the daemon recorded a canonicalized cwd.
+fn role_panes_in(
+    socket: &Path,
+    orch: &str,
+    dir_is: impl Fn(&str) -> bool,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for record in common::agent_records_on(socket) {
+        let Some(TabMembership::Orchestration {
+            name, role_name, ..
+        }) = record.tab_membership.clone()
+        else {
+            continue;
+        };
+        let (Some(cwd), Some(pane_id)) = (record.cwd.clone(), record.pane_id_env.clone()) else {
+            continue;
+        };
+        let basename = Path::new(&cwd)
+            .file_name()
+            .map(|b| b.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name == orch && dir_is(&basename) {
+            out.insert(role_name, pane_id);
+        }
+    }
+    out
+}
+
+/// Poll until orchestration `orch` has a pane for every one of `roles` under a
+/// cwd satisfying `dir_is`, and return them. Panics with the full record set on
+/// timeout, so a failure names which role never showed up.
+fn wait_for_role_panes(
+    deck: &TuiDeck,
+    orch: &str,
+    label: &str,
+    roles: &[&str],
+    dir_is: impl Fn(&str) -> bool + Copy,
+    timeout: Duration,
+) -> BTreeMap<String, String> {
+    let socket = deck.attach_socket_path();
+    common::wait_until(timeout, || {
+        let found = role_panes_in(socket, orch, dir_is);
+        roles.iter().all(|r| found.contains_key(*r))
+    });
+    let found = role_panes_in(socket, orch, dir_is);
+    assert!(
+        roles.iter().all(|r| found.contains_key(*r)),
+        "the {label} `{orch}` never had a pane for every role {roles:?} within {}s — got {found:?}.\n\
+         Records: {:?}\nFinal grid:\n{}",
+        timeout.as_secs(),
+        common::agent_records_on(socket)
+            .iter()
+            .map(|r| (
+                r.pane_id_env.clone(),
+                r.cwd.clone(),
+                r.tab_membership.clone()
+            ))
+            .collect::<Vec<_>>(),
+        deck.snapshot_grid()
+    );
+    found
+}
+
+/// Run the REAL `dot-agent-deck delegate` CLI as the agent inside `pane_id`
+/// would: same binary, same hook socket, same `DOT_AGENT_DECK_PANE_ID` env the
+/// deck exports into every pane it spawns.
+///
+/// Invoking the CLI directly rather than prompting an LLM to invoke it is
+/// deliberate and faithful — this IS the command the orchestrator's Bash tool
+/// runs, and it removes model variance from a test about daemon-side routing.
+/// (`orchestration/dispatch/002` covers the same path with a real orchestrator
+/// deciding to run it.)
+fn run_delegate(deck: &TuiDeck, pane_id: &str, role: &str, task: &str) -> std::process::Output {
+    run_delegate_to(deck, pane_id, &[role], task)
+}
+
+/// [`run_delegate`] with the repeatable `--to` in its general form, for the
+/// fan-out cases — in particular the partially-resolvable one, where some roles
+/// have a worker pane and some do not.
+fn run_delegate_to(
+    deck: &TuiDeck,
+    pane_id: &str,
+    roles: &[&str],
+    task: &str,
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    cmd.arg("delegate");
+    for role in roles {
+        cmd.args(["--to", role]);
+    }
+    cmd.args(["--task", task])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", pane_id)
+        .output()
+        .expect("the delegate CLI should run")
+}
+
+/// Wait for the daemon's delegate pointer for `role` to appear in that role's
+/// pane, re-resolving the pane's registry agent id(s) on every poll.
+///
+/// Two properties here are load-bearing rather than defensive, and both were
+/// found by running this helper against the WORKING control path, where it
+/// failed once and then passed:
+///
+///  1. **Re-resolve, don't cache.** `clear` defaults to `true`, so a delegate
+///     RESPAWNS the worker: the agent id that existed when the delegate was sent
+///     is dead by the time the pointer is written ~31s later (the 30s
+///     `SessionStart` wait a `cat` role can never satisfy, plus the readiness
+///     buffer). A cached id reads an empty snapshot forever.
+///  2. **Check EVERY record carrying the pane id, not the first.** Across a
+///     respawn the registry briefly holds both the old and the new agent for one
+///     pane, and `ListAgents` order is not specified — so `.find()` can hand back
+///     the dead one, whose scrollback will never contain the pointer. That is a
+///     coin flip between a pass and a spurious failure, which is exactly what it
+///     did on the control.
+fn wait_for_delegate_pointer(
+    deck: &TuiDeck,
+    orch: &str,
+    dir_is: impl Fn(&str) -> bool + Copy,
+    role: &str,
+    timeout: Duration,
+) -> bool {
+    let socket = deck.attach_socket_path();
+    let needle = common::search_key(&worker_pointer(role));
+    common::wait_until(timeout, || {
+        let Some(pane_id) = role_panes_in(socket, orch, dir_is).get(role).cloned() else {
+            return false;
+        };
+        common::agent_records_on(socket)
+            .into_iter()
+            .filter(|r| r.pane_id_env.as_deref() == Some(pane_id.as_str()))
+            .any(|r| common::pane_search_key_on(socket, &r.id).contains(&needle))
+    })
+}
+
+/// Drive the production `Ctrl+N` new-pane flow to open the fixture's single
+/// orchestration against the deck's CURRENT directory — the "normal" way a user
+/// starts one, and the CONTROL for the dispatched path.
+///
+/// With no `[[modes]]` in the `orch-deck` fixture the Mode chip row is
+/// `[No mode] [Orch: demo-orch] [schedule]`, so ONE Right selects the
+/// orchestration; selecting one HIDES the Command field, so the second Enter
+/// submits. Mirrors `e2e_orchestration_route_isolation::open_orchestration_tab`.
+fn open_orchestration_tab(deck: &TuiDeck, orch: &str) {
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.send_keys(b" "); // Space → confirm the current dir → new-pane form
+    deck.wait_for_string("No mode"); // form up, Mode field focused
+    deck.send_keys(b"\x1b[C"); // Right → [Orch: <orch>]
+    deck.wait_for_string(orch);
+    deck.send_keys(b"\r"); // Mode → Name
+    deck.send_keys(b"\r"); // submit (Command is hidden for an orchestration)
 }
 
 /// Scenario: Launch the deck in the minimal fixture with real Claude credentials
@@ -439,7 +618,12 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
 /// `dot-agent-deck dispatch <name> --orchestration demo-orch` CLI against the deck's
 /// own hook socket exactly as an agent in that pane would. A full orchestration tab
 /// labelled `demo-orch` must surface live on the tab strip, with the sibling worktree
-/// and the orchestrator's delegation context on disk.
+/// and the orchestrator's delegation context on disk. Then open the SAME orchestration
+/// the normal way with Ctrl+N as a control, and run the real `dot-agent-deck delegate`
+/// CLI from each orchestrator: both workers must receive the daemon's task pointer in
+/// their panes. Finally, delegate twice more in ways that cannot resolve — from a pane
+/// with no role, and to a role that does not exist — and require the CLI to exit
+/// non-zero naming what it could not resolve.
 #[spec("orchestration/dispatch/001")]
 #[test]
 fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
@@ -559,6 +743,192 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
         content.contains("## Your task") && content.contains("Say hello"),
         "the caller's task must ride inside the context file:\n{content}"
     );
+
+    // ===== Does the dispatched orchestrator's `delegate` REACH its worker? ====
+    //
+    // Everything above this line was GREEN while a user's dispatched orchestration
+    // could not delegate at all: the tab was there, the worktree was there, the
+    // orchestrator had its context file telling it how to delegate — and every
+    // `dot-agent-deck delegate --to worker` it ran exited 0 having done nothing,
+    // because the daemon had no idea that pane was an orchestrator
+    // (`delegate from unknown pane`, `~/.local/state/dot-agent-deck/deck.log`).
+    //
+    // The dispatched roles are told apart from the control's identically-named
+    // ones by the directory they run in.
+    let worktree_dir = expected_worktree
+        .file_name()
+        .expect("the dispatch worktree has a basename")
+        .to_string_lossy()
+        .into_owned();
+    let is_worktree = |basename: &str| basename == worktree_dir;
+    let is_fixture = |basename: &str| basename != worktree_dir;
+
+    const ROLES: [&str; 2] = ["orchestrator", "worker"];
+    const DELEGATE_WAIT: Duration = Duration::from_secs(90);
+
+    // --- CONTROL first: the SAME orchestration, started the NORMAL way -------
+    //
+    // Run before the dispatched case on purpose. It is the same fixture, the same
+    // two roles, the same delegate CLI and the same daemon — the ONLY thing that
+    // differs is which code path spawned the panes. So if the control passes and
+    // the dispatched case fails, the failure is attributable to the dispatch spawn
+    // path specifically and not to delegation being broken generally; and if the
+    // control ITSELF fails, the harness is wrong and the dispatched result below
+    // proves nothing (the `reproduce-first` skill's "add a control" step).
+    open_orchestration_tab(&deck, "demo-orch");
+    let control = wait_for_role_panes(
+        &deck,
+        "demo-orch",
+        "normally-started (Ctrl+N) orchestration",
+        &ROLES,
+        is_fixture,
+        DELEGATE_WAIT,
+    );
+
+    let out = run_delegate(
+        &deck,
+        &control["orchestrator"],
+        "worker",
+        "Control delegation.",
+    );
+    assert!(
+        out.status.success(),
+        "CONTROL FAILED: `delegate` from a normally-started orchestration's \
+         orchestrator exited {:?}. The control must pass for the dispatched result \
+         below to mean anything.\nstdout: {}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_for_delegate_pointer(&deck, "demo-orch", is_fixture, "worker", DELEGATE_WAIT),
+        "CONTROL FAILED: the worker of a NORMALLY-STARTED `demo-orch` never received \
+         the delegate pointer {:?} within {}s. This path is known to work (it is the \
+         one a user falls back to), so a failure here means the harness is wrong — \
+         fix it before reading anything into the dispatched case.\nFinal grid:\n{}",
+        worker_pointer("worker"),
+        DELEGATE_WAIT.as_secs(),
+        deck.snapshot_grid()
+    );
+
+    // --- The reported case: the DISPATCHED orchestration --------------------
+    let dispatched = wait_for_role_panes(
+        &deck,
+        "demo-orch",
+        "dispatched orchestration",
+        &ROLES,
+        is_worktree,
+        DELEGATE_WAIT,
+    );
+
+    let out = run_delegate(
+        &deck,
+        &dispatched["orchestrator"],
+        "worker",
+        "Dispatched delegation.",
+    );
+    assert!(
+        out.status.success(),
+        "`delegate` from a DISPATCHED orchestration's orchestrator exited {:?}.\n\
+         stdout: {}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_for_delegate_pointer(&deck, "demo-orch", is_worktree, "worker", DELEGATE_WAIT),
+        "THE REPORTED BUG: the worker of a DISPATCHED `demo-orch` never received the \
+         delegate pointer {:?} within {}s, while the identical delegation in the \
+         control (same fixture, same roles, same CLI, started with Ctrl+N) DID \
+         arrive. An orchestration started by `dispatch --orchestration` cannot \
+         delegate to its own workers: the daemon's role maps are populated only by \
+         the `StartAgent` handler, so panes spawned daemon-side are unknown to \
+         `handle_delegate` and it drops the signal.\nDispatched panes: {dispatched:?}\n\
+         Final grid:\n{}",
+        worker_pointer("worker"),
+        DELEGATE_WAIT.as_secs(),
+        deck.snapshot_grid()
+    );
+
+    // ===== …and when it CANNOT resolve, it must say so ======================
+    //
+    // The second half of the report: `delegate` was fire-and-forget, so every
+    // failure above was invisible to the caller. An orchestrator that cannot tell
+    // success from failure announces the worker is working and then waits forever
+    // for a `work-done` that can never arrive — the silent failure is what turned
+    // a routing bug into a hung orchestration.
+    //
+    // Two ways to be unresolvable, both exercised from the REAL CLI:
+    //   1. a sender the daemon holds no role for (the `cat` caller pane) — the
+    //      literal shape of the reported log line, `delegate from unknown pane`;
+    //   2. a resolvable orchestrator naming a role its orchestration does not have.
+    let unknown = run_delegate(&deck, &caller_pane, "worker", "From a non-orchestrator.");
+    let unknown_err = String::from_utf8_lossy(&unknown.stderr).into_owned();
+    assert!(
+        !unknown.status.success(),
+        "`delegate` from a pane the daemon holds no role for exited 0. It must FAIL \
+         LOUDLY: the orchestrator has no other way to learn its delegation went \
+         nowhere, and a silent success is what makes it report phantom progress and \
+         then wait forever.\nstdout: {}\nstderr: {unknown_err}",
+        String::from_utf8_lossy(&unknown.stdout)
+    );
+    assert!(
+        unknown_err.contains(&caller_pane),
+        "a failed `delegate` must name the pane id it could not resolve ({caller_pane}) \
+         on stderr, so the agent reading it can say what broke.\nstderr: {unknown_err}"
+    );
+
+    let bad_role = run_delegate(
+        &deck,
+        &dispatched["orchestrator"],
+        "nonexistent-role",
+        "To nobody.",
+    );
+    let bad_role_err = String::from_utf8_lossy(&bad_role.stderr).into_owned();
+    assert!(
+        !bad_role.status.success(),
+        "`delegate --to nonexistent-role` from a VALID orchestrator exited 0. A role \
+         with no pane is a delegation that reached nobody and must be reported as \
+         one.\nstdout: {}\nstderr: {bad_role_err}",
+        String::from_utf8_lossy(&bad_role.stdout)
+    );
+    assert!(
+        bad_role_err.contains("nonexistent-role"),
+        "a failed `delegate` must name the ROLE it could not resolve on stderr.\n\
+         stderr: {bad_role_err}"
+    );
+
+    // ===== …and a HALF-landed delegate is not a failure =====================
+    //
+    // PR #466 review's blocker, from the real CLI. `--to worker
+    // --to nonexistent-role` fans out to the worker for real — the task is in
+    // its PTY and its idle-worker record is armed — so reporting failure would
+    // invite the orchestrator to retry under this command's own contract
+    // ("non-zero ⇒ it did not land") and dispatch the worker a second time,
+    // arming two records for one pane. Exit 0, and name BOTH sides so a retry
+    // can be aimed at just the role that missed.
+    let partial = run_delegate_to(
+        &deck,
+        &dispatched["orchestrator"],
+        &["worker", "nonexistent-role"],
+        "Half-landed delegation.",
+    );
+    let partial_err = String::from_utf8_lossy(&partial.stderr).into_owned();
+    assert!(
+        partial.status.success(),
+        "`delegate --to worker --to nonexistent-role` exited {:?}. The worker DID \
+         receive it, so a non-zero exit tells the orchestrator to retry a \
+         delegation that half landed — and the worker gets the task twice.\n\
+         stdout: {}\nstderr: {partial_err}",
+        partial.status.code(),
+        String::from_utf8_lossy(&partial.stdout)
+    );
+    assert!(
+        partial_err.contains("nonexistent-role") && partial_err.contains("worker"),
+        "a half-landed `delegate` must name BOTH the role that missed and the \
+         role that received it, or a retry cannot be aimed safely.\n\
+         stderr: {partial_err}"
+    );
 }
 
 fn card_label(role: &str) -> String {
@@ -583,7 +953,9 @@ fn card_titled(grid: &str, role: &str) -> bool {
 /// <name> --orchestration real-team` CLI against the deck's own hook socket. Every
 /// role named in the toml must reach LIVE-AGENT state in the dispatched worktree —
 /// the daemon holding an event-derived live session for each — not merely have a
-/// pane spawned for it.
+/// pane spawned for it, and every role must be named on its own card. Then ask the
+/// real orchestrator to delegate a sentinel-file task to its `coder`: the coder
+/// agent must receive it and actually create the file in the dispatched worktree.
 #[spec("orchestration/dispatch/002")]
 #[test]
 fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
@@ -757,6 +1129,113 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
             .iter()
             .filter(|role| !card_titled(&deck.snapshot_grid(), role))
             .collect::<Vec<_>>(),
+        role_diagnostics(&deck, ORCH, &ROLES),
+        deck.snapshot_grid()
+    );
+
+    // ===== …and the orchestration can actually ORCHESTRATE ==================
+    //
+    // Everything above passed while a dispatched orchestration was completely
+    // inert: three real agents up, every card correctly named, and an orchestrator
+    // holding a delegation protocol it could not use, because the daemon had no
+    // role map for panes it spawned itself. `orchestration/dispatch/001` pins the
+    // ROUTING half cheaply (`cat` roles, daemon-authored pointer, plus the
+    // normally-started control that makes the failure attributable to the dispatch
+    // path). This is the half only real agents can show: a real orchestrator
+    // DECIDING to shell `dot-agent-deck delegate`, and a real worker receiving the
+    // task and doing the work — the user's actual altitude, "I dispatched an
+    // orchestration and the team got something done".
+    //
+    // The observable is a uniquely-named sentinel FILE in the dispatched worktree
+    // (rule 4): it survives LLM phrasing and tool variance, and — unlike anything
+    // on the grid — it cannot be produced by an agent merely echoing the task back.
+    const SENTINEL: &str = "dispatch_delegate_a41f.txt";
+    let worker_task = format!(
+        "Create a file named {SENTINEL} in the current directory containing the single \
+         word DONE. Do not ask what to do, offer numbered choices, or wait for a task to \
+         be defined - this message IS the task and you have everything you need. If a \
+         file you were pointed at looks empty or missing, create {SENTINEL} anyway \
+         instead of asking about it."
+    );
+    let role_panes = role_panes_in(deck.attach_socket_path(), ORCH, |_| true);
+    let coder_pane = role_panes
+        .get("coder")
+        .cloned()
+        .expect("the dispatched orchestration has a `coder` role pane (asserted above)");
+    let orchestrator_pane = role_panes
+        .get("orchestrator")
+        .cloned()
+        .expect("the dispatched orchestration has an `orchestrator` role pane");
+
+    // Wait for every role pane to STOP painting before injecting anything.
+    //
+    // Not defensive — load-bearing, and learned the expensive way. Without it this
+    // test passed in ~17s run alone and failed at its full 300s budget inside a
+    // full `cargo test-e2e`: on a saturated machine the boot is slower, the
+    // directive lands during a claude TUI's mid-init lull, and bytes injected in
+    // that lull are simply dropped. The orchestrator then never delegates, so
+    // nothing distinguishes it from the product bug this test exists to catch.
+    // `wait_until_panes_settled`'s `min_alive` floor is the part that matters:
+    // "quiet" alone is also true of a pane that has not started painting yet.
+    // Mirrors `orchestration/route/001`, which injects into real agents the same
+    // way. Non-fatal on timeout (a busy agent may still accept input) but logged,
+    // so a later failure is diagnosable.
+    let settle_ids: Vec<String> = {
+        let states = role_states(deck.attach_socket_path(), ORCH);
+        ROLES
+            .iter()
+            .filter_map(|r| states.get(*r).map(|s| s.agent_id.clone()))
+            .collect()
+    };
+    if !common::wait_until_panes_settled(
+        deck.attach_socket_path(),
+        &settle_ids,
+        Duration::from_millis(1500),
+        Duration::from_secs(8),
+        Duration::from_secs(180),
+    ) {
+        eprintln!("warning: not every role pane settled within 180s; proceeding anyway");
+    }
+
+    // Delivered through the daemon's production `WriteAndSubmit` — the same atomic
+    // write-then-submit a user's keystrokes take. What the orchestrator does with
+    // it (shell `dot-agent-deck delegate`) is the AGENT's own doing, which is the
+    // point: this is the decision path, not a test-issued CLI call.
+    let directive = format!(
+        "Use the Bash tool to run exactly this one command, then stop and say nothing \
+         else: dot-agent-deck delegate --to coder --task \"{worker_task}\""
+    );
+    let resp = common::attach_request_on(
+        deck.attach_socket_path(),
+        &AttachRequest::WriteAndSubmit {
+            pane_id: orchestrator_pane.clone(),
+            text: directive,
+        },
+    )
+    .expect("WriteAndSubmit to the dispatched orchestrator pane over the attach socket");
+    assert!(
+        resp.ok,
+        "the daemon refused to deliver the delegate directive to the dispatched \
+         orchestrator pane {orchestrator_pane}: {:?}",
+        resp.error
+    );
+
+    // Generous: an orchestrator turn, a `clear = false` worker's delivery, and a
+    // worker turn — three real Haiku round trips on a machine already running
+    // three agents. A slow chain must not read as a broken one.
+    const WORK_WAIT: Duration = Duration::from_secs(300);
+    let sentinel_path = expected_worktree.join(SENTINEL);
+    assert!(
+        common::wait_for_path(&sentinel_path, WORK_WAIT),
+        "the dispatched orchestration's `coder` never did the delegated work within {}s — \
+         no {SENTINEL} at {}. A dispatched orchestration whose orchestrator cannot reach \
+         its own workers looks completely healthy (panes up, cards named, tab live) and \
+         gets nothing done: the orchestrator reports the worker is working and then waits \
+         forever for a work-done that cannot arrive.{}\n\
+         Orchestrator pane {orchestrator_pane}, coder pane {coder_pane}.\n\
+         Final grid:\n{}",
+        WORK_WAIT.as_secs(),
+        sentinel_path.display(),
         role_diagnostics(&deck, ORCH, &ROLES),
         deck.snapshot_grid()
     );

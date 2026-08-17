@@ -232,12 +232,13 @@ fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> O
     Some(detail)
 }
 
+/// Issue #424: delegates to the shared, char-boundary-safe truncation. The
+/// former `&s[..max]` PANICKED whenever the cut landed inside a multi-byte
+/// character — in this binary that kills the hook process and the event is never
+/// emitted at all, which for a `user_prompt` now also means a delivered prompt
+/// can never be confirmed. Identical output for ASCII, so nothing else moves.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
+    crate::prompt_delivery::truncate_on_char_boundary(s, max)
 }
 
 /// PRD #20 W1: normalize a Codex `shell` tool's `command` value into a single
@@ -325,7 +326,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     }
     let tool_detail = extract_tool_detail(tool_name.as_deref(), tool_input.as_ref());
 
-    let user_prompt = prompt.map(|p| truncate(&p, 200));
+    let user_prompt = prompt.map(|p| truncate(&p, crate::prompt_delivery::USER_PROMPT_MAX_LEN));
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
     // PRD #92 F9 followup-7: the daemon injects DOT_AGENT_DECK_AGENT_ID
     // on spawn (same pattern as DOT_AGENT_DECK_PANE_ID). Forwarding it
@@ -337,6 +338,36 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     let mut metadata = HashMap::new();
     if let Some(tool_use_id) = tool_use_id {
         metadata.insert("tool_use_id".to_string(), tool_use_id);
+    }
+
+    // Issue #424 (reviewer option 3): forward EXPLICIT BOOT PROVENANCE.
+    //
+    // A launcher that posts a Claude-shaped `SessionStart` for its own bootstrap
+    // (`devbox run claude …`, a wrapper script that `exec`s the real agent) can
+    // say so with [`crate::event::SESSION_START_ORIGIN_METADATA_KEY`], exactly
+    // as `dot-agent-deck wrap` does on its fork-time event (PRD #225 M3).
+    // Without this, the whole `metadata` object of a Claude-compatible payload
+    // was dropped on the floor here, so such a launcher was INDISTINGUISHABLE
+    // from an initialized session — which is what made a boot-time generation
+    // change and a `/clear` look identical to the delivery latch, and what was
+    // used to argue for the (rejected) forward-tracking rule. See
+    // [`crate::state::latch_generation`].
+    //
+    // Deliberately narrow: ONE key, only on `SessionStart`, only the one value
+    // the repo defines. Everything else in an incoming `metadata` object is
+    // still ignored, so this cannot become an arbitrary producer-controlled
+    // channel into the daemon's event metadata.
+    if event_type == EventType::SessionStart
+        && extra
+            .get("metadata")
+            .and_then(|m| m.get(crate::event::SESSION_START_ORIGIN_METADATA_KEY))
+            .and_then(|v| v.as_str())
+            == Some(crate::event::WRAPPER_FORK_SESSION_START_ORIGIN)
+    {
+        metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
     }
 
     // Store full bash command for reactive pane routing (tool_detail truncates).
@@ -393,7 +424,9 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
 fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     let event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
     let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
-    let user_prompt = input.prompt.map(|p| truncate(&p, 200));
+    let user_prompt = input
+        .prompt
+        .map(|p| truncate(&p, crate::prompt_delivery::USER_PROMPT_MAX_LEN));
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
     let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
 
@@ -437,6 +470,47 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     })
 }
 
+/// The total-operation budget for a `delegate`'s reply — the same 5s
+/// [`GET_SEED_REQUEST_TIMEOUT`] gives `get-seed`, and the value that comment
+/// already names as this path's bound.
+///
+/// PR #466 review: `send_and_await_reply` originally connected, wrote and read
+/// with **no** deadline of any kind, and the two platforms were not symmetric
+/// about it. Windows' `IpcClient::connect` seeds a 5s default, so the
+/// "delivered, unverifiable" story held there; Unix' is a bare
+/// `UnixStream::connect` and nothing else, leaving the read unbounded. The
+/// half-close covers only an OLD daemon (its line reader hits EOF, its task
+/// ends, the write half drops). It does not cover a LIVE daemon that accepts
+/// and then answers slowly — and `handle_delegate` runs under
+/// `state.read().await` while tokio's `RwLock` is write-preferring, so a queued
+/// `state.write().await` (including the one this change adds inside `spawn` for
+/// a large orchestration) parks readers behind it. In that window `delegate`
+/// blocked with no ceiling: an orchestrator whose `delegate` hangs is the same
+/// hung orchestration this change set out to remove, reached through another
+/// door.
+pub const DELEGATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send a line to the daemon hook socket and await ONE reply line, classifying
+/// what came back rather than folding every failure into `None`.
+///
+/// [`request_from_socket`]'s `None` cannot distinguish "no daemon" from "old
+/// daemon that does not answer this verb", which is fine for `get-seed` (both
+/// degrade to "no seed") and wrong for `delegate`, where the first is a failure
+/// the orchestrator must see and the second must stay a success or every
+/// delegate against an older daemon starts reporting a phantom error. Only
+/// [`SocketReply::Unreachable`] means the signal was not delivered.
+///
+/// Deliberately the same transport as `get-seed` — [`request_from_socket_at`],
+/// bounded by [`DELEGATE_REPLY_TIMEOUT`] — rather than a second hand-rolled
+/// connect/write/read. An earlier draft of this function was exactly that, and
+/// it carried no deadline; sharing the one implementation gives `delegate` the
+/// total-operation bound, the half-close, the read-exactly-one-line behaviour
+/// PRD #163 M4 needed for Windows, and any future fix to the connect phase
+/// (issue #435) for free.
+pub fn send_and_await_reply(json: &str) -> SocketReply {
+    request_from_socket_inner(json, Some(DELEGATE_REPLY_TIMEOUT))
+}
+
 pub fn send_to_socket(json: &str) -> Option<()> {
     send_to_socket_at(&socket_path(), json)
 }
@@ -470,7 +544,7 @@ fn send_to_socket_at(path: &std::path::Path, json: &str) -> Option<()> {
 /// never touches the `state` lock that `delegate`'s reply path contends on —
 /// it only reads/clears an in-memory entry in `pty_registry` — so it is
 /// strictly cheaper than the `delegate` reply already bounded at
-/// `DELEGATE_REPLY_TIMEOUT` (5s, `src/main.rs`). A caller waiting on
+/// [`DELEGATE_REPLY_TIMEOUT`] (5s, above). A caller waiting on
 /// `get-seed`'s socket has no reason to be given a longer overall budget than
 /// `delegate`'s own reply is allowed, and 5s is still comfortably above the
 /// 300ms reply delay `error/socket/004` exercises, so a merely slow (not
@@ -515,9 +589,11 @@ pub fn request_from_socket(json: &str) -> Option<String> {
 /// Outcome of [`request_from_socket_inner`]/[`request_from_socket_at`] —
 /// richer than [`request_from_socket`]'s `Option<String>` because a caller
 /// that needs to tell "never even reached the daemon" apart from "reached
-/// it, but got no confirmation back" (as the not-yet-submitted `delegate`
-/// wiring will) can report each honestly instead of collapsing both to
-/// `None` the way [`request_from_socket`] does.
+/// it, but got no confirmation back" can report each honestly instead of
+/// collapsing both to `None` the way [`request_from_socket`] does.
+///
+/// That caller is now real: [`send_and_await_reply`], behind
+/// `dot-agent-deck delegate`.
 #[derive(Debug)]
 pub enum SocketReply {
     /// Connected, wrote the request, and read a reply line (possibly empty).
@@ -528,9 +604,17 @@ pub enum SocketReply {
     /// or the total-operation deadline elapsed while a peer kept dribbling
     /// bytes without ever finishing the reply line. The request was still
     /// sent.
+    ///
+    /// For `delegate` this is the pre-response contract: the verb was
+    /// fire-and-forget before the daemon answered it at all, so a daemon that
+    /// does not answer must stay a success — handed to the socket,
+    /// unverifiable — rather than becoming a phantom failure on every
+    /// mixed-version pair. It is deliberately NOT "delivered": a daemon killed
+    /// between accept and read also lands here.
     NoReply,
     /// Could not connect to the daemon, or failed while writing — the
-    /// request was never sent.
+    /// request was never sent. The only case a caller may report as "not
+    /// delivered".
     Unreachable,
 }
 
@@ -1359,6 +1443,72 @@ mod tests {
 
     /// Serialize env-var-mutating tests to avoid races.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Issue #424: a launcher's Claude-shaped `SessionStart` can declare that it
+    /// is a BOOTSTRAP, and that declaration has to survive the hook builder —
+    /// the whole incoming `metadata` object used to be discarded here, which is
+    /// what made a launcher indistinguishable from an initialized session.
+    #[test]
+    fn session_start_origin_survives_the_claude_hook_builder() {
+        let origin_payload = |event: &str, value: &str| {
+            let mut extra = HashMap::new();
+            extra.insert(
+                "metadata".to_string(),
+                serde_json::json!({ crate::event::SESSION_START_ORIGIN_METADATA_KEY: value }),
+            );
+            ClaudeCodeHookInput {
+                session_id: "bootstrap-pane-1".into(),
+                hook_event_name: event.into(),
+                cwd: None,
+                tool_name: None,
+                tool_input: None,
+                tool_use_id: None,
+                prompt: None,
+                _extra: extra,
+            }
+        };
+
+        let launcher = build_event(origin_payload(
+            "SessionStart",
+            crate::event::WRAPPER_FORK_SESSION_START_ORIGIN,
+        ))
+        .expect("SessionStart maps to an event");
+        assert!(
+            launcher.is_wrapper_fork_session_start(),
+            "a launcher's declared boot provenance must reach the daemon: {:?}",
+            launcher.metadata
+        );
+
+        // Narrow on purpose: only this key, only this value, only on a
+        // `SessionStart`. Everything else stays ignored, so an arbitrary
+        // producer cannot push free-form metadata through the hook builder.
+        let unknown_value = build_event(origin_payload("SessionStart", "something-else"))
+            .expect("SessionStart maps to an event");
+        assert!(!unknown_value.is_wrapper_fork_session_start());
+        assert!(unknown_value.metadata.is_empty());
+        let wrong_event = build_event(origin_payload(
+            "UserPromptSubmit",
+            crate::event::WRAPPER_FORK_SESSION_START_ORIGIN,
+        ))
+        .expect("UserPromptSubmit maps to an event");
+        assert!(!wrong_event.is_wrapper_fork_session_start());
+        assert!(wrong_event.metadata.is_empty());
+
+        // And an ordinary agent's `SessionStart`, which carries no metadata at
+        // all, is still read as a genuine initialized session.
+        let genuine = build_event(ClaudeCodeHookInput {
+            session_id: "real".into(),
+            hook_event_name: "SessionStart".into(),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            prompt: None,
+            _extra: HashMap::new(),
+        })
+        .expect("SessionStart maps to an event");
+        assert!(!genuine.is_wrapper_fork_session_start());
+    }
 
     #[test]
     fn pane_id_propagated_from_env_claude_code() {

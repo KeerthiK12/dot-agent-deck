@@ -693,6 +693,70 @@
         }
       }
     },
+    "python314Packages.pyte@0.8.2": {
+      "last_modified": "2026-08-01T16:34:20Z",
+      "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#python314Packages.pyte",
+      "source": "devbox-search",
+      "version": "0.8.2",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/lq1r52ayn9k4sag1zx1d6wsx6rgrkpb5-python3.14-pyte-0.8.2",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/9kx9pwbwbvkx4b8k6rdlfbnmccjjaak3-python3.14-pyte-0.8.2-dist"
+            }
+          ],
+          "store_path": "/nix/store/lq1r52ayn9k4sag1zx1d6wsx6rgrkpb5-python3.14-pyte-0.8.2"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/f3abhwl215kyqw4jf7zp97zadnv88yzw-python3.14-pyte-0.8.2",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/g5xay94ym79bsxxkhrivm692p9n353xc-python3.14-pyte-0.8.2-dist"
+            }
+          ],
+          "store_path": "/nix/store/f3abhwl215kyqw4jf7zp97zadnv88yzw-python3.14-pyte-0.8.2"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/qsand9apm8bj400wxcsdwz0hij708y90-python3.14-pyte-0.8.2",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/0d9mf66bf96gn8xjg466jgg7ag1znwi5-python3.14-pyte-0.8.2-dist"
+            }
+          ],
+          "store_path": "/nix/store/qsand9apm8bj400wxcsdwz0hij708y90-python3.14-pyte-0.8.2"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/q75549krv6vqzva2hyjh58rjvykp6pvk-python3.14-pyte-0.8.2",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/qplpiqaqx3x0ssdc6fqw8ns7d5nha887-python3.14-pyte-0.8.2-dist"
+            }
+          ],
+          "store_path": "/nix/store/q75549krv6vqzva2hyjh58rjvykp6pvk-python3.14-pyte-0.8.2"
+        }
+      }
+    },
     "ripgrep@15.2.0": {
       "last_modified": "2026-08-01T16:34:20Z",
       "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#ripgrep",
