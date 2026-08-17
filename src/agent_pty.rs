@@ -2588,7 +2588,11 @@ struct DelegationCommission {
 /// first of those the completion is genuine and must still be reported as such.
 /// Reading `Nothing` as "unsolicited" would silently mislabel every completion
 /// in every project that has turned the detector off.
-#[derive(Debug, PartialEq, Eq)]
+// `Clone, Copy` for parity with its sibling `state::WorkDoneReportChannel`
+// (issue #448 review, finding 7 minor): both are small plain enums describing one
+// completion, and a caller that has to `match`-and-rebuild one but not the other
+// is an avoidable papercut. No behavioural effect today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkDoneProvenance {
     /// The orchestrator had at least one unanswered delegation to this worker
     /// pane; one is now credited to this completion.
