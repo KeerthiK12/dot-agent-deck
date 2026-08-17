@@ -1,6 +1,5 @@
 pub mod agent_pty;
 pub mod agent_registry;
-pub mod ascii_art;
 pub mod build_id;
 pub mod build_version_handshake;
 pub mod codex_hooks_manage;
@@ -27,7 +26,6 @@ pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod keybindings;
-pub mod llm;
 pub mod login_shell;
 pub mod mode_manager;
 pub mod opencode_manage;
@@ -38,6 +36,7 @@ pub mod pane;
 pub mod pane_input;
 pub mod platform;
 pub mod project_config;
+pub mod prompt_delivery;
 pub mod remote;
 pub mod schedule_cli;
 pub mod scheduler;
@@ -46,6 +45,11 @@ pub mod state;
 pub mod tab;
 pub mod tab_layout;
 pub mod terminal_widget;
+// Issue #322: test-only, and never part of the shipped library. Unit tests in
+// this crate do not link `tests/common/`, so before this they allocated scratch
+// space in the OS temp dir — the RAM-backed `/tmp` the issue is about.
+#[cfg(test)]
+mod test_temp;
 pub mod ui;
 pub mod version;
 pub mod watch;

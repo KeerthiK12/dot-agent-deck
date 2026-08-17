@@ -18,6 +18,15 @@ use std::process::Command;
 
 use spec::spec;
 
+// Issue #322. Fast-tier, and deliberately does NOT link `tests/common/mod.rs`;
+// the ~40-line crate-internal resolver is `#[path]`-included instead, at two
+// extra test executions rather than the harness's ~530. Every fixture here is a
+// real git repository plus its worktrees — structurally unbounded, and the
+// largest shape in the fast tier — so it is exactly what must not land on the
+// RAM-backed `/tmp`. See `docs/develop/e2e-temp-dirs.md`.
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -134,7 +143,7 @@ fn git(dir: &Path, args: &[&str]) {
 impl Fixture {
     /// A real git repo with one commit on `main`, plus a stub `gh` on `PATH`.
     fn new() -> Self {
-        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let scratch = test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
         std::fs::create_dir_all(&repo).expect("create repo dir");
 

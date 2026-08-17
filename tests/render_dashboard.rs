@@ -1952,6 +1952,108 @@ fn density_004_no_trailing_blank_rows() {
     }
 }
 
+/// Turn the fully-populated [`filled_session`] fixture into a long-idle one:
+/// same 3 prompts and 3 tool calls, `Idle` status, and a `last_activity` an
+/// hour in the past. This is exactly the state the removed ASCII-art overlay
+/// used to `Clear` and paint over at Spacious density.
+fn filled_idle_session() -> SessionState {
+    SessionState {
+        status: SessionStatus::Idle,
+        active_tool: None,
+        last_activity: chrono::Utc::now() - chrono::Duration::hours(1),
+        display_name: Some("example-coder".to_string()),
+        ..filled_session()
+    }
+}
+
+/// Scenario: Render a long-idle, fully-populated session card at Spacious
+/// density at the flash-on tick and again at the flash-off tick, and render the
+/// same session at Normal density for comparison. The Spacious card must keep
+/// all of its ordinary content — three prompt lines, three tool lines, the dir
+/// line and the title — and carry an `Idle` badge whose leading dot is inked at
+/// tick 0 and blank at tick 30, exactly as Normal renders it.
+#[spec("dashboard/density/005")]
+#[test]
+fn density_005_spacious_idle_shows_flashing_dot_over_card_content() {
+    // Issue #519: Spacious used to be the ONE density where an idle card could
+    // stop showing card content — `render_session_card` ran `Clear` over the
+    // inner area and painted generated ASCII-art frames on top. That branch is
+    // gone, so all three densities now share the flashing-dot indicator. This
+    // pins the surviving behavior at the density that used to diverge; without
+    // it the only Spacious assertion left is `density_004`'s trailing-blank-row
+    // count, which a re-introduced full-area overlay would still satisfy.
+    let session = filled_idle_session();
+    let width: u16 = 80;
+    let density = CardDensityKind::Spacious;
+
+    let render_at = |tick: u64, density: CardDensityKind| {
+        buffer_to_text(&render_card_to_buffer(
+            &session,
+            Some("example-coder"),
+            Some(1),
+            density,
+            tick,
+            false, // not selected
+            width,
+            density.rendered_height(),
+        ))
+    };
+
+    // `flash_dot` inks the dot for the first half of each 60-tick period and
+    // blanks it for the second, so tick 0 and tick 30 straddle one flash.
+    let flash_on = render_at(0, density);
+    let flash_off = render_at(30, density);
+
+    assert!(
+        flash_on.contains("● Idle"),
+        "Spacious idle card should ink the status dot at the flash-on tick:\n{flash_on}"
+    );
+    assert!(
+        !flash_off.contains("● Idle") && flash_off.contains("Idle"),
+        "Spacious idle card should blank the status dot at the flash-off tick, \
+         keeping the Idle label:\n{flash_off}"
+    );
+
+    // The overlay used to Clear the inner area, so content presence — not just
+    // the badge — is what distinguishes the fallback from a re-introduced art
+    // pane. Spacious is the tier that shows the fixture at full capacity.
+    for (label, rendered) in [("flash-on", &flash_on), ("flash-off", &flash_off)] {
+        for needle in [
+            "first prompt",
+            "second prompt",
+            "third prompt",
+            "Read",
+            "Edit",
+            "Bash",
+            "example-project",
+            "example-coder",
+        ] {
+            assert!(
+                rendered.contains(needle),
+                "{label} Spacious idle card should still show {needle:?}:\n{rendered}"
+            );
+        }
+    }
+
+    // Same indicator as the densities that never had an art path, so the three
+    // tiers cannot drift apart again.
+    assert!(
+        render_at(0, CardDensityKind::Normal).contains("● Idle"),
+        "Normal density should render the same idle indicator as Spacious"
+    );
+    assert!(
+        render_at(0, CardDensityKind::Compact).contains("● Idle"),
+        "Compact density should render the same idle indicator as Spacious"
+    );
+
+    assert_eq!(
+        flash_on.lines().count(),
+        density.rendered_height() as usize,
+        "the Spacious card should occupy exactly its declared height"
+    );
+    insta::assert_snapshot!(flash_on);
+}
+
 /// Replicate `choose_density`'s tier selection using the public
 /// `rendered_height` seam: pick the largest tier whose stacked card rows fit
 /// in `avail`, falling back to Compact. Mirrors `src/ui.rs::choose_density` so

@@ -72,21 +72,6 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Generate ASCII art from session context via LLM
-    Ascii {
-        /// User prompts / session input context
-        #[arg(long)]
-        input: String,
-        /// Agent response / session output context
-        #[arg(long)]
-        output: String,
-        /// LLM provider (overrides config; e.g., anthropic, openai, ollama)
-        #[arg(long)]
-        provider: Option<String>,
-        /// LLM model (overrides config; e.g., claude-haiku-4-5, gpt-4o-mini)
-        #[arg(long)]
-        model: Option<String>,
-    },
     /// Generate a .dot-agent-deck.toml template in the current or specified directory
     Init {
         /// Target directory (defaults to current directory)
@@ -520,12 +505,12 @@ enum HooksAction {
 enum ConfigAction {
     /// Get a configuration value
     Get {
-        /// Configuration key (e.g., default_command, idle_art.provider)
+        /// Configuration key (e.g., default_command, bell.on_idle)
         key: String,
     },
     /// Set a configuration value
     Set {
-        /// Configuration key (e.g., default_command, idle_art.provider)
+        /// Configuration key (e.g., default_command, bell.on_idle)
         key: String,
         /// Value to set
         value: String,
@@ -571,6 +556,102 @@ fn read_task_file(path: &str, mut stdin: impl std::io::Read) -> Result<String, S
         Ok(buf)
     } else {
         std::fs::read_to_string(path).map_err(|e| format!("failed to read task file '{path}': {e}"))
+    }
+}
+
+/// What `dot-agent-deck delegate` should print and exit with, for one daemon
+/// reply. See [`delegate_verdict`].
+#[derive(Debug, PartialEq, Eq)]
+struct DelegateVerdict {
+    /// `true` → `ExitCode::FAILURE`. Under this command's contract that means
+    /// "nothing landed", which is what makes a retry safe.
+    failed: bool,
+    /// Printed to stderr verbatim when set. `None` only for a delegate that
+    /// reached every role it named.
+    message: Option<String>,
+}
+
+/// Parse one line of daemon reply into a [`DelegateResponse`], or `None` when
+/// the line is not a delegate reply this build understands.
+///
+/// PR #466 review: `None` covers BOTH a line that fails to parse and a line that
+/// parses but carries no [`DELEGATE_RESPONSE_KIND`] marker. Every field of
+/// `DelegateResponse` is `#[serde(default)]`, so without the marker check `{}`
+/// and `{"seed":null}` both parse into a pristine "nothing failed" response and
+/// the caller reports success it has no evidence for. Callers treat `None` as
+/// [`dot_agent_deck::hook::SocketReply::NoReply`] — delivered, unverifiable.
+fn parse_delegate_reply(line: &str) -> Option<dot_agent_deck::event::DelegateResponse> {
+    serde_json::from_str::<dot_agent_deck::event::DelegateResponse>(line)
+        .ok()
+        .filter(|r| r.is_delegate_reply())
+}
+
+/// Decide what `delegate` reports for a daemon reply it does understand.
+///
+/// Pure, and separate from the `Delegate` arm, so the contract below is pinned
+/// by unit tests in this file — the tier that actually gates a merge. The e2e
+/// assertions that cover it live in `tests/e2e_dispatcher_mode.rs`, which CI
+/// compiles to nothing (`#![cfg(feature = "e2e")]` + no `--features e2e` in any
+/// build job), so a refactor that made the rejection silent again would
+/// otherwise pass every gate (PR #466 review).
+///
+/// Three outcomes, and the middle one is the whole point:
+///
+/// * `error` — routing failed outright, nothing was dispatched. **Failure.**
+/// * `unresolved_roles` with an EMPTY `delivered` — every named role missed.
+///   **Failure**, and the message must not assert a cause it has not
+///   established: a role can be missing from the toml, BE the sending
+///   orchestrator (which `delegate_targets` excludes by design), or have had its
+///   worker pane closed. "Check the role names" is right for only the first.
+/// * `unresolved_roles` with a NON-EMPTY `delivered` — the delegate HALF landed.
+///   **Not a failure**: the task really is in the delivered panes' PTYs and
+///   their idle-worker records are armed, so an orchestrator applying the
+///   contract "non-zero ⇒ it did not land" would retry and dispatch those panes
+///   a second time, arming two records for one pane. The message names both
+///   sides so a retry can be aimed at just the roles that missed.
+fn delegate_verdict(
+    pane_id: &str,
+    resp: &dot_agent_deck::event::DelegateResponse,
+) -> DelegateVerdict {
+    if let Some(error) = resp.error.as_deref() {
+        return DelegateVerdict {
+            failed: true,
+            message: Some(format!(
+                "Error: delegate from pane {pane_id} failed: {error}"
+            )),
+        };
+    }
+    if resp.unresolved_roles.is_empty() {
+        return DelegateVerdict {
+            failed: false,
+            message: None,
+        };
+    }
+    let unresolved = resp.unresolved_roles.join(", ");
+    // The three causes, stated as the three causes rather than as the one that
+    // happens to be most common.
+    let causes = "(A role reaches no worker when it is absent from \
+                  .dot-agent-deck.toml, when it is the delegating orchestrator \
+                  itself — an orchestrator cannot delegate to itself — or when \
+                  its worker pane has been closed.)";
+    if resp.delivered.is_empty() {
+        return DelegateVerdict {
+            failed: true,
+            message: Some(format!(
+                "Error: delegate from pane {pane_id} reached no worker for role(s): \
+                 {unresolved}. No role in this orchestration received it. {causes}"
+            )),
+        };
+    }
+    DelegateVerdict {
+        failed: false,
+        message: Some(format!(
+            "Warning: delegate from pane {pane_id} reached no worker for role(s): \
+             {unresolved}. It WAS delivered to: {}. Retry only the roles that \
+             missed — re-sending the whole delegate would dispatch the delivered \
+             roles a second time. {causes}",
+            resp.delivered.join(", ")
+        )),
     }
 }
 
@@ -657,28 +738,6 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Some(Commands::Ascii {
-            input,
-            output,
-            provider,
-            model,
-        }) => {
-            let config = DashboardConfig::load();
-            let mut idle_art = config.idle_art;
-            if let Some(p) = provider {
-                idle_art.provider = p;
-            }
-            if let Some(m) = model {
-                idle_art.model = m;
-            }
-            match run_ascii(&input, &output, &idle_art) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         Some(Commands::Config { action }) => match action {
             ConfigAction::Get { key } => {
                 let config = DashboardConfig::load();
@@ -735,6 +794,11 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // Kept for the error messages below — the signal is moved into the
+            // wire message, and a failure has to name the pane and the roles it
+            // could not reach.
+            let pane_id_for_report = pane_id.clone();
+            let signal_roles = to.clone();
             let signal = dot_agent_deck::event::DelegateSignal {
                 pane_id,
                 task,
@@ -749,11 +813,51 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
-                eprintln!("Failed to send delegate signal to daemon socket.");
-                return ExitCode::FAILURE;
+            // A REQUEST, not a fire-and-forget send. The daemon is the only place
+            // that knows whether this delegate resolved to a worker, and until it
+            // answered, `delegate` printed nothing and exited 0 no matter what
+            // happened on the other side — so an orchestrator whose delegation was
+            // dropped announced that its worker was working and then waited
+            // forever for a `work-done` that could not arrive.
+            //
+            // `send_and_await_reply`, not `request_from_socket`: the latter folds
+            // "no daemon" and "old daemon that does not answer this verb" into one
+            // `None`, and those must not be reported the same way — the first is a
+            // real failure, the second has to stay a success or every delegate
+            // against an older daemon reports a phantom error.
+            use dot_agent_deck::hook::SocketReply;
+            let line = match dot_agent_deck::hook::send_and_await_reply(&json) {
+                SocketReply::Unreachable => {
+                    eprintln!(
+                        "Error: could not reach the dot-agent-deck daemon socket, so the \
+                         delegate to {} was NOT delivered.",
+                        signal_roles.join(", ")
+                    );
+                    return ExitCode::FAILURE;
+                }
+                // Handed to the socket of a daemon that answered nothing
+                // readable in `DELEGATE_REPLY_TIMEOUT` — usually one predating
+                // this response. Pre-response contract: unverifiable, and the
+                // caller must not turn that into a phantom failure. See
+                // `SocketReply::NoReply`.
+                SocketReply::NoReply => return ExitCode::SUCCESS,
+                SocketReply::Line(line) => line,
+            };
+            let Some(resp) = parse_delegate_reply(&line) else {
+                // Same reasoning as `NoReply`: a line we cannot parse — or one
+                // that never identifies itself as a delegate reply — is a daemon
+                // we do not understand, not a proven failure.
+                return ExitCode::SUCCESS;
+            };
+            let verdict = delegate_verdict(&pane_id_for_report, &resp);
+            if let Some(message) = verdict.message {
+                eprintln!("{message}");
             }
-            ExitCode::SUCCESS
+            if verdict.failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Some(Commands::Dispatch {
             name,
@@ -2022,23 +2126,6 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-#[tokio::main]
-async fn run_ascii(
-    input: &str,
-    output: &str,
-    config: &dot_agent_deck::config::IdleArtConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let result = dot_agent_deck::ascii_art::generate_ascii_art(input, output, config).await?;
-    for (i, frame) in result.frames.iter().enumerate() {
-        if i > 0 {
-            println!("---FRAME---");
-        }
-        print!("{frame}");
-    }
-    println!();
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2410,5 +2497,115 @@ mod tests {
             clap::error::ErrorKind::ArgumentConflict,
             "expected a clap ArgumentConflict, got: {err}"
         );
+    }
+
+    // ---- PR #466 review: what `delegate` reports for a daemon reply --------
+    //
+    // The e2e assertions that cover this (`orchestration/dispatch/001`) live
+    // behind `#![cfg(feature = "e2e")]`, and no CI build job passes
+    // `--features e2e`, so they compile to nothing where it counts. These pin
+    // the same contract in the tier that gates a merge.
+
+    use dot_agent_deck::event::{DELEGATE_RESPONSE_KIND, DelegateResponse};
+
+    fn reply(delivered: &[&str], unresolved: &[&str], error: Option<&str>) -> DelegateResponse {
+        DelegateResponse {
+            delivered: delivered.iter().map(|s| s.to_string()).collect(),
+            unresolved_roles: unresolved.iter().map(|s| s.to_string()).collect(),
+            error: error.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn delegate_verdict_reports_a_full_delivery_silently() {
+        let v = delegate_verdict("pane-1", &reply(&["coder", "tester"], &[], None));
+        assert!(!v.failed, "every named role resolved — this is a success");
+        assert_eq!(v.message, None, "a clean delegate prints nothing");
+    }
+
+    #[test]
+    fn delegate_verdict_fails_a_routing_error() {
+        let v = delegate_verdict("xcaller", &reply(&[], &[], Some("no orchestration role")));
+        assert!(v.failed, "a routing error means nothing was dispatched");
+        let msg = v.message.expect("a routing error must be reported");
+        assert!(
+            msg.contains("xcaller") && msg.contains("no orchestration role"),
+            "the message must name the pane and the daemon's reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn delegate_verdict_fails_when_nothing_landed() {
+        let v = delegate_verdict("pane-1", &reply(&[], &["ghost"], None));
+        assert!(v.failed, "no role received the task — non-zero is correct");
+        let msg = v.message.expect("an unreached delegate must be reported");
+        assert!(
+            msg.contains("ghost"),
+            "the message must name the role that missed: {msg}"
+        );
+        // The three causes, not the one that happens to be most common: the
+        // old message told the user to go check role names in the toml even
+        // when the role was sitting there correctly and was simply the
+        // orchestrator itself, or had had its worker pane closed.
+        assert!(
+            msg.contains(".dot-agent-deck.toml")
+                && msg.contains("orchestrator cannot delegate to itself")
+                && msg.contains("worker pane has been closed"),
+            "the message must state all three causes, not assert one: {msg}"
+        );
+    }
+
+    // THE blocker of the PR #466 review. `--to coder --to tester` with only a
+    // `coder` pane really does write the task into the coder's PTY and arm its
+    // idle-worker record. Reporting that as a failure invites the orchestrator
+    // to retry — under this command's own new contract, non-zero means it did
+    // not land — and the coder gets the same task twice, arming two records for
+    // one pane.
+    #[test]
+    fn delegate_verdict_does_not_fail_a_partial_delivery() {
+        let v = delegate_verdict("pane-1", &reply(&["coder"], &["tester"], None));
+        assert!(
+            !v.failed,
+            "a delegate that half landed must NOT exit non-zero: a retry would \
+             dispatch `coder` a second time"
+        );
+        let msg = v
+            .message
+            .expect("a partial delivery must still be reported");
+        assert!(
+            msg.contains("tester") && msg.contains("coder"),
+            "a partial delivery must name BOTH what missed and what landed, or \
+             a retry cannot be aimed safely: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_delegate_reply_requires_the_delegate_marker() {
+        let good = serde_json::to_string(&reply(&["coder"], &[], None)).expect("serialize");
+        assert!(
+            good.contains(DELEGATE_RESPONSE_KIND),
+            "the daemon's own reply must carry the marker: {good}"
+        );
+        let parsed = parse_delegate_reply(&good).expect("a real delegate reply must parse");
+        assert_eq!(parsed.delivered, vec!["coder".to_string()]);
+
+        // Every field is `#[serde(default)]`, so each of these DESERIALIZES
+        // fine and yields a pristine "nothing failed" response. Accepting one
+        // is how the verb whose purpose is answering "did this land?" answers
+        // yes when it cannot tell.
+        for line in [
+            "{}",
+            r#"{"seed":null}"#,
+            r#"{"kind":"get-seed"}"#,
+            "",
+            "not json",
+        ] {
+            assert!(
+                parse_delegate_reply(line).is_none(),
+                "a reply that does not identify itself as a delegate response \
+                 must be treated as unverifiable, not as success: {line}"
+            );
+        }
     }
 }

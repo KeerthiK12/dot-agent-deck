@@ -84,10 +84,6 @@ The overlay always builds against *your* nixpkgs, never the pinned one, so that 
     settings = {
       default_command = "claude";
       worker_response_timeout_minutes = 90;
-      idle_art = {
-        enabled = true;
-        provider = "anthropic";
-      };
     };
 
     # ~/.config/dot-agent-deck/keybindings.toml

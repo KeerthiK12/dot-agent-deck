@@ -4,13 +4,39 @@ This note exists because the "a pane reads `Working` while its agent's shell com
 
 ## What the signal actually tests
 
-The daemon's `run_shell_activity_monitor` (`src/daemon.rs`) polls every live pane every 500 ms. For each pane it samples the whole process table once (`process_table()` — one `ps -A -w -w -o pid=,ppid=,tty=,args=` per poll cycle, parsed once and reused across panes) and hands it to `descendant_shell_activity()` (`src/platform/proc/scan.rs`), which walks the pane's PTY child's transitive descendants and asks one structural question per candidate:
+The daemon's `run_shell_activity_monitor` (`src/daemon.rs`) polls every live pane every 500 ms. Each tick first resolves the candidate panes under the registry lock (`AgentPtyRegistry::shell_activity_candidates`), then — only if there is at least one — samples the whole process table once (one `ps -A -w -w -o pid=,ppid=,tty=,args=` per poll cycle, parsed once and reused across panes) and hands it to `descendant_shell_activity()` (`src/platform/proc/scan.rs`), which walks the pane's PTY child's transitive descendants and asks one structural question per candidate:
 
 > is this descendant in a **different POSIX session** than the agent — `getsid(descendant) != getsid(agent_pid)`?
 
 That is the whole primary test. It reads no argv and no controlling-terminal flag, and it compares against the *agent's own* session id rather than any constant, which is what keeps it meaningful in a container where the agent itself has no controlling terminal (a bare "descendant has no tty" test matches everything there and pins every pane at `Working` — see PRD #386's "CI trap" section).
 
 It answers correctly for exactly one reason: **Claude Code `setsid`-detaches its Bash-tool child into a session of its own**, while every other child of the agent — MCP servers, `caffeinate`, plugins — stays in the agent's session on the pane's tty. Measured on 2026-08-06 against Claude Code 2.1.220.
+
+## What the sample costs, and the two guards around it
+
+The `ps` sample is the expensive part of the mechanism, and the number matters for PRD #386's M5 (the cadence, and the Route A `ps` vs. Route B native-enumeration question). Measured on an idle 16-core Linux box with ~620 processes, release build, 40 samples:
+
+| | per sample | duty cycle at 2 Hz |
+|---|---|---|
+| Wall time | ~49 ms | ~10% of one core |
+| Our own CPU (`getsid` loop + parse) | ~1.4 ms | ~0.3% of one core |
+
+The gap between the two rows is the whole story: ~97% of the cost is the `ps` child's own work and the wait on it, not anything this process computes. Two consequences shaped the code (issues #493 and #429).
+
+**The sample is conditional.** `process_table()` used to be the first statement of `shell_foreground_busy_snapshot`, so the cost above was paid unconditionally — a daemon with zero panes forked `ps -A` twice a second to classify nobody, and the daemon's idle shutdown does not bound that (it requires no clients **and** no agents, so a TUI attached with no panes polls forever). Resolving the candidates first makes the sample conditional on there being something to classify. Note the ordering constraint this had to respect: the original sample-first ordering existed so no fork/exec ever ran while the registry lock — which TUI-facing paths also take — was held. That property is now preserved by *dropping* the lock before sampling, which is why `ShellActivityCandidate` carries owned data (including the pane's `shell_pid`) rather than borrowing from the registry.
+
+**The sample is awaited and bounded.** In the daemon it goes through `process_table_async()` (tokio `Command`, `kill_on_drop`) under a 2-second `tokio::time::timeout`. Synchronously blocking on it held a Tokio worker thread for the ~49 ms above every 500 ms, and indefinitely if `ps` wedged in D-state on a stuck filesystem — stalling hook ingestion, client requests and daemon shutdown behind a status signal. `spawn_blocking` is *not* the fix: it relocates the stall to the blocking pool, and because a `timeout` around a `spawn_blocking` handle does not cancel the thread, a permanently-wedged `ps` at 2 Hz would leak one pool thread per tick up to the 512-thread cap. Awaiting an async child frees the worker and makes the deadline real.
+
+**The deadline bounds the wait, not the child.** This distinction is easy to get backwards and the natural-looking version is wrong. `timeout(d, sample())` followed by dropping the expired future would abandon the `ps` and start a fresh one next tick — but a process in uninterruptible sleep does not act on the `SIGKILL` that `kill_on_drop` sends until it leaves D-state, so the abandoned `ps` stays on the process table and the retry adds another one every 2.5 s (~24/minute), turning a stalled signal into a pid leak. The monitor instead **retains** the overrunning future and re-awaits it on the following tick, which holds the invariant that *at most one `ps` child exists at a time*. Retention is unconditional, including on a tick with no candidates (which simply does not poll it): dropping it there looks tidier but reopens the accumulation path through pane churn, and a paneless daemon starts no sample at all anyway. A sample that answers "failed" is finished, so it is dropped and the next tick starts fresh. The overrun is logged once per wedged sample, not once per tick.
+
+**A retained sample is trusted only while its table is fresh, and only about the panes it could have seen.** Retention is what makes a *late* answer possible, so it needs two guards of its own, and the failure they prevent is the same one in both cases: a pid is only a name for a process *at a moment*, and a table taken at one moment being applied at another can attribute one process's descendants to a different pane. Under pid reuse that is exactly what happens, and it is worse than it sounds, because the monitor's `last_known` has no entry for a newly-appeared pane — so the wrong reading is a transition, and emits immediately rather than being swallowed as a non-change.
+
+- **Freshness.** `MAX_TABLE_AGE` (3 s) is compared against the sample's start; an older answer is discarded rather than classified. Without it, a wedge that outlasts every pane and then recovers would classify today's pids against a table from before they existed. A healthy sample answers in ~49 ms and a heavily loaded one in a few hundred, so this never trips in normal operation.
+- **Identity.** A bound is not an identity check: a pane can be replaced *inside* the 3 s window. So on the resumed path the monitor classifies only panes whose `(pane_id, shell_pid)` pair is unchanged since the sample began. A respawn in the same slot keeps the pane id but takes a new pid; a fresh pane brings a new pane id — either way the pair differs and the pane waits for the next sample, which is the honest answer, since this table predates it. A sample started on the current tick has an identical set by construction, so the common path pays nothing.
+
+Discarding an *answered* sample is free and cannot accumulate — that child is already finished, unlike an abandoned un-answered one. That is why these guards do not conflict with the retention above: retention refuses to abandon an *un-answered* sample; these refuse to believe an *answered* one that has aged out or is being asked about the wrong pane.
+
+**A timed-out sample means "no opinion", never "not busy".** This is the one decision in the monitor that is not recoverable from the code, so it is commented at the call site. A wedged `ps` says nothing about the panes; they are exactly as busy as they were a moment earlier. Reading a blown deadline as `Some(false)` would synthesize a `ShellIdle` for every live pane and flip them all to `Idle` — the stale-`Idle` bug this whole mechanism exists to fix, reintroduced with a new trigger. Both a failed and a timed-out sample therefore skip the tick entirely, leaving the monitor's `last_known` edge-detection map untouched (clearing it would make every pane look new on the next good sample and re-emit a spurious edge for each one). A timeout logs a warning; that log line is the only trace such a tick leaves.
 
 ## Failure mode 1 — Claude Code stops `setsid`-ing: a total, silent false negative
 
@@ -38,7 +64,7 @@ Only **Claude Code's** shell-tool shape was ever measured. Codex, OpenCode, Pi a
 
 **The failure mode to watch for across all of them is silence, not noise.** A pane that never reads `Working` during a long command looks identical to a pane that had nothing to run. There is no log line, no metric, and no test that fails.
 
-Two smaller gaps belong in the same list. On **Windows** `process_table()` returns `None` unconditionally, so the signal never fires there at all — a documented gap, not a bug. And if Linux **sandboxing** (bwrap / PID namespaces) is ever enabled for the Bash tool, the payload runs in its own PID namespace and a host-side descendant walk may not enumerate it; neither predicate is known to survive that, and it needs its own measurement before anyone relies on it.
+Two smaller gaps belong in the same list. On **Windows** both `process_table()` and its async twin return `None` unconditionally, so the signal never fires there at all — a documented gap, not a bug. And if Linux **sandboxing** (bwrap / PID namespaces) is ever enabled for the Bash tool, the payload runs in its own PID namespace and a host-side descendant walk may not enumerate it; neither predicate is known to survive that, and it needs its own measurement before anyone relies on it.
 
 ## The argv cross-check is a per-agent veto, not the signal
 
@@ -47,7 +73,7 @@ The Bash-tool **argv shape** (`shell-snapshots/snapshot-` plus `&& eval `, with 
 It is applied as a **veto**: a structurally-busy candidate is discarded unless it also matches one of the shapes it was handed. Which shapes a pane gets is selected **per agent kind**, not globally:
 
 - `crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES` is the catalog of shapes actually measured — today exactly `[CLAUDE_BASH_TOOL_SHAPE]`. The daemon passes the whole catalog and decides nothing itself.
-- `AgentPtyRegistry::shell_foreground_busy_snapshot` selects from it per pane via `shell_tool_shape_key` (`src/agent_pty.rs`), keyed on `RunningAgent::agent_type`: `AgentType::ClaudeCode` → the measured Claude shape; **everything else, including `None` → `&[]`**, i.e. the structural session-id test alone.
+- `AgentPtyRegistry::shell_activity_candidates` selects from it per pane via `shell_tool_shape_key` (`src/agent_pty.rs`), keyed on `RunningAgent::agent_type`: `AgentType::ClaudeCode` → the measured Claude shape; **everything else, including `None` → `&[]`**, i.e. the structural session-id test alone. It happens there because the pane's agent kind is only visible under the registry lock, so that is the one place the selection can be made.
 - `None` maps to `&[]` deliberately rather than to "assume Claude". A pane spawned through a launcher (`devbox run codex-big`) carries `agent_type == None` because `AgentType::from_command` cannot see through the launcher, so treating unknown as Claude would apply Claude's argv veto to exactly the panes least likely to carry it — turning an unmeasured agent into a silent false negative, which is failure mode 1 by construction.
 
 If you add a per-agent shape, add it to the catalog **and** to `shell_tool_shape_key`, and only after measuring it against that agent — an invented shape is a veto that silently kills the signal for the agent it claims to support.

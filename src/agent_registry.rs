@@ -121,12 +121,10 @@ pub struct AgentSpec {
 // module's signature to the spec's handler shape. Keeping them here (as the
 // values the statics point at) is what makes dispatch spec-resolved.
 fn claude_install() -> Result<(), String> {
-    crate::hooks_manage::install();
-    Ok(())
+    crate::hooks_manage::install()
 }
 fn claude_uninstall() -> Result<(), String> {
-    crate::hooks_manage::uninstall();
-    Ok(())
+    crate::hooks_manage::uninstall()
 }
 fn opencode_install() -> Result<(), String> {
     crate::opencode_manage::install().map_err(|e| e.to_string())
@@ -153,7 +151,7 @@ fn codex_install() -> Result<(), String> {
         .ok_or_else(|| "no Codex home resolves (CODEX_HOME and HOME are both unset)".to_string())?;
     let binary_path = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "dot-agent-deck".into());
+        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
     crate::codex_hooks_manage::install_to(&home, &binary_path).map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
     if let Err(e) = crate::codex_hooks_manage::trust_deck_hooks_in(&home, &cwd) {
