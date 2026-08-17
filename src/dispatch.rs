@@ -229,6 +229,13 @@ pub struct DispatchContext {
     /// rather than read here so [`handle_dispatch`] does not depend on global
     /// config. See [`resolve_single_agent_command`].
     pub default_command: Option<String>,
+    /// The daemon's [`AppState`](crate::state::AppState), so a dispatched
+    /// ORCHESTRATION's role panes are registered in the maps `handle_delegate`
+    /// routes on. Without it the dispatch produces an orchestrator that has been
+    /// handed a delegation protocol it cannot use — see
+    /// [`crate::state::AppState::register_orchestration_role`]. `None` in unit
+    /// tests, which assert on the worktree/spawn result rather than on routing.
+    pub state: Option<crate::state::SharedState>,
 }
 
 /// Translate the wire choice into the spawn-side override.
@@ -351,7 +358,16 @@ pub async fn handle_dispatch(
 
     let notifier = StderrNotifier;
 
-    match spawn(req, &ctx.registry, &notifier, Some(&ctx.event_tx), false).await {
+    match spawn(
+        req,
+        &ctx.registry,
+        &notifier,
+        Some(&ctx.event_tx),
+        false,
+        ctx.state.as_ref(),
+    )
+    .await
+    {
         Ok(handle) => DispatchResult {
             worktree_dir: paths.worktree_dir.clone(),
             success: true,
@@ -423,6 +439,12 @@ pub async fn handle_dispatch(
     }
 }
 
+// Issue #322: every scratch dir here goes through `crate::test_temp::tempdir()`
+// rather than a bare `tempfile::tempdir()`. These tests build real git repos and
+// real worktrees — the e2e-gated one below was measured holding a live 184 KiB
+// `/tmp/.tmpYN3lNF` during a recorded `cargo test-e2e` — and the lib target does
+// not link `tests/common/`, so nothing else moves them off the RAM-backed `/tmp`.
+// `linkage-check` rule 8 covers this file, so a bare constructor cannot come back.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,7 +528,7 @@ mod tests {
     /// which would blame a worktree the user can see is already gone.
     #[tokio::test]
     async fn second_dispatch_of_a_name_reports_branch_exists_after_cleanup() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_repo(&repo);
         let paths = derive_dispatch_paths(&repo, "fix-auth");
@@ -537,7 +559,7 @@ mod tests {
     /// path the refusal message tells the user about.
     #[tokio::test]
     async fn deleting_the_leftover_branch_frees_the_name() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_repo(&repo);
         let paths = derive_dispatch_paths(&repo, "fix-auth");
@@ -565,7 +587,7 @@ mod tests {
     /// over cleanup — the tree stays so the user can recover it.
     #[tokio::test]
     async fn keep_if_dirty_preserves_a_worktree_with_uncommitted_work() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_repo(&repo);
         let paths = derive_dispatch_paths(&repo, "unit");
@@ -588,7 +610,7 @@ mod tests {
     /// This is the exact regression that dropping `--force` introduced.
     #[tokio::test]
     async fn force_removes_a_dirty_worktree_so_the_slot_is_reclaimable() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_repo(&repo);
         let worktree_dir = repo.join(".worktrees").join("issue-7");
@@ -743,13 +765,13 @@ mod tests {
         );
 
         // Genuinely none: no config file at all.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_temp::tempdir().unwrap();
         let none = list_targets_response(Some(tmp.path()));
         assert!(none.error.is_none(), "an absent config is not an error");
         assert!(none.rendered.contains("No orchestrations are defined here"));
 
         // Broken config: named, and flagged as an error.
-        let bad = tempfile::tempdir().unwrap();
+        let bad = crate::test_temp::tempdir().unwrap();
         std::fs::write(
             bad.path().join(".dot-agent-deck.toml"),
             "[[orchestrations]]\nname = \"unterminated\n",
@@ -764,7 +786,7 @@ mod tests {
         assert!(broken.rendered.contains(".dot-agent-deck.toml"));
 
         // Present and parseable: listed structurally as well as rendered.
-        let good = tempfile::tempdir().unwrap();
+        let good = crate::test_temp::tempdir().unwrap();
         std::fs::write(
             good.path().join(".dot-agent-deck.toml"),
             "[[orchestrations]]\nname = \"digest\"\n\n\
@@ -796,7 +818,7 @@ mod tests {
     #[cfg(feature = "e2e")]
     #[tokio::test]
     async fn an_orchestration_dispatch_writes_the_delegation_protocol_and_the_task() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_repo(&repo);
         std::fs::write(
@@ -825,6 +847,9 @@ mod tests {
             event_tx,
             worktrees: new_worktree_registry(),
             default_command: None,
+            // These unit tests assert on the worktree + spawn shape, not on
+            // delegate routing (`orchestration/dispatch/001` owns that).
+            state: None,
         };
 
         let result = handle_dispatch(
@@ -883,7 +908,7 @@ mod tests {
     /// failure.
     #[tokio::test]
     async fn an_unknown_orchestration_name_is_refused_without_creating_a_worktree() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_repo(&repo);
 
@@ -894,6 +919,9 @@ mod tests {
             event_tx,
             worktrees: new_worktree_registry(),
             default_command: None,
+            // These unit tests assert on the worktree + spawn shape, not on
+            // delegate routing (`orchestration/dispatch/001` owns that).
+            state: None,
         };
         let result = handle_dispatch(
             &ctx,

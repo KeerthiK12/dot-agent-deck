@@ -18,5 +18,22 @@ regex = "1"
 syn = { version = "3", features = ["full", "parsing"] }
 xtask-docs = { path = "../docs" }
 
+# `clean-e2e-tmp` needs two libc calls that have no std equivalent:
+#
+# - `geteuid(2)` (issue #322) scopes the harness's private `/var/tmp` parent to
+#   the effective UID, and proves that parent is really this user's before
+#   anything under it is deleted.
+# - `kill(pid, 0)` (issue #461) decides ownership by liveness — the only call
+#   that distinguishes "no such process" (ESRCH, dead) from "not yours" (EPERM,
+#   alive).
+#
+# `libc` is already a workspace dependency at the same version and gating (the
+# root package declares it under `[target.'cfg(unix)'.dependencies]`), so this
+# pulls no new crate into Cargo.lock. Unix-only: every `libc::` reference is
+# behind `#[cfg(unix)]`, the whole `/var/tmp` rung is `cfg(unix)`-gated to match
+# the harness, and non-Unix targets fall back to the age rule.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
