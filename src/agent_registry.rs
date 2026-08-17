@@ -124,8 +124,7 @@ fn claude_install() -> Result<(), String> {
     crate::hooks_manage::install()
 }
 fn claude_uninstall() -> Result<(), String> {
-    crate::hooks_manage::uninstall();
-    Ok(())
+    crate::hooks_manage::uninstall()
 }
 fn opencode_install() -> Result<(), String> {
     crate::opencode_manage::install().map_err(|e| e.to_string())

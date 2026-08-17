@@ -12,6 +12,18 @@
 //! explicit-settings-path seam `codex_hooks_safety.rs` uses for the sibling
 //! Codex matcher — against a `tempfile` settings.json fixture. No `$HOME`
 //! manipulation, no spawned processes.
+//!
+//! `_013` onwards widen the remit from *which rule is ours* to *what the deck
+//! is allowed to do to a file it does not own* — the same family of defect seen
+//! from the other end. `~/.claude/settings.json` belongs to the user and holds
+//! their `model`, `env` and `permissions` alongside the deck's hooks, so every
+//! one of these pins a property of the form "the user's own content is still
+//! there afterwards": #516/#522 (a file the deck cannot parse is never
+//! rewritten, on install *and* uninstall), #535 (a user command co-located in
+//! one rule object with the deck's is never deleted along with it), and #534
+//! (the publish is a same-directory temp + `rename`, so a concurrent reader
+//! never sees a truncated file and a crash mid-write leaves the original
+//! intact).
 
 use std::path::{Path, PathBuf};
 
@@ -103,11 +115,11 @@ fn hook_rule_identification_001_repeated_install_renamed_binary_stays_single_rul
     let (_dir, path) = settings_path();
     let binary = "/opt/tools/worker-agent-deck";
 
-    install_to(&path, binary);
+    install_to(&path, binary).expect("install");
     let after_one = total_rule_count(&read_settings(&path));
 
-    install_to(&path, binary);
-    install_to(&path, binary);
+    install_to(&path, binary).expect("install");
+    install_to(&path, binary).expect("install");
     let after_three = total_rule_count(&read_settings(&path));
 
     assert_eq!(
@@ -130,8 +142,8 @@ fn hook_rule_identification_002_uninstall_removes_rules_written_under_renamed_bi
     let (_dir, path) = settings_path();
     let binary = "/opt/tools/worker-agent-deck";
 
-    install_to(&path, binary);
-    uninstall_from(&path);
+    install_to(&path, binary).expect("install");
+    uninstall_from(&path).expect("uninstall");
 
     let settings = read_settings(&path);
     assert_eq!(
@@ -146,8 +158,8 @@ fn hook_rule_identification_002_uninstall_removes_rules_written_under_renamed_bi
 fn hook_rule_identification_003_distinct_binaries_each_keep_their_own_rule() {
     let (_dir, path) = settings_path();
 
-    install_to(&path, "/a/dot-agent-deck");
-    install_to(&path, "/b/other-deck-name");
+    install_to(&path, "/a/dot-agent-deck").expect("install");
+    install_to(&path, "/b/other-deck-name").expect("install");
 
     let after_two = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
@@ -156,7 +168,7 @@ fn hook_rule_identification_003_distinct_binaries_each_keep_their_own_rule() {
         "two genuinely different deck binaries must each keep their own rule; got {after_two:?}"
     );
 
-    install_to(&path, "/a/dot-agent-deck");
+    install_to(&path, "/a/dot-agent-deck").expect("install");
     let after_reinstall = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         after_reinstall.len(),
@@ -179,14 +191,14 @@ fn hook_rule_identification_004_user_hook_mentioning_name_is_never_deleted() {
         }),
     );
 
-    install_to(&path, "/opt/tools/worker-agent-deck");
+    install_to(&path, "/opt/tools/worker-agent-deck").expect("install");
     let after_install = rule_commands(&read_settings(&path), "PreToolUse");
     assert!(
         after_install.contains(&user_command.to_string()),
         "a user hook that merely mentions dot-agent-deck must survive install; got {after_install:?}"
     );
 
-    uninstall_from(&path);
+    uninstall_from(&path).expect("uninstall");
     let after_uninstall = rule_commands(&read_settings(&path), "PreToolUse");
     assert!(
         after_uninstall.contains(&user_command.to_string()),
@@ -208,7 +220,7 @@ fn hook_rule_identification_005_unrelated_command_ending_in_hook_is_never_delete
         }),
     );
 
-    install_to(&path, "/opt/tools/worker-agent-deck");
+    install_to(&path, "/opt/tools/worker-agent-deck").expect("install");
     let after_install = rule_commands(&read_settings(&path), "PreToolUse");
     for command in unrelated {
         assert!(
@@ -217,7 +229,7 @@ fn hook_rule_identification_005_unrelated_command_ending_in_hook_is_never_delete
         );
     }
 
-    uninstall_from(&path);
+    uninstall_from(&path).expect("uninstall");
     let after_uninstall = rule_commands(&read_settings(&path), "PreToolUse");
     for command in unrelated {
         assert!(
@@ -252,7 +264,7 @@ fn hook_rule_identification_006_legacy_rule_is_recognised_and_replaced() {
     // Deliberately a binary name that does not "look" deck-ish at all — proving
     // migration is driven by the legacy RULE's own name, not by whether the
     // installing binary resembles one.
-    install_to(&path, "/usr/local/bin/foo-tool");
+    install_to(&path, "/usr/local/bin/foo-tool").expect("install");
 
     let rules = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
@@ -277,7 +289,7 @@ fn hook_rule_identification_007_old_flat_format_rule_is_recognised() {
         }),
     );
 
-    uninstall_from(&path);
+    uninstall_from(&path).expect("uninstall");
 
     let remaining = read_settings(&path)["hooks"]["PreToolUse"]
         .as_array()
@@ -307,7 +319,7 @@ fn hook_rule_identification_008_spaced_binary_path_round_trips() {
     #[cfg(windows)]
     let expected_command = "\"/Applications/My Deck/dot-agent-deck\" hook --agent claude-code";
 
-    install_to(&path, binary);
+    install_to(&path, binary).expect("install");
     let after_one = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         after_one,
@@ -316,7 +328,7 @@ fn hook_rule_identification_008_spaced_binary_path_round_trips() {
          intended argv; got {after_one:?}"
     );
 
-    install_to(&path, binary);
+    install_to(&path, binary).expect("install");
     let after_two = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         after_two,
@@ -325,7 +337,7 @@ fn hook_rule_identification_008_spaced_binary_path_round_trips() {
          got {after_two:?}"
     );
 
-    uninstall_from(&path);
+    uninstall_from(&path).expect("uninstall");
     let remaining = total_rule_count(&read_settings(&path));
     assert_eq!(
         remaining, 0,
@@ -352,7 +364,7 @@ fn hook_rule_identification_009_historical_unquoted_spaced_rule_is_still_recogni
         }),
     );
 
-    uninstall_from(&path);
+    uninstall_from(&path).expect("uninstall");
 
     let remaining = rule_commands(&read_settings(&path), "PreToolUse");
     assert!(
@@ -379,11 +391,12 @@ fn hook_rule_identification_010_symlinked_binary_collapses_to_one_rule() {
     std::os::unix::fs::symlink(&real_binary, &symlink_path).expect("create symlink");
 
     let (_dir, path) = settings_path();
-    install_to(&path, symlink_path.to_str().expect("symlink path is utf8"));
+    install_to(&path, symlink_path.to_str().expect("symlink path is utf8")).expect("install");
     install_to(
         &path,
         real_binary.to_str().expect("real binary path is utf8"),
-    );
+    )
+    .expect("install");
 
     let pre_tool_use = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
@@ -412,8 +425,8 @@ fn hook_rule_identification_011_distinct_builds_sharing_basename_do_not_collapse
     std::fs::write(&build_b, b"#!/bin/sh\n").expect("write build b");
 
     let (_dir, path) = settings_path();
-    install_to(&path, build_a.to_str().expect("build a path is utf8"));
-    install_to(&path, build_b.to_str().expect("build b path is utf8"));
+    install_to(&path, build_a.to_str().expect("build a path is utf8")).expect("install");
+    install_to(&path, build_b.to_str().expect("build b path is utf8")).expect("install");
 
     let after_two = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
@@ -423,7 +436,7 @@ fn hook_rule_identification_011_distinct_builds_sharing_basename_do_not_collapse
          rule; got {after_two:?}"
     );
 
-    install_to(&path, build_a.to_str().expect("build a path is utf8"));
+    install_to(&path, build_a.to_str().expect("build a path is utf8")).expect("install");
     let after_reinstall = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         after_reinstall.len(),
@@ -454,7 +467,7 @@ fn hook_rule_identification_012_fragment_match_mutation_guard() {
         }),
     );
 
-    install_to(&path, "/opt/tools/worker-agent-deck");
+    install_to(&path, "/opt/tools/worker-agent-deck").expect("install");
     let after_install = rule_commands(&read_settings(&path), "PreToolUse");
     assert!(
         after_install.contains(&unrelated_command.to_string()),
@@ -462,7 +475,7 @@ fn hook_rule_identification_012_fragment_match_mutation_guard() {
          unless it is EXACTLY the historical default binary name; got {after_install:?}"
     );
 
-    uninstall_from(&path);
+    uninstall_from(&path).expect("uninstall");
     let after_uninstall = rule_commands(&read_settings(&path), "PreToolUse");
     assert!(
         after_uninstall.contains(&unrelated_command.to_string()),
@@ -505,7 +518,7 @@ fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
         }),
     );
 
-    install_to(&path, &build_a_str);
+    install_to(&path, &build_a_str).expect("install");
     // Total right after only build_a is installed: one deck rule per event
     // type plus the untouched user hook. Captured here (rather than hardcoding
     // the private HOOK_TYPES length) so the final assertion below can check
@@ -513,7 +526,7 @@ fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
     // an invariant that holds regardless of how many event types there are.
     let after_one_total = total_rule_count(&read_settings(&path));
 
-    install_to(&path, &build_b_str);
+    install_to(&path, &build_b_str).expect("install");
 
     let after_two = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
@@ -525,7 +538,7 @@ fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
 
     std::fs::remove_file(&build_a).expect("delete build a from disk");
 
-    install_to(&path, &build_b_str);
+    install_to(&path, &build_b_str).expect("install");
 
     let settings = read_settings(&path);
     let pre_tool_use = rule_commands(&settings, "PreToolUse");
@@ -579,7 +592,7 @@ fn hook_rule_identification_015_windows_percent_and_bang_are_quoted() {
     let binary = r"C:\Tools\RUNNER~1\100%!\dot-agent-deck.exe";
     let expected_command = format!("\"{binary}\" hook --agent claude-code");
 
-    install_to(&path, binary);
+    install_to(&path, binary).expect("install");
     let after_install = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         after_install,
@@ -591,7 +604,7 @@ fn hook_rule_identification_015_windows_percent_and_bang_are_quoted() {
          got {after_install:?}"
     );
 
-    uninstall_from(&path);
+    uninstall_from(&path).expect("uninstall");
     let remaining = total_rule_count(&read_settings(&path));
     assert_eq!(
         remaining, 0,
@@ -635,7 +648,7 @@ fn hook_rule_identification_016_windows_legacy_exe_rule_is_recognised_and_remove
         }),
     );
 
-    install_to(&path, r"C:\Tools\worker-agent-deck.exe");
+    install_to(&path, r"C:\Tools\worker-agent-deck.exe").expect("install");
 
     let pre_tool_use = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
@@ -657,7 +670,7 @@ fn hook_rule_identification_016_windows_legacy_exe_rule_is_recognised_and_remove
         }),
     );
 
-    uninstall_from(&path2);
+    uninstall_from(&path2).expect("uninstall");
 
     let remaining = total_rule_count(&read_settings(&path2));
     assert_eq!(
@@ -683,7 +696,9 @@ fn hook_rule_identification_013_malformed_settings_json_is_never_clobbered() {
                       \"permissions\": {\"allow\": [\"Bash(git *)\"]},\n  \"hooks\": {},\n}\n";
     std::fs::write(&path, malformed).expect("write malformed settings fixture");
 
-    install_to(&path, "/opt/tools/worker-agent-deck");
+    let err = install_to(&path, "/opt/tools/worker-agent-deck")
+        .expect_err("install must refuse a settings.json it cannot parse");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "got {err}");
 
     let after = std::fs::read_to_string(&path).expect("read settings after install attempt");
     assert_eq!(
@@ -691,5 +706,439 @@ fn hook_rule_identification_013_malformed_settings_json_is_never_clobbered() {
         "a malformed settings.json must never be silently replaced by install — the \
          user's model/env/permissions would be destroyed and only deck hooks would \
          remain"
+    );
+}
+
+/// A `settings.json` invalidated by exactly one trailing comma, carrying the
+/// same real configuration as #516's measured reproduction: `model`, `env`, and
+/// both halves of `permissions`.
+fn malformed_settings_fixture() -> &'static str {
+    "{\n  \"model\": \"opus\",\n  \"env\": {\"ANTHROPIC_LOG\": \"debug\"},\n  \
+     \"permissions\": {\"allow\": [\"Bash(git status)\"], \"deny\": [\"Bash(rm -rf *)\", \
+     \"Read(./.env)\"]},\n  \"hooks\": {},\n}\n"
+}
+
+/// Scenario: A `settings.json` made invalid by a single trailing comma — while
+/// still carrying the user's `model`, `env` and `permissions` — is uninstalled
+/// from. The file must be left byte-for-byte as it was found, with the user's
+/// bytes additionally preserved at `settings.json.bak`. #506 fixed this for
+/// install and deliberately left uninstall on the lenient reader, so uninstall
+/// still mapped the unparseable file to `{}` and wrote that over it —
+/// destroying `model`, `env` and every `permissions` entry (`deny` included, so
+/// the user's own `Bash(rm -rf *)` and `Read(./.env)` guards go with it) while
+/// reporting success and exiting 0. This is #522: the remainder of #516 on the
+/// path #516's fix does not cover.
+#[test]
+fn hook_rule_identification_017_malformed_settings_json_is_never_clobbered_by_uninstall() {
+    let (_dir, path) = settings_path();
+    let malformed = malformed_settings_fixture();
+    std::fs::write(&path, malformed).expect("write malformed settings fixture");
+
+    let err =
+        uninstall_from(&path).expect_err("uninstall must refuse a settings.json it cannot parse");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "got {err}");
+
+    let after = std::fs::read_to_string(&path).expect("read settings after uninstall attempt");
+    assert_eq!(
+        after, malformed,
+        "a malformed settings.json must never be truncated to {{}} by uninstall — the \
+         user's model/env/permissions (including permissions.deny) would be destroyed"
+    );
+
+    // The refusal must also reach the shell, not just the file: the CLI exits
+    // non-zero on this `Err` (`main.rs`'s `HooksAction::Uninstall` arm), where
+    // `agent_registry::claude_uninstall` used to hardcode `Ok(())`.
+    let backup = std::fs::read_to_string(path.with_extension("json.bak"))
+        .expect("uninstall must preserve the user's bytes at settings.json.bak");
+    assert_eq!(
+        backup, malformed,
+        "the backup must be a byte-for-byte copy of what the user had"
+    );
+}
+
+/// Scenario: A perfectly VALID `settings.json` carrying `model`, `env`,
+/// `permissions.allow` and `permissions.deny` alongside the deck's hooks goes
+/// through a full install and then a full uninstall. Every one of those keys
+/// must still be present and unchanged at both points. `hooks/install/001`
+/// explicitly does not assert this ("Does not assert: other unrelated keys in
+/// `settings.json`"), so the preservation property was unpinned on both paths.
+///
+/// This is the CONTROL for `_017`: it is the nearest thing that must keep
+/// working, and it passes both before and after that fix. Its job is to show
+/// that `_017`'s red is attributable to the file being *unparseable*, not to
+/// install/uninstall dropping unrelated keys in general.
+#[test]
+fn hook_rule_identification_018_valid_settings_keep_model_env_and_permissions() {
+    let (_dir, path) = settings_path();
+    let user_keys = json!({
+        "model": "opus",
+        "env": {"ANTHROPIC_LOG": "debug"},
+        "permissions": {
+            "allow": ["Bash(git status)", "Bash(git diff)"],
+            "deny": ["Bash(rm -rf *)", "Read(./.env)"]
+        }
+    });
+    let mut fixture = user_keys.clone();
+    fixture["hooks"] = json!({});
+    write_settings(&path, &fixture);
+
+    install_to(&path, "/opt/tools/worker-agent-deck").expect("install");
+    let after_install = read_settings(&path);
+    for key in ["model", "env", "permissions"] {
+        assert_eq!(
+            after_install.get(key),
+            user_keys.get(key),
+            "install must leave the user's {key} untouched; got {after_install:?}"
+        );
+    }
+
+    uninstall_from(&path).expect("uninstall");
+    let after_uninstall = read_settings(&path);
+    for key in ["model", "env", "permissions"] {
+        assert_eq!(
+            after_uninstall.get(key),
+            user_keys.get(key),
+            "uninstall must leave the user's {key} untouched; got {after_uninstall:?}"
+        );
+    }
+}
+
+/// The fixture from #535's executed reproduction: the user's own audit hook and
+/// the deck's, co-located as two commands inside ONE rule object under a shared
+/// `"matcher": "Bash"`.
+fn co_located_rule(deck_command: &str) -> Value {
+    json!({
+        "matcher": "Bash",
+        "hooks": [
+            {"type": "command", "command": USER_AUDIT_COMMAND},
+            {"type": "command", "command": deck_command}
+        ]
+    })
+}
+
+const USER_AUDIT_COMMAND: &str = "/usr/local/bin/my-critical-audit.sh";
+
+/// Scenario: The user put their own `my-critical-audit.sh` and the deck's hook
+/// command in the SAME rule object — a normal thing to do, since one rule's
+/// `hooks` array is a list of commands sharing a matcher — and then runs
+/// `hooks uninstall`. Only the deck's command may be removed; the user's must
+/// still be there, still under its `"matcher": "Bash"`.
+///
+/// This is #535, and it is a granularity defect rather than a matching one:
+/// the predicate was an `any()` over every command in a rule and `retain` then
+/// dropped the entire rule `Value`, so it made no difference which rule the
+/// matcher identified — `strip_deck_commands` replaces both halves. The
+/// reproduction in the issue ends `--> my-critical-audit.sh still present?
+/// False`, with nothing said about it.
+#[test]
+fn hook_rule_identification_019_co_located_user_command_survives_uninstall() {
+    let (_dir, path) = settings_path();
+    let deck_command = "/usr/local/bin/dot-agent-deck hook --agent claude-code";
+    write_settings(
+        &path,
+        &json!({
+            "hooks": {
+                "PreToolUse": [co_located_rule(deck_command)]
+            }
+        }),
+    );
+
+    uninstall_from(&path).expect("uninstall");
+
+    let settings = read_settings(&path);
+    let commands = rule_commands(&settings, "PreToolUse");
+    assert!(
+        commands.contains(&USER_AUDIT_COMMAND.to_string()),
+        "the user's own hook co-located in the deck's rule object must survive \
+         uninstall — only the deck's command may be removed; got {commands:?}"
+    );
+    assert!(
+        !commands.contains(&deck_command.to_string()),
+        "uninstall must still remove the deck's own command from the shared rule; \
+         got {commands:?}"
+    );
+    let matchers: Vec<_> = settings["hooks"]["PreToolUse"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|rule| {
+            rule.get("matcher")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        matchers.contains(&"Bash".to_string()),
+        "the surviving rule must keep the matcher the user's hook was registered \
+         under, not be rebuilt without it; got {matchers:?}"
+    );
+}
+
+/// Scenario: The same co-located rule as `_019`, but the deck INSTALLS over it
+/// instead of uninstalling — the path that matters more in practice, since
+/// `auto_install` runs unattended at every dashboard startup. Install
+/// normalizes the deck's own rules down to a single fresh rule per event type,
+/// and it did so with the same whole-rule `retain`, so a user who moved the
+/// deck's command into their own rule object lost their hook the next time they
+/// merely *opened* the deck.
+///
+/// The co-located command here belongs to the binary that is installing —
+/// that is what makes install claim the rule at all. `_003` pins the
+/// complementary case (a rule belonging to a genuinely different deck binary is
+/// not touched), which is why `_019`'s fixture does not reproduce this on the
+/// install path.
+#[test]
+fn hook_rule_identification_020_co_located_user_command_survives_install() {
+    let (_dir, path) = settings_path();
+    let binary = "/opt/tools/worker-agent-deck";
+    let deck_command = format!("{binary} hook --agent claude-code");
+    write_settings(
+        &path,
+        &json!({
+            "hooks": {
+                "PreToolUse": [co_located_rule(&deck_command)]
+            }
+        }),
+    );
+
+    install_to(&path, binary).expect("install");
+
+    let commands = rule_commands(&read_settings(&path), "PreToolUse");
+    assert!(
+        commands.contains(&USER_AUDIT_COMMAND.to_string()),
+        "the user's own hook co-located in the deck's rule object must survive \
+         install — auto-install runs at every startup; got {commands:?}"
+    );
+    assert_eq!(
+        commands.iter().filter(|c| *c == &deck_command).count(),
+        1,
+        "the installing binary must end up with exactly one rule of its own, not \
+         zero and not a duplicate beside the co-located one; got {commands:?}"
+    );
+
+    // Installing twice must converge, not accumulate: the second run sees the
+    // user's rule with the deck's command already stripped out of it.
+    install_to(&path, binary).expect("install");
+    let after_two = rule_commands(&read_settings(&path), "PreToolUse");
+    assert_eq!(
+        after_two, commands,
+        "a second install over a stripped co-located rule must be a no-op; got {after_two:?}"
+    );
+}
+
+/// Scenario: A hard link is made to `settings.json` before the deck installs,
+/// standing in for a concurrent reader (Claude Code itself) holding the file
+/// the deck is about to rewrite. After the install, the hard link must still
+/// hold the ORIGINAL bytes — proving the deck published by writing a temp file
+/// and `rename`-ing it over the destination, rather than truncating the
+/// original file object in place.
+///
+/// This is #534's mechanism, observed deterministically. `std::fs::write` opens
+/// with `O_TRUNC` and writes: for a window between those two syscalls the file
+/// every other process is looking at is zero bytes long, which is both the
+/// torn read Claude Code can hit and the partial file that a crash mid-write
+/// leaves behind — i.e. exactly the malformed `settings.json` that `_013` and
+/// `_017` exist to refuse. A `rename(2)` publish has no such window: the
+/// original inode is never modified, so the witness link still reads clean.
+#[cfg(unix)]
+#[test]
+fn hook_rule_identification_021_settings_are_published_by_rename_not_truncated_in_place() {
+    let (dir, path) = settings_path();
+    let original = "{\n  \"model\": \"opus\",\n  \"hooks\": {}\n}\n";
+    std::fs::write(&path, original).expect("write settings fixture");
+
+    let witness = dir.path().join("witness.json");
+    std::fs::hard_link(&path, &witness).expect("hard link the settings file");
+
+    install_to(&path, "/opt/tools/worker-agent-deck").expect("install");
+
+    let witnessed = std::fs::read_to_string(&witness).expect("read witness after install");
+    assert_eq!(
+        witnessed, original,
+        "the file object a concurrent reader is holding must never be truncated or \
+         rewritten in place — the deck must publish a new file with rename(2), \
+         leaving the original intact until the instant it is replaced"
+    );
+
+    // The destination itself must, of course, have been updated.
+    let commands = rule_commands(&read_settings(&path), "PreToolUse");
+    assert_eq!(
+        commands,
+        vec!["/opt/tools/worker-agent-deck hook --agent claude-code".to_string()],
+        "the destination path must carry the freshly installed rule; got {commands:?}"
+    );
+}
+
+/// Scenario: Four threads install four distinct deck binaries concurrently over
+/// one `settings.json` while a fifth reads it in a tight loop — two deck
+/// processes and a human editor, compressed into one process. Every single read
+/// must parse as JSON, and when the storm is over all four binaries' rules must
+/// be there.
+///
+/// The read-modify-write had no serialization of any kind, and the two
+/// assertions pin the two halves that fixes it. The reader catches the TORN
+/// READ, which the temp-file+`rename` publish closes: `std::fs::write`'s
+/// `O_TRUNC` leaves the file zero bytes long until the following `write`
+/// lands. The four-rule assertion catches the LOST UPDATE, which only the
+/// mutex closes: an atomic publish still lets two callers read the same
+/// "before" state and have the second overwrite the first's rule with a stale
+/// copy, and every install here preserves the other three binaries' rules
+/// (`_003`, `_011`), so a missing rule at the end means exactly one such
+/// interleaving. `codex_hooks_manage` closed both with a
+/// `static INSTALL_LOCK: Mutex<()>` plus an atomic publish (its findings
+/// #1/M-2); this pins the same pair for Claude's adapter.
+///
+/// Deterministic in the green direction, probabilistic in the red: with both in
+/// place neither window exists, so this cannot flake to failure; without them
+/// the reader catches the `O_TRUNC` gap well within a hundred writes and the
+/// writers lose updates at the same rate.
+#[test]
+fn hook_rule_identification_022_concurrent_installs_never_tear_or_lose_updates() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (_dir, path) = settings_path();
+    write_settings(&path, &json!({"model": "opus", "hooks": {}}));
+
+    // Distinct basenames, so no writer's install treats another's rule as a
+    // stale sibling of its own and prunes it (`_014`'s dead-binary sweep is
+    // keyed on the installing binary's basename).
+    let binary = |i: usize| format!("/opt/build{i}/worker-agent-deck-{i}");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let path = path.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut torn = 0usize;
+            let mut reads = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                reads += 1;
+                match std::fs::read(&path) {
+                    Ok(bytes) if serde_json::from_slice::<Value>(&bytes).is_ok() => {}
+                    _ => torn += 1,
+                }
+                std::thread::yield_now();
+            }
+            (torn, reads)
+        })
+    };
+
+    let writers: Vec<_> = (0..4)
+        .map(|i| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for _ in 0..25 {
+                    install_to(&path, &binary(i)).expect("install");
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().expect("writer thread panicked");
+    }
+    stop.store(true, Ordering::Relaxed);
+    let (torn, reads) = reader.join().expect("reader thread panicked");
+
+    assert_eq!(
+        torn, 0,
+        "a concurrent reader must never observe a truncated or half-written \
+         settings.json; {torn} of {reads} reads did not parse as JSON"
+    );
+
+    let settings = read_settings(&path);
+    let commands = rule_commands(&settings, "PreToolUse");
+    for i in 0..4 {
+        let expected = format!("{} hook --agent claude-code", binary(i));
+        assert!(
+            commands.contains(&expected),
+            "every concurrent installer's rule must survive — a missing one is a \
+             lost update, where two callers read the same state and the second \
+             wrote its own rule over the first's; got {commands:?}"
+        );
+    }
+    assert_eq!(
+        settings.get("model"),
+        Some(&json!("opus")),
+        "the user's model key must survive concurrent installs; got {settings:?}"
+    );
+}
+
+/// Scenario: A `settings.json` the user has deliberately kept private (mode
+/// 0600) is installed into. Its mode must be exactly 0600 afterwards — the
+/// deck must not widen a file it does not own.
+///
+/// This is the guard for the specific hazard a temp-file+rename publish
+/// introduces and an in-place `std::fs::write` does not have: `File::create`
+/// applies `0666 & !umask` — 0644 under a typical 022 umask, 0664 under 002 —
+/// and the `rename` then replaces the destination with that wider file. #382
+/// records the same defect in `codex_hooks_manage::write_atomic`, and #360
+/// fixed it in `devin_hooks_manage` where a real install ships the config at
+/// 0600; this pins it for Claude's adapter at the moment the publish switches
+/// to a rename, so the fix for #534 cannot introduce #382's bug here.
+#[cfg(unix)]
+#[test]
+fn hook_rule_identification_023_install_never_widens_settings_permissions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_dir, path) = settings_path();
+    write_settings(&path, &json!({"model": "opus", "hooks": {}}));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict settings fixture to 0600");
+
+    install_to(&path, "/opt/tools/worker-agent-deck").expect("install");
+
+    let mode = std::fs::metadata(&path)
+        .expect("stat settings after install")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "install must preserve the destination's own mode; settings.json went from \
+         0600 to {mode:o}, exposing the user's env/permissions to every local account"
+    );
+}
+
+/// Scenario: `settings.json` is a symlink into a dotfiles checkout — a normal
+/// `stow`/`chezmoi` arrangement. The deck must refuse rather than guess: the
+/// symlink must still be a symlink afterwards and the file it points at must be
+/// byte-for-byte unchanged.
+///
+/// There is no safe silent option here. A `rename(2)` publish onto the link
+/// path replaces the symlink with a regular file, orphaning the dotfiles copy
+/// (the user's edits and the deck's silently diverge from then on); resolving
+/// the link instead means writing through it to a path outside the directory
+/// the deck meant to touch, which is the write-anywhere hazard a same-directory
+/// publish exists to close. Refusing is the only branch that destroys nothing,
+/// so it fails loudly and leaves the arrangement alone.
+#[cfg(unix)]
+#[test]
+fn hook_rule_identification_024_symlinked_settings_are_refused_not_replaced() {
+    let (_dir, path) = settings_path();
+    let dotfiles = test_temp::tempdir().expect("create dotfiles dir");
+    let real = dotfiles.path().join("claude-settings.json");
+    let original = "{\n  \"model\": \"opus\",\n  \"hooks\": {}\n}\n";
+    std::fs::write(&real, original).expect("write dotfiles settings");
+    std::os::unix::fs::symlink(&real, &path).expect("symlink settings.json into dotfiles");
+
+    let err = install_to(&path, "/opt/tools/worker-agent-deck")
+        .expect_err("install must refuse a symlinked settings.json");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "got {err}");
+
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .expect("stat settings path after install")
+            .file_type()
+            .is_symlink(),
+        "a symlinked settings.json must still be a symlink after the deck refuses — \
+         replacing it with a regular file orphans the user's dotfiles copy"
+    );
+    let after = std::fs::read_to_string(&real).expect("read dotfiles settings after install");
+    assert_eq!(
+        after, original,
+        "the file a symlinked settings.json points at must be left byte-for-byte as \
+         found — the deck must not write outside the directory it was pointed at"
     );
 }
