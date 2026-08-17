@@ -197,11 +197,30 @@ fn delivery_log_states(log: &str) -> HashMap<String, BTreeSet<&'static str>> {
     states
 }
 
+/// How long the deck's readiness gate waits for a `SessionStart` before writing
+/// the prompt anyway, pinned short so the fallback path is reached in seconds
+/// rather than the production 30 s.
+const READINESS_GATE_MS: u64 = 3_000;
+
+/// How long the late-claim stand-in withholds its `SessionStart`, comfortably
+/// past [`READINESS_GATE_MS`] so the claim is unambiguously post-write.
+const LATE_CLAIM_SESSION_START_DELAY_SECS: u64 = 6;
+
+/// The stand-in is named `claude` on purpose: the deck resolves
+/// [`AgentType::from_command`] over the command IT chose to exec, so this is
+/// the ordinary production shape (`default_command = "claude …"`) rather than
+/// an anonymous script the deck can vouch for nothing about. Issue #570's fix
+/// keys on exactly that spawn-time record, and `scheduler/dispatch/016` holds
+/// the other side — a pane spawned with no known type still refuses a
+/// post-write producer claim.
 fn write_swallowing_agent(workdir: &Path) -> PathBuf {
-    let path = workdir.join("swallow-first-seed-agent.sh");
+    let path = workdir.join("claude");
     let bin = shell_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
     let body = format!(
         "#!/bin/sh\n\
+         case \"$DOT_AGENT_DECK_PANE_ID\" in\n\
+           *late-claim*) sleep {LATE_CLAIM_SESSION_START_DELAY_SECS} ;;\n\
+         esac\n\
          printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"seed-%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 97\n\
          sleep 1\n\
          IFS= read -r swallowed || exit 0\n\
@@ -229,7 +248,7 @@ fn write_default_command_config(command: &str) -> tempfile::TempDir {
     dir
 }
 
-/// Scenario: Launch an attached deck whose single-agent command posts SessionStart, delays its input reader, and deliberately swallows the first submitted line, then issue three dispatch --single calls concurrently. Every pane must receive a backoff retry, emit a matching UserPromptSubmit hook for that retry, retain a durable confirmation, and produce written/unconfirmed/confirmed logs under its own distinct delivery id.
+/// Scenario: Launch an attached deck whose single-agent command posts SessionStart, delays its input reader, and deliberately swallows the first submitted line, then issue four dispatch --single calls concurrently. Three panes announce themselves before the prompt is written; the fourth withholds its SessionStart until after the readiness gate has expired and the prompt is already in the pane, so its producer claims a reporting agent only afterwards. Every pane must receive a backoff retry, emit a matching UserPromptSubmit hook for that retry, retain a durable confirmation, and produce written/unconfirmed/confirmed logs under its own distinct delivery id.
 #[spec("scheduler/dispatch/014")]
 #[test]
 fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
@@ -243,15 +262,28 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
             config.path().join("config.toml").to_string_lossy(),
         )
         .with_env("DOT_AGENT_DECK_LOG", log_name)
+        // Issue #570: the reported failure is a `SessionStart` that missed the
+        // readiness gate by 37 ms. Shortening the gate makes "the producer
+        // identified itself only after the write" a deterministic input
+        // instead of a race nobody could reproduce on demand.
+        .with_env(
+            "DOT_AGENT_DECK_SESSION_START_WAIT_MS",
+            READINESS_GATE_MS.to_string(),
+        )
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
     commit_fixture_repo(deck.workdir());
     let caller_pane = open_cat_caller_pane(&deck);
 
+    // The first three announce themselves BEFORE the write — the control, and
+    // the nearest thing to the fourth that should still work. `seed-late-claim`
+    // is issue #570: same command, same swallow, same everything, except its
+    // producer identifies itself only after the prompt is already in the pane.
     let cases = [
         ("seed-alpha", "Confirm synthetic seed alpha-7f31"),
         ("seed-beta", "Confirm synthetic seed beta-8c42"),
         ("seed-gamma", "Confirm synthetic seed gamma-9d53"),
+        ("seed-late-claim", "Confirm synthetic seed late-claim-1a05"),
     ];
     let worktrees: Vec<PathBuf> = cases
         .iter()
@@ -261,7 +293,10 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
     let outputs = dispatch_concurrently(&deck, &caller_pane, &cases);
     assert_dispatch_commands_succeeded(&cases, &outputs);
 
-    let confirmed = common::wait_until(Duration::from_secs(20), || {
+    // The late-claim pane cannot confirm before its withheld `SessionStart`
+    // plus a retry round trip, so the budget covers that rather than the
+    // three-pane wait it replaced.
+    let confirmed = common::wait_until(Duration::from_secs(45), || {
         cases
             .iter()
             .all(|(name, prompt)| confirmed_prompt(&deck, name).as_deref() == Some(*prompt))

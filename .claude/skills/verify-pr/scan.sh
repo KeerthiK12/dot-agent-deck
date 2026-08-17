@@ -129,7 +129,7 @@ classify() {
     src/*hooks_manage.rs | src/schedule_cli.rs | src/event.rs) echo PROTOCOL ;;
     src/ui.rs | src/pane*.rs | src/tab*.rs | src/terminal_widget.rs) echo UI ;;
     src/embedded_pane.rs | src/keybindings.rs | src/palette.rs) echo UI ;;
-    src/ascii_art.rs | src/features.rs | src/hyperlink.rs) echo UI ;;
+    src/features.rs | src/hyperlink.rs) echo UI ;;
     tests/snapshots/*) echo UI_SNAPSHOT ;;
     tests/CATALOG.md) echo CATALOG ;;
     tests/*) echo TESTS ;;

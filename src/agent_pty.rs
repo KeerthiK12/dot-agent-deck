@@ -3449,14 +3449,54 @@ impl AgentPtyRegistry {
             .insert(agent_id.to_string());
     }
 
-    /// Issue #424 F4: whether `agent_id`'s pane made that declaration — the only
-    /// standing on which a producer identifying itself AFTER the write may arm
-    /// this delivery's retries.
+    /// Issue #424 F4: whether `agent_id`'s pane made that declaration — one of
+    /// the two standings on which a producer identifying itself AFTER the write
+    /// may arm this delivery's retries. The other is
+    /// [`Self::agent_spawned_as_reporting_agent`].
     pub fn agent_declared_launcher_handoff(&self, agent_id: &str) -> bool {
         self.launcher_handoff_agents
             .lock()
             .unwrap()
             .contains(agent_id)
+    }
+
+    /// Issue #570: whether THIS DAEMON spawned `agent_id` as an agent type it
+    /// selected itself, and that type reports submitted prompts.
+    ///
+    /// The second standing for accepting a post-write producer, and the same
+    /// KIND of fact as [`Self::agent_declared_launcher_handoff`]: a statement
+    /// about the pane made before a byte of the prompt was written. It is a
+    /// STRONGER one, because the deck did not merely observe it — the deck
+    /// exec'd that command. `default_command = "claude …"` means the pane holds
+    /// Claude Code because we put it there, so a Claude Code producer
+    /// announcing itself on that pane a moment later is the expected occupant
+    /// arriving, not an unauthenticated claim about a pane we cannot vouch for.
+    ///
+    /// It reads [`RunningAgent::spawn_agent_type`], NOT
+    /// [`RunningAgent::agent_type`], and the difference is the whole security
+    /// argument: `spawn_agent_type` is the frozen launch-shape identity the
+    /// caller supplied at spawn ([`SpawnOptions::agent_type`], computed by the
+    /// spawn site from the command via [`AgentType::from_command`]), and
+    /// [`Self::set_agent_type`] — the learn-from-hook-event upgrade — never
+    /// writes it. So no producer, honest or forged, can manufacture this
+    /// standing for itself; a pane spawned as a bare shell, `cat`, a recorder
+    /// stand-in or any command the deck could not resolve stays `None` and
+    /// keeps refusing, which is exactly what #424 F4 protects.
+    ///
+    /// Note this deliberately does not make the delivery armed at write time
+    /// (that stays [`crate::state::SessionStartWait::observed_producer`]'s
+    /// job): it licenses accepting the producer WHEN IT ANNOUNCES ITSELF, so
+    /// the replacement payload goes in when there is an agent there to receive
+    /// it rather than on the retry clock. Same reasoning as the launcher
+    /// handoff — see the comment at its recording site in `crate::spawn`.
+    pub fn agent_spawned_as_reporting_agent(&self, agent_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .and_then(|agent| agent.spawn_agent_type.as_ref())
+            .is_some_and(crate::prompt_delivery::agent_reports_submitted_prompt)
     }
 
     /// Issue #424 F1: record that a guarded send in `mode` just put `payload`

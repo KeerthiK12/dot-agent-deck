@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::io::{self, ErrorKind, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use serde_json::{Value, json};
 
@@ -33,28 +35,223 @@ fn settings_path() -> PathBuf {
         .join("settings.json")
 }
 
-fn read_settings(path: &PathBuf) -> Value {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|_| json!({})),
-        Err(_) => json!({}),
+/// Serializes the whole read-modify-write of `settings.json` across concurrent
+/// in-process callers — two panes launching Claude Code at once, each running
+/// [`auto_install`]. Combined with [`write_atomic`]'s temp-file+`rename`
+/// publish, this closes the concurrent-clobber and partial-write window on the
+/// user's real `~/.claude/settings.json` (issue #534), mirroring
+/// `codex_hooks_manage::INSTALL_LOCK` (`:87`) and its findings #1/M-2.
+///
+/// Every public entry point in this module takes it for the FULL span from the
+/// read to the write, not just around the write: locking the write alone still
+/// lets two callers read the same "before" state and have the second one
+/// overwrite the first's rule with a stale copy.
+///
+/// What this does NOT close is the cross-PROCESS lost update — two deck
+/// binaries at different paths starting at the same instant, or a deck racing a
+/// human's editor save. That needs an advisory file lock; neither sibling
+/// adapter has one either, and the atomic publish means the loser of such a
+/// race loses a whole update rather than leaving a torn file behind.
+static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take [`SETTINGS_LOCK`], recovering from a poisoned mutex rather than
+/// panicking: a previous caller panicking mid-install says nothing about
+/// whether the settings file is usable now, and the read is re-done from disk
+/// under the guard regardless.
+fn lock_settings() -> MutexGuard<'static, ()> {
+    SETTINGS_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Read `path` the STRICT way used by every install AND uninstall path. Only a
+/// MISSING file (`ErrorKind::NotFound`) means empty — mirroring
+/// `codex_hooks_manage::install_to`'s contract (`:290-316`). Malformed JSON is
+/// backed up next to the original (`<path>.bak`, leaving the original bytes on
+/// disk untouched) and returned as an `Err` so every caller skips the write
+/// instead of silently collapsing the user's settings to `{}` — the old
+/// behavior here mapped ANY parse error to an empty config, so a settings.json
+/// invalidated by a single trailing comma came back with `model`, `env`, and
+/// every `permissions` entry destroyed, while the run reported success.
+///
+/// Issue #522: this used to be the install path's reader only, with a
+/// `read_settings_lenient` twin still serving [`uninstall`] and
+/// [`uninstall_from`] — which called [`write_settings`] UNCONDITIONALLY on
+/// whatever it returned, so an unparseable settings.json was truncated to `{}`
+/// and rewritten on every uninstall run while the run reported success and
+/// exited 0. The lenient reader is gone; there is one contract for both
+/// directions now.
+fn load_settings_or_refuse(path: &Path) -> io::Result<Value> {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => Ok(value),
+            Err(parse_err) => {
+                let backup = path.with_extension("json.bak");
+                let _ = std::fs::write(&backup, &bytes);
+                Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "{} is not valid JSON (left unchanged, original preserved at {}): \
+                         {parse_err}",
+                        path.display(),
+                        backup.display()
+                    ),
+                ))
+            }
+        },
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(json!({})),
+        Err(e) => Err(e),
     }
 }
 
-fn write_settings(path: &PathBuf, settings: &Value) -> std::io::Result<()> {
+/// Publish `settings` to `path`, atomically and without widening or redirecting
+/// anything (issue #534). The caller is expected to already hold
+/// [`lock_settings`].
+///
+/// The old body was `std::fs::write` — `open(O_TRUNC)` then `write`, over a file
+/// two deck processes and a human editor all write. Three exposures followed,
+/// and the second and third are what MANUFACTURE the malformed settings.json
+/// that [`load_settings_or_refuse`] now refuses to clobber: Claude Code reading
+/// inside the window between the truncate and the write sees an empty file; a
+/// crash between them leaves one on disk permanently.
+fn write_settings(path: &Path, settings: &Value) -> io::Result<()> {
     if let Some(parent) = path.parent() {
+        // `create_dir_all("")` is a documented no-op, so a bare relative
+        // filename (whose parent is `""`) needs no special case here.
         std::fs::create_dir_all(parent)?;
     }
+    refuse_symlinked_destination(path)?;
     let contents = serde_json::to_string_pretty(settings)?;
-    std::fs::write(path, contents)
+    write_atomic(path, contents.as_bytes())
 }
+
+/// Refuse when `path` is a symlink — typically `~/.claude/settings.json`
+/// stowed into a dotfiles checkout.
+///
+/// There is no safe silent branch here. A `rename(2)` publish onto the link
+/// path replaces the symlink with a regular file, orphaning the dotfiles copy
+/// so the user's edits and the deck's silently diverge from that point on.
+/// Resolving the link instead means writing through it to a path outside the
+/// directory the deck was pointed at — the write-anywhere hazard a
+/// same-directory publish exists to close, and the reason the temp file below
+/// is never placed in a resolved target's directory. Refusing is the only
+/// branch that destroys nothing: the error reaches the shell on an explicit
+/// `hooks install` / `hooks uninstall`, and `deck.log` on the startup
+/// auto-install (issue #91 covers making that startup refusal visible).
+///
+/// `symlink_metadata` does not follow the final component, so this is the one
+/// stat that can see the link itself. A dangling symlink is caught too — it is
+/// the same arrangement with the target not checked out yet.
+fn refuse_symlinked_destination(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{} is a symlink (left unchanged): the deck will not replace it with a \
+                 regular file, nor write through it to a path outside {}. Point it at a \
+                 real file, or edit the linked file's hooks by hand.",
+                path.display(),
+                path.parent().unwrap_or(Path::new(".")).display()
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Write `bytes` to a temp file in `dest`'s OWN directory and `rename` it over
+/// `dest`. Same directory means same filesystem, which is what makes the rename
+/// atomic — a reader sees either the whole old file or the whole new one, never
+/// a truncated one, and a crash leaves the old file intact with at most a stray
+/// temp beside it.
+///
+/// Mode is taken from the destination, or 0600 when the file is new. This is
+/// the fix #382 records for `codex_hooks_manage::write_atomic` and #360 already
+/// applied to `devin_hooks_manage` (`:342-375`), and it is load-bearing
+/// precisely BECAUSE this switches to a rename: `File::create` applies
+/// `0666 & !umask` — 0644 under a typical 022 umask, 0664 under 002 — and the
+/// rename would then replace the destination with that wider file. An in-place
+/// `std::fs::write` never had that exposure, so publishing atomically without
+/// this would trade one defect for another over a file holding the user's `env`
+/// and `permissions`.
+fn write_atomic(dest: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("settings.json");
+    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+
+    let mut file = match create_new(&tmp) {
+        Ok(file) => file,
+        // A leftover temp from a crashed run under this same pid — or anything
+        // else squatting the name. `remove_file` unlinks a symlink rather than
+        // following it, so taking the name this way cannot be turned into a
+        // write to somewhere else.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&tmp)?;
+            create_new(&tmp)?
+        }
+        Err(e) => return Err(e),
+    };
+
+    let published = (|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dest)
+                .map(|meta| meta.permissions().mode() & 0o777)
+                .unwrap_or(0o600);
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+
+    drop(file);
+    if let Err(e) = published.and_then(|()| std::fs::rename(&tmp, dest)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// `open(O_CREAT | O_EXCL | O_WRONLY)`: create the temp file or fail, never
+/// truncate an existing one and never follow a symlink at that path.
+fn create_new(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// The fixed command signature that identifies a deck-authored rule, mirroring
+/// `codex_hooks_manage::HOOK_COMMAND_SUFFIX` (`:81`) and
+/// `devin_hooks_manage::HOOK_COMMAND_SUFFIX` (`:70`). `--agent` defaults to
+/// `CliAgent::ClaudeCode` (`src/main.rs:60-64`), so `<path> hook --agent
+/// claude-code` is a valid invocation, behaviourally identical to the bare
+/// `<path> hook` this used to write — writing the explicit form is what lets a
+/// rule be identified by this SUFFIX alone, regardless of the executable path
+/// (or its basename) preceding it.
+const HOOK_COMMAND_SUFFIX: &str = "hook --agent claude-code";
+
+/// The compiled crate's own binary name (`"dot-agent-deck"` — upstream and every
+/// fork alike; the crate name itself is never renamed). Every hook rule written
+/// before this fix carries exactly this as its executable's basename in the
+/// LEGACY `<path> hook` shape — see [`is_legacy_deck_rule`].
+const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 
 /// Build a rule object in the new hooks format:
 /// `{ "hooks": [{"type": "command", "command": "..."}] }`
 /// For Notification, adds a matcher for permission_prompt.
 fn make_rule(binary_path: &str, hook_type: &str) -> Value {
+    let command = format!(
+        "{} {HOOK_COMMAND_SUFFIX}",
+        shell_quote_if_needed(binary_path)
+    );
     let command_obj = json!({
         "type": "command",
-        "command": format!("{binary_path} hook")
+        "command": command
     });
 
     if hook_type == "Notification" {
@@ -67,6 +264,82 @@ fn make_rule(binary_path: &str, hook_type: &str) -> Value {
             "hooks": [command_obj]
         })
     }
+}
+
+/// Single-quote `path` for a POSIX shell only when it contains a character
+/// outside a conservative safe set; otherwise return it unchanged. Mirrors
+/// `devin_hooks_manage::shell_quote_if_needed` (`:232-245`, tested by
+/// `install_quotes_a_binary_path_with_spaces`, `:726-730`) — a binary path
+/// containing whitespace (e.g. `/Applications/My Deck/dot-agent-deck`) written
+/// unquoted splits into extra shell tokens and the command no longer parses to
+/// the intended argv.
+///
+/// Claude Code invokes the hook command line via the platform's native shell —
+/// `cmd.exe` on Windows, a different shell with different quoting rules — so
+/// this is `#[cfg(unix)]` here; see the `#[cfg(windows)]` sibling below. POSIX
+/// single quotes are not a `cmd.exe` quoting mechanism: `cmd.exe` treats `'`
+/// as a literal character, so wrapping a Windows path in single quotes names a
+/// file that does not exist rather than quoting it.
+#[cfg(unix)]
+fn shell_quote_if_needed(path: &str) -> String {
+    fn is_safe(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b':' | b'@' | b'%' | b','
+            )
+    }
+    if !path.is_empty() && path.bytes().all(is_safe) {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', r"'\''"))
+    }
+}
+
+/// Double-quote `path` for `cmd.exe` only when it contains a character outside
+/// a conservative safe set; otherwise return it unchanged. `~` is NOT special
+/// to `cmd.exe` (unlike POSIX, where it triggers home-directory expansion), so
+/// it is in the safe set here — a real Windows temp path such as
+/// `C:\Users\RUNNER~1\...\dot-agent-deck` needs no quoting at all.
+///
+/// `%` and `!` are excluded from the safe set, but excluding them does NOT
+/// resolve them — the same species of over-claiming comment corrected as H3
+/// on [`read_settings_lenient`] above. `cmd.exe` expands `%VAR%` even *inside*
+/// double quotes, and `!VAR!` under delayed expansion; wrapping the path in
+/// quotes here changes neither. What quoting actually buys is limited to
+/// spaces and the other characters outside the safe set — a path containing a
+/// literal `%` or `!` is written through with that character unresolved,
+/// quoted or not.
+#[cfg(windows)]
+fn shell_quote_if_needed(path: &str) -> String {
+    fn is_safe(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'\\' | b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b':' | b'@' | b',' | b'~'
+            )
+    }
+    if !path.is_empty() && path.bytes().all(is_safe) {
+        path.to_string()
+    } else {
+        format!("\"{}\"", path.replace('"', "\\\""))
+    }
+}
+
+/// Undo [`shell_quote_if_needed`]: strip a single- or double-quoted wrapper
+/// and unescape it back to the raw path, or return `exe` unchanged if it was
+/// never quoted. Tries BOTH quoting forms regardless of platform — not just
+/// the one this platform's writer produces — so a settings file written on
+/// one platform and read on another is not stranded, mirroring `_009`'s
+/// "a historical unquoted rule must still be recognised" principle.
+fn unquote_if_needed(exe: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(inner) = exe.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return std::borrow::Cow::Owned(inner.replace(r"'\''", "'"));
+    }
+    if let Some(inner) = exe.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return std::borrow::Cow::Owned(inner.replace("\\\"", "\""));
+    }
+    std::borrow::Cow::Borrowed(exe)
 }
 
 /// Ensure `settings["hooks"]` is an object and return a mutable reference to it.
@@ -98,12 +371,14 @@ fn ensure_hook_array<'a>(
 fn install_impl(settings: &mut Value, binary_path: &str) -> (Vec<&'static str>, Vec<&'static str>) {
     let hooks_obj = ensure_hooks_object(settings);
 
-    // Clean up dot-agent-deck entries for hook types no longer in HOOK_TYPES
+    // Clean up deck entries for hook types no longer in HOOK_TYPES. These are
+    // gone from HOOK_TYPES entirely, so any deck rule there is stale regardless
+    // of which binary wrote it — use the generic, binary-agnostic predicate.
     let all_keys: Vec<String> = hooks_obj.keys().cloned().collect();
     for key in all_keys {
         if !HOOK_TYPES.contains(&key.as_str()) {
             if let Some(arr) = hooks_obj.get_mut(&key).and_then(|v| v.as_array_mut()) {
-                arr.retain(|rule| !rule_contains_dot_agent_deck(rule));
+                strip_deck_commands(arr, command_is_ours);
             }
             // Remove the key entirely if the array is now empty
             if hooks_obj
@@ -121,14 +396,34 @@ fn install_impl(settings: &mut Value, binary_path: &str) -> (Vec<&'static str>, 
 
     for &hook_type in HOOK_TYPES {
         let rules = ensure_hook_array(hooks_obj, hook_type);
+
+        // Prune STALE deck-owned rules sharing the installing binary's own
+        // basename — the shape N worktree builds actually take: every
+        // `target/debug/dot-agent-deck` is a distinct real path with the SAME
+        // basename, so a rebuilt or removed worktree leaves a dead rule with
+        // that basename behind, and a fresh install from a surviving worktree
+        // is the natural point to drop it. Scoped narrowly two ways: (1) only
+        // rules ALREADY identified as deck-owned by `rule_is_ours` — never a
+        // general "delete anything pointing at a missing path" sweep, which
+        // would delete a user's own hooks for tools that simply are not
+        // installed right now (test 014's coexisting `nonexistent-tool` rule);
+        // (2) only rules whose basename matches the CURRENTLY installing
+        // binary's basename — a genuinely different-looking deck binary
+        // installed under a fictional/not-yet-real path (as most of this
+        // file's fixtures are) must not be swept up just because it happens
+        // not to exist on disk (test 003 pins this: installing `/b/…` must
+        // never prune `/a/…`'s unrelated rule).
+        strip_deck_commands(rules, |cmd| command_is_dead_deck(cmd, binary_path));
+
         let expected = make_rule(binary_path, hook_type);
 
         let already_current = rules.iter().any(|rule| rule == &expected);
-        let before = rules.len();
 
-        // Always normalize dot-agent-deck entries down to a single fresh rule.
-        rules.retain(|rule| !rule_contains_dot_agent_deck(rule));
-        let removed = before - rules.len();
+        // Normalize down to a single fresh rule, but only for THIS binary —
+        // leave rules belonging to a genuinely different deck binary alone —
+        // except a LEGACY rule under the historical default name, which always
+        // migrates to whichever binary is currently installing.
+        let removed = strip_deck_commands(rules, |cmd| command_matches_binary(cmd, binary_path));
         rules.push(expected);
 
         if already_current && removed == 1 {
@@ -141,45 +436,304 @@ fn install_impl(settings: &mut Value, binary_path: &str) -> (Vec<&'static str>, 
     (installed, skipped)
 }
 
-fn uninstall_impl(settings: &mut Value) -> Vec<&'static str> {
+/// Outcome of [`uninstall_impl`]: which hook types had at least one deck
+/// command removed, and the total number of individual commands removed across
+/// all of them. Reporting the actual count is what makes "matched nothing"
+/// distinguishable from "removed some" — a message that always reads
+/// "No dot-agent-deck hooks found to remove." is correct-sounding but silently
+/// wrong the moment the matcher goes blind: it prints on every run whether or
+/// not anything was actually there.
+///
+/// The count is of COMMANDS, not rule objects, since [`strip_deck_commands`]
+/// removes one command at a time and a rule the user shares with the deck
+/// survives with the deck's command taken out of it.
+struct UninstallOutcome {
+    hook_types: Vec<&'static str>,
+    commands_removed: usize,
+}
+
+fn uninstall_impl(settings: &mut Value) -> UninstallOutcome {
     let hooks = match settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
         Some(h) => h,
-        None => return Vec::new(),
+        None => {
+            return UninstallOutcome {
+                hook_types: Vec::new(),
+                commands_removed: 0,
+            };
+        }
     };
 
-    let mut removed = Vec::new();
+    let mut hook_types = Vec::new();
+    let mut commands_removed = 0;
 
     for &hook_type in HOOK_TYPES {
         if let Some(arr) = hooks.get_mut(hook_type).and_then(|v| v.as_array_mut()) {
-            let before = arr.len();
-            arr.retain(|rule| !rule_contains_dot_agent_deck(rule));
-            if arr.len() < before {
-                removed.push(hook_type);
+            let removed = strip_deck_commands(arr, command_is_ours);
+            if removed > 0 {
+                hook_types.push(hook_type);
+                commands_removed += removed;
             }
         }
     }
 
+    UninstallOutcome {
+        hook_types,
+        commands_removed,
+    }
+}
+
+/// Remove every command matching `is_target` from `rules`, dropping a rule
+/// object only once it carries no commands at all — the fix for issue #535.
+///
+/// A rule's `hooks` array is a LIST of commands sharing one matcher, so a user
+/// who put their own hook and the deck's in the same rule object is doing a
+/// normal thing. Removal used to be a `retain` over whole rules keyed on an
+/// `any()` across that list, so one deck command anywhere in a rule deleted the
+/// user's commands with it — measured in #535, where a user's
+/// `/usr/local/bin/my-critical-audit.sh` disappeared on `hooks uninstall` and
+/// nothing said so. Install had the identical granularity and is the more
+/// frequent path, since `auto_install` runs unattended at every dashboard
+/// startup.
+///
+/// Two deliberate conservatisms, both in the "never delete what we did not
+/// write" direction:
+///
+/// - a rule NOTHING matched in is returned untouched, so an already-empty or
+///   command-less rule object is never tidied away as a side effect;
+/// - a rule is dropped only when [`rule_commands`] reports nothing left in it,
+///   which keeps a rule alive on any command the deck does not claim, in either
+///   JSON shape.
+///
+/// Returns the number of individual commands removed.
+fn strip_deck_commands(rules: &mut Vec<Value>, mut is_target: impl FnMut(&str) -> bool) -> usize {
+    let mut removed = 0usize;
+    rules.retain_mut(|rule| {
+        let before = removed;
+
+        // Current shape: `{"hooks": [{"command": …}, …]}` — drop just the
+        // matching command objects and leave the rest of the array, and the
+        // rule's own `matcher`, exactly as the user wrote them.
+        if let Some(hooks) = rule.get_mut("hooks").and_then(Value::as_array_mut) {
+            let len = hooks.len();
+            hooks.retain(|hook| {
+                !hook
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(&mut is_target)
+            });
+            removed += len - hooks.len();
+        }
+
+        // Legacy flat shape: `{"command": …}` — the command IS the rule, so
+        // there is nothing smaller to remove. Take the key out and let the
+        // no-commands-left check below decide the rule's fate, rather than
+        // assuming it carries nothing else.
+        if rule
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(&mut is_target)
+        {
+            if let Some(obj) = rule.as_object_mut() {
+                obj.remove("command");
+            }
+            removed += 1;
+        }
+
+        if removed == before {
+            return true;
+        }
+        rule_commands(rule).next().is_some()
+    });
     removed
 }
 
-fn rule_contains_dot_agent_deck(rule: &Value) -> bool {
-    // New format: { "hooks": [{"command": "...dot-agent-deck..."}] }
-    let new_format = rule
+// --- Identify deck rules by command SUFFIX, not by basename ---
+//
+// The old matcher looked for the literal substring "dot-agent-deck" in a rule's
+// command, which blinds it the moment the binary runs under any other filename
+// (this fork's `worker-agent-deck`, or any other renamed build) — the rule it
+// just wrote becomes invisible to the tool that wrote it. A second revision
+// relocated the hardcoding into a basename FRAGMENT check instead, which failed
+// destructively on a crate rename (a crate named `dot-x` derives fragment `"x"`,
+// and uninstall then deletes unrelated user hooks) and could only migrate a
+// legacy rule when the INSTALLING binary's own name looked deck-ish, which made
+// a coexisting fork/upstream install silently delete each other's rules.
+//
+// The replacement identifies a rule by its command's exact SUFFIX,
+// [`HOOK_COMMAND_SUFFIX`] — mirroring `codex_hooks_manage::command_is_deck_owned`
+// (`:132-137`) and `devin_hooks_manage::command_is_deck_owned` (`:199-204`). No
+// basename check is layered on top: the suffix `"hook --agent claude-code"` is
+// specific enough on its own that an unrelated `mytool hook` or `git hook` (test
+// 005) does not end with it, and a user hook that merely mentions the deck's
+// name as an argument (test 004) does not either.
+//
+// The one basename check that remains is narrower and different in kind: a
+// LEGACY rule (written before this fix, in the bare `<path> hook` shape with no
+// `--agent` suffix) is recognised only when its own executable's basename is
+// EXACTLY [`DEFAULT_BINARY_NAME`] — never a fragment, and never compared against
+// the installing binary's name. See [`is_legacy_deck_rule`].
+
+/// Parse `command` as `<executable> hook --agent claude-code` in the CURRENT
+/// format, recovering the executable by parsing from the RIGHT
+/// (`strip_suffix`), not by counting whitespace-split tokens — so a quoted (or,
+/// historically, unquoted) executable path containing spaces still round-trips
+/// (test 008). The returned token may still be shell-quoted; pass it through
+/// [`unquote_if_needed`] before comparing it as a path.
+fn current_format_executable(command: &str) -> Option<&str> {
+    let exe = command.trim_end().strip_suffix(HOOK_COMMAND_SUFFIX)?;
+    let exe = exe.strip_suffix(' ')?;
+    if exe.is_empty() { None } else { Some(exe) }
+}
+
+/// Parse `command` as the LEGACY, pre-fix `<executable> hook` shape — no
+/// `--agent` suffix, never quoted — recovering the executable the same
+/// parse-from-the-right way as [`current_format_executable`], so a historical
+/// unquoted spaced path (test 009) is still recoverable even though counting
+/// whitespace-split tokens could not locate its executable.
+fn legacy_format_executable(command: &str) -> Option<&str> {
+    let exe = command.trim_end().strip_suffix("hook")?;
+    let exe = exe.strip_suffix(' ')?;
+    if exe.is_empty() { None } else { Some(exe) }
+}
+
+/// Whether `command` is a LEGACY deck rule: the bare `<executable> hook` shape,
+/// where `executable`'s basename is EXACTLY [`DEFAULT_BINARY_NAME`] — the
+/// historical default every rule was written under before this fix existed.
+/// Scoped to an exact basename match (never a fragment, never the installing
+/// binary's own name) so a user tool whose basename merely contains "deck"
+/// (test 012) or ends in the literal word "hook" (test 005) is never swept up.
+///
+/// Review finding H2: on Windows the installed binary carries the platform's
+/// executable suffix (`dot-agent-deck.exe`), so every real legacy Windows rule
+/// has a basename that never equals bare [`DEFAULT_BINARY_NAME`]. The
+/// comparison is therefore extension-aware — it also accepts
+/// `DEFAULT_BINARY_NAME` with [`std::env::consts::EXE_SUFFIX`] appended, rather
+/// than hardcoding `".exe"` — and, on Windows only, case-insensitive, since
+/// Windows filesystems are and a rule reading `Dot-Agent-Deck.EXE` is a
+/// legitimate legacy rule. `EXE_SUFFIX` is empty on Unix, so this is a no-op
+/// there: the comparison stays exact-basename, case-sensitive, exactly as
+/// before.
+fn is_legacy_deck_rule(command: &str) -> bool {
+    let Some(basename) = legacy_format_executable(command)
+        .and_then(|exe| Path::new(exe).file_name())
+        .and_then(|n| n.to_str())
+    else {
+        return false;
+    };
+
+    if cfg!(windows) {
+        let with_suffix = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+        basename.eq_ignore_ascii_case(DEFAULT_BINARY_NAME)
+            || basename.eq_ignore_ascii_case(&with_suffix)
+    } else {
+        basename == DEFAULT_BINARY_NAME
+    }
+}
+
+/// Whether `existing` and `installing` (both already unquoted) name the SAME
+/// binary, so a rule for `existing` should be replaced rather than left
+/// alongside a fresh rule for `installing`. Symlinks are resolved first — the
+/// real-world case this exists for: a `dot-agent-deck` symlink pointing at a
+/// renamed `worker-agent-deck` collapses to one rule. Every path here can fail
+/// to resolve (most callers are test fixtures never written to disk), so
+/// resolution failure falls back to a literal string comparison; this never
+/// panics or unwraps on it.
+fn executables_match(existing: &str, installing: &str) -> bool {
+    if let (Ok(existing_real), Ok(installing_real)) = (
+        Path::new(existing).canonicalize(),
+        Path::new(installing).canonicalize(),
+    ) {
+        return existing_real == installing_real;
+    }
+    existing == installing
+}
+
+/// Every command string a rule carries, from either JSON shape: the current
+/// nested `{"hooks": [{"command": ...}]}` or the legacy flat
+/// `{"command": ...}`.
+fn rule_commands(rule: &Value) -> impl Iterator<Item = &str> {
+    let nested = rule
         .get("hooks")
-        .and_then(|h| h.as_array())
-        .is_some_and(|hooks| {
-            hooks.iter().any(|hook| {
-                hook.get("command")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|cmd| cmd.contains("dot-agent-deck"))
-            })
-        });
-    // Old format: { "command": "...dot-agent-deck..." }
-    let old_format = rule
-        .get("command")
-        .and_then(|c| c.as_str())
-        .is_some_and(|cmd| cmd.contains("dot-agent-deck"));
-    new_format || old_format
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str));
+    let flat = rule.get("command").and_then(Value::as_str).into_iter();
+    nested.chain(flat)
+}
+
+/// Whether `command` is a deck-owned hook command, generically — no specific
+/// installing binary to compare against. True for any CURRENT-format command
+/// (any executable, by the suffix alone) or any LEGACY-format command whose
+/// executable is exactly [`DEFAULT_BINARY_NAME`].
+fn command_is_ours(command: &str) -> bool {
+    current_format_executable(command).is_some() || is_legacy_deck_rule(command)
+}
+
+/// Whether `command` is a deck-owned hook command that should be treated as
+/// belonging to the SPECIFIC binary currently installing: either a
+/// current-format command whose executable matches `binary_path`
+/// ([`executables_match`]), or a legacy rule — which always migrates to
+/// whichever binary is installing now, regardless of that binary's own name —
+/// migration is keyed off the legacy RULE, never the installer.
+fn command_matches_binary(command: &str, binary_path: &str) -> bool {
+    if let Some(exe) = current_format_executable(command) {
+        return executables_match(&unquote_if_needed(exe), binary_path);
+    }
+    is_legacy_deck_rule(command)
+}
+
+/// Whether `command` is a deck-owned command sharing `binary_path`'s own basename
+/// whose executable is POSITIVELY KNOWN to no longer exist on disk.
+/// `owned_command_executable` returns `None` for any command that is not
+/// deck-owned by either shape, so this can never prune a user's own hook —
+/// only a rule the deck itself would recognise as its own, and only when it
+/// looks like a stale sibling of the binary currently installing (same
+/// basename, different — now-dead — path). A deck rule for a genuinely
+/// different-looking binary is left to
+/// [`command_matches_binary`]/[`is_legacy_deck_rule`] instead, since most of
+/// this file's own fixtures are fictional paths that were never on disk to
+/// begin with and must not be swept up just because they don't exist.
+///
+/// Review finding: pruning on a bare `exists()` conflates "confirmed absent"
+/// with "could not determine" — a working binary behind an unmounted volume,
+/// or a path this process cannot `stat` (permissions), both make `exists()`
+/// return `false` even though the executable is fine, and deleting a working
+/// user's hook is worse than leaving a stale rule. [`Path::try_exists`]
+/// distinguishes the two: it returns `Ok(false)` only when the OS positively
+/// reports the path missing (`NotFound`), and `Err` for every other stat
+/// failure (permission denied, an I/O error off an unmounted or stale mount).
+/// The prune now fires ONLY on `Ok(false)` — `Err` is treated the same as
+/// "exists", i.e. left alone, which is the fail-safe direction.
+///
+/// This does not fully resolve the underlying nondeterminism, and is not
+/// meant to: it relocates the same class of problem one layer down rather
+/// than removing it. `try_exists` still assumes `exe` is itself a bare
+/// filesystem path; a command whose "executable" token is actually an
+/// argv-prefixed wrapper invocation (not a literal path) will still report a
+/// confident-looking `Ok(false)` for a string that was never a real path to
+/// begin with, the same way [`executables_match`]'s `canonicalize` call can
+/// already fail to resolve a path for reasons unrelated to the binary's
+/// health. That gap is unchanged by this fix.
+fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
+    let installing_basename = Path::new(binary_path).file_name();
+    owned_command_executable(command).is_some_and(|exe| {
+        Path::new(&exe).file_name() == installing_basename
+            && matches!(Path::new(&exe).try_exists(), Ok(false))
+    })
+}
+
+/// The literal, unquoted executable path a deck-owned command names, or `None`
+/// if `command` is not deck-owned by either shape. Used only to check whether
+/// that binary still exists on disk.
+fn owned_command_executable(command: &str) -> Option<String> {
+    if let Some(exe) = current_format_executable(command) {
+        return Some(unquote_if_needed(exe).into_owned());
+    }
+    if is_legacy_deck_rule(command) {
+        return legacy_format_executable(command).map(str::to_string);
+    }
+    None
 }
 
 /// Silently install hooks if Claude Code is detected.
@@ -194,7 +748,14 @@ pub fn auto_install() {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
 
-    let mut settings = read_settings(&path);
+    let _guard = lock_settings();
+    let mut settings = match load_settings_or_refuse(&path) {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::warn!("auto-install: {e}");
+            return;
+        }
+    };
     let (installed, _skipped) = install_impl(&mut settings, &binary_path);
 
     if installed.is_empty() {
@@ -210,36 +771,50 @@ pub fn auto_install() {
 }
 
 /// Auto-install to a custom settings path (for testing).
-pub fn auto_install_to(path: &PathBuf) {
+pub fn auto_install_to(path: &Path) {
     if path.parent().is_none_or(|p| !p.exists()) {
         return;
     }
 
     let binary_path = "dot-agent-deck".to_string();
-    let mut settings = read_settings(path);
+    let _guard = lock_settings();
+    let mut settings = match load_settings_or_refuse(path) {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::warn!("auto-install: {e}");
+            return;
+        }
+    };
     let (installed, _skipped) = install_impl(&mut settings, &binary_path);
 
     if installed.is_empty() {
         return;
     }
 
-    write_settings(path, &settings).expect("failed to write settings");
+    if let Err(e) = write_settings(path, &settings) {
+        tracing::warn!("auto-install: failed to write Claude Code hooks: {e}");
+    }
 }
 
-pub fn install() {
+/// `dot-agent-deck hooks install --agent claude-code` — the explicit, chatty
+/// install. Returns `Err` on a refused write (malformed settings.json left
+/// unchanged, or the write itself failing) so the CLI dispatch in `main.rs`
+/// reports failure on stderr AND exits non-zero, instead of a refusal
+/// silently reporting success to the shell — see [`crate::agent_registry`]'s
+/// `claude_install` adapter, which used to hardcode `Ok(())` here regardless
+/// of outcome.
+pub fn install() -> Result<(), String> {
     let binary_path = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
 
     let path = settings_path();
-    let mut settings = read_settings(&path);
+    let _guard = lock_settings();
+    let mut settings = load_settings_or_refuse(&path).map_err(|e| e.to_string())?;
 
     let (installed, skipped) = install_impl(&mut settings, &binary_path);
 
-    if let Err(e) = write_settings(&path, &settings) {
-        eprintln!("Error writing {}: {e}", path.display());
-        return;
-    }
+    write_settings(&path, &settings).map_err(|e| format!("writing {}: {e}", path.display()))?;
 
     if !installed.is_empty() {
         println!("Installed hooks: {}", installed.join(", "));
@@ -248,37 +823,67 @@ pub fn install() {
         println!("Already installed (skipped): {}", skipped.join(", "));
     }
     println!("Settings file: {}", path.display());
+    Ok(())
 }
 
-pub fn uninstall() {
+/// `dot-agent-deck hooks uninstall --agent claude-code`. Returns `Err` on a
+/// refused read or a failed write, so the refusal reaches the shell — issue
+/// #522, the uninstall half of #516. `agent_registry::claude_uninstall`
+/// hardcoded `Ok(())` here regardless of outcome, so even a genuine write
+/// failure could not reach the CLI's exit code; that is what #506 fixed for
+/// `claude_install` alone.
+pub fn uninstall() -> Result<(), String> {
     let path = settings_path();
-    let mut settings = read_settings(&path);
+    let _guard = lock_settings();
+    let mut settings = load_settings_or_refuse(&path).map_err(|e| e.to_string())?;
 
-    let removed = uninstall_impl(&mut settings);
+    let outcome = uninstall_impl(&mut settings);
 
-    if let Err(e) = write_settings(&path, &settings) {
-        eprintln!("Error writing {}: {e}", path.display());
-        return;
-    }
-
-    if removed.is_empty() {
+    if outcome.commands_removed == 0 {
+        // Nothing of ours was in there, so there is nothing to publish. Writing
+        // anyway would reserialize the whole file — reindenting and reordering
+        // keys the deck does not own, and creating a `{}` settings.json on a
+        // machine that never had one.
         println!("No dot-agent-deck hooks found to remove.");
     } else {
-        println!("Removed hooks: {}", removed.join(", "));
+        write_settings(&path, &settings).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        println!(
+            "Removed {} hook command{}: {}",
+            outcome.commands_removed,
+            if outcome.commands_removed == 1 {
+                ""
+            } else {
+                "s"
+            },
+            outcome.hook_types.join(", ")
+        );
     }
     println!("Settings file: {}", path.display());
+    Ok(())
 }
 
 // --- Testable versions that accept a custom path ---
 
-pub fn install_to(path: &PathBuf, binary_path: &str) {
-    let mut settings = read_settings(path);
+/// [`install`] against an explicit settings path. Returns the same refusals the
+/// CLI path reports rather than swallowing them, so a test that expects a write
+/// to be refused has to say so — a seam that quietly discarded the refusal is
+/// how #522's uninstall defect stayed invisible under a green suite.
+pub fn install_to(path: &Path, binary_path: &str) -> io::Result<()> {
+    let _guard = lock_settings();
+    let mut settings = load_settings_or_refuse(path)?;
     install_impl(&mut settings, binary_path);
-    write_settings(path, &settings).expect("failed to write settings");
+    write_settings(path, &settings)
 }
 
-pub fn uninstall_from(path: &PathBuf) {
-    let mut settings = read_settings(path);
-    uninstall_impl(&mut settings);
-    write_settings(path, &settings).expect("failed to write settings");
+/// [`uninstall`] against an explicit settings path, with [`uninstall`]'s
+/// contract: a file that cannot be read or parsed is left byte-for-byte as
+/// found and reported as an error, and nothing is written when nothing of the
+/// deck's was there.
+pub fn uninstall_from(path: &Path) -> io::Result<()> {
+    let _guard = lock_settings();
+    let mut settings = load_settings_or_refuse(path)?;
+    if uninstall_impl(&mut settings).commands_removed == 0 {
+        return Ok(());
+    }
+    write_settings(path, &settings)
 }

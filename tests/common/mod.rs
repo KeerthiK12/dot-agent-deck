@@ -1217,6 +1217,15 @@ impl TuiDeck {
     /// lifecycle is fast, but the terminal `Idle`/exit races real-agent
     /// variance (Design Decision #7: real-agent tests use generous
     /// timeouts).
+    ///
+    /// The terminal condition is settled by [`terminal_reached`], which
+    /// accepts EITHER the post-prefix byte stream or the currently
+    /// rendered grid. The byte stream alone was a flake source: it is
+    /// not a faithful record of the screen (differential rendering
+    /// emits nothing for an unchanged region), so a terminal state the
+    /// user was plainly looking at could go unobserved until the
+    /// timeout — the assertion failed while printing a final grid that
+    /// contained the very needle it said it had not seen.
     pub fn wait_for_strings_in_order_then_any_within(
         &self,
         prefix: &[&str],
@@ -1225,6 +1234,10 @@ impl TuiDeck {
     ) {
         let start_idx = self.byte_history.lock().unwrap().len();
         let deadline = Instant::now() + timeout;
+        // Latched by `terminal_reached` the first time the prefix completes
+        // with the stream unsatisfied — see its docs for why the grid arm
+        // needs a "what was already there" reference.
+        let mut baseline_grid: Option<String> = None;
         loop {
             let snapshot: Vec<u8> = {
                 let hist = self.byte_history.lock().unwrap();
@@ -1234,8 +1247,13 @@ impl TuiDeck {
                     Vec::new()
                 }
             };
-            let (matched, terminal_found) =
-                match_prefix_then_terminal(&snapshot, prefix, terminal_alternatives);
+            let (matched, terminal_found) = terminal_reached(
+                &snapshot,
+                prefix,
+                terminal_alternatives,
+                &mut baseline_grid,
+                || self.snapshot_grid(),
+            );
             if matched == prefix.len() && terminal_found {
                 return;
             }
@@ -2173,6 +2191,66 @@ fn match_prefix_then_terminal(
     }
     let terminal_found = terminals.iter().any(|t| text[cursor..].contains(t));
     (matched, terminal_found)
+}
+
+/// Whether the terminal condition is satisfied, weighing BOTH available
+/// sources of evidence: the rolling byte stream (which catches a transient
+/// state already overwritten by the time anyone looks) and the CURRENTLY
+/// rendered grid (which catches a state plainly on screen whose bytes were
+/// never re-emitted).
+///
+/// The grid arm exists because the byte stream is NOT a faithful record of
+/// what is on screen. ratatui renders DIFFERENTIALLY — a cell region that does
+/// not change between frames emits no bytes at all — and it can split one
+/// visible line across several writes when styling changes mid-line. Either is
+/// enough for a terminal state the user is plainly looking at to be missing
+/// from the post-prefix stream, which is exactly how
+/// `claude_001_thinking_working_idle` flaked: its panic printed a final grid
+/// containing `Launch an agent to get started` while reporting it had seen
+/// none of the terminal alternatives.
+///
+/// The grid arm carries the SAME ordering rule as the stream arm, and needs it
+/// for the same reason. The stream is searched only after the prefix cursor;
+/// the grid is a whole screen with no cursor, so "is the needle on screen" is
+/// far too loose — the needle may have been sitting in some unrelated region
+/// since boot. `delegate_014` is the proof: its worker command is
+/// `claude --model … --allowedTools Bash Read Write`, the deck renders a role's
+/// command on its card, and the terminal alternatives there are
+/// `["Bash", "bash"]`. A bare `grid.contains` would match that command string
+/// the instant `Thinking → Working` completed and pass the test without the
+/// worker ever running a Bash tool (Greptile P2 on #585).
+///
+/// So the grid must show the needle ARRIVING: `baseline` latches the screen at
+/// the moment the prefix first completes with the stream still unsatisfied,
+/// and only a needle present now and ABSENT from that baseline counts. That is
+/// the grid-dimension equivalent of "after the cursor", and it keeps the
+/// property the byte stream had — a state that was already true before the
+/// working lifecycle finished can never satisfy the terminal condition.
+///
+/// `grid` is a closure because [`Deck::snapshot_grid`] renders the whole
+/// screen and this is polled every 20 ms — it must not be paid for on the
+/// common path where the cheap stream check already settled the question.
+fn terminal_reached(
+    haystack: &[u8],
+    prefix: &[&str],
+    terminals: &[&str],
+    baseline: &mut Option<String>,
+    grid: impl FnOnce() -> String,
+) -> (usize, bool) {
+    let (matched, in_stream) = match_prefix_then_terminal(haystack, prefix, terminals);
+    if matched < prefix.len() || in_stream {
+        return (matched, in_stream);
+    }
+    let grid = grid();
+    // First poll past the gate establishes what was ALREADY on screen; nothing
+    // can have arrived yet, so this poll never matches by construction.
+    let baseline = baseline.get_or_insert_with(|| grid.clone());
+    (
+        matched,
+        terminals
+            .iter()
+            .any(|t| grid.contains(t) && !baseline.contains(t)),
+    )
 }
 
 fn locate_fixture(name: &str) -> PathBuf {
@@ -8842,6 +8920,136 @@ mod harness_unit_tests {
         );
         assert_eq!(matched, 3);
         assert!(!terminal);
+    }
+
+    /// The observed `claude_001_thinking_working_idle` flake, reduced to its
+    /// mechanism. The pane's placeholder was painted BEFORE the working
+    /// lifecycle and never repainted after it, so the post-prefix byte stream
+    /// carries none of its bytes — yet the user is plainly looking at it, and
+    /// the failing run's own panic message printed a final grid containing it.
+    ///
+    /// The byte stream is not a faithful record of what is on screen: ratatui
+    /// renders DIFFERENTIALLY (an unchanged cell region emits nothing at all)
+    /// and can split one visible line across several writes when styling
+    /// changes mid-line. Either is enough to hide a terminal state that has
+    /// genuinely been reached, which is why the grid is consulted as a second
+    /// source of evidence.
+    #[test]
+    fn terminal_reached_accepts_a_terminal_state_that_arrives_on_the_grid() {
+        // Placeholder bytes appear only BEFORE the prefix completes, so the
+        // post-cursor stream never carries them.
+        let haystack = b"Thinking... Working `Bash`";
+        let working = "1 claude-sm... - Bash\nDir: .tmpZNOTi9\nWorking";
+        let exited = "1 No agent - claude-sm...\nDir: .tmpZNOTi9\nLaunch an agent to get started";
+        let prefix = ["Thinking", "Working", "Bash"];
+        let terminals = ["Idle", "Launch an agent to get started"];
+        let mut baseline = None;
+
+        // First poll past the gate only latches what was already on screen.
+        let (matched, terminal) =
+            terminal_reached(haystack, &prefix, &terminals, &mut baseline, || {
+                working.to_string()
+            });
+        assert_eq!(matched, 3);
+        assert!(!terminal, "nothing has arrived yet on the first poll");
+
+        // The agent exits and the card repaints to the placeholder.
+        let (_, terminal) = terminal_reached(haystack, &prefix, &terminals, &mut baseline, || {
+            exited.to_string()
+        });
+        assert!(
+            terminal,
+            "a terminal state that ARRIVES on screen must satisfy the terminal \
+             condition even when a differential render never re-emitted its bytes \
+             after the prefix"
+        );
+    }
+
+    /// Greptile P2 on #585, and a false pass that `delegate_014` would have
+    /// hit every run. Its worker command is
+    /// `claude --model … --allowedTools Bash Read Write`, the deck renders a
+    /// role's command on its card, and that test's terminal alternatives are
+    /// `["Bash", "bash"]` — so the needle sits on the grid from boot. A bare
+    /// "is it on screen" check would pass the instant the prefix completed,
+    /// without the worker ever running a Bash tool. Only a needle that ARRIVES
+    /// after the prefix counts.
+    #[test]
+    fn terminal_reached_rejects_a_needle_that_was_on_the_grid_all_along() {
+        let haystack = b"Thinking... Working, worker still going";
+        let grid = "orchestrator | worker\n\
+                    command: claude --model haiku --allowedTools Bash Read Write\n\
+                    Working";
+        let mut baseline = None;
+        let prefix = ["Thinking", "Working"];
+        let terminals = ["Bash", "bash"];
+
+        for _ in 0..3 {
+            let (matched, terminal) =
+                terminal_reached(haystack, &prefix, &terminals, &mut baseline, || {
+                    grid.to_string()
+                });
+            assert_eq!(matched, 2);
+            assert!(
+                !terminal,
+                "a needle that has been on screen since boot must never satisfy \
+                 the terminal condition — the test would finish while the worker \
+                 is still working"
+            );
+        }
+    }
+
+    /// The ordering guarantee must survive the grid arm: a restored session
+    /// renders a default `Idle` before the agent starts, and that must still
+    /// not count. The grid is consulted ONLY once the prefix has fully
+    /// matched, so the gate is shut while the stale state is on screen.
+    #[test]
+    fn terminal_reached_still_ignores_a_terminal_state_before_the_prefix_completes() {
+        let haystack = b"Idle (restored) then Thinking... Working took over, no tool used";
+        let mut baseline = None;
+        let (matched, terminal) = terminal_reached(
+            haystack,
+            &["Thinking", "Working", "Bash"],
+            &["Idle", "Launch an agent to get started"],
+            &mut baseline,
+            || "Idle".to_string(),
+        );
+        assert_eq!(matched, 2);
+        assert!(
+            !terminal,
+            "an Idle on screen while the working lifecycle is still incomplete \
+             must never satisfy the terminal condition — the prefix gate is what \
+             makes the grid arm safe"
+        );
+        assert!(
+            baseline.is_none(),
+            "the baseline must not latch before the gate opens, or it would \
+             capture a mid-lifecycle screen"
+        );
+    }
+
+    /// The cheap path stays cheap: when the byte stream already answers the
+    /// question, the grid is never rendered. `snapshot_grid` locks and walks
+    /// the whole screen, and this decision is polled every 20 ms.
+    #[test]
+    fn terminal_reached_does_not_render_the_grid_when_the_stream_settles_it() {
+        let mut rendered = false;
+        let mut baseline = None;
+        let (matched, terminal) = terminal_reached(
+            b"Thinking... Working `Bash` then Idle",
+            &["Thinking", "Working", "Bash"],
+            &["Idle"],
+            &mut baseline,
+            || {
+                rendered = true;
+                String::new()
+            },
+        );
+        assert_eq!(matched, 3);
+        assert!(terminal);
+        assert!(
+            !rendered,
+            "the grid must not be rendered when the byte stream already matched"
+        );
     }
 
     #[test]

@@ -42,6 +42,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::broadcast;
 
@@ -700,6 +701,135 @@ pub enum WorktreeCreation {
     BranchExists,
 }
 
+/// Attempts (the first included) at `git worktree add` when it fails because a
+/// concurrent add's administrative directory was only half written — issue #541.
+/// Bounded on purpose: the window is microseconds wide in the wild, so a handful
+/// of tries covers a genuine race by orders of magnitude, while a `commondir`
+/// that is permanently unreadable still surfaces as an error instead of being
+/// retried forever.
+const WORKTREE_ADD_ATTEMPTS: u32 = 5;
+
+/// Backoff before retry `attempt` (1-based): 100ms, 200ms, 400ms, 800ms — 1.5s
+/// of cover in total, which is ~six orders of magnitude more than the two-syscall
+/// window it exists for, and is also the entire latency a genuinely broken repo
+/// pays before its error is reported.
+fn worktree_add_backoff(attempt: u32) -> Duration {
+    // Saturating and capped so the arithmetic stays total: at five attempts the
+    // shift never exceeds 3, but raising [`WORKTREE_ADD_ATTEMPTS`] must not be
+    // able to turn a backoff into an overflow panic.
+    Duration::from_millis(100u64 << attempt.saturating_sub(1).min(10))
+}
+
+/// How long to wait for the per-repository worktree lock before giving up on
+/// serialization and creating the worktree unserialized. A stuck holder must
+/// slow a dispatch down, never wedge it forever.
+const WORKTREE_LOCK_WAIT: Duration = Duration::from_secs(60);
+
+/// Issue #541: does this `git worktree add` failure look like the reader side of
+/// a concurrent add rather than a real problem?
+///
+/// `git worktree add` scans the repo's worktree list before creating its own
+/// entry, reading every entry's `commondir`. An add that has created its entry
+/// but not yet written that file makes the read come back short, and git turns
+/// that into `fatal: failed to read '<…>/worktrees/<name>/commondir': Success` —
+/// `strerror(errno)` for an errno nothing ever set, which is the tell that the
+/// read did not actually fail.
+///
+/// Keyed on the FILE NAME, not on git's sentence: both the `die_errno` format
+/// string and `strerror` are localized, so "failed to read" and "Success"
+/// disappear under a non-English locale while `commondir` — a path component —
+/// does not. Deliberately narrow all the same: it matches only failures naming
+/// that one administrative file, and even those are retried a bounded number of
+/// times.
+fn is_worktree_scan_short_read(err: &str) -> bool {
+    err.contains("commondir")
+}
+
+/// Path of the lock that serializes worktree creation for one repository.
+///
+/// Derived from `git rev-parse --git-common-dir` and placed inside it, because
+/// that directory is exactly the contended resource — `worktrees/<name>` lives
+/// there — and because `clone_dir` may itself be a linked worktree, whose `.git`
+/// is a FILE and whose per-worktree admin dir is private. Asking git means every
+/// spelling of one repository (the main checkout, any of its worktrees, a
+/// relative path) maps onto a single lock file, which is what makes the
+/// exclusion hold between separate deck PROCESSES and not merely between tasks
+/// in one.
+///
+/// Returns `None` when the directory cannot be resolved (not a git repo) — the
+/// add itself then fails with git's own message, which is the better error.
+async fn worktree_lock_path(clone_dir: &Path) -> Option<PathBuf> {
+    let common = run_capture_args(
+        "git",
+        &[
+            "-C",
+            &clone_dir.to_string_lossy(),
+            "rev-parse",
+            "--git-common-dir",
+        ],
+    )
+    .await
+    .ok()?;
+    let common = common.trim();
+    if common.is_empty() {
+        return None;
+    }
+    // `--git-common-dir` answers relative to the repository (plain `.git` for an
+    // ordinary checkout), and our cwd is the daemon's, not `clone_dir`'s — so a
+    // relative answer has to be joined here. Resolved this way rather than with
+    // `--path-format=absolute` so the derivation does not depend on git 2.31+.
+    let common = Path::new(common);
+    let path = if common.is_absolute() {
+        common.to_path_buf()
+    } else {
+        clone_dir.join(common)
+    };
+    Some(path.join("dot-agent-deck-worktree.lock"))
+}
+
+/// Serialize `git worktree add` for one repository across processes (issue
+/// #541), so this deck's own concurrent dispatches cannot observe each other's
+/// half-created administrative directories.
+///
+/// Every failure mode degrades to "create the worktree anyway": an unresolvable
+/// repo, an unwritable `.git`, or a holder that never lets go all return `None`,
+/// which is precisely the pre-#541 behaviour that the bounded retry in
+/// [`create_worktree`] already covers. A lock is worth having only while it
+/// cannot itself become the reason a dispatch fails or hangs.
+///
+/// Serialization also does not make the retry redundant, and vice versa: this
+/// only binds processes that take the lock, so an add started by the user or by
+/// another tool still races us, and only the retry survives that.
+async fn acquire_worktree_lock(clone_dir: &Path) -> Option<crate::platform::lock::SpawnLock> {
+    let path = worktree_lock_path(clone_dir).await?;
+    match tokio::time::timeout(
+        WORKTREE_LOCK_WAIT,
+        crate::platform::lock::acquire_spawn_lock(&path),
+    )
+    .await
+    {
+        Ok(Ok(guard)) => Some(guard),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                lock = %path.display(),
+                error = %e,
+                "could not take the per-repository worktree lock; creating the worktree \
+                 unserialized (the bounded retry still covers a concurrent add)"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                lock = %path.display(),
+                waited_secs = WORKTREE_LOCK_WAIT.as_secs(),
+                "timed out waiting for the per-repository worktree lock; creating the \
+                 worktree unserialized rather than wedging the dispatch"
+            );
+            None
+        }
+    }
+}
+
 /// M2.2: create the per-issue worktree on `agent/issue-<n>`. The `.worktrees`
 /// parent is created first so the add never trips on a missing dir.
 ///
@@ -723,6 +853,28 @@ pub enum WorktreeCreation {
 /// [`WorktreeCreation::AlreadyClaimed`] (→ skip) instead of a hard failure. A
 /// genuine add failure (bad ref, permissions, …) leaves the dir absent and
 /// still propagates as `Err`.
+///
+/// Issue #541 — a SECOND, unrelated concurrency hazard, on a different name.
+/// The one above is two dispatches racing for the same worktree; this one is any
+/// two adds racing on the same *repository*, and it fails the loser even though
+/// nothing about its dispatch is wrong. `git worktree add` scans the repo's
+/// worktree list before creating its own entry and reads every entry's
+/// `commondir`; a concurrent add that has created its entry but not yet written
+/// that file makes the read come back short, and the loser dies with `fatal:
+/// failed to read '…/worktrees/<name>/commondir': Success`. Two defences, and
+/// each covers what the other cannot:
+///
+/// - [`acquire_worktree_lock`] serializes the adds this deck starts, per
+///   repository and across processes, so the deck stops being its own worst
+///   offender (three concurrent dispatches — `scheduler/dispatch/015` — is the
+///   reported case).
+/// - [`is_worktree_scan_short_read`] + [`WORKTREE_ADD_ATTEMPTS`] retry the one
+///   transient signature a bounded number of times, which is the only thing that
+///   can help against an add the deck did not start (the user's own, another
+///   tool's) since those take no lock.
+///
+/// Neither defence swallows anything: a `commondir` that stays unreadable
+/// exhausts the attempts and surfaces as `Err`.
 pub async fn create_worktree(
     clone_dir: &Path,
     worktree_dir: &Path,
@@ -733,29 +885,84 @@ pub async fn create_worktree(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create worktree parent {}: {e}", parent.display()))?;
     }
+    // Issue #541: keep this deck's own concurrent creations off each other's
+    // half-created entries. Held across the probe AND the add so the two are
+    // atomic with respect to another dispatch of the same name; released on drop
+    // at the end of the function.
+    let _repo_lock = acquire_worktree_lock(clone_dir).await;
+
     let clone = clone_dir.to_string_lossy();
     let wt = worktree_dir.to_string_lossy();
     let branch_ref = format!("refs/heads/{branch}");
-    let branch_exists = run_status(
-        "git",
-        &[
-            "-C",
-            &clone,
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &branch_ref,
-        ],
-    )
-    .await
-    .is_ok();
-    if branch_exists && !reuse_existing_branch {
-        return Ok(WorktreeCreation::BranchExists);
-    }
-    let add = if branch_exists {
-        run_status("git", &["-C", &clone, "worktree", "add", &wt, branch]).await
-    } else {
-        run_status("git", &["-C", &clone, "worktree", "add", &wt, "-b", branch]).await
+    let mut attempt: u32 = 1;
+    let add = loop {
+        // Re-probed on every attempt, not hoisted out of the loop: a `git
+        // worktree add` that dies on the scan has already CREATED its `-b`
+        // branch (the branch survives the exit-128), so passing `-b` again would
+        // fail with "a branch named … already exists" and turn a transient race
+        // into a hard failure — and, with `reuse_existing_branch: false`, into a
+        // dispatch name the user has to `git branch -D` by hand.
+        let branch_exists = run_status(
+            "git",
+            &[
+                "-C",
+                &clone,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &branch_ref,
+            ],
+        )
+        .await
+        .is_ok();
+        // Only attempt 1 can report BranchExists. Reaching attempt 2 means the
+        // branch was PROVEN absent moments ago, so anything there now was
+        // created either by our own failed attempt or by a dispatch racing us —
+        // never the "may hold committed work from an earlier dispatch" case this
+        // guard exists for. (A branch a racing dispatch is really using fails the
+        // attach with "already used by worktree at …", and its worktree dir is
+        // then present, so the outcome is `AlreadyClaimed` below.)
+        if branch_exists && !reuse_existing_branch && attempt == 1 {
+            // …but only when the worktree really IS gone, which is precisely what
+            // the BranchExists message asserts ("its worktree is already gone",
+            // `dispatch.rs`). A directory that is present is a live claim, and
+            // saying otherwise sends the user to `git branch -D` for a worktree
+            // they can see. Serializing creation made this reachable by design
+            // rather than by luck: the loser of a same-name race now always
+            // probes AFTER the winner created the branch, where before it might
+            // have probed first and been classified (correctly) as
+            // `AlreadyClaimed` by the post-add check below.
+            if worktree_dir.exists() {
+                return Ok(WorktreeCreation::AlreadyClaimed);
+            }
+            return Ok(WorktreeCreation::BranchExists);
+        }
+        let result = if branch_exists {
+            run_status("git", &["-C", &clone, "worktree", "add", &wt, branch]).await
+        } else {
+            run_status("git", &["-C", &clone, "worktree", "add", &wt, "-b", branch]).await
+        };
+        match result {
+            Err(e) if attempt < WORKTREE_ADD_ATTEMPTS && is_worktree_scan_short_read(&e) => {
+                let backoff = worktree_add_backoff(attempt);
+                tracing::warn!(
+                    clone = %clone_dir.display(),
+                    worktree = %worktree_dir.display(),
+                    attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = %e,
+                    "git worktree add read another add's half-created administrative \
+                     directory (issue #541); retrying after a backoff"
+                );
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+            }
+            // Success, a non-transient failure, or the last attempt: the retry
+            // is bounded, so a `commondir` that is genuinely unreadable (a
+            // crashed add left an empty one behind) still surfaces as an error
+            // rather than looping or being swallowed.
+            other => break other,
+        }
     };
     match add {
         Ok(()) => Ok(WorktreeCreation::Created),
@@ -1066,6 +1273,318 @@ mod tests {
             outcome.is_err(),
             "a real add failure with no worktree on disk must propagate as Err, got {outcome:?}"
         );
+    }
+
+    // --- Issue #541: concurrent `git worktree add` reads a half-created
+    // administrative directory ---
+
+    /// A real git repo with one commit — `git worktree add` needs a commit to
+    /// branch from. Disk-backed (issue #322 / CLAUDE.md rule 14): this fixture
+    /// is a git repository plus its worktrees, not a scratch file.
+    fn init_repo_with_commit(repo: &Path) {
+        std::fs::create_dir_all(repo).expect("create repo dir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main", "--quiet"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        // The dev box may have `commit.gpgsign` on globally; the fixture must
+        // not depend on a signing key being present.
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README.md"), "seed\n").expect("write seed file");
+        git(&["add", "README.md"]);
+        git(&["commit", "--quiet", "-m", "seed"]);
+    }
+
+    /// Stage the state a `git worktree add` leaves in
+    /// `$GIT_COMMON_DIR/worktrees/<name>` *between* creating the entry and
+    /// finishing it — the window issue #541 is about.
+    ///
+    /// The byte sequence is git's own, read off an `strace` of `git worktree
+    /// add` (2.55.0), which in order: `mkdir(worktrees/<name>)`, writes
+    /// `locked`, writes `gitdir`, then `openat("commondir", O_CREAT|O_TRUNC)`
+    /// — and only on the NEXT syscall writes `../..` into it. Every other `git
+    /// worktree add` on the repo scans the worktree list before creating its own
+    /// entry and reads each entry's `commondir`; on a short read git calls
+    /// `die_errno()`, which prints `strerror(errno)` for an errno that was never
+    /// set. That is where the reported message's giveaway `: Success` comes from.
+    ///
+    /// Staged rather than raced because that window is two adjacent syscalls
+    /// wide. It IS reachable by genuine concurrency — measured on this box with
+    /// N concurrent real `git worktree add`s against one repo: 12 failures in 960
+    /// adds at N=64, 7 in 1024 at N=128, 0 in 960 at N=3 and 0 in 400 at N=16,
+    /// every failure carrying the reported `fatal: failed to read
+    /// .git/worktrees/<name>/commondir: Success` verbatim. About a thousand real
+    /// worktree checkouts per observed failure is neither affordable in the fast
+    /// tier nor a reliable gate, so the test stages the identical bytes and
+    /// closes the window on a timer instead of on luck.
+    fn begin_half_created_entry(repo: &Path, name: &str) -> PathBuf {
+        let entry = repo.join(".git").join("worktrees").join(name);
+        std::fs::create_dir_all(&entry).expect("create half-created worktree entry");
+        std::fs::write(entry.join("locked"), "creating\n").expect("write locked");
+        std::fs::write(
+            entry.join("gitdir"),
+            format!("{}\n", repo.join(name).join(".git").display()),
+        )
+        .expect("write gitdir");
+        // The `O_CREAT|O_TRUNC` has happened; the write of `../..` has not.
+        std::fs::write(entry.join("commondir"), b"").expect("create empty commondir");
+        entry
+    }
+
+    /// The writer's very next syscall: `commondir` becomes readable and the
+    /// window closes, exactly as it does when the concurrent add proceeds.
+    fn finish_half_created_entry(entry: &Path) {
+        std::fs::write(entry.join("commondir"), "../..\n").expect("finish commondir");
+    }
+
+    /// Issue #541 — three concurrent dispatches (`scheduler/dispatch/015`'s
+    /// shape) must each end up with their worktree even though an unrelated
+    /// `git worktree add` is mid-flight on the same repo. Each of the three
+    /// scans the half-created entry, so each dies on it before its own worktree
+    /// is created — the reported symptom, in the setup step, before any agent
+    /// runs.
+    ///
+    /// The window is closed by a fourth party that holds no deck lock, so this
+    /// exercises the case serialization alone cannot fix: a `git worktree add`
+    /// the deck did not start (the user's own, or another tool's).
+    ///
+    /// Also pins the second-order defect: the add that dies on the scan has
+    /// ALREADY created its `-b` branch, so a retry has to re-probe and ATTACH
+    /// that branch rather than pass `-b` again — hence the per-dispatch HEAD
+    /// assertion.
+    #[tokio::test]
+    async fn create_worktree_survives_a_concurrent_adds_half_created_entry() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+        let entry = begin_half_created_entry(&repo, "concurrent-add");
+
+        // Closes while the three dispatches are in flight. Not a timing race:
+        // without a retry there is no second attempt for the timer to rescue,
+        // so a slow machine cannot turn this green by accident.
+        let closing = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            finish_half_created_entry(&entry);
+        });
+
+        let mut fires = Vec::new();
+        for name in ["alpha", "beta", "gamma"] {
+            let clone_dir = repo.clone();
+            let worktree_dir = scratch.path().join(format!("repo-dispatch-{name}"));
+            fires.push(tokio::spawn(async move {
+                let branch = format!("agent/dispatch-{name}");
+                let outcome = create_worktree(&clone_dir, &worktree_dir, &branch, false).await;
+                (name, worktree_dir, branch, outcome)
+            }));
+        }
+        closing.await.expect("window-closing task");
+
+        for fire in fires {
+            let (name, worktree_dir, branch, outcome) = fire.await.expect("dispatch task");
+            assert_eq!(
+                outcome,
+                Ok(WorktreeCreation::Created),
+                "dispatch '{name}' must get its worktree despite a concurrent add's \
+                 half-created entry; `Err(… commondir …)` is issue #541 itself, and \
+                 `Ok(BranchExists)`/`… already exists` is a retry that failed to \
+                 re-probe the branch its own failed attempt left behind"
+            );
+            assert!(
+                worktree_dir.join("README.md").exists(),
+                "dispatch '{name}' reported Created but its worktree has no checkout at {}",
+                worktree_dir.display()
+            );
+            let head = run_capture_args(
+                "git",
+                &[
+                    "-C",
+                    &worktree_dir.to_string_lossy(),
+                    "branch",
+                    "--show-current",
+                ],
+            )
+            .await
+            .expect("read the new worktree's branch");
+            assert_eq!(
+                head.trim(),
+                branch,
+                "dispatch '{name}' must be checked out on its own branch"
+            );
+        }
+    }
+
+    /// Control for the test above, and the guard on the retry's blast radius: a
+    /// `commondir` that never becomes readable is NOT transient — a crashed add
+    /// leaves exactly this behind — so it must still surface as `Err` naming the
+    /// file, not be retried away or swallowed. Bounds the retry too: if it ever
+    /// became unbounded this test would hang rather than fail.
+    #[tokio::test]
+    async fn create_worktree_surfaces_a_half_created_entry_that_never_completes() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+        let _entry = begin_half_created_entry(&repo, "abandoned-add");
+        let worktree_dir = scratch.path().join("repo-dispatch-stuck");
+
+        let err = create_worktree(&repo, &worktree_dir, "agent/dispatch-stuck", false)
+            .await
+            .expect_err("a permanently unreadable commondir must surface as an error");
+        assert!(
+            err.contains("commondir"),
+            "the error must still name the file git could not read, got: {err}"
+        );
+        assert!(
+            !worktree_dir.exists(),
+            "a failed creation must not leave a worktree behind at {}",
+            worktree_dir.display()
+        );
+    }
+
+    /// Issue #541, the other half of the fix: worktree creation is serialized
+    /// PER REPOSITORY and, because the lock is an `flock(2)` on a file (a named
+    /// mutex on Windows), between separate deck processes rather than merely
+    /// between tasks in one — concurrent dispatches can come from different
+    /// decks, and an in-process mutex would silently not cover them.
+    ///
+    /// Written the way the platform lock's own contract test is: a held lock
+    /// makes the creation block, and releasing it lets the creation complete.
+    /// The lock is taken through the SAME derivation production uses, so a
+    /// change that moved worktree creation off this key would fail here rather
+    /// than quietly stop serializing.
+    #[tokio::test]
+    async fn create_worktree_serializes_per_repository_across_processes() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+
+        let lock_path = worktree_lock_path(&repo)
+            .await
+            .expect("a git repo must resolve a worktree lock path");
+        assert!(
+            lock_path.starts_with(repo.join(".git")),
+            "the lock must live in the repository's git common dir (the contended \
+             directory), got {}",
+            lock_path.display()
+        );
+        let held = crate::platform::lock::acquire_spawn_lock(&lock_path)
+            .await
+            .expect("hold the repository's worktree lock, as another deck process would");
+
+        let clone_dir = repo.clone();
+        let worktree_dir = scratch.path().join("repo-dispatch-serialized");
+        let creating = tokio::spawn(async move {
+            create_worktree(
+                &clone_dir,
+                &worktree_dir,
+                "agent/dispatch-serialized",
+                false,
+            )
+            .await
+        });
+        // Long enough to reach the blocking wait. Not a race: while the lock is
+        // held the creation can NEVER finish, so a slow machine also passes.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !creating.is_finished(),
+            "worktree creation must wait while another process holds this \
+             repository's worktree lock; not waiting is how two `git worktree add`s \
+             end up reading each other's half-created entries (#541)"
+        );
+
+        drop(held);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), creating)
+            .await
+            .expect("releasing the lock must let the creation proceed")
+            .expect("the creating task must not panic");
+        assert_eq!(
+            outcome,
+            Ok(WorktreeCreation::Created),
+            "once the lock is released the worktree must be created normally"
+        );
+    }
+
+    /// A dispatch whose name is claimed by a LIVE worktree must be told that,
+    /// not that its branch is left over from a dispatch "whose worktree is
+    /// already gone" — the user can see the directory, and the leftover-branch
+    /// message sends them to `git branch -D` for a tree another dispatch is
+    /// working in.
+    ///
+    /// The mirror image of `dispatch.rs`'s
+    /// `second_dispatch_of_a_name_reports_branch_exists_after_cleanup`, which
+    /// pins the same distinction from the other side (dir gone → BranchExists).
+    /// Serializing creation (#541) is what makes this reachable by design rather
+    /// than by luck: the loser of a same-name race now always probes the branch
+    /// AFTER the winner created it.
+    #[tokio::test]
+    async fn create_worktree_reports_a_live_claim_not_a_leftover_branch() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+        let worktree_dir = scratch.path().join("repo-dispatch-claimed");
+
+        assert_eq!(
+            create_worktree(&repo, &worktree_dir, "agent/dispatch-claimed", false).await,
+            Ok(WorktreeCreation::Created),
+            "precondition: the first dispatch claims the name"
+        );
+
+        assert_eq!(
+            create_worktree(&repo, &worktree_dir, "agent/dispatch-claimed", false).await,
+            Ok(WorktreeCreation::AlreadyClaimed),
+            "a second dispatch of a name whose worktree is still THERE is a live \
+             claim; reporting BranchExists would tell the user their worktree is \
+             gone while it is in front of them"
+        );
+        assert!(
+            worktree_dir.exists(),
+            "the live claim must be left untouched at {}",
+            worktree_dir.display()
+        );
+    }
+
+    /// The retry predicate matches the reported signature — including the
+    /// `: Success` tell (`strerror` on an errno nothing set) — and does not
+    /// match ordinary `git worktree add` failures, which must stay hard
+    /// failures rather than costing a dispatch 1.5s of pointless backoff.
+    #[test]
+    fn worktree_scan_short_read_matches_only_the_commondir_signature() {
+        // Verbatim from the issue…
+        assert!(is_worktree_scan_short_read(
+            "fatal: failed to read '.git/worktrees/repo-dispatch-alpha/commondir': Success"
+        ));
+        // …and verbatim from a real concurrent reproduction on git 2.55.0,
+        // which prints the path unquoted.
+        assert!(is_worktree_scan_short_read(
+            "`git -C /tmp/repo worktree add /tmp/wt -b agent/x` failed (exit status: 128): \
+             Preparing worktree (new branch 'agent/x')\n\
+             fatal: failed to read .git/worktrees/w-2-2/commondir: Success"
+        ));
+
+        for genuine in [
+            "fatal: a branch named 'agent/dispatch-alpha' already exists",
+            "fatal: '/ws/repo-dispatch-alpha' already exists",
+            "fatal: invalid reference: agent/nope",
+            "fatal: not a git repository (or any of the parent directories): .git",
+            "error: could not create leading directories of '/ws/x': Permission denied",
+        ] {
+            assert!(
+                !is_worktree_scan_short_read(genuine),
+                "a genuine failure must not be retried: {genuine}"
+            );
+        }
     }
 
     // --- .worktrees/ git-status hygiene via .git/info/exclude ---

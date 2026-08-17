@@ -129,6 +129,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact `card_height` value per tier (covered by `card_height_001_content_derived_values`); the mid-card blank separator line on Normal/Spacious (intentional content, not a trailing row).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/density/005 — A Spacious idle card shows the flashing-dot indicator over ordinary card content, the same as Normal and Compact (issue #519).
+- **Layer:** L1 (ratatui `TestBackend`, buffer inspection + `insta`).
+- **Agent:** none.
+- **Asserts:** an `Idle` session rendered at Spacious density keeps its ordinary card content — prompt line, dir line, agent-type badge — and carries the `Idle` status badge whose leading dot is inked at the flash-on tick and blank at the flash-off tick, matching the indicator Normal renders for the same session. Pins the fallback that idle cards use in **every** density now that issue #519 removed the Spacious-only ASCII-art overlay, which used to `Clear` this content and paint generated frames over it.
+- **Does not assert:** the removed art path itself (deleted, with no seam left to drive); the flash period, covered by the `flash_dot` unit test.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/card-stats
 
 ##### dashboard/card-stats/001 — A wide card renders its full Last/Tools stats at the bottom-right border.
@@ -3693,11 +3700,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the delegation chain / sentinel as a hard gate (logged best-effort — too LLM/timing-dependent); exact agent phrasing; the clone/worktree/branch derivation or skip/dedup/cap/cleanup logic (covered by the headless `scheduler/dispatch/001-009` and the deterministic-stub `scheduler/dispatch/011-012`); the single-agent live-surfacing path (covered by `scheduler/dispatch/011`).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/014 — Concurrent single-agent dispatch seeds survive a deterministic boot-window swallow and are confirmed after retry.
-- **Layer:** L2 synthetic PTY-attached (real deck and daemon, three real dispatch worktrees, scripted Claude-shaped stand-ins that post hooks through the real CLI; no LLM).
-- **Agent:** synthetic hook-emitting stand-in that posts `SessionStart`, delays its input reader, consumes the first submitted line without a hook, then emits `UserPromptSubmit` only for a later line.
-- **Asserts:** three concurrent `dispatch --single` panes each record the swallowed first write, receive a retry, durably expose the exact submitted prompt through daemon session state, and produce written/unconfirmed/confirmed delivery logs for each of three distinct delivery IDs.
-- **Does not assert:** the retry's internal matching strategy, exact log sentence, or real-agent boot behavior (covered by `scheduler/dispatch/015`).
+##### scheduler/dispatch/014 — Concurrent single-agent dispatch seeds survive a deterministic boot-window swallow and are confirmed after retry, whether the producer identifies itself before or after the write.
+- **Layer:** L2 synthetic PTY-attached (real deck and daemon, four real dispatch worktrees, scripted Claude-shaped stand-ins that post hooks through the real CLI; no LLM). The stand-in is named `claude` so the deck's own `AgentType::from_command` resolves the spawn as ClaudeCode — the ordinary `default_command = "claude …"` production shape, and the pre-write spawn record issue #570's fix consults. `DOT_AGENT_DECK_SESSION_START_WAIT_MS` pins the readiness gate to 3 s so the fallback write path is reached in seconds rather than the production 30 s.
+- **Agent:** synthetic hook-emitting stand-in that posts `SessionStart`, delays its input reader, consumes the first submitted line without a hook, then emits `UserPromptSubmit` only for a later line. The fourth pane (`seed-late-claim`, keyed off its pane id) withholds that `SessionStart` for 6 s, so the readiness gate expires, the prompt is written unarmed on the fallback path, and its producer claims a reporting agent only afterwards — issue #570.
+- **Asserts:** four concurrent `dispatch --single` panes each record the swallowed first write, receive a retry, durably expose the exact submitted prompt through daemon session state, and produce written/unconfirmed/confirmed delivery logs for each of four distinct delivery IDs. The three early-announcing panes are the control: identical in every input except when the producer identifies itself, and green before and after #570's fix, so the late pane's failure is attributable to the race rather than to the delivery path. Because attempt 1 submits in NEITHER population (the stand-in swallows it by construction, as the field report's own control did), a confirmation here can only come from a retry.
+- **Does not assert:** the retry's internal matching strategy, exact log sentence, or real-agent boot behavior (covered by `scheduler/dispatch/015`); the sub-150 ms production window in which #570 was actually observed (a `SessionStart` landing between the pre-write drain and the write completing) — the late claim is staged as strictly post-write instead, which reaches the identical gate state deterministically; the refusal side of that gate for a pane the deck cannot vouch for (covered by `scheduler/dispatch/016`).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/dispatch/015 — Three concurrent real interactive Claude dispatches each genuinely submit their seed prompt.
@@ -3708,11 +3715,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** exact model response phrasing, ordering between the three agents, or a fixed boot duration.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/016 — Detached prompt retries stop on terminal targets/evidence and do not arm from an unauthenticated producer claim.
+##### scheduler/dispatch/016 — Detached prompt retries stop on terminal targets/evidence and arm from a post-write producer claim only where the deck vouched for the pane first.
 - **Layer:** L1 (in-process detached spawn confirmation task with real registry-owned platform-native shell/byte-observation PTYs and synthetic hook events).
 - **Agent:** none (the real platform-native PTYs — `/bin/sh` and `/bin/cat` on Unix, `cmd.exe` and `more.com` on Windows — are observation targets, not agent stand-ins).
-- **Asserts:** replacement, a bound `SessionEnd`, broadcast lag, and broadcast closure each terminally stop the watch without stale retry bytes; pane close and daemon shutdown cancel registered watches; a newer same-pane delivery aborts the older single flight before it retries; an unmarked event merely claiming a reporting `AgentType` cannot arm a replacement-payload retry into a hookless byte sink.
-- **Does not assert:** TUI-owned automatic seed/orchestrator delivery (covered by `prompt/pane-input/028`) or finer same-agent generation tracking without `SessionEnd` (provisional behavior intentionally not pinned).
+- **Asserts:** replacement, a bound `SessionEnd`, broadcast lag, and broadcast closure each terminally stop the watch without stale retry bytes; pane close and daemon shutdown cancel registered watches; a newer same-pane delivery aborts the older single flight before it retries; an unmarked event merely claiming a reporting `AgentType` cannot arm a replacement-payload retry into a hookless byte sink; and — issue #570 — the same unmarked claim DOES arm it when the deck spawned that pane with a reporting `SpawnOptions::agent_type` of its own choosing. The last two cases are each other's control: same `/bin/cat` sink, same `can_report_prompts: false`, same post-write `SessionStart`, differing only in the deck's own pre-write spawn record.
+- **Does not assert:** TUI-owned automatic seed/orchestrator delivery (covered by `prompt/pane-input/028`) or finer same-agent generation tracking without `SessionEnd` (provisional behavior intentionally not pinned); the user-visible end of the #570 arming case — that the retried prompt is genuinely SUBMITTED and confirmed by the agent (covered by `scheduler/dispatch/014`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### scheduler/dispatch/017 — Cap-exhaustion notices reach a hookless card that exists only in the attached TUI's broadcast state.
@@ -4083,10 +4090,8 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 | Doc behavior | Why skipped |
 |---|---|
-| Idle ASCII art rendering on cards ([docs/configuration.md#idle-ascii-art](../docs/configuration.md), [docs/configuration.md#standalone-cli](../docs/configuration.md)) | LLM-driven side feature; lives outside the deck/daemon/PTY surface the harness covers. Reconsider in M4+ if the feature warrants its own catalog section. |
 | `dot-agent-deck connect <remote>` end-to-end SSH flow ([docs/remote-environments.md](../docs/remote-environments.md), [docs/remote-recipes.md](../docs/remote-recipes.md)) | Requires a remote-harness shape that does not exist yet. Catalogued at M4+ when remote testing lands. Local quit-dialog coverage (`prompt/quit/001`–`005`) already pins the Detach / Stop / Cancel behavior; remote attach adds only the daemon-side log distinction. |
 | `dot-agent-deck remote add / list / upgrade / remove` ([docs/remote-environments.md](../docs/remote-environments.md)) | Same — remote-harness territory; the lib already covers the pure-data slices (URL parsing, command construction, error classification) in the kept tests. **Security properties deferred to M4+ end-to-end coverage:** shell-metacharacter quoting on remote-CLI argv assembly (unit-covered by `system_ssh_executor_quotes_arguments_safely`), `remotes.toml` written at mode 0o600 (covered by the now-moved `remotes_toml_written_at_0o600` test — restore at M4+), `DOT_AGENT_DECK_VIA_DAEMON=1` propagation on the remote shell (unit-covered by `build_connect_command_has_t_flag_and_via_daemon_env`). |
-| `dot-agent-deck ascii` CLI subcommand ([docs/configuration.md#standalone-cli](../docs/configuration.md)) | Non-TUI subcommand; tested as a CLI smoke in M4+ if it warrants coverage. |
 | `dot-agent-deck validate` CLI subcommand ([docs/workspace-modes.md#config-validation](../docs/workspace-modes.md)) | Non-TUI; the underlying validator is exhaustively covered by the pure-data `config_validation` tests. |
 | `dot-agent-deck watch` CLI subcommand ([docs/workspace-modes.md#dot-agent-deck-watch](../docs/workspace-modes.md)) | Non-TUI subcommand; an L2 test would only exercise its output formatting against a real shell — low value compared to the deck-rendering surface. |
 | `dot-agent-deck config get` / `config set` ([docs/configuration.md](../docs/configuration.md)) | Non-TUI; the underlying config field reflection is covered by pure-data tests (`*_get_set_field`, `*_get_set_fields`). |

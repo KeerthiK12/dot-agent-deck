@@ -33,12 +33,56 @@
 //!
 //! # Shape
 //!
-//! [`collect`] is the only part of this module that shells out to git; it
-//! turns two git invocations' worth of output into a plain [`RepoState`].
+//! [`run_git`] is the only part of this module that shells out to git.
+//! [`collect_with`] turns two git invocations' worth of output into a plain
+//! [`RepoState`], and [`collect`] is the four-line binding of the two.
 //! Everything that decides pass/fail — [`should_assert_shallow`],
 //! [`preflight_failures`], [`is_linked_worktree`], [`parse_worktree_entries`],
 //! [`parse_rev_parse`] — is a pure function over already-collected values, so
 //! it is unit-tested without building a real git repository.
+//!
+//! # How it is tested (issue #568)
+//!
+//! Three layers, because no single one of them reaches everything:
+//!
+//! - **`mod tests`** — the pure layer, over hand-built values. Fast, exact,
+//!   and able to pin shapes real git will not produce on demand (a `\r`, a
+//!   non-UTF-8 byte, a git < 2.36 record layout).
+//! - **`mod fake_git`** — [`collect_with`] driven by a recording stub. This
+//!   is the only layer that can see the git *argument list* and the `-z` →
+//!   `--porcelain` fallback, neither of which has any observable effect on a
+//!   healthy repository, and the second of which cannot be provoked at all on
+//!   a git new enough to run these tests.
+//! - **`mod real_git`** — [`collect`] and [`run`] against repositories built
+//!   in a `tempfile::tempdir()` by real `git`: a shallow clone, a linked
+//!   worktree, registry drift, a bare repo, a newline in a path. This is the
+//!   only layer that proves the fixtures the other two assert against are
+//!   what git actually emits.
+//!
+//! The through-line is that every case is an *unhealthy* repository the
+//! preflight must reject, not merely a healthy one it must accept: the defect
+//! class this module exists to prevent is a preflight that passes while the
+//! repository is in the state it was written to catch, and a green run is
+//! that defect's symptom rather than its absence.
+//!
+//! ## Every test here has been observed failing
+//!
+//! An assertion never seen red is not evidence, which is the whole of issue
+//! #568's complaint — so each test below was run against a deliberately broken
+//! `repo_state.rs` and confirmed to go red before it was accepted as passing
+//! (`.claude/skills/reproduce-first`). Nineteen single-line defects were
+//! injected one at a time and every one was caught: dropping
+//! `--path-format=absolute`; restoring the pre-#558 argument order; parsing
+//! the `--porcelain` fallback with [`RECORD_NUL`]; swallowing the fallback's
+//! error into an empty registry; each of the three arms of the `exists`
+//! mapping; [`run_git`]'s terminator trim and its non-zero-exit routing;
+//! [`should_assert_shallow`] and [`preflight_failures`] stubbed off;
+//! [`is_linked_worktree`] pinned to each constant; `paths_degraded` forcing
+//! `true`; the shallow flag misread; the [`failures_from`] skip turned into a
+//! hard failure; and — a *fixture* defect rather than a code one — a
+//! `shallow_clone` helper that omits the `file://` URL, which makes git ignore
+//! `--depth` and quietly produce a complete repository for every shallow
+//! assertion to pass vacuously against.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -76,6 +120,7 @@ struct WorktreeEntry {
 
 /// Everything [`preflight_failures`] needs, already collected. Kept
 /// separate from the git-shelling [`collect`] so the decision logic is pure.
+#[derive(Debug)]
 struct RepoState {
     is_shallow: bool,
     worktrees: Vec<WorktreeEntry>,
@@ -404,8 +449,9 @@ fn parse_rev_parse(stdout: &[u8]) -> Result<RevParse, String> {
     })
 }
 
-/// Shells out to git and turns the output into a [`RepoState`]. The only
-/// part of this module that is not a pure function.
+/// Shells out to git and turns the output into a [`RepoState`]: production's
+/// binding of [`collect_with`]'s logic to [`run_git`]'s `Command` spawn, and
+/// the only place the two meet.
 ///
 /// Two invocations, kept to that count deliberately (issue #557: "stay
 /// cheap"): one combined `rev-parse` for the shallow check, the toplevel
@@ -413,19 +459,42 @@ fn parse_rev_parse(stdout: &[u8]) -> Result<RevParse, String> {
 /// `--path-format=absolute` is what makes [`is_linked_worktree`]'s
 /// comparison sound rather than incidental — see its doc comment — and the
 /// **argument order** is what keeps a newline in a path from disabling the
-/// whole preflight; see [`parse_rev_parse`].
+/// whole preflight; see [`parse_rev_parse`]. Both of those live in
+/// [`collect_with`], and `mod fake_git` asserts them there.
 fn collect(root: &Path) -> Result<RepoState, String> {
-    let rev_parse = run_git(
-        root,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--is-shallow-repository",
-            "--show-toplevel",
-            "--git-common-dir",
-            "--git-dir",
-        ],
-    )?;
+    collect_with(|args| run_git(root, args))
+}
+
+/// [`collect`]'s body with the git invocation injected (issue #568).
+///
+/// The split is what makes the *decisions this function makes about git* —
+/// which arguments it asks for and in which order, whether the `-z` probe
+/// falls back, and how a `prunable` attribute beats a filesystem check —
+/// assertable without a repository in that state being available, or
+/// constructible at all. Two of the three properties are invisible from the
+/// outside: an argument list has no observable effect on a healthy repo (a
+/// dropped `--path-format=absolute` or a reordered `--is-shallow-repository`
+/// changes nothing until a subdirectory or a newline path is involved), and
+/// the `-z` fallback cannot be triggered at all on the git we run against.
+/// Both were fail-greens with no coverage before this seam existed.
+///
+/// `run` receives exactly the argument vector `collect` would have passed to
+/// [`run_git`], so the fake sees the real thing rather than a paraphrase.
+/// `collect` remains the only caller in production, and [`run_git`] — the
+/// `Command` spawn itself — is now the whole of the untested shell, covered
+/// instead by this module's real-git tests.
+fn collect_with<F>(run: F) -> Result<RepoState, String>
+where
+    F: Fn(&[&str]) -> Result<Vec<u8>, String>,
+{
+    let rev_parse = run(&[
+        "rev-parse",
+        "--path-format=absolute",
+        "--is-shallow-repository",
+        "--show-toplevel",
+        "--git-common-dir",
+        "--git-dir",
+    ])?;
     let parsed = parse_rev_parse(&rev_parse)?;
     if parsed.paths_degraded {
         eprintln!(
@@ -440,12 +509,9 @@ fn collect(root: &Path) -> Result<RepoState, String> {
     // That is what makes the truncation handling below dead code on any
     // modern git rather than merely well-tested. Older git rejects the flag,
     // so fall back to the newline form and accept its ambiguity there.
-    let (porcelain, sep) = match run_git(root, &["worktree", "list", "--porcelain", "-z"]) {
+    let (porcelain, sep) = match run(&["worktree", "list", "--porcelain", "-z"]) {
         Ok(out) => (out, RECORD_NUL),
-        Err(_) => (
-            run_git(root, &["worktree", "list", "--porcelain"])?,
-            RECORD_LF,
-        ),
+        Err(_) => (run(&["worktree", "list", "--porcelain"])?, RECORD_LF),
     };
     let worktrees = parse_worktree_entries(&porcelain, sep)
         .into_iter()
@@ -1129,5 +1195,962 @@ mod tests {
         let bytes = [b'/', b'r', b'e', b'p', 0xFF, b'o'];
         let os = os_string_from_bytes(&bytes);
         assert_eq!(os.as_bytes(), &bytes[..]);
+    }
+}
+
+/// [`collect_with`] driven by a recording stub, for the decisions it makes
+/// that leave **no trace on a healthy repository** (issue #568).
+///
+/// Two things live here and nowhere else. The **git argument vector** is one:
+/// `--path-format=absolute` and the position of `--is-shallow-repository` are
+/// both documented as correctness-critical, and undoing either one leaves
+/// every pure test in `mod tests` green — they only bite on a subdirectory or
+/// a newline path, and `mod real_git` covers those consequences while this
+/// module covers the cause. The **`-z` → `--porcelain` fallback** is the
+/// other, and it is stronger than that: it is *unreachable* on any git that
+/// can run these tests at all, since `-z` arrived in 2.36 and `collect`'s
+/// `--path-format` requires 2.31, so every git that survives the `rev-parse`
+/// call accepts `-z` too. Without a stub that branch has never executed
+/// anywhere.
+#[cfg(test)]
+mod fake_git {
+    use super::*;
+    use std::cell::RefCell;
+    use tempfile::TempDir;
+
+    /// The exact argument vectors `collect_with` is required to ask for, in
+    /// order. Spelled out here rather than shared with the implementation
+    /// deliberately: a constant both sides read would move in lockstep with
+    /// an accidental edit and assert nothing.
+    const REV_PARSE_ARGV: &[&str] = &[
+        "rev-parse",
+        "--path-format=absolute",
+        "--is-shallow-repository",
+        "--show-toplevel",
+        "--git-common-dir",
+        "--git-dir",
+    ];
+    const WORKTREE_Z_ARGV: &[&str] = &["worktree", "list", "--porcelain", "-z"];
+    const WORKTREE_LF_ARGV: &[&str] = &["worktree", "list", "--porcelain"];
+
+    /// Records the argument vector of every git invocation `collect_with`
+    /// makes, and answers it from a caller-supplied reply.
+    struct Recorder {
+        calls: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Recorder {
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// The vectors recorded here are exactly the ones `collect` hands
+        /// [`run_git`] — `collect_with` is the body both go through — so an
+        /// assertion on them pins the production invocation rather than a
+        /// copy of it.
+        fn collect(
+            &self,
+            reply: impl Fn(&[&str]) -> Result<Vec<u8>, String>,
+        ) -> Result<RepoState, String> {
+            collect_with(|args| {
+                self.calls
+                    .borrow_mut()
+                    .push(args.iter().map(|a| a.to_string()).collect());
+                reply(args)
+            })
+        }
+
+        fn assert_invocations(&self, expected: &[&[&str]]) {
+            let calls = self.calls.borrow();
+            let actual: Vec<Vec<&str>> = calls
+                .iter()
+                .map(|c| c.iter().map(String::as_str).collect())
+                .collect();
+            let expected: Vec<Vec<&str>> = expected.iter().map(|c| c.to_vec()).collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    /// A `rev-parse` answer for a primary checkout rooted at `root`.
+    ///
+    /// No trailing newline, because [`run_git`] strips it: a fake that left
+    /// one on would feed `collect_with` a shape production never sees, and
+    /// would silently mask the trim being removed (a trailing `\n` splits
+    /// into a fourth, empty path value, which trips `paths.len() > 3` and
+    /// forces `paths_degraded` on *every* invocation).
+    fn rev_parse_reply(root: &Path, shallow: bool) -> Vec<u8> {
+        let root = root.display();
+        let shallow = if shallow { "true" } else { "false" };
+        format!("{shallow}\n{root}\n{root}/.git\n{root}/.git").into_bytes()
+    }
+
+    /// One NUL-terminated `worktree list --porcelain -z` entry, as git ≥ 2.36
+    /// emits it: every record NUL-terminated, one extra NUL closing the block.
+    fn z_entry(path: &Path, branch: &str, prunable: Option<&str>) -> Vec<u8> {
+        let mut out = format!("worktree {}\0", path.display()).into_bytes();
+        out.extend_from_slice(format!("HEAD {}\0", "0".repeat(40)).as_bytes());
+        out.extend_from_slice(format!("branch refs/heads/{branch}\0").as_bytes());
+        if let Some(reason) = prunable {
+            out.extend_from_slice(format!("prunable {reason}\0").as_bytes());
+        }
+        out.push(b'\0');
+        out
+    }
+
+    /// **The argument list is load-bearing and otherwise invisible.** Both of
+    /// the properties `collect` documents at length are no-ops on an ordinary
+    /// repository: drop `--path-format=absolute` and nothing changes until
+    /// someone runs from a subdirectory; move `--is-shallow-repository` back
+    /// to last and nothing changes until a path contains a newline. This is
+    /// the assertion that fails the moment either is undone, rather than
+    /// waiting for the configuration that makes it hurt.
+    ///
+    /// It also pins the invocation *count* at two (issue #557: "stay cheap"),
+    /// and that `-z` succeeding means no fallback call is made.
+    #[test]
+    fn the_git_invocations_are_exactly_the_two_documented_ones_in_order() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let rec = Recorder::new();
+        rec.collect(|args| match args.first().copied() {
+            Some("rev-parse") => Ok(rev_parse_reply(root, false)),
+            Some("worktree") => Ok(z_entry(root, "main", None)),
+            other => panic!("unexpected git invocation {other:?}"),
+        })
+        .expect("collects");
+
+        rec.assert_invocations(&[REV_PARSE_ARGV, WORKTREE_Z_ARGV]);
+    }
+
+    /// The `-z` → plain `--porcelain` fallback for git < 2.36, which no
+    /// machine able to run this suite can reach on its own.
+    ///
+    /// The payload is not "a second call happened" — it is that the fallback
+    /// output is parsed with [`RECORD_LF`]. Reusing [`RECORD_NUL`] there
+    /// would swallow a multi-entry listing into ONE record, collapsing a
+    /// two-worktree repository to one; that turns off `should_assert_shallow`'s
+    /// count term, and this shallow two-worktree clone — the exact damage
+    /// shape issue #557 exists for — would report clean.
+    #[test]
+    fn a_git_that_rejects_z_falls_back_to_newline_records_and_parses_them_as_such() {
+        let tmp = TempDir::new().expect("tempdir");
+        let main = tmp.path().join("main");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&main).expect("mkdir");
+        std::fs::create_dir_all(&other).expect("mkdir");
+
+        let rec = Recorder::new();
+        let state = rec
+            .collect(|args| match args {
+                a if a.first() == Some(&"rev-parse") => Ok(rev_parse_reply(&main, true)),
+                a if a.contains(&"-z") => Err("error: unknown switch `z'".to_string()),
+                _ => Ok(format!(
+                    "worktree {}\nHEAD {h}\nbranch refs/heads/main\n\nworktree {}\nHEAD {h}\nbranch refs/heads/other",
+                    main.display(),
+                    other.display(),
+                    h = "0".repeat(40),
+                )
+                .into_bytes()),
+            })
+            .expect("collects");
+
+        rec.assert_invocations(&[REV_PARSE_ARGV, WORKTREE_Z_ARGV, WORKTREE_LF_ARGV]);
+        assert_eq!(
+            state.worktrees.len(),
+            2,
+            "the fallback output must be split on newlines, not NULs — one record means the \
+             whole listing collapsed into a single entry"
+        );
+        let failures = preflight_failures(&state);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains(UNSHALLOW_REMEDY), "{}", failures[0]);
+    }
+
+    /// When the fallback fails too, the error must PROPAGATE.
+    ///
+    /// `collect_with`'s `match` discards the `-z` error on purpose — an old
+    /// git rejecting a flag is not news — and it is a small edit to discard
+    /// the second one the same way and carry on with an empty listing. That
+    /// reads to the pure layer as a repository with zero worktrees: no drift
+    /// to report, and `should_assert_shallow`'s count term off. git failing
+    /// outright would produce a clean preflight.
+    #[test]
+    fn both_worktree_listings_failing_is_an_error_not_an_empty_registry() {
+        let tmp = TempDir::new().expect("tempdir");
+        let rec = Recorder::new();
+        let collected = rec.collect(|args| match args.first().copied() {
+            Some("rev-parse") => Ok(rev_parse_reply(tmp.path(), true)),
+            _ => Err("fatal: not a git repository".to_string()),
+        });
+
+        assert!(collected.is_err(), "must not degrade to an empty registry");
+        rec.assert_invocations(&[REV_PARSE_ARGV, WORKTREE_Z_ARGV, WORKTREE_LF_ARGV]);
+    }
+
+    /// A `rev-parse` failure propagates rather than being collected around.
+    #[test]
+    fn a_rev_parse_failure_stops_collection() {
+        let rec = Recorder::new();
+        let collected = rec.collect(|_| Err("fatal: detected dubious ownership".to_string()));
+        assert!(collected.is_err());
+        // And nothing further is asked: no worktree listing after the failure.
+        rec.assert_invocations(&[REV_PARSE_ARGV]);
+    }
+
+    /// git's own `prunable` verdict outranks the filesystem check, and the
+    /// directory here **exists** — that is the whole point. It is not a
+    /// contrived state either: emptying a worktree's checkout removes the
+    /// `.git` file pointing back at the admin directory while leaving the
+    /// directory itself, and git reports `prunable gitdir file points to
+    /// non-existent location` for it (`mod real_git`'s
+    /// `a_prunable_worktree_whose_directory_still_exists_is_still_drift`
+    /// builds exactly that with real git).
+    ///
+    /// A `try_exists()`-first mapping calls that registry clean.
+    #[test]
+    fn a_prunable_entry_is_missing_even_though_its_directory_exists() {
+        let tmp = TempDir::new().expect("tempdir");
+        let main = tmp.path().join("main");
+        let dead = tmp.path().join("dead");
+        std::fs::create_dir_all(&main).expect("mkdir");
+        std::fs::create_dir_all(&dead).expect("mkdir");
+        assert!(dead.try_exists().expect("stat"), "fixture precondition");
+
+        let rec = Recorder::new();
+        let state = rec
+            .collect(|args| match args.first().copied() {
+                Some("rev-parse") => Ok(rev_parse_reply(&main, false)),
+                _ => {
+                    let mut out = z_entry(&main, "main", None);
+                    out.extend_from_slice(&z_entry(
+                        &dead,
+                        "dead",
+                        Some("gitdir file points to non-existent location"),
+                    ));
+                    Ok(out)
+                }
+            })
+            .expect("collects");
+
+        let failures = preflight_failures(&state);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains(&format!("{dead:?}")),
+            "the still-present but dead worktree must be named: {}",
+            failures[0]
+        );
+        assert!(failures[0].contains(PRUNE_REMEDY), "{}", failures[0]);
+    }
+
+    /// The other side of the `exists` mapping: a path the parser could not
+    /// read intact is reported **present**, so a live worktree is never
+    /// accused of drift over a path that was never on disk in that form.
+    /// Only reachable on the git < 2.36 fallback, so only reachable with a
+    /// stub.
+    #[test]
+    fn a_truncated_path_is_treated_as_present_rather_than_as_drift() {
+        let tmp = TempDir::new().expect("tempdir");
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&main).expect("mkdir");
+        // `try_exists().ok()` rather than `.expect()`: this module is not
+        // Unix-gated, and a newline in a path is a name Win32 may refuse to
+        // stat at all rather than report absent. Either answer satisfies the
+        // precondition — what must not hold is that it is really there.
+        let ghost = tmp.path().join("wt\nnewline");
+        assert_ne!(
+            ghost.try_exists().ok(),
+            Some(true),
+            "fixture precondition: the untruncated path is not on disk"
+        );
+
+        let rec = Recorder::new();
+        let state = rec
+            .collect(|args| match args {
+                a if a.first() == Some(&"rev-parse") => Ok(rev_parse_reply(&main, false)),
+                a if a.contains(&"-z") => Err("error: unknown switch `z'".to_string()),
+                _ => Ok(format!(
+                    "worktree {}\nnewline\nHEAD {}\nbranch refs/heads/sneaky",
+                    tmp.path().join("wt").display(),
+                    "0".repeat(40),
+                )
+                .into_bytes()),
+            })
+            .expect("collects");
+
+        assert_eq!(state.worktrees.len(), 1, "{:?}", state.worktrees);
+        assert!(
+            state.worktrees[0].exists,
+            "an unverifiable path must degrade to present, not to drift"
+        );
+        assert!(preflight_failures(&state).is_empty());
+    }
+
+    /// And the ordinary branch between those two: no `prunable` attribute, a
+    /// path that reads fine and simply is not there. This is the case git
+    /// < 2.36 leaves entirely to us, and a **locked** worktree leaves to us
+    /// at every version — git never marks one prunable.
+    #[test]
+    fn a_registered_path_that_is_simply_gone_is_drift() {
+        let tmp = TempDir::new().expect("tempdir");
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&main).expect("mkdir");
+        let gone = tmp.path().join("gone");
+
+        let rec = Recorder::new();
+        let state = rec
+            .collect(|args| match args.first().copied() {
+                Some("rev-parse") => Ok(rev_parse_reply(&main, false)),
+                _ => {
+                    let mut out = z_entry(&main, "main", None);
+                    out.extend_from_slice(&z_entry(&gone, "gone", None));
+                    Ok(out)
+                }
+            })
+            .expect("collects");
+
+        let failures = preflight_failures(&state);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains(&format!("{gone:?}")),
+            "{}",
+            failures[0]
+        );
+    }
+}
+
+/// [`collect`], [`run_git`] and [`run`] against repositories that real `git`
+/// puts into the states this preflight exists to reject (issue #568).
+///
+/// The other two test modules assert against fixtures. This one builds the
+/// repository, so it is the layer that can be wrong in the direction that
+/// matters: a hand-written fixture only ever proves the parser agrees with
+/// whoever typed it, and every case here is instead a repository genuinely in
+/// the shape being asserted about — shallow, drifted, bare, linked, or with a
+/// newline in its path. The motivating one is `.git/shallow` living in the
+/// common dir, so a single `--depth=1` clone degrades every worktree sharing
+/// that object store at once; that is built here rather than described.
+///
+/// **Everything is an unhealthy repository unless it is labelled a control.**
+/// A test that only proves `collect` returns `Ok` on a healthy checkout would
+/// stay green through every defect this module is guarding, because a
+/// preflight that has silently disabled itself also returns `Ok` on a healthy
+/// checkout. The controls are here for the reason `/reproduce-first` gives —
+/// to make each failure attributable — not as the point.
+///
+/// **Fast tier, deliberately.** These shell out to git, which CLAUDE.md
+/// rule 5 previously recorded as something no `xtask` test did. They are in
+/// `cargo test-fast` anyway because they meet the bar the rule is actually
+/// protecting: each builds two or three tiny repositories in a
+/// `tempfile::tempdir()` with empty commits, touches neither the network nor
+/// the repository it is running inside, and the whole module lands in well
+/// under a second across nextest's process-per-test parallelism. Moving them
+/// behind `--features e2e` would have put the only coverage of the collector
+/// in the tier CLAUDE.md rule 5 tells you not to run per task, which is a
+/// slower way of arriving back at no coverage.
+///
+/// **Unix only.** `cargo xtask linkage-check` is a Linux-CI tool — the module
+/// says so where [`os_string_from_bytes`] falls back to lossy UTF-8 off Unix
+/// — and two of the fixtures are Unix constructs outright: a `file://` URL
+/// spelled from a POSIX path, and a directory whose name contains a literal
+/// newline, which Win32 rejects. `build-windows` still type-checks and lints
+/// this module, and `build-macos` runs it.
+///
+/// **What is NOT covered here**, so it is not mistaken for covered: the
+/// degenerate drift case, where the *current* checkout's own registry entry
+/// is the missing one. It has no real-git construction — git cannot report a
+/// toplevel for a directory that is not there, and every way of half-removing
+/// a worktree either drops it from `worktree list` entirely or re-resolves
+/// the toplevel to the primary checkout. `mod tests`'
+/// `current_worktree_missing_gets_its_own_message` covers the branch over a
+/// built state, which is what that branch's coverage is.
+#[cfg(all(test, unix))]
+mod real_git {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    /// `collect` passes `--path-format`, added in git 2.31 (March 2021).
+    const MIN_GIT: (u32, u32) = (2, 31);
+
+    /// `git worktree list --porcelain -z` and the `prunable` attribute both
+    /// arrived in git 2.36 (April 2022).
+    const GIT_WITH_Z_AND_PRUNABLE: (u32, u32) = (2, 36);
+
+    /// The local git's `(major, minor)`, read rather than assumed.
+    ///
+    /// Only two things below actually change shape with the git version — the
+    /// `-z` record layout and the `prunable` attribute, both from 2.36 — and
+    /// each is asserted against this explicitly, so a test either states the
+    /// version it depends on or does not depend on one. What it must never
+    /// become is a silent dependency on whatever this machine happens to ship.
+    fn git_version() -> (u32, u32) {
+        let out = Command::new("git")
+            .arg("--version")
+            .output()
+            .expect("`git --version` must run: this module drives real git");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        // "git version 2.55.0", or "git version 2.39.5 (Apple Git-154)".
+        let version = text.split_whitespace().nth(2).unwrap_or_default();
+        let mut parts = version.split('.');
+        let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        assert!(
+            (major, minor) != (0, 0),
+            "could not read a version out of {text:?}"
+        );
+        (major, minor)
+    }
+
+    /// Asserts rather than skips, on purpose. A skip is how a check quietly
+    /// stops running in the places that matter — the defect class this whole
+    /// module exists to gate — so an under-version git fails loudly and says
+    /// which version it needed and what for.
+    fn require_git(min: (u32, u32), what: &str) {
+        let have = git_version();
+        assert!(
+            have >= min,
+            "this fixture needs git >= {}.{} ({what}); this machine has {}.{}. \
+             Deliberately an assertion and not a skip: silently not running is the \
+             failure mode issue #568 is about.",
+            min.0,
+            min.1,
+            have.0,
+            have.1
+        );
+    }
+
+    /// A throwaway tree of repositories under a `tempfile::tempdir()`.
+    ///
+    /// Every *fixture* command runs with the ambient git configuration
+    /// switched off — `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` pointed at a
+    /// path that does not exist, `HOME` and `XDG_CONFIG_HOME` inside the
+    /// sandbox, an empty template dir so no system hook is installed, and the
+    /// commit identity supplied by environment rather than by config — so the
+    /// repositories are byte-identical on a developer's machine and on a bare
+    /// runner, and nothing here can read or write the checkout these tests are
+    /// running inside.
+    ///
+    /// [`collect`] itself is deliberately *not* given that environment: it is
+    /// called exactly the way `main.rs` calls it, so what is under test is the
+    /// production invocation rather than a specially-configured one.
+    struct Sandbox {
+        /// Kept only to hold the directory open for the test's lifetime.
+        _dir: TempDir,
+        /// `TempDir::path()` canonicalised. Load-bearing on macOS, where
+        /// `/var` is a symlink to `/private/var` and git reports the resolved
+        /// form — an uncanonicalised path would make every comparison against
+        /// `--show-toplevel` fail for a reason that has nothing to do with
+        /// this module.
+        root: PathBuf,
+    }
+
+    impl Sandbox {
+        fn new() -> Sandbox {
+            require_git(
+                MIN_GIT,
+                "`git rev-parse --path-format`, which `collect` passes",
+            );
+            let dir = TempDir::new().expect("tempdir");
+            let root = dir.path().canonicalize().expect("canonicalize tempdir");
+            fs::create_dir_all(root.join("home")).expect("mkdir home");
+            fs::create_dir_all(root.join("empty-template")).expect("mkdir template");
+            Sandbox { _dir: dir, root }
+        }
+
+        fn at(&self, rel: &str) -> PathBuf {
+            self.root.join(rel)
+        }
+
+        /// Runs a fixture git command, and fails the test with git's own
+        /// stderr if it does not succeed — a fixture that half-built itself
+        /// and then produced a green assertion is the same fail-green in
+        /// miniature.
+        fn git(&self, cwd: &Path, args: &[&str]) -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("HOME", self.at("home"))
+                .env("XDG_CONFIG_HOME", self.at("home/.config"))
+                .env("GIT_CONFIG_GLOBAL", self.at("no-such-gitconfig"))
+                .env("GIT_CONFIG_SYSTEM", self.at("no-such-gitconfig"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TEMPLATE_DIR", self.at("empty-template"))
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_AUTHOR_NAME", "linkage-check tests")
+                .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
+                .env("GIT_COMMITTER_NAME", "linkage-check tests")
+                .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
+                .output()
+                .unwrap_or_else(|e| panic!("failed to invoke `git {}`: {e}", args.join(" ")));
+            assert!(
+                out.status.success(),
+                "fixture command `git {}` failed in {}: {}",
+                args.join(" "),
+                cwd.display(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// A repository with two commits at `<root>/origin`, so a `--depth=1`
+        /// clone of it is genuinely truncated rather than merely complete and
+        /// tiny. Empty commits: nothing here reads a tree.
+        fn origin(&self) -> PathBuf {
+            let origin = self.at("origin");
+            fs::create_dir_all(&origin).expect("mkdir origin");
+            self.git(&origin, &["init", "-q", "-b", "main"]);
+            self.git(&origin, &["commit", "-q", "--allow-empty", "-m", "first"]);
+            self.git(&origin, &["commit", "-q", "--allow-empty", "-m", "second"]);
+            origin
+        }
+
+        /// Clones `origin` to depth 1 and **verifies the result really is
+        /// shallow** before handing it back.
+        ///
+        /// The `file://` URL is load-bearing: for a plain local path git
+        /// ignores `--depth` (it hard-links the object store instead) and only
+        /// warns about it, so the same call written without the URL yields a
+        /// COMPLETE repository — and every shallow assertion downstream would
+        /// then pass vacuously, which is precisely the fail-green shape this
+        /// module is here to prevent. The check below is what makes that
+        /// impossible to reintroduce silently.
+        fn shallow_clone(&self, origin: &Path, name: &str) -> PathBuf {
+            self.git(
+                &self.root,
+                &[
+                    "clone",
+                    "-q",
+                    "--depth=1",
+                    &format!("file://{}", origin.display()),
+                    name,
+                ],
+            );
+            let clone = self.at(name);
+            assert_eq!(
+                self.git(&clone, &["rev-parse", "--is-shallow-repository"]),
+                "true",
+                "fixture precondition: `--depth=1` must have produced a shallow clone"
+            );
+            clone
+        }
+
+        /// A complete clone — the control for [`Sandbox::shallow_clone`].
+        fn full_clone(&self, origin: &Path, name: &str) -> PathBuf {
+            self.git(
+                &self.root,
+                &["clone", "-q", &format!("file://{}", origin.display()), name],
+            );
+            let clone = self.at(name);
+            assert_eq!(
+                self.git(&clone, &["rev-parse", "--is-shallow-repository"]),
+                "false",
+                "fixture precondition: this control must NOT be shallow"
+            );
+            clone
+        }
+
+        /// Adds a linked worktree of `clone` at `<root>/<name>` and confirms
+        /// the registry now lists two entries.
+        fn add_worktree(&self, clone: &Path, name: &str, branch: &str) -> PathBuf {
+            let wt = self.at(name);
+            self.git(
+                clone,
+                &["worktree", "add", "-q", &wt.to_string_lossy(), "-b", branch],
+            );
+            assert_eq!(
+                self.git(clone, &["worktree", "list", "--porcelain"])
+                    .matches("worktree ")
+                    .count(),
+                2,
+                "fixture precondition: the clone must now have two registered worktrees"
+            );
+            wt
+        }
+    }
+
+    /// **The motivating case (issue #557).** `.git/shallow` lives in the
+    /// common dir, so the single `--depth=1` clone below has truncated the
+    /// object store for the linked worktree too — and nothing about either
+    /// checkout looks wrong: `git log` works, `git status` is clean, refs
+    /// resolve. The preflight must report it from BOTH, because both are
+    /// damaged, and a green run from either is the misdiagnosis this exists
+    /// to prevent.
+    #[test]
+    fn a_shallow_clone_with_a_linked_worktree_fails_from_both_checkouts() {
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let clone = sb.shallow_clone(&origin, "clone");
+        let wt = sb.add_worktree(&clone, "wt", "wt");
+
+        for checkout in [&clone, &wt] {
+            let failures = run(checkout);
+            assert_eq!(
+                failures.len(),
+                1,
+                "from {}: {failures:?}",
+                checkout.display()
+            );
+            assert!(
+                failures[0].contains(UNSHALLOW_REMEDY),
+                "from {}: {}",
+                checkout.display(),
+                failures[0]
+            );
+        }
+    }
+
+    /// **Control** — the `actions/checkout@v7` shape, which clones at depth 1
+    /// with exactly one worktree. It must stay exempt, or every job in the CI
+    /// matrix goes red. This is the direction the gate exists to protect, and
+    /// it pairs with the test above: together they show the failure there is
+    /// attributable to the shared object store, not to shallowness alone.
+    #[test]
+    fn a_shallow_single_worktree_clone_is_exempt() {
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let clone = sb.shallow_clone(&origin, "ci-checkout");
+        assert!(run(&clone).is_empty(), "{:?}", run(&clone));
+    }
+
+    /// **Control** — two worktrees, complete history. Shows the failure in
+    /// `a_shallow_clone_with_a_linked_worktree_fails_from_both_checkouts` is
+    /// attributable to the truncated object store and not to merely having a
+    /// linked worktree.
+    #[test]
+    fn a_complete_clone_with_a_linked_worktree_passes() {
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let clone = sb.full_clone(&origin, "clone");
+        let wt = sb.add_worktree(&clone, "wt", "wt");
+
+        for checkout in [&clone, &wt] {
+            assert!(
+                run(checkout).is_empty(),
+                "from {}: {:?}",
+                checkout.display(),
+                run(checkout)
+            );
+        }
+    }
+
+    /// **`--path-format=absolute` is what makes the primary/linked
+    /// distinction sound, and this is the only test that can tell.** Measured
+    /// on git 2.55.0: run from a subdirectory *without* that flag,
+    /// `--git-common-dir` comes back relative (`../../.git`) while `--git-dir`
+    /// is printed absolute, the two compare unequal, and a primary checkout
+    /// reads as a linked worktree — which switches the shallow assertion on
+    /// for the exempt CI shape above and fails every job in the matrix.
+    ///
+    /// `cargo xtask` sets the working directory to the workspace root today,
+    /// so nothing in production currently runs from a subdirectory. That is
+    /// the point: the flag's protection is invisible until it is needed, and
+    /// dropping it costs nothing observable until the day it costs CI.
+    #[test]
+    fn a_shallow_primary_checkout_stays_exempt_from_a_subdirectory() {
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let clone = sb.shallow_clone(&origin, "ci-checkout");
+        let deep = clone.join("sub/deep");
+        fs::create_dir_all(&deep).expect("mkdir subdir");
+
+        let state = collect(&deep).expect("collects from a subdirectory");
+        assert!(
+            !state.is_linked_worktree,
+            "a primary checkout read from a subdirectory must not report as linked"
+        );
+        assert_eq!(state.current_worktree, clone);
+        assert!(run(&deep).is_empty(), "{:?}", run(&deep));
+    }
+
+    /// The other direction of the same comparison: from a subdirectory of a
+    /// *linked* worktree it must still read as linked, so the exemption is
+    /// not bought by simply answering `false` everywhere.
+    #[test]
+    fn a_linked_worktree_reads_as_linked_from_its_own_subdirectory() {
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let clone = sb.full_clone(&origin, "clone");
+        let wt = sb.add_worktree(&clone, "wt", "wt");
+        let deep = wt.join("sub/deep");
+        fs::create_dir_all(&deep).expect("mkdir subdir");
+
+        let state = collect(&deep).expect("collects from a subdirectory");
+        assert!(state.is_linked_worktree);
+        assert_eq!(state.current_worktree, wt);
+    }
+
+    /// Registry drift: a worktree removed with `rm -rf` instead of `git
+    /// worktree remove` leaves its registry entry behind, and that entry is
+    /// the only trace of it. The message must name the path and the remedy.
+    ///
+    /// Git version does change what is asserted here, so it is asserted
+    /// explicitly: from 2.36 git reports the entry `prunable <reason>` itself
+    /// and the reason is folded into the message verbatim; before that the
+    /// attribute does not exist and the drift is found by the
+    /// `try_exists()` fallback, with no reason to fold in.
+    #[test]
+    fn a_worktree_removed_without_pruning_is_reported_as_drift() {
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let clone = sb.full_clone(&origin, "clone");
+        let wt = sb.add_worktree(&clone, "wt", "wt");
+        fs::remove_dir_all(&wt).expect("remove the worktree without pruning");
+
+        let failures = run(&clone);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains(&wt.to_string_lossy().into_owned()),
+            "{}",
+            failures[0]
+        );
+        assert!(failures[0].contains(PRUNE_REMEDY), "{}", failures[0]);
+        if git_version() >= GIT_WITH_Z_AND_PRUNABLE {
+            // Read the reason out of git rather than typing it (Greptile P2 on
+            // PR #583): the porcelain `prunable` text is a translated string
+            // too — a literal msgid in the `de` catalog git ships, machine-
+            // readable output notwithstanding — so a hard-coded copy would
+            // make this depend on the contributor's locale. Capturing it here
+            // also asserts something stricter: that whatever git said is
+            // folded in verbatim, not merely that some reason was.
+            let porcelain = sb.git(&clone, &["worktree", "list", "--porcelain"]);
+            let reason = porcelain
+                .lines()
+                .find_map(|line| line.strip_prefix("prunable "))
+                .expect("git >= 2.36 reports a prunable reason for a removed worktree");
+            assert!(
+                failures[0].contains(reason),
+                "git's own prunable reason must be folded in verbatim.\n  git said: {reason}\n  message: {}",
+                failures[0]
+            );
+        }
+    }
+
+    /// **The `try_exists()` fail-green.** The worktree's directory is still
+    /// on disk here — only its `.git` file is gone, which is what an
+    /// interrupted removal or a stray `rm -rf <wt>/*` leaves behind — so a
+    /// filesystem-first existence check reports this registry clean while the
+    /// worktree is dead. git says `prunable` for it, and that verdict is what
+    /// the mapping has to prefer.
+    ///
+    /// Needs git >= 2.36 by construction: before the `prunable` attribute
+    /// existed there was nothing to prefer, and this state was genuinely
+    /// undetectable.
+    #[test]
+    fn a_prunable_worktree_whose_directory_still_exists_is_still_drift() {
+        require_git(
+            GIT_WITH_Z_AND_PRUNABLE,
+            "the `prunable` attribute, the only way to see this state",
+        );
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let clone = sb.full_clone(&origin, "clone");
+        let wt = sb.add_worktree(&clone, "wt", "wt");
+        fs::remove_dir_all(&wt).expect("empty the checkout");
+        fs::create_dir_all(&wt).expect("but leave the directory itself");
+        assert!(
+            wt.try_exists().expect("stat"),
+            "fixture precondition: the directory must still be there"
+        );
+
+        let failures = run(&clone);
+        assert_eq!(
+            failures.len(),
+            1,
+            "a still-present directory must not read as a healthy worktree: {failures:?}"
+        );
+        assert!(
+            failures[0].contains(&wt.to_string_lossy().into_owned()),
+            "{}",
+            failures[0]
+        );
+        assert!(failures[0].contains(PRUNE_REMEDY), "{}", failures[0]);
+    }
+
+    /// **Greptile P1, against a real repository.** A shallow, single-worktree
+    /// PRIMARY checkout whose path contains a literal newline must stay
+    /// exempt. git emits path values unescaped, so `rev-parse` here returns
+    /// seven lines rather than four and `parse_rev_parse` cannot identify the
+    /// two dir flags; answering that unanswerable question `true` failed an
+    /// otherwise-exempt `linkage-check`, which is the CI-breaking direction.
+    #[test]
+    fn a_shallow_primary_checkout_with_a_newline_in_its_path_stays_exempt() {
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let clone = sb.shallow_clone(&origin, "ci\ncheckout");
+
+        let state = collect(&clone).expect("collects");
+        assert!(state.is_shallow, "fixture precondition");
+        assert!(
+            !state.is_linked_worktree,
+            "an unanswerable linked-worktree question must not be answered `true`"
+        );
+        assert!(run(&clone).is_empty(), "{:?}", run(&clone));
+    }
+
+    /// **The Greptile P1 in the fail-GREEN direction, against a real
+    /// repository.** A shallow clone with a linked worktree whose path
+    /// contains a newline: `rev-parse` returns five lines instead of four
+    /// (measured on git 2.55.0, and rebuilt here rather than pasted). With
+    /// `--is-shallow-repository` requested last it absorbed that shift, landed
+    /// on a path instead of `true`/`false`, and returned `Err` — which
+    /// `failures_from` turns into a silent skip of the WHOLE preflight, in a
+    /// repository that is genuinely damaged. Asking for it first puts it on
+    /// line 0, where no path can displace it.
+    #[test]
+    fn a_shallow_linked_worktree_with_a_newline_in_its_path_still_fails() {
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let clone = sb.shallow_clone(&origin, "clone");
+        let wt = sb.add_worktree(&clone, "wt\nnewline", "sneaky");
+
+        let state = collect(&wt).expect("must NOT be an Err — an Err here is a silent skip");
+        assert!(state.is_shallow, "the shallow flag must survive the shift");
+
+        let failures = run(&wt);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains(UNSHALLOW_REMEDY), "{}", failures[0]);
+    }
+
+    /// The `-z` record layout `mod tests` pins by hand, re-derived from the
+    /// local git rather than trusted. This is what keeps the hand-built
+    /// fixtures from drifting into fiction: the same newline-in-a-path
+    /// worktree, read through the production [`run_git`] call and the
+    /// production parser, must yield the exact path with nothing truncated.
+    #[test]
+    fn real_git_z_output_matches_the_record_layout_the_fixtures_assume() {
+        require_git(
+            GIT_WITH_Z_AND_PRUNABLE,
+            "`git worktree list --porcelain -z`",
+        );
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let clone = sb.full_clone(&origin, "clone");
+        let wt = sb.add_worktree(&clone, "wt\nnewline", "sneaky");
+
+        let raw = run_git(&clone, &["worktree", "list", "--porcelain", "-z"])
+            .expect("this git supports -z");
+        assert!(
+            raw.contains(&RECORD_NUL),
+            "records must be NUL-terminated, not newline-terminated"
+        );
+
+        let entries = parse_worktree_entries(&raw, RECORD_NUL);
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].path, clone);
+        assert_eq!(
+            entries[1].path, wt,
+            "the newline must sit INSIDE the record, leaving the path exact"
+        );
+        assert!(
+            entries.iter().all(|e| !e.path_maybe_truncated),
+            "NUL records cannot truncate a path"
+        );
+    }
+
+    /// [`run_git`] trims the trailing newline git appends, and that trim is
+    /// load-bearing rather than cosmetic: `parse_rev_parse` splits on `\n`, so
+    /// one surviving terminator adds a fourth, empty path value, trips the
+    /// `paths.len() > 3` degradation branch, and forces `is_linked_worktree`
+    /// to `false` on **every** invocation — the linked-worktree half of the
+    /// shallow gate off, permanently and silently.
+    #[test]
+    fn run_git_trims_the_terminator_git_appends() {
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let out = run_git(&origin, &["rev-parse", "HEAD"]).expect("rev-parse HEAD");
+        assert_eq!(out.len(), 40, "{:?}", String::from_utf8_lossy(&out));
+        assert!(!out.ends_with(b"\n") && !out.ends_with(b"\r"));
+    }
+
+    /// A non-zero git exit becomes an `Err` carrying git's own stderr, rather
+    /// than being read as empty output — which `parse_rev_parse` would reject
+    /// anyway, but `parse_worktree_entries` would happily read as a repository
+    /// with no worktrees at all.
+    ///
+    /// The expected text is **captured from git, not typed in** (Greptile P2
+    /// on PR #583). `fatal: Needed a single revision` is a translated string —
+    /// verified as a literal msgid in the `de` catalog git ships — so a
+    /// contributor whose locale is generated for a translated language would
+    /// fail this test, in the tier everyone runs per task, for a reason that
+    /// has nothing to do with the property under test. Running the same
+    /// command in the same directory and environment `run_git` uses yields
+    /// whatever prose this machine actually produces, which makes the
+    /// assertion locale-proof and version-proof while checking something
+    /// stronger than a substring: that git's message arrives *verbatim*.
+    #[test]
+    fn run_git_routes_a_non_zero_exit_to_err_with_gits_own_message() {
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let args = ["rev-parse", "--verify", "refs/heads/nope"];
+
+        let direct = Command::new("git")
+            .args(args)
+            .current_dir(&origin)
+            .output()
+            .expect("git runs");
+        assert!(
+            !direct.status.success(),
+            "fixture precondition: this invocation must fail"
+        );
+        let stderr = String::from_utf8_lossy(&direct.stderr).trim().to_string();
+        assert!(
+            !stderr.is_empty(),
+            "fixture precondition: git must have said something on stderr"
+        );
+
+        let err = run_git(&origin, &args).expect_err("must not succeed");
+        assert!(
+            err.contains(&stderr),
+            "git's own message must be carried through verbatim.\n  git said: {stderr}\n  run_git: {err}"
+        );
+        assert!(
+            err.contains("git rev-parse --verify"),
+            "the failing invocation must be named: {err}"
+        );
+    }
+
+    /// A directory that is not a repository at all: [`collect`] fails and
+    /// [`run`] turns that into the documented fail-open skip rather than
+    /// crashing the build. The skip is deliberate — see [`failures_from`] —
+    /// and it is the one outcome that must stay a *pass*.
+    #[test]
+    fn a_directory_that_is_not_a_repository_is_a_documented_skip() {
+        let sb = Sandbox::new();
+        let plain = sb.at("not-a-repo");
+        fs::create_dir_all(&plain).expect("mkdir");
+
+        assert!(collect(&plain).is_err());
+        assert!(run(&plain).is_empty());
+    }
+
+    /// A **bare** repository, which `failures_from`'s doc comment names as one
+    /// of the states routed to that same skip: `--show-toplevel` fails
+    /// outright there. Asserted against real git rather than left as a claim
+    /// in a comment.
+    ///
+    /// The assertion is on [`run_git`]'s **own** message rather than on git's
+    /// prose (Greptile P2 on PR #583): `this operation must be run in a work
+    /// tree` is likewise a msgid in git's translation catalogs, so matching it
+    /// would make this fast-tier test depend on the contributor's locale.
+    /// Naming the invocation is also the sharper check — it pins the failure
+    /// to the `rev-parse` call, which is exactly what `failures_from` claims,
+    /// where the prose alone could have come from either invocation.
+    #[test]
+    fn a_bare_repository_is_a_documented_skip() {
+        let sb = Sandbox::new();
+        let bare = sb.at("bare.git");
+        fs::create_dir_all(&bare).expect("mkdir");
+        sb.git(&bare, &["init", "-q", "--bare"]);
+
+        let err = collect(&bare).expect_err("a bare repo has no work tree");
+        assert!(
+            err.starts_with("`git rev-parse "),
+            "`--show-toplevel` is what must fail in a bare repo, so the rev-parse \
+             invocation is the one that must be named: {err}"
+        );
+        assert!(run(&bare).is_empty());
     }
 }
