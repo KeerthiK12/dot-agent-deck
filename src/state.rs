@@ -2774,7 +2774,11 @@ fn write_work_done_summary(
 ///    The debt is therefore already gone by the time this arm can run, and
 ///    `finish_pane_close` sweeps again regardless of whether the close succeeded.
 ///    Calling the release here would find nothing and return `false`; the sweep,
-///    not this function, is the discharge.
+///    not this function, is the discharge. Note this is only a statement about
+///    THIS exit, which delivers nothing and so owes nothing: whether the sweep's
+///    refusal to restore on a FAILED close is right for a still-live worker that
+///    did have a genuine delegation outstanding is a separate question, tracked
+///    as issue #505.
 /// 4. **The tail, after the guarded send** — releases whenever the send did not
 ///    deliver (`WrongSession`, `Stale`, `NoLiveTarget`, `Err`). `Ambiguous` counts
 ///    as delivered on purpose: some bytes reached the authorized worker, so a
