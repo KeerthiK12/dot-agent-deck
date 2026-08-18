@@ -100,14 +100,32 @@ RENOVATE_APP_ID="${RENOVATE_APP_ID:-2740}"
 # override, so the job id is the check name. A context that never reports is
 # worse than one that fails: it leaves the pull request permanently unmergeable
 # with nothing red to fix (governance.md records #416, a fork whose workflows
-# had never run). That is also why `REQUIRED_CHECKS=` omits the rule entirely:
-# a fork of this repository whose CI does not produce these four check names
-# needs a way to apply the pull-request gate without them.
+# had never run). A fork of this repository whose CI does not produce these four
+# check names therefore needs a way to apply the pull-request gate without them,
+# which is what ALLOW_NO_REQUIRED_CHECKS below exists for.
 #
 # `-` rather than `:-`, unlike the tunables above: with `:-` an explicitly empty
 # value falls back to the default, which would make that escape hatch a dead
 # end. Unset still means "the four defaults".
 REQUIRED_CHECKS="${REQUIRED_CHECKS-build build-macos build-windows security}"
+
+# Acknowledge that an empty REQUIRED_CHECKS is intended. Without this set to
+# `true`, an empty (or whitespace-only) REQUIRED_CHECKS is a hard error rather
+# than an instruction to omit the rule.
+#
+# The extra step is the point. Because `apply` sends a full `PUT`, omitting the
+# rule does not merely decline to add it — it STRIPS every required status check
+# off a live repository, with no error, no warning and a success exit: the same
+# class of silent weakening that warning 3 above exists for. An empty
+# environment variable is an ordinary way to arrive there by accident (a CI step
+# with an unset variable, a sourced env file, a mistyped export), so the
+# dangerous branch is made affirmative: reaching it takes a second, plainly
+# named variable that reads as a decision.
+#
+# This flag never removes anything by itself. With REQUIRED_CHECKS non-empty it
+# is inert and the contexts are emitted exactly as they would be otherwise; all
+# it does is permit what an empty REQUIRED_CHECKS already asked for.
+ALLOW_NO_REQUIRED_CHECKS="${ALLOW_NO_REQUIRED_CHECKS:-false}"
 
 # Whether a pull request must be up to date with `main` before merging. `false`
 # deliberately: with a dozen pull requests open, `true` means near-continuous
@@ -136,9 +154,11 @@ bypass_actors_json() {
 }
 
 # Render the `required_status_checks` rule, or nothing when REQUIRED_CHECKS is
-# empty. Emits its own leading comma so payload()'s `rules` array stays valid
-# JSON either way — the same shape bypass_actors_json uses for its conditional
-# entry, and kept out of the payload heredoc for the same reason.
+# empty *and* ALLOW_NO_REQUIRED_CHECKS says that is intended — an empty value on
+# its own is refused here rather than quietly producing a checkless ruleset.
+# Emits its own leading comma so payload()'s `rules` array stays valid JSON
+# either way — the same shape bypass_actors_json uses for its conditional entry,
+# and kept out of the payload heredoc for the same reason.
 required_status_checks_rule_json() {
   local ctx first=true
   case "$STRICT_REQUIRED_CHECKS" in
@@ -146,6 +166,17 @@ required_status_checks_rule_json() {
     *)
       echo >&2
       echo "error: STRICT_REQUIRED_CHECKS must be true or false, got '$STRICT_REQUIRED_CHECKS'." >&2
+      return 1
+      ;;
+  esac
+  # Validated rather than compared with `= true` alone: a typo like `yes` would
+  # otherwise fail closed into the refusal below, whose message then blames
+  # REQUIRED_CHECKS for a mistake made in this variable.
+  case "$ALLOW_NO_REQUIRED_CHECKS" in
+    true|false) ;;
+    *)
+      echo >&2
+      echo "error: ALLOW_NO_REQUIRED_CHECKS must be true or false, got '$ALLOW_NO_REQUIRED_CHECKS'." >&2
       return 1
       ;;
   esac
@@ -157,7 +188,25 @@ required_status_checks_rule_json() {
   # shellcheck disable=SC2086
   set -- $REQUIRED_CHECKS
   set +f
+  # Tested on the word count after splitting rather than with
+  # `[ -z "$REQUIRED_CHECKS" ]`, so a whitespace-only value reaches the same
+  # decision instead of slipping through as "omit the rule".
   if [ "$#" -eq 0 ]; then
+    if [ "$ALLOW_NO_REQUIRED_CHECKS" != true ]; then
+      echo >&2
+      echo "error: REQUIRED_CHECKS is empty, which emits a ruleset with NO required status" >&2
+      echo "checks. \`apply\` sends a full PUT, so on $REPO that REMOVES every check the" >&2
+      echo "ruleset currently requires — silently, and with a success exit." >&2
+      echo >&2
+      echo "If a checkless ruleset is what you want (a fork whose CI produces different job" >&2
+      echo "names, and which wants the pull-request gate without them), say so explicitly:" >&2
+      echo >&2
+      echo "  REQUIRED_CHECKS= ALLOW_NO_REQUIRED_CHECKS=true $0 apply" >&2
+      echo >&2
+      echo "Otherwise leave REQUIRED_CHECKS unset for this repository's four defaults, or set" >&2
+      echo "it to your own job names. See docs/develop/governance.md." >&2
+      return 1
+    fi
     return 0
   fi
   for ctx in "$@"; do
@@ -221,12 +270,19 @@ existing_ruleset_id() {
 
 payload() {
   local actors checks_rule
-  # Assign on its own line so a non-zero return (bad RENOVATE_APP_ID, bad
-  # REQUIRED_CHECKS entry) propagates under `set -e` instead of being masked,
-  # and so a malformed value can never reach the API as part of an otherwise
-  # valid-looking ruleset.
-  actors="$(bypass_actors_json)"
-  checks_rule="$(required_status_checks_rule_json)"
+  # `|| return 1` explicitly, rather than leaning on `set -e` to abort the
+  # assignment. Bash ignores errexit inside a command substitution used as an
+  # assignment's right-hand side, and *"if a shell function executes in a
+  # context where -e is being ignored, none of the commands executed within the
+  # function body will be affected by the -e setting"* — so in a caller written
+  # as `body="$(payload)"` an errexit-only guard is silently inert: the refusal
+  # below is printed, `checks_rule` is left empty, and payload happily emits a
+  # ruleset with the required-checks rule missing. That is the very failure this
+  # validation exists to prevent, reintroduced by the shape of the call site.
+  # An explicit return propagates from a pipeline, a substitution and a direct
+  # call alike, so no caller can un-arm it.
+  actors="$(bypass_actors_json)" || return 1
+  checks_rule="$(required_status_checks_rule_json)" || return 1
   cat <<JSON
 {
   "name": "$RULESET_NAME",
@@ -332,14 +388,26 @@ cmd_apply() {
     echo "admin PAT they will fail with GH006. See docs/develop/governance.md." >&2
     exit 1
   fi
-  local id
+  local id body
   id="$(existing_ruleset_id)"
+  # Rendered into a variable before any API call rather than piped straight into
+  # `gh`. payload() can refuse (a non-numeric RENOVATE_APP_ID, an unacknowledged
+  # empty REQUIRED_CHECKS, a context carrying a quote), and piped it would still
+  # have started `gh api --input -` and handed it empty stdin, leaving "is
+  # anything sent" up to how `gh` treats an empty body. Rendering first means a
+  # refusal aborts with nothing transmitted at all.
+  #
+  # What aborts it is payload()'s own `|| return 1`, NOT `set -e` — errexit is
+  # ignored inside this substitution (see the note on payload). Keep that return
+  # there; without it this line silently assigns a ruleset missing whichever
+  # rule failed to render, which is the exact failure the validation exists for.
+  body="$(payload)"
   if [ -n "$id" ]; then
     echo "updating ruleset $id ($RULESET_NAME)"
-    payload | gh api --method PUT "repos/$REPO/rulesets/$id" --input - >/dev/null
+    printf '%s\n' "$body" | gh api --method PUT "repos/$REPO/rulesets/$id" --input - >/dev/null
   else
     echo "creating ruleset $RULESET_NAME"
-    payload | gh api --method POST "repos/$REPO/rulesets" --input - >/dev/null
+    printf '%s\n' "$body" | gh api --method POST "repos/$REPO/rulesets" --input - >/dev/null
   fi
   echo "done."
   cmd_status
