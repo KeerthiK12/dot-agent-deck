@@ -18,7 +18,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 
 use dot_agent_deck::keybindings::KeybindingConfig;
-use dot_agent_deck::ui::{Action, Button, global_action, hit_test_button};
+use dot_agent_deck::ui::{Action, Button, global_action, hit_test_button, opened_link_status};
 use spec::spec;
 
 /// Scenario: Build the Ctrl+N key event and run it through the keyboard
@@ -110,4 +110,62 @@ fn button_001_render_label_and_disabled_dim() {
         buf2[(1, 0)].modifier.contains(Modifier::DIM),
         "disabled button must render dimmed"
     );
+}
+
+/// The longest prefix of `s` that fits in `max` bytes without splitting a
+/// character, computed by walking characters rather than by slicing bytes — a
+/// deliberately different algorithm from the production truncator, so the
+/// expectation states independently what a char-boundary cut is.
+///
+/// Deliberately duplicated in `tests/render_dashboard.rs` rather than shared:
+/// `tests/common` is the 9k-line PTY harness, and neither of these pure-L1 test
+/// binaries links it today — pulling it in for nine lines would cost both of
+/// them that compile.
+fn char_boundary_prefix(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        if out.len() + ch.len_utf8() > max {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Scenario: Hand `opened_link_status` — the function the live Ctrl+click arm
+/// calls to build its status line — the URLs an agent can write into its own
+/// PTY as an OSC-8 hyperlink. A short URL is reported whole; an over-long one
+/// is cut on a character boundary and marked, rather than panicking the event
+/// loop on a byte index that lands inside a character.
+#[spec("mouse/hyperlink/001")]
+#[test]
+fn hyperlink_001_opened_status_cuts_a_long_url_on_a_char_boundary() {
+    // Issue #574, second site: `format!("{}...", &url[..57])`. The URL comes
+    // from the embedded pane's hyperlink map — text the agent emitted — so the
+    // 57th byte is as producer-controlled as the string itself.
+    let short = "https://example.com/ok";
+    assert_eq!(
+        opened_link_status(short),
+        format!("Opened: {short}"),
+        "a URL inside the budget must be reported verbatim"
+    );
+
+    // Exactly at the boundary of the shortening rule: 60 bytes is still whole.
+    let sixty = format!("https://example.com/{}", "a".repeat(40));
+    assert_eq!(sixty.len(), 60);
+    assert_eq!(opened_link_status(&sixty), format!("Opened: {sixty}"));
+
+    for filler in ['α', 'あ', '𝄞', '😀'] {
+        for pad in 0..4usize {
+            let url: String =
+                format!("https://ex.co/{}", "x".repeat(pad)) + &filler.to_string().repeat(40);
+            assert!(url.len() > 60, "the sweep must exercise the shortening arm");
+            let want = format!("Opened: {}…", char_boundary_prefix(&url, 57));
+            assert_eq!(
+                opened_link_status(&url),
+                want,
+                "URL `{url}` must be cut on a character boundary"
+            );
+        }
+    }
 }

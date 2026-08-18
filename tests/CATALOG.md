@@ -90,6 +90,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** that the tagged session keeps its accumulated history (the `pre_f9_hook_with_no_agent_id_*` unit tests in `src/state.rs` pin that half); the `WaitingForInput` command-entry carve-out that reads the collision-hardened join (`orchestration/lock/007`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/011 — A multi-byte-Unicode `session_id` truncates on a char boundary instead of panicking the whole deck (issue #574).
+- **Layer:** L1 (ratatui `TestBackend`).
+- **Agent:** none (a hook event carrying a non-ASCII `session_id`, replayed through `AppState::apply_event`).
+- **Asserts:** `apply_event` keys the session map on a producer-supplied `session_id` of nine `α` characters verbatim (no validation between the hook socket and the render), and rendering that card in a three-card deck draws ALL THREE cards — the poisoned card's id shortened to the longest char-boundary prefix within the 11-byte title budget plus an `…`, its two healthy neighbours untouched. Repeats the render across 2-, 3- and 4-byte characters at every ASCII offset that puts byte 11 mid-character. Before the fix `&session.session_id[..11]` panicked inside the render loop, so every frame died and the whole deck went down with it.
+- **Does not assert:** any rejection or sanitisation of the id upstream of the render (the id is stored verbatim by design); the OSC-8 hyperlink status line, which is the same defect on a different string (`mouse/hyperlink/001`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
@@ -3169,6 +3176,15 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Agent:** none.
 - **Asserts:** `global_ctrl_action(Ctrl+N)` and `hit_test_button` on a synthetic New-Pane button rect both yield `Action::NewPane`; a click that misses every rect yields `None`.
 - **Does not assert:** rendering or end-to-end dispatch side effects.
+- **Platform coverage:** mac+linux+windows.
+
+#### mouse/hyperlink
+
+##### mouse/hyperlink/001 — The Ctrl+click "Opened:" status shortens an agent-controlled URL on a char boundary (issue #574).
+- **Layer:** pure-data (plain logic, no TUI harness).
+- **Agent:** none (URL strings as they arrive from the embedded pane's OSC-8 hyperlink map).
+- **Asserts:** `opened_link_status` — the exact function the live Ctrl+click arm calls — leaves a short URL whole, and shortens an over-long one to the longest char-boundary prefix within its 57-byte budget plus an `…`, for 2-, 3- and 4-byte characters at every ASCII offset that puts byte 57 mid-character. Before the fix `&url[..57]` panicked the event loop on a URL an agent had written into its own PTY.
+- **Does not assert:** the hit-test that finds the URL under the cursor, or the `open::that` call itself (both are outside this seam); the session-card id, which is the same defect on a different string (`dashboard/pane/011`).
 - **Platform coverage:** mac+linux+windows.
 
 #### mouse/button

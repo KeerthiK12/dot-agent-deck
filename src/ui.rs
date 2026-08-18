@@ -5398,6 +5398,26 @@ fn screen_row_offset(screen: &vt100::Screen, pane_rect: Rect) -> u16 {
     effective_rows.saturating_sub(inner_h) as u16
 }
 
+/// The status line a Ctrl+click on an OSC-8 hyperlink leaves behind, with the
+/// URL shortened to fit the one-row status area.
+///
+/// Extracted out of the mouse arm so the L1 seam (`mouse/hyperlink/001`)
+/// exercises the same code the live click path runs rather than an agreeing
+/// copy of it.
+pub fn opened_link_status(url: &str) -> String {
+    // Issue #574: the URL is whatever the agent wrote into its own PTY as an
+    // OSC-8 hyperlink, so byte 57 is as arbitrary as the string — `&url[..57]`
+    // panicked the event loop the moment it landed inside a character. The
+    // `> 60` gate is kept so the set of URLs that get shortened at all is
+    // unchanged; only the cut itself moves to a character boundary.
+    let display = if url.len() > 60 {
+        crate::prompt_delivery::truncate_on_char_boundary(url, 57)
+    } else {
+        url.to_string()
+    };
+    format!("Opened: {display}")
+}
+
 /// Extract text from a vt100 screen for the given selection region.
 /// Selection coordinates are widget-relative; `row_offset` maps them to screen rows.
 fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offset: u16) -> String {
@@ -12884,13 +12904,8 @@ pub fn run_tui(
                                                 drop(parser);
                                                 drop(hmap);
                                                 if open::that(&url).is_ok() {
-                                                    let display = if url.len() > 60 {
-                                                        format!("{}...", &url[..57])
-                                                    } else {
-                                                        url
-                                                    };
                                                     ui.status_message = Some((
-                                                        format!("Opened: {display}"),
+                                                        opened_link_status(&url),
                                                         std::time::Instant::now(),
                                                     ));
                                                 }
@@ -17777,11 +17792,14 @@ fn render_session_card(
     };
     let status_color = status_style.fg.unwrap_or(Color::Reset);
 
-    let id_display = if session.session_id.len() > 11 {
-        &session.session_id[..11]
-    } else {
-        &session.session_id
-    };
+    // Issue #574: `session_id` is producer-controlled — `apply_event` keys the
+    // session map on whatever the hook socket sent, with no length, charset or
+    // boundary check between the socket and here. `&session_id[..11]` is a BYTE
+    // index, so an id whose 11th byte falls inside a character panicked this
+    // function — and because it runs inside the render loop, EVERY frame died
+    // and the whole deck went down with the one bad card. Same truncator the
+    // hook binary already uses on prompts, for the same reason.
+    let id_display = crate::prompt_delivery::truncate_on_char_boundary(&session.session_id, 11);
 
     let num_prefix = match card_number {
         Some(n) => format!("{n} "),
