@@ -2370,6 +2370,43 @@ without depending on the config struct API.
 - **Does not assert:** the payload guard's records or refusal reason, exact task-file contents, or which safe mechanism admits B; the outcome is solely that B is physically delivered after A completed.
 - **Platform coverage:** mac+linux.
 
+#### orchestration/work-done
+
+##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
+- **Layer:** fast integration (real `handle_work_done` against daemon-owned PTYs; `cat` stand-ins, no LLM and no `e2e` feature gate).
+- **Agent:** none (a raw no-echo `cat` orchestrator observer, so one daemon submission appears exactly once in its snapshot, plus a `cat` worker).
+- **Asserts:** with an earlier delegation's report already parked at `.dot-agent-deck/work-done-coder.md` and nothing delegated, the worker's `work-done` produces feedback carrying the daemon's unsolicited label (`you have no outstanding delegation to that worker`); the happy-path pointer (`Read .dot-agent-deck/work-done-coder.md for their full report.`) is ABSENT; the worker's own report still reaches the orchestrator inline, framed as `[UNTRUSTED-WORKER-REPORT: … :END-UNTRUSTED-WORKER-REPORT]`; and the earlier report is still on disk byte-for-byte.
+- **Does not assert:** what the orchestrator then DOES with the label (an LLM decision); the commonest sibling trace — a worker redirected by a human mid-delegation, which produces a well-formed completion for a diverged task and involves no defect (#445/#369); the ledger's own arithmetic (unit-tested on `AgentPtyRegistry::retire_delegation_commission`).
+- **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
+
+##### orchestration/work-done/002 — With the idle detector switched OFF (`worker_response_timeout_minutes = 0`) a genuinely delegated completion is still reported normally, and is never labelled unsolicited (issue #448's decisive regression guard).
+- **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs; `cat` stand-ins).
+- **Agent:** none (raw no-echo `cat` orchestrator observer plus a `cat` worker).
+- **Asserts:** on a project config whose `worker_response_timeout_minutes = 0` leaves BOTH delegation watches arming nothing at all, a delegate followed by the worker's `work-done` still submits the unchanged pointer into the orchestrator pane, carries no unsolicited label and no inlined report frame, and writes the fresh report to `.dot-agent-deck/work-done-coder.md`. This is the case that rules out inferring "never delegated" from `DelegationRetirement::Nothing`: doing so would have silently stopped reporting completions for every project that has turned the detector off.
+- **Does not assert:** the detector's own firing behaviour with a positive timeout (`scheduler/idle-worker/*`); the millisecond test seam; the exact task text delegated.
+- **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
+
+##### orchestration/work-done/003 — When the summary file cannot be written, the orchestrator is told so and receives the report inline instead of a pointer to a path the daemon never wrote (issue #433).
+- **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs; `cat` stand-ins).
+- **Agent:** none (raw no-echo `cat` orchestrator observer plus a `cat` worker).
+- **Asserts:** with `.dot-agent-deck` occupied by a regular FILE — so `create_dir_all` and the write both fail, for uid 0 as well — a delegated worker's `work-done` produces feedback stating the deck `could not write .dot-agent-deck/work-done-coder.md`, with the happy-path pointer ABSENT and the worker's report inlined inside the untrusted-report frame. The daemon still holds the summary in memory at the moment it gives up on the file, so the failure degrades to a worse-formatted report rather than to a confidently wrong one.
+- **Does not assert:** the no-cwd and mkdir-only variants of the same failure (unit-tested on `write_work_done_summary`); the stale-file READ itself (the pointer's absence is what makes it unreachable); recovery of the file on a later delegation.
+- **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
+
+##### orchestration/work-done/004 — On the REAL binary, an unsolicited `work-done` renders its label and the worker's framed report in the attached TUI's orchestration surface, with no pointer to a file that was never written (issues #448 + #433).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, with its lazy daemon; the completion is issued by running the REAL `dot-agent-deck work-done` CLI against the deck's own hook socket, so the spawned-binary → hook-socket → daemon → rendered-pane boundary is covered end to end). Synthetic (`cat` roles, no LLM), so deliberately NOT demo-reel-marked.
+- **Agent:** none (the `orch-deck` fixture's two `cat` roles: `orchestrator` start + `worker`). Both delegation watches are switched off via the millisecond seams so no detector competes for the surface under assertion.
+- **Asserts:** with the orchestration opened through the production new-pane flow and NOTHING delegated, the real `work-done` CLI exits 0 and the rendered orchestration surface visibly carries the daemon's unsolicited label (`you have no outstanding delegation to that worker`) plus its provenance clause, and the worker's own report inside `[UNTRUSTED-WORKER-REPORT: … ]` (sentinel `e2e-unsolicited-report-4b7d`); the happy-path pointer (`Read .dot-agent-deck/work-done-worker.md …`) is ABSENT; and no `work-done-worker.md` exists on disk. Needles are matched with whitespace squeezed out of both sides, because a long daemon-injected line wraps at whatever column a role pane happens to be — the failure mode `scheduler/idle-worker/011` demonstrates.
+- **Does not assert:** the failed-summary-write branch (deterministic only by sabotaging the coordination path, so it stays fast-tier as `orchestration/work-done/003`); the commission ledger's arithmetic (unit-tested); a real agent reading and acting on the label (an LLM decision, not a rendering fact).
+- **Platform coverage:** mac+linux (unix-only PTY/UDS).
+
+##### orchestration/work-done/005 — A `clear = true` delegate whose respawn FAILS releases its commission, so the next uncommissioned `work-done` from that worker is still reported as unsolicited (issue #448 review, round 2).
+- **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs; `cat` stand-ins).
+- **Agent:** none (raw no-echo `cat` orchestrator observer; the worker's `cat` is deliberately evicted before the delegate).
+- **Asserts:** with the `coder` role at `clear = true` and BOTH delegation watches switched off (`worker_response_timeout_minutes = 0`), evicting the worker pane's live agent makes `respawn_agent_for_pane` fail deterministically with `NotFound`, and the dispatch takes its respawn-error return. The orchestrator first sees the daemon's `⚠ respawn failed for role 'coder'` notice — the test's synchronization edge, so no timing is guessed at — and a subsequent `work-done` from that same worker is then reported with the unsolicited label, with the happy-path pointer ABSENT and no `work-done-coder.md` on disk. Confirmed red with only the release removed: the completion arrives as `Worker coder has completed their task. Read .dot-agent-deck/work-done-coder.md …`, which is #448 and its clobber reproduced through the ledger added to prevent them. Both detectors are off on purpose — the release must be independent of them, exactly as the arming is.
+- **Does not assert:** the guarded-send refusal arm's release (unit-tested arithmetic plus a manual real-binary run; forcing an undelivered guarded send here would depend on the spawned dispatch task winning a race); the pi-native seed return, which is a DELIVERY path and correctly keeps its commission; the readiness-buffer close return, where `begin_pane_close`'s sweep is the discharge.
+- **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
