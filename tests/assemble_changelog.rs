@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 //! Issue #582 — regression tests for `scripts/assemble-changelog.sh`, the
 //! release-time fragment assembler.
 //!
@@ -19,8 +19,22 @@
 //! tests only). They run in the fast tier: each one is a single `bash`
 //! invocation against a scratch directory, no network, no sleeps.
 //!
-//! `#![cfg(unix)]` because the subject is a `bash` script that the release
-//! workflow runs on Linux; there is no Windows path to regress.
+//! `#![cfg(target_os = "linux")]` because that is where the subject actually
+//! runs: `release.yml` invokes this script on `ubuntu-latest`, and nothing else
+//! invokes it at all. The gate is deliberately narrower than `unix`, and it is
+//! not caution — an earlier `#![cfg(unix)]` turned `build-macos` red, with
+//! every case failing identically at `assemble-changelog.sh: line 12: added:
+//! unbound variable`. Line 12 is the `declare -A TYPE_HEADERS=(` block, which
+//! predates this file: macOS ships bash 3.2, which has no associative arrays,
+//! so `[added]="Added"` is parsed as an *arithmetic* subscript and `added` is
+//! an unset variable under the script's `set -u`. (Reproduced on bash 5 by
+//! dropping the `declare -A`: same message, same variable.) So the script has
+//! always required bash 4+, and these tests were simply the first thing ever to
+//! execute it on a macOS runner. Making it bash-3.2-clean is a real
+//! improvement, but it is a change to the highest-blast-radius script in the
+//! repo and belongs to its own issue rather than to the #582 fix — tracked in
+//! #593. Until then a test that runs where the script does not is a test whose
+//! red says nothing about the script's correctness.
 
 // Issue #322 / linkage-check check 8: `tests/` may not call a bare `tempfile`
 // constructor. This crate does not link the PTY harness, so it uses the
