@@ -2140,3 +2140,156 @@ fn layout_001_seven_decks_fit_single_column() {
         "with {MANY} decks scrolling must still engage (only {many_visible} fit)"
     );
 }
+
+/// The longest prefix of `s` that fits in `max` bytes without splitting a
+/// character, computed by walking characters rather than by slicing bytes —
+/// deliberately a different algorithm from the production truncator, so the
+/// expectation is an independent statement of what a char-boundary cut is
+/// rather than a restatement of the code under test.
+///
+/// Deliberately duplicated in `tests/mouse_dispatch.rs` rather than shared: see
+/// the note there.
+fn char_boundary_prefix(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        if out.len() + ch.len_utf8() > max {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Expand `s` the way a ratatui buffer holds it: a double-width character
+/// occupies two cells, and `buffer_to_text` joins the second (padding) cell in
+/// as a space. Without this a sweep over wide characters would compare the
+/// rendered title against a string the renderer never produces.
+fn as_rendered_cells(s: &str) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        out.push(ch);
+        for _ in 1..ch.to_string().width().max(1) {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+/// Scenario: A hook posts a session whose id is nine `α` characters, so byte 11
+/// — where the card title cuts the id — falls inside a character. Render that
+/// card between two healthy ones: the deck must draw all three cards with the
+/// Unicode id cut on a character boundary, instead of panicking the render loop
+/// and taking every other agent's card down with it. Repeated for 2-, 3- and
+/// 4-byte characters at every offset that puts byte 11 mid-character.
+#[spec("dashboard/pane/011")]
+#[test]
+fn pane_011_multibyte_session_id_renders_the_whole_deck() {
+    // Issue #574. `&session.session_id[..11]` is a BYTE index, and `str`
+    // indexing panics when it lands inside a character. The id is
+    // producer-controlled — `apply_event` keys the session map on whatever the
+    // hook socket sent, with no length, charset or boundary check anywhere in
+    // between — so this drives the real state transition first and renders
+    // whatever it produces, rather than hand-building the card list.
+    //
+    // The blast radius is the point: the slice runs inside the render loop, so
+    // one bad id killed EVERY frame. That is why the assertion is made on a
+    // three-card deck and not on the poisoned card alone.
+    const POISONED_ID: &str = "ααααααααα"; // 9 chars x 2 bytes = 18; byte 11 is mid-char
+    assert!(
+        !POISONED_ID.is_char_boundary(11),
+        "the fixture only reproduces the defect if byte 11 splits a character"
+    );
+
+    let mut state = AppState::default();
+    state.register_pane("2".to_string());
+    state.apply_event(AgentEvent {
+        session_id: POISONED_ID.to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::WaitingForInput,
+        tool_name: None,
+        tool_detail: None,
+        cwd: Some("/home/dev/worker".to_string()),
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("2".to_string()),
+        agent_id: None,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    });
+    let poisoned = state
+        .sessions
+        .get(POISONED_ID)
+        .expect("apply_event keys the session map on the producer's id verbatim")
+        .clone();
+
+    // Two ordinary neighbours, so a panic in the middle card is visible as the
+    // loss of cards that have nothing wrong with them.
+    let mut healthy_a = poisoned.clone();
+    healthy_a.session_id = "sess-alpha".to_string();
+    healthy_a.pane_id = Some("1".to_string());
+    let mut healthy_b = poisoned.clone();
+    healthy_b.session_id = "sess-gamma".to_string();
+    healthy_b.pane_id = Some("3".to_string());
+
+    // No display name on the poisoned card: the id is what the title renders
+    // only when the card has no friendlier label.
+    let cards: [(&SessionState, Option<&str>); 3] = [
+        (&healthy_a, Some("example-alpha")),
+        (&poisoned, None),
+        (&healthy_b, Some("example-gamma")),
+    ];
+    let rendered = buffer_to_text(&render_dashboard_cards_to_buffer(
+        &cards,
+        Some(0),
+        CardDensityKind::Normal,
+        0,
+        80,
+    ));
+
+    // One status badge per card, so counting badges counts surviving cards.
+    assert_eq!(
+        rendered.matches("Needs Input").count(),
+        3,
+        "one bad session id must not cost the other agents their cards:\n{rendered}"
+    );
+    let expected = format!(
+        "{}…",
+        as_rendered_cells(&char_boundary_prefix(POISONED_ID, 11))
+    );
+    assert!(
+        rendered.contains(&expected),
+        "the title must cut the id on a character boundary and mark the cut, expected `{expected}`:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("example-alpha") && rendered.contains("example-gamma"),
+        "both neighbouring cards must still render their titles:\n{rendered}"
+    );
+
+    // Property sweep: every character width, at every ASCII offset that moves
+    // the cut inside a character. `session_id` is arbitrary bytes from the
+    // socket, so no single fixture proves the render is boundary-safe.
+    for filler in ['α', 'あ', '𝄞', '😀'] {
+        for pad in 0..4usize {
+            let id: String = "x".repeat(pad) + &filler.to_string().repeat(12);
+            let mut session = poisoned.clone();
+            session.session_id = id.clone();
+            let card = buffer_to_text(&render_card_to_buffer(
+                &session,
+                None,
+                Some(1),
+                CardDensityKind::Normal,
+                0,
+                false,
+                80,
+                CardDensityKind::Normal.rendered_height(),
+            ));
+            let want = format!("{}…", as_rendered_cells(&char_boundary_prefix(&id, 11)));
+            assert!(
+                card.contains(&want),
+                "id `{id}` must render as `{want}`:\n{card}"
+            );
+        }
+    }
+}
