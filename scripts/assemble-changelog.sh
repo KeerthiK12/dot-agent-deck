@@ -28,6 +28,17 @@ TYPES=(breaking added feature changed fixed bugfix removed doc misc)
 # rather than silently skipping them. (v0.24.3 shipped with `*.fix.md` fragments
 # that were ignored because only `*.bugfix.md`/`*.fixed.md` are recognized,
 # leaving the GitHub release body and CHANGELOG.md empty for that version.)
+#
+# LOCKSTEP: this validation `find` and the collection `find` further down MUST
+# scan the same tree. Both are recursive — no `-maxdepth` on either — so every
+# `*.md` under changelog.d/ is suffix-checked before the collection loop can
+# reach it, and nothing is deleted without having passed this gate. They
+# disagreed once: validation was `-maxdepth 1` while collection was unbounded,
+# so a fragment in a subdirectory was invisible to the guard and visible to the
+# `rm -f` at the end, and an unrecognized one sat there while its siblings were
+# consumed around it (issue #582) — the same silent-drop shape this guard was
+# written to prevent, reached by the one path it did not cover. Change the depth
+# of one and you must change the other.
 if [ -d "$CHANGELOG_DIR" ]; then
   unknown_fragments=()
   while IFS= read -r -d '' f; do
@@ -37,8 +48,11 @@ if [ -d "$CHANGELOG_DIR" ]; then
     for type in "${TYPES[@]}"; do
       [[ "$name" == *.${type}.md ]] && { matched=true; break; }
     done
-    $matched || unknown_fragments+=("$name")
-  done < <(find "$CHANGELOG_DIR" -maxdepth 1 -name '*.md' -print0 2>/dev/null)
+    # Report the path relative to changelog.d/, so a fragment in a
+    # subdirectory names the directory to look in; for the flat layout the
+    # repo actually uses this is still just the filename.
+    $matched || unknown_fragments+=("${f#"$CHANGELOG_DIR"/}")
+  done < <(find "$CHANGELOG_DIR" -name '*.md' -print0 2>/dev/null)
 
   if [ ${#unknown_fragments[@]} -gt 0 ]; then
     echo "ERROR: changelog.d/ contains fragments with unrecognized type suffix:" >&2
@@ -56,6 +70,9 @@ seen_headers=()
 
 for type in "${TYPES[@]}"; do
   fragments=()
+  # LOCKSTEP with the validation `find` above — see the note there. Recursive,
+  # and every path it can yield has already been suffix-checked by the time this
+  # loop runs, which is what makes the `rm -f` at the end safe.
   while IFS= read -r -d '' f; do
     fragments+=("$f")
   done < <(find "$CHANGELOG_DIR" -name "*.$type.md" -print0 2>/dev/null | sort -z)
