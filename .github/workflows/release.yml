@@ -24,18 +24,41 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       changelog: ${{ steps.changelog.outputs.changelog }}
     steps:
+      # Fail here, not 20 steps later at the push. This job commits the
+      # changelog straight to `main`, which only an admin identity may do:
+      # `main` is ruleset-protected and `github-actions[bot]` is deliberately
+      # NOT a bypass actor (GITHUB_TOKEN cannot be one on a user-owned repo).
+      # RELEASE_TOKEN is the admin PAT that bypasses it.
+      #
+      # This step replaces a `|| github.token` fallback that was correct when
+      # written and is now a trap. Its stated purpose was to keep the workflow
+      # "behaving exactly as it does today while the secret is unset, so this
+      # change is safe to merge before `main` is protected" — both conditions
+      # have since flipped (`main` protected 2026-08-08, secret set the same
+      # day). All the fallback can do now is turn an unset or empty secret into
+      # a silent downgrade to an identity that cannot push, surfacing as the
+      # v0.35.6 `GH006` failure after the release is already half-done.
+      #
+      # What this guard does NOT cover: it tests emptiness, so a token that is
+      # present but expired, revoked or under-scoped passes it and still fails
+      # later at the push, with the tag cut and the changelog written. Probing
+      # the token would cost an API call and add a failure mode of its own on
+      # the release path, so the cheap check is deliberate. The old fallback did
+      # not cover that case either -- GitHub's `||` returns the left operand
+      # whenever it is non-empty, so an expired PAT went straight through.
+      - name: Verify RELEASE_TOKEN is present
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_TOKEN}" ]; then
+            echo "::error::RELEASE_TOKEN is unset or empty. This job pushes the changelog commit to the protected \`main\` branch and needs the admin PAT to bypass the ruleset; GITHUB_TOKEN cannot. Set the RELEASE_TOKEN secret and re-run. See CLAUDE.md rule 8."
+            exit 1
+          fi
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          # This job pushes the changelog commit straight to `main` (see the
-          # "Commit changelog updates" step). Once `main` is protected, the
-          # default GITHUB_TOKEN is rejected with `GH006: Protected branch
-          # update failed` and the tag dies here — the v0.35.6 failure mode
-          # recorded in CLAUDE.md rule 8. RELEASE_TOKEN is an admin PAT that
-          # bypasses the ruleset. The `|| github.token` fallback keeps this
-          # workflow behaving exactly as it does today while the secret is
-          # unset, so this change is safe to merge before `main` is protected.
-          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+          token: ${{ secrets.RELEASE_TOKEN }}
       - name: Extract version
         id: version
         # Every GitHub-context value a `run:` script in this workflow consumes
@@ -463,13 +486,23 @@ jobs:
     needs: [prepare, finalize]
     uses: ./.github/workflows/docs-publish.yml
     # A reusable workflow invoked via `uses:` receives NO secrets unless the
-    # caller passes them, so without this line `secrets.RELEASE_TOKEN` is empty
-    # inside docs-publish.yml. Its checkout then silently falls back to
-    # `github.token`, whose push to `main` the `main-protected` ruleset rejects
-    # with `GH013: … Changes must be made through a pull request` — which is
-    # exactly how v0.35.9's "Commit chart changes" step failed. The image had
-    # already been pushed to GHCR by then, so the symptom was a docs site that
-    # never rolled forward rather than an obviously broken release.
+    # caller forwards them, so without this line `secrets.RELEASE_TOKEN` is
+    # empty inside docs-publish.yml and its push to `main` cannot bypass the
+    # `main-protected` ruleset. That is exactly how v0.35.9's "Commit chart
+    # changes" step failed, with `GH013: … Changes must be made through a pull
+    # request` — and because the image had already reached GHCR by then, the
+    # symptom was a docs site that never rolled forward rather than an
+    # obviously broken release. (The callee now guards for an empty token in
+    # its first step, so the same mistake fails before anything is published.)
+    #
+    # `inherit` is broader than this job needs: it forwards every repository
+    # secret, including HOMEBREW_TAP_TOKEN and SCOOP_BUCKET_TOKEN, which are
+    # cross-repo write credentials that docs-publish.yml never reads. Narrowing
+    # it to an explicit `RELEASE_TOKEN` map is tracked in #514 — deliberately
+    # not done inline, because the callee is also `workflow_dispatch`-able and
+    # that path has to be canaried first (governance.md step 5). Keep the
+    # forwarding until then; do not read this line as an endorsement of
+    # `inherit` over a narrow map.
     secrets: inherit
     with:
       image_tag: v${{ needs.prepare.outputs.version }}
