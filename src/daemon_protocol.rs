@@ -812,6 +812,24 @@ pub async fn serve_attach_with_counter(
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
+    // Issue #454: this is one of the two seams that first hold BOTH the
+    // registry and the daemon's own `AppState`, so it is where the admission
+    // check learns to ask the registry who this daemon owns. Without it,
+    // `AppState::apply_event` falls back to the pane set alone and every
+    // lifecycle report from an ordinary daemon-spawned pane is dropped as
+    // unowned. Idempotent — `run_daemon_with` installs the same registry.
+    //
+    // Weakly — see the same call in `crate::daemon::run_daemon_with` for the
+    // reference cycle a strong reference closes. `registry` is this function's
+    // own argument and outlives the loop below, so the oracle stays answerable
+    // for as long as the server runs.
+    {
+        let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+        state
+            .write()
+            .await
+            .set_agent_ownership(Arc::downgrade(&ownership));
+    }
     // PRD #93 round-2 reviewer REV-1: the same Notify the registry uses for
     // spawn/close/exit transitions also fires on every attach-counter
     // transition. The daemon's edge-triggered idle monitor waits on it, so
@@ -1328,6 +1346,71 @@ async fn handle_connection(
                             crate::agent_pty::seed_fallback_grace(),
                         );
                     }
+                    // Issue #454: NOTHING is registered in the daemon's
+                    // `AppState` here, deliberately.
+                    //
+                    // `AppState::apply_event` admits a non-`SessionStart`
+                    // event only for an agent this process owns (admission
+                    // control: an arbitrary same-user process must not be
+                    // able to drive daemon session state for an agent the
+                    // daemon does not own), and the daemon used to be unable
+                    // to answer that for an ordinary pane — it owned one in
+                    // `AgentPtyRegistry` and nowhere else, so the real
+                    // `dot-agent-deck agent-event` CLI (which emits
+                    // `Thinking`/`Idle`/`Working`, never `SessionStart`) had
+                    // every one of its reports dropped, `ListAgents` joined
+                    // `live = None`, `daemon status` printed
+                    // `STATUS=- TOOL=-`, and a TUI reconnect rebuilt the card
+                    // as `Idle` (PRD #162).
+                    //
+                    // The first fix for that inserted `pane_id_env` into
+                    // `managed_pane_ids` right here. It was wrong in three
+                    // ways, all of them about LIFETIME rather than about this
+                    // line: the child can report before this line runs (it is
+                    // two `.await`s past the spawn); a child that simply dies
+                    // revokes nothing, because the registry marks it `exited`
+                    // and `agent_records` then filters it out of the very
+                    // lookup `StopAgent` uses to clean up; and every
+                    // short-lived pane therefore left an id behind that kept
+                    // admitting forged reports. The daemon now installs
+                    // `crate::state::AgentOwnership` once at startup and the
+                    // registry answers each question as it is asked — from
+                    // before the child exists (the spawn reservation) until
+                    // its record is reaped. See
+                    // `AgentPtyRegistry::owns_generation`.
+                    //
+                    // WHAT IS ACTUALLY GUARANTEED, stated narrowly because the
+                    // wider claim this comment used to make was false. A
+                    // NON-`SessionStart` event is admitted only when one of
+                    // these holds:
+                    //
+                    // * it names an `agent_id`, and that GENERATION holds the
+                    //   pane it names — live, or retired with the pane not yet
+                    //   claimed by anyone else (round 2: pane-scoped was not
+                    //   enough, because a pane id is a reusable slot);
+                    // * it names NO `agent_id` and some generation holds the
+                    //   pane. There is nothing to bind such an event to, and
+                    //   PRD #110 / issue #398 keep the shape working
+                    //   deliberately, so a same-uid process that omits the id
+                    //   can still drive a card on a pane this daemon owns.
+                    //   Unchanged by round 2 and stated because it is the
+                    //   residual;
+                    // * the pane was explicitly registered by this process (an
+                    //   orchestration role below, or the auto-registration in
+                    //   the next line). Registration is pane-scoped by design —
+                    //   the registrant is asserting the pane, not a generation.
+                    //
+                    // A `SessionStart` is weaker on purpose — `apply_event`
+                    // auto-registers a pane id it names, unless the id is the
+                    // synthetic `__dead-slot__-…` shape or the registry already
+                    // holds a generation for that pane — to cover the TUI
+                    // startup race where the hook beats `register_pane`. So a
+                    // same-uid process CAN mint a card for a pane NOBODY
+                    // spawned by forging one. That is pre-existing, it is not a
+                    // cross-user escalation (both sockets are owner-only and
+                    // an attach peer can already write to agents directly),
+                    // and closing it is tracked separately; it is stated here
+                    // rather than papered over.
                     // PRD #93 round-5: populate daemon-side role maps so
                     // `handle_delegate` / `handle_work_done` can resolve
                     // the worker pane and orchestrator pane purely from
@@ -1411,8 +1494,65 @@ async fn handle_connection(
             // `pane_id_env` cleans up the daemon's per-pane role maps; the
             // record's cwd/orchestration-cwd is how the PRD #120 M2.4 close
             // watcher matches a dispatched issue agent to its worktree.
-            let stopping_record = registry.agent_records().into_iter().find(|r| r.id == id);
-            let pane_id_env = stopping_record.as_ref().and_then(|r| r.pane_id_env.clone());
+            //
+            // Issue #454: read it through `agent_record_any`, NOT
+            // `agent_records`. The latter filters out an agent whose child has
+            // already exited — right for hydration, exactly wrong here, because
+            // a common way an agent reaches `StopAgent` is that its child died
+            // first and the pane is closed afterwards. Through the filtered list
+            // such a record came back `None`, so `pane_id_env` was `None`, so
+            // EVERY cleanup step below was skipped: the delegation sweep,
+            // `cancel_prompt_confirmation`, the role-map removal,
+            // `unregister_pane` and the dispatched-worktree cleanup. And it was
+            // skipped permanently — `close_agent` drops the entry in this same
+            // handler, so no later call could repair it.
+            //
+            // Round-2 audit (blocker C): reading a DEAD agent's pane back is
+            // what makes the cleanup below reachable at all, and it is also
+            // what makes it dangerous — because every step after this lookup is
+            // PANE-scoped while the agent being stopped is not. The registry
+            // deliberately lets a live agent B reuse the pane a dead agent A
+            // left; a `StopAgent(A)` arriving after that (a stale client, or
+            // just ordinary lifecycle ordering) would then mark B's pane
+            // closing, cancel B's prompt confirmation and every delegation
+            // touching it, and `unregister_pane` B's role, cwd, orchestrator
+            // marker and routing identity. That is strictly worse than the leak
+            // it replaced: before the round-1 fix the filtered lookup found
+            // nothing for A and cleanup was skipped, so stale state lingered but
+            // no LIVE agent's state was deleted.
+            //
+            // So the pane travels into the cleanup only while it is still A's to
+            // give up: nobody else holds it, or A itself still does. Anything
+            // else and A owes the pane nothing — its successor owns it, and
+            // owns the cleanup of it too. `close_agent(&id)` below is keyed by
+            // registry id and is unaffected either way; it is only the
+            // pane-scoped work that is gated. The dispatched-worktree cleanup
+            // keeps reading the record directly: it is guarded by its own
+            // `worktree_still_in_use` sweep over the live records, which is the
+            // same "is anyone else using this?" question asked of a worktree
+            // instead of a pane.
+            //
+            // Round-3 review (blocker 1): that gate is now taken from the
+            // registry as a HOLD rather than as a boolean read, for two reasons
+            // the first version got wrong. It was asked of
+            // `pane_current_agent_id`, which sees only published, non-exited
+            // agents — so a successor that had RESERVED the pane and not
+            // published yet came back `None` and was read as "nobody holds it".
+            // And it was check-then-act: decided here, before a `close_agent`
+            // that can spend the full three-second termination grace, and acted
+            // on afterwards in `unregister_pane`, so a successor could reserve,
+            // spawn, publish and register its whole identity inside the gap only
+            // for this handler to delete it. The hold answers both — it sees
+            // reservations, and nothing may claim the pane until it is dropped
+            // at the end of this arm. See `AgentPtyRegistry::hold_pane_for_cleanup`.
+            let stopping_record = registry.agent_record_any(&id);
+            let pane_cleanup_hold = stopping_record
+                .as_ref()
+                .and_then(|r| r.pane_id_env.as_deref())
+                .and_then(|pane| registry.hold_pane_for_cleanup(pane, &id));
+            let pane_id_env = pane_cleanup_hold
+                .as_ref()
+                .map(|hold| hold.pane_id().to_string());
             let dispatched_worktree = stopping_record
                 .as_ref()
                 .and_then(crate::issue_dispatch_run::worktree_of_record);
@@ -1551,7 +1691,12 @@ async fn handle_connection(
                     }
                     write_resp(&mut stream, &AttachResponse::err(msg)).await?
                 }
-            }
+            };
+            // Issue #454 round 3: released HERE and not one line earlier —
+            // everything from the authorisation above through `unregister_pane`
+            // and `finish_pane_close` is the pane-scoped cleanup the hold exists
+            // to keep valid. Every `?` above releases it too, via `Drop`.
+            drop(pane_cleanup_hold);
         }
         AttachRequest::SetAgentLabel {
             id,
@@ -2266,6 +2411,607 @@ async fn handle_attach_stream(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Issue #454, the root cause pinned at its own seam: a `StartAgent` for an
+    /// ORDINARY dashboard pane — no `tab_membership`, so none of the
+    /// orchestration role-map machinery runs — must leave the daemon's
+    /// `AppState` able to accept that pane's lifecycle reports.
+    ///
+    /// Until the fix, `managed_pane_ids` was the only answer the daemon had and
+    /// it was populated only by `register_orchestration_role` and by
+    /// `apply_event`'s auto-register-on-`SessionStart` branch, so this pane
+    /// lived in `AgentPtyRegistry` and nowhere else. `AppState::apply_event`
+    /// then rejected every non-`SessionStart` report the pane made — which is
+    /// every report the real `dot-agent-deck agent-event` CLI sends — and
+    /// `ListAgents` had no live session to join onto the record.
+    ///
+    /// Two negatives are just as load-bearing. Owning the pane must NOT make a
+    /// dashboard pane look like an orchestration role, or `handle_delegate`
+    /// would start resolving panes that never joined an orchestration. And the
+    /// daemon must NOT record the pane in `managed_pane_ids`: an entry there
+    /// survives the child's death (nothing reports it) and would keep admitting
+    /// reports for a pane with no process behind it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ordinary_daemon_spawned_panes_reports_are_admitted() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        // The bind happens inside the task, so wait for it to accept.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pane_id = "dashboard-pane-454";
+        let agent_id = DaemonClient::new(sock.clone())
+            .start_agent(StartAgentOptions {
+                command: Some("cat".to_string()),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                // Deliberately no `tab_membership`: this is a plain dashboard
+                // pane, the case the old code registered nowhere.
+                ..StartAgentOptions::default()
+            })
+            .await
+            .expect("spawn an ordinary pane through the attach socket");
+
+        // The registry owns the pane — that is the fact the admission check now
+        // consults. Nothing was copied into `AppState` to make it true.
+        assert!(
+            registry
+                .agent_records()
+                .iter()
+                .any(|r| r.id == agent_id && r.pane_id_env.as_deref() == Some(pane_id)),
+            "precondition: the registry owns the spawned pane"
+        );
+        {
+            let mut guard = state.write().await;
+            assert!(
+                !guard.managed_pane_ids.contains(pane_id),
+                "an ordinary pane needs no entry in the daemon's registered set: \
+                 an entry there could not be revoked when the child died and \
+                 would keep admitting reports for a pane with no process behind \
+                 it; managed={:?}",
+                guard.managed_pane_ids
+            );
+            assert!(
+                !guard.pane_role_map.contains_key(pane_id),
+                "owning a dashboard pane must not give it an orchestration ROLE"
+            );
+            assert!(
+                !guard.orchestrator_pane_ids.contains(pane_id),
+                "owning a dashboard pane must not make it an orchestrator"
+            );
+            // The property that actually matters, exercised end to end through
+            // the daemon's own `AppState`: the lifecycle report a real
+            // `dot-agent-deck agent-event --type running` sends is ADMITTED, and
+            // carries the ids `ListAgents` joins on.
+            guard.apply_event(thinking_event_454(pane_id, &agent_id));
+            let session = guard
+                .sessions
+                .values()
+                .find(|s| s.pane_id.as_deref() == Some(pane_id))
+                .expect("a `Thinking` report for a daemon-spawned pane must be admitted");
+            assert_eq!(session.agent_id.as_deref(), Some(agent_id.as_str()));
+            assert_eq!(session.status, crate::state::SessionStatus::Thinking);
+        }
+
+        registry.shutdown_all();
+        server.abort();
+    }
+
+    /// The payload the real `dot-agent-deck agent-event --type running` CLI puts
+    /// on the hook socket (`Commands::AgentEvent` in `main.rs`): a bare
+    /// `AgentEvent`, `EventType::Thinking`, a pane-derived session id, and the
+    /// `DOT_AGENT_DECK_PANE_ID` / `DOT_AGENT_DECK_AGENT_ID` pair the daemon
+    /// injected into the spawned pane. Never a `SessionStart` — which is the
+    /// whole reason admission decided issue #454.
+    #[cfg(unix)]
+    fn thinking_event_454(pane_id: &str, agent_id: &str) -> crate::event::AgentEvent {
+        crate::event::AgentEvent {
+            session_id: format!("{pane_id}-session"),
+            agent_type: crate::event::AgentType::Pi,
+            event_type: crate::event::EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// Issue #454 review, item 3: a child that exits on its own revokes
+    /// admission, and a later `StopAgent` can still clean up after it.
+    ///
+    /// Both halves failed before. Admission failed because the pane id had been
+    /// copied into the daemon's registered set at spawn and only `StopAgent`
+    /// removed it — so `dead-pane` stayed admissible for as long as the daemon
+    /// lived, while the registry separately allowed an unrelated later spawn to
+    /// REUSE that id. Cleanup failed because `StopAgent` read the stopping
+    /// agent's `pane_id_env` out of `agent_records()`, which filters exited
+    /// entries: for a child that had already died it read `None` and skipped
+    /// every cleanup step — permanently, since the same handler then dropped the
+    /// registry entry.
+    ///
+    /// `/usr/bin/true` is the shortest possible version of the normal death
+    /// path, not a contrived one: any agent whose process ends before its pane
+    /// is closed goes through exactly this.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_naturally_exited_pane_is_disowned_and_still_cleaned_up_on_stop() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // A role pane, so the role-map cleanup `StopAgent` owes is observable
+        // too — that is the half `agent_records()`' exited filter silently
+        // skipped.
+        let pane_id = "dead-pane-454";
+        let client = DaemonClient::new(sock.clone());
+        let agent_id = client
+            .start_agent(StartAgentOptions {
+                command: Some("/usr/bin/true".to_string()),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                    name: "dead-orch-454".to_string(),
+                    role_index: 0,
+                    role_name: "worker".to_string(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(dir.path().to_string_lossy().into_owned()),
+                    display_title: None,
+                    orchestration_id: Some("orch-454".to_string()),
+                }),
+                ..StartAgentOptions::default()
+            })
+            .await
+            .expect("spawn a short-lived role pane through the attach socket");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Half one — natural exit WITHOUT a stop. The role registration still
+        // stands (nothing has taken it back yet), and the retired generation
+        // still owns its OWN pane, because its final report can still be in
+        // flight (round-2 reviewer blocker B). What it does NOT do is speak for
+        // anyone else's id, and once the role entry AND the registry record are
+        // gone below, the dead pane admits nothing at all.
+        assert!(
+            registry.generation_ownership(Some(pane_id), Some(&agent_id))
+                == crate::state::Ownership::Owned,
+            "a retired generation still owns its own pane until something \
+             claims or reaps it"
+        );
+        assert!(
+            registry.generation_ownership(Some(pane_id), Some("some-other-id-454"))
+                == crate::state::Ownership::Unclaimed,
+            "but it does not make the pane a bearer token for any other id"
+        );
+
+        // Half two — the later `StopAgent` still finds the metadata it needs.
+        client
+            .stop_agent(&agent_id)
+            .await
+            .expect("stop the already-dead agent");
+
+        {
+            let mut guard = state.write().await;
+            assert!(
+                !guard.managed_pane_ids.contains(pane_id),
+                "StopAgent must unregister a naturally-exited agent's pane; \
+                 managed={:?}",
+                guard.managed_pane_ids
+            );
+            assert!(
+                !guard.pane_role_map.contains_key(pane_id),
+                "StopAgent must take back the dead pane's ROLE, or a later \
+                 delegate still resolves it"
+            );
+            guard.apply_event(thinking_event_454(pane_id, &agent_id));
+            assert!(
+                guard.sessions.is_empty(),
+                "a report naming the dead pane must be refused; sessions={:?}",
+                guard.sessions.keys().collect::<Vec<_>>()
+            );
+        }
+
+        registry.shutdown_all();
+        server.abort();
+    }
+
+    /// Round-2 audit, blocker C — and a regression the round-1 fix INTRODUCED,
+    /// which is why it is worth a test of its own rather than a clause in the
+    /// one above.
+    ///
+    /// `agent_record_any` deliberately resolves a dead agent's pane so that
+    /// `StopAgent` can clean up after a child that died on its own. But every
+    /// cleanup step downstream of that lookup is PANE-scoped while the agent
+    /// being stopped is not, and the registry explicitly permits a live agent to
+    /// reuse a dead one's pane id. So: A dies, B takes pane P, a stale
+    /// `StopAgent(A)` arrives — and the handler marked P closing, cancelled
+    /// every delegation touching it, and `unregister_pane`d B's role, cwd,
+    /// orchestrator marker and routing identity. Reachable through ordinary
+    /// lifecycle ordering, not only a malicious client.
+    ///
+    /// On `main` this could not happen for the opposite reason: the filtered
+    /// lookup found nothing for A, so cleanup was skipped entirely. Stale state
+    /// leaked, but no LIVE agent's state was ever deleted. The fix has to keep
+    /// the first behaviour without buying the second, so the pane travels into
+    /// the cleanup only while it is still A's to give up.
+    ///
+    /// The ORDER is the finding: A exits, B claims the pane, and only then is A
+    /// stopped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_retired_agent_leaves_its_panes_new_occupant_alone() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pane_id = "handover-pane-454";
+        let client = DaemonClient::new(sock.clone());
+        let role_spawn = |command: &str, role: &str| {
+            let dir_path = dir.path().to_string_lossy().into_owned();
+            StartAgentOptions {
+                command: Some(command.to_string()),
+                cwd: Some(dir_path.clone()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                    name: "handover-orch-454".to_string(),
+                    role_index: 0,
+                    role_name: role.to_string(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(dir_path),
+                    display_title: None,
+                    orchestration_id: Some("orch-handover-454".to_string()),
+                }),
+                ..StartAgentOptions::default()
+            }
+        };
+
+        // Generation A takes the pane and immediately dies.
+        let old_id = client
+            .start_agent(role_spawn("/usr/bin/true", "worker-a"))
+            .await
+            .expect("spawn the first role pane");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Generation B takes the pane over — which the registry allows and the
+        // daemon re-registers under B's own role.
+        let new_id = client
+            .start_agent(role_spawn("/bin/sh", "worker-b"))
+            .await
+            .expect("the pane must be reusable once its child is gone");
+        assert_eq!(
+            registry.pane_current_agent_id(pane_id).as_deref(),
+            Some(new_id.as_str()),
+            "precondition: the live agent on the pane is the second generation"
+        );
+
+        // B has work outstanding against it, which is what the pane-scoped
+        // cleanup would sweep.
+        let armed = registry
+            .arm_outstanding_delegation(
+                pane_id,
+                "worker-b",
+                "orchestrator-pane-454",
+                "orchestrator-agent-454",
+                None,
+            )
+            .expect("precondition: arming a delegation on the live pane must succeed");
+
+        // Only now does the stale stop for the RETIRED generation arrive.
+        client
+            .stop_agent(&old_id)
+            .await
+            .expect("stop the already-dead first generation");
+
+        assert_eq!(
+            registry.pane_current_agent_id(pane_id).as_deref(),
+            Some(new_id.as_str()),
+            "stopping a retired generation must not touch the live agent that \
+             took its pane"
+        );
+        assert!(
+            registry
+                .take_outstanding_delegation_if(pane_id, armed.seq)
+                .is_some(),
+            "the live agent's outstanding delegation must survive — the \
+             pane-scoped `begin_pane_close` sweep would have cancelled it, \
+             silently dropping in-flight orchestration work"
+        );
+        assert!(
+            !registry.is_pane_closing(pane_id),
+            "the live agent's pane must not be left marked closing"
+        );
+
+        {
+            let guard = state.read().await;
+            assert!(
+                guard.managed_pane_ids.contains(pane_id),
+                "the live agent's pane must stay registered; managed={:?}",
+                guard.managed_pane_ids
+            );
+            assert_eq!(
+                guard.pane_role_map.get(pane_id).map(String::as_str),
+                Some("worker-b"),
+                "the live agent's ROLE must survive — losing it means every \
+                 later delegate to `worker-b` resolves nothing"
+            );
+            assert!(guard.pane_cwd_map.contains_key(pane_id), "…and its cwd");
+            assert!(
+                guard.pane_orchestration_map.contains_key(pane_id),
+                "…and its routing identity"
+            );
+        }
+
+        registry.shutdown_all();
+        server.abort();
+    }
+
+    /// Round-3 review, blocker 1 — the same finding as the test above, one
+    /// ordering earlier, which is the ordering the fix for it MISSED.
+    ///
+    /// The gate that decided whether the stopping agent still owed its pane any
+    /// cleanup asked `pane_current_agent_id`, and that lookup sees only
+    /// PUBLISHED, non-exited agents. A successor that has RESERVED the pane and
+    /// not published yet — the window `spawn_agent` occupies between taking its
+    /// reservation and inserting its record, which every spawn passes through —
+    /// therefore came back `None`, and `None` was read as "nobody holds this
+    /// pane, so it is still mine to give up". The handler then marked the pane
+    /// closing, cancelled every delegation touching it, and `unregister_pane`d
+    /// the pane's role, cwd, orchestrator marker and routing identity, all of
+    /// which the successor was in the middle of claiming.
+    ///
+    /// The sibling above places the successor fully LIVE before the stop, so it
+    /// catches neither this ordering nor the check-then-act one (the successor
+    /// reserving after the gate but before `unregister_pane`, across a
+    /// `close_agent` that can spend the full three-second termination grace).
+    /// Both are answered the same way, by the durable hold whose own two
+    /// properties are pinned in `crate::agent_pty`'s tests; this one pins that
+    /// the HANDLER actually takes it.
+    ///
+    /// What survives here is the predecessor's own registration, because the
+    /// successor has not published yet — and that is the correct outcome, not a
+    /// leak: the pane is the successor's, so the successor's `StartAgent`
+    /// overwrites every one of these entries the moment it publishes, and its
+    /// own close is what takes them back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_retired_agent_leaves_a_pane_its_successor_has_reserved_alone() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pane_id = "reserved-handover-pane-454";
+        let client = DaemonClient::new(sock.clone());
+        let dir_path = dir.path().to_string_lossy().into_owned();
+        let old_id = client
+            .start_agent(StartAgentOptions {
+                command: Some("/usr/bin/true".to_string()),
+                cwd: Some(dir_path.clone()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                    name: "reserved-orch-454".to_string(),
+                    role_index: 0,
+                    role_name: "worker-a".to_string(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(dir_path),
+                    display_title: None,
+                    orchestration_id: Some("orch-reserved-454".to_string()),
+                }),
+                ..StartAgentOptions::default()
+            })
+            .await
+            .expect("spawn the first role pane");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The successor is mid-spawn: it holds the pane's reservation and has
+        // not published a record yet.
+        registry.reserve_pane_for_test("successor-454", pane_id);
+        assert!(
+            registry.pane_current_agent_id(pane_id).is_none(),
+            "precondition: the old gate's question answers None in exactly this \
+             state, which is why it authorised the cleanup"
+        );
+
+        // Work outstanding against the pane — what the pane-scoped
+        // `begin_pane_close` sweep would silently drop.
+        let armed = registry
+            .arm_outstanding_delegation(
+                pane_id,
+                "worker-a",
+                "orchestrator-pane-454",
+                "orchestrator-agent-454",
+                None,
+            )
+            .expect("precondition: arming a delegation on the pane must succeed");
+
+        client
+            .stop_agent(&old_id)
+            .await
+            .expect("stop the already-dead first generation");
+
+        assert!(
+            registry
+                .take_outstanding_delegation_if(pane_id, armed.seq)
+                .is_some(),
+            "the pane's outstanding delegation must survive — `begin_pane_close` \
+             would have cancelled it on behalf of an agent that no longer owns \
+             the pane"
+        );
+        assert!(
+            !registry.is_pane_closing(pane_id),
+            "the successor's pane must not be left marked closing"
+        );
+        {
+            let guard = state.read().await;
+            assert!(
+                guard.managed_pane_ids.contains(pane_id),
+                "a pane a successor has already reserved must not be \
+                 unregistered by its predecessor's close; managed={:?}",
+                guard.managed_pane_ids
+            );
+            assert_eq!(
+                guard.pane_role_map.get(pane_id).map(String::as_str),
+                Some("worker-a"),
+                "…nor may its ROLE be taken back: the successor's `StartAgent` \
+                 is about to overwrite this entry, and deleting it afterwards \
+                 leaves every delegate to that role resolving nothing"
+            );
+            assert!(guard.pane_cwd_map.contains_key(pane_id), "…nor its cwd");
+            assert!(
+                guard.pane_orchestration_map.contains_key(pane_id),
+                "…nor its routing identity"
+            );
+        }
+
+        registry.shutdown_all();
+        server.abort();
+    }
 
     /// PRD #20 Greptile finding #6 (coder-authored): the per-attach STREAM_IN
     /// rejection channel must be BOUNDED so a client flooding a history-only /
