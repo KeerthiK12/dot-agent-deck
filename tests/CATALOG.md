@@ -3597,18 +3597,18 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### mode/scroll
 
-##### mode/scroll/001 — Focused agent-pane wheel routing obeys the full mode × child-mouse matrix.
-- **Layer:** L1 (in-process synthetic pane with real vt100 scrollback and a recording child-input channel; no PTY subprocess).
-- **Agent:** none (one in-memory focused pane with synthetic history).
-- **Asserts:** PaneInput forwards a wheel report only when the child has mouse reporting enabled and otherwise moves dot-agent-deck scrollback; command mode moves dot-agent-deck scrollback for both child-mouse states and emits no mouse-protocol bytes, explicitly pinning the Normal+mouse-enabled safety cell.
-- **Does not assert:** wheel-down direction (the same production route receives a direction parameter); side-pane hit-testing, which already works in every mode; real terminal mouse-report decoding.
+##### mode/scroll/001 — Focused agent-pane wheel routing explains mature zero-depth panes without false positives.
+- **Layer:** L1 (in-process production wheel and pane-render seams over real vt100 parsers, with a recording child-input channel and synthetic DECSTBM/cursor-repaint, trivial-output, and plain-stream fixtures; no PTY subprocess).
+- **Agent:** none (agent-agnostic synthetic byte streams; the trigger names no agent).
+- **Asserts:** every mode × child-mouse cell that routes to deck scrollback arms the notice when the live vt100 retained-line depth is zero despite at least 8 `rows * cols` screenfuls fed since spawn; PaneInput+child-mouse forwards exactly one report and never arms it; a substantial plain stream has nonzero live depth, scrolls normally, and stays notice-free; trivial fresh output stays notice-free; two focus/reconcile frames with substantial zero-depth output but no scroll attempt prove the notice is reactive rather than proactive. The depth assertion explicitly measures vt100's live clamp rather than the 10,000-line configured capacity.
+- **Does not assert:** wheel-down direction (the same production route receives a direction parameter), real terminal mouse-report decoding (covered by the next scanner delegation), side-pane pointer hit-testing, real-agent behavior, or that any particular agent produces the synthetic repaint pattern.
 - **Platform coverage:** mac+linux+windows.
 
-##### mode/scroll/002 — PageUp/PageDown provide a remappable command-mode keyboard equivalent for focused agent-pane scrollback.
-- **Layer:** L1 (in-process production keybinding resolution plus synthetic focused-pane scroll observation).
-- **Agent:** none (one in-memory focused pane with synthetic history).
-- **Asserts:** the default PageUp/PageDown bindings move focused-agent scrollback away from/toward live output in `UiMode::Normal` without writing to the child; `[dashboard] scroll_pane_up` and `scroll_pane_down` remaps parse without warnings, disable the old defaults, and move scrollback on their replacement chords.
-- **Does not assert:** PaneInput key forwarding; help-overlay or bottom-bar discoverability; filesystem loading of `keybindings.toml`.
+##### mode/scroll/002 — Default and remapped keyboard scrolls share the cannot-scroll explanation.
+- **Layer:** L1 (in-process production keybinding resolution, focused-pane scroll, vt100 depth, pane render, and child-input recording seams).
+- **Agent:** none (agent-agnostic synthetic plain-stream and DECSTBM/cursor-repaint output).
+- **Asserts:** PageUp/PageDown still move ordinary focused-pane history away from/toward live output without writing to the child; `[dashboard]` scroll remaps parse without warnings, retire their defaults, and move history on replacement chords; default PageUp, default PageDown, and remapped `scroll_pane_up` all arm the same notice when a mature zero-depth pane cannot move, still without child bytes; a retired default attempts no scroll and arms nothing.
+- **Does not assert:** real terminal mouse-report decoding (covered by the next scanner delegation), help-overlay or bottom-bar discoverability, filesystem loading of `keybindings.toml`, real-agent behavior, or that any particular agent produces the synthetic repaint pattern.
 - **Platform coverage:** mac+linux+windows.
 
 ##### mode/scroll/003 — PaneInput snaps newly targeted panes back to live output without disabling deliberate scrolling.
@@ -3623,6 +3623,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (a controller with no panes).
 - **Asserts:** a no-focus PaneInput frame lands in Normal with an Expanded banner, remains Normal on the next frame, and reports Collapsed exactly at the TTL so the entry instant was not re-stamped; equal frame instants remain Expanded, and an already-Normal initial mode produces the identical idempotent result.
 - **Does not assert:** how focus vanished, focus replacement policy when another pane exists, rendered banner geometry, or real-agent behavior.
+- **Platform coverage:** mac+linux+windows.
+
+##### mode/scroll/005 — The cannot-scroll notice selects a safe render tier and stays transient, pane-local, and non-consuming.
+- **Layer:** L1 (in-process production wheel, boundary-sized one- and two-pane renders, single-line and rich block-tier command-banner overlays, production focus change, and full `handle_key_event` seams with injected `Instant`s and a recording child-input channel; no PTY subprocess).
+- **Agent:** none (agent-agnostic mature DECSTBM/cursor-repainting panes, including both panes in the focus-affinity frame).
+- **Asserts:** an inner pane exactly as wide as the production sentence renders the complete long tier, one column below it falls back to the centred short sentence, an inner pane exactly as wide as the short sentence still renders it without offering PageUp, and one column below that omits both tiers without modifying either border or any guard column beyond the pane — every boundary derived from the production constants' own lengths, never transcribed, so a reword cannot silently un-pin them; when the notice overlaps either the compact two-row single-line command banner or the roomy seven-row `BlockCommandModeWithSubtitle` tier, the intact notice renders exactly once as the frame's only reversed run, with no block-letter rows or `Ctrl+D to type` subtitle surviving anywhere, while the focused pane remains dimmed in command mode; after production focus moves from pane A to pane B, exactly one notice remains on A and none appears on B; the normal wide notice remains a single centred REVERSED line reporting only what was observed — this pane has no scrollback and there is nothing to scroll — without suggesting PageUp and without asserting the agent's rendering model; it clears exactly at the shared 2.5-second `COMMAND_BANNER_TTL`, refreshes without duplication through the original expiry, and clears at the refreshed expiry; the next unbound printable and bound Ctrl+D each dismiss it without losing normal child forwarding or mode transition.
+- **Does not assert:** the intermediate five-row `BlockCommand` geometry or exact block-glyph shapes (the richest seven-row tier pins whole-banner suppression); real terminal mouse-report decoding (covered by the next scanner delegation); wall-clock scheduling in the live 16ms loop; horizontal multi-column pane geometry; real-agent behavior; or that any particular agent produces the synthetic repaint pattern.
 - **Platform coverage:** mac+linux+windows.
 
 #### mode/live
