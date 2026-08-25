@@ -60,5 +60,6 @@ pub mod ui;
 pub mod untrusted_text;
 pub mod version;
 pub mod watch;
+pub mod worktree_owner;
 pub mod worktree_reclaim;
 pub mod wrap;
