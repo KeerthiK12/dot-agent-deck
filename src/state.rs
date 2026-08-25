@@ -2366,11 +2366,20 @@ pub(crate) struct SessionStartWait {
     /// `scheduler/dispatch/015`'s bootstrap launcher declares itself, holds the
     /// gate open until the fallback writes, eats that write, and only then execs
     /// the real agent.
-    pub(crate) launcher_handoff: bool,
+    ///
+    /// Issue #666: the DECLARED TYPE is carried, not just the fact — `Some(ty)`
+    /// is the old `true`. A bare bool cannot answer "does the post-write
+    /// declaration AGREE with what we already believed", and answering that is
+    /// what keeps a declared type from GRANTING privilege (#424 F4). FIRST
+    /// declaration wins, for the same reason: a producer that can post one must
+    /// not be able to walk the belief to whatever it needs matched. See
+    /// [`crate::prompt_delivery::AgentStartRearm`] and
+    /// [`crate::agent_pty::AgentPtyRegistry::pre_write_believed_agent_type`].
+    pub(crate) launcher_handoff: Option<AgentType>,
 }
 
 impl SessionStartWait {
-    fn unready(launcher_handoff: bool) -> Self {
+    fn unready(launcher_handoff: Option<AgentType>) -> Self {
         Self {
             ready: false,
             generation: None,
@@ -2440,7 +2449,7 @@ pub(crate) async fn wait_for_session_start(
     // Issue #424 F4: see [`SessionStartWait::launcher_handoff`]. Carried across
     // every exit from this loop, including the timeout, because the launcher
     // case is exactly the one that times out.
-    let mut launcher_handoff = false;
+    let mut launcher_handoff: Option<AgentType> = None;
     loop {
         let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
             return SessionStartWait::unready(launcher_handoff);
@@ -2457,9 +2466,17 @@ pub(crate) async fn wait_for_session_start(
                         // launcher, so a start arriving after our write is the
                         // ONE authorized successor rather than an unrelated
                         // claim. The declared type can only withhold it.
-                        launcher_handoff |= crate::prompt_delivery::agent_reports_submitted_prompt(
-                            &event.agent_type,
-                        );
+                        // Issue #666: record WHICH type was declared, and keep
+                        // the FIRST one — a later `wrapper_fork` start naming a
+                        // different type must not revise the belief the
+                        // post-write declaration will have to match.
+                        if launcher_handoff.is_none()
+                            && crate::prompt_delivery::agent_reports_submitted_prompt(
+                                &event.agent_type,
+                            )
+                        {
+                            launcher_handoff = Some(event.agent_type.clone());
+                        }
                         tracing::debug!(
                             pane_id,
                             agent_id,
@@ -2547,7 +2564,27 @@ pub(crate) enum PromptWatch {
     /// the agent's id. Pi emits exactly such events and hardcodes
     /// `user_prompt: None`, so a Pi pane armed a retry loop that could never
     /// terminate on success and retyped the prompt until the deadline.
-    Elapsed { can_report_prompts: bool },
+    ///
+    /// Issue #666: `agent_start` carries the FIRST `SessionStart` seen in this
+    /// window that satisfies the rearm's facts G ∧ I ∧ W — genuine (not
+    /// wrapper-fork boot provenance), from the exact expected agent on the
+    /// expected pane, and post-write by construction (the caller drained
+    /// everything queued before it wrote, so anything reaching this loop arrived
+    /// afterwards). `None` when no such start was seen.
+    ///
+    /// The instant is when the start was OBSERVED, not when the window expired.
+    /// [`crate::prompt_delivery::REARM_READINESS_BUFFER`] is measured from the
+    /// arming signal, so stamping it at the caller's `Elapsed` would fold this
+    /// loop's own window length into the buffer and push the armed attempt a
+    /// whole backoff step later.
+    ///
+    /// Facts S, U and T are NOT decided here — they belong to
+    /// [`crate::prompt_delivery::AgentStartRearm`], which the caller feeds this
+    /// into. This variant reports an observation, never an authorization.
+    Elapsed {
+        can_report_prompts: bool,
+        agent_start: Option<(std::time::Instant, AgentType)>,
+    },
     /// Reviewer finding B7: the observer broadcast dropped frames, so the real
     /// `UserPromptSubmit` may have been among them. A lossy stream's silence is
     /// not evidence of non-delivery, and re-submitting on it types a second copy
@@ -2623,9 +2660,15 @@ pub(crate) async fn wait_for_prompt_submission(
 ) -> PromptWatch {
     let deadline = tokio::time::Instant::now() + window;
     let mut can_report_prompts = false;
+    // Issue #666: the first genuine, identity-matching, post-write `SessionStart`
+    // of this window. See [`PromptWatch::Elapsed`].
+    let mut agent_start: Option<(std::time::Instant, AgentType)> = None;
     loop {
         let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
-            return PromptWatch::Elapsed { can_report_prompts };
+            return PromptWatch::Elapsed {
+                can_report_prompts,
+                agent_start,
+            };
         };
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(BroadcastMsg::Event(event))) => {
@@ -2654,6 +2697,21 @@ pub(crate) async fn wait_for_prompt_submission(
                 }
                 can_report_prompts |=
                     crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type);
+                // Issue #666, facts G ∧ I ∧ W. Identity is already enforced above
+                // (exact `agent_id`, exact pane); W holds because the caller
+                // drained the channel before it wrote, so everything this loop
+                // receives arrived after those bytes. G is the wrapper-fork
+                // discriminator — a launcher's boot-provenance start is emitted
+                // BEFORE the agent exists by construction and proves nothing
+                // about input readiness. First qualifying start only: what the
+                // rearm needs is when the agent came up, not how many frames it
+                // has sent since.
+                if agent_start.is_none()
+                    && event.event_type == EventType::SessionStart
+                    && !event.is_wrapper_fork_session_start()
+                {
+                    agent_start = Some((std::time::Instant::now(), event.agent_type.clone()));
+                }
                 if let Some(reported) = event.user_prompt.as_deref() {
                     if crate::prompt_delivery::prompt_submission_matches(expected, reported) {
                         return PromptWatch::Confirmed;
@@ -2669,7 +2727,12 @@ pub(crate) async fn wait_for_prompt_submission(
             Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => return PromptWatch::Indeterminate,
             Ok(Err(broadcast::error::RecvError::Closed)) => return PromptWatch::Closed,
-            Err(_) => return PromptWatch::Elapsed { can_report_prompts },
+            Err(_) => {
+                return PromptWatch::Elapsed {
+                    can_report_prompts,
+                    agent_start,
+                };
+            }
         }
     }
 }
