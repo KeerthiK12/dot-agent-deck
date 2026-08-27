@@ -20887,6 +20887,7 @@ pub fn render_new_pane_orchestration_guard_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     let orchestrations = vec![OrchestrationConfig {
+        default: false,
         name: "tdd-cycle".to_string(),
         roles: vec![crate::project_config::OrchestrationRoleConfig {
             agent: None,
@@ -20934,6 +20935,7 @@ pub fn render_new_pane_orchestration_name_collision_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     let orchestrations = vec![OrchestrationConfig {
+        default: false,
         name: "tdd-cycle".to_string(),
         roles: vec![crate::project_config::OrchestrationRoleConfig {
             agent: None,
@@ -21688,6 +21690,7 @@ mod tests {
         );
 
         let cfg = |name: &str| OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
@@ -21802,6 +21805,7 @@ mod tests {
         let frame_area = Rect::new(0, 0, 100, 40);
 
         let cfg = |name: &str| OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
@@ -22861,6 +22865,7 @@ mod tests {
 
         let state = AppState::default();
         let cfg = OrchestrationConfig {
+            default: false,
             name: "tdd-cycle".into(),
             roles: vec![
                 mk_role("orch", true),
@@ -23446,6 +23451,7 @@ mod tests {
     fn local_config_enrichment_preserved_when_available() {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
         let local = OrchestrationConfig {
+            default: false,
             name: "review".into(),
             roles: vec![
                 OrchestrationRoleConfig {
@@ -23910,6 +23916,7 @@ mod tests {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
 
         let config = OrchestrationConfig {
+            default: false,
             name: "code-review".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
@@ -24081,6 +24088,7 @@ mod tests {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
 
         let config = OrchestrationConfig {
+            default: false,
             name: "test".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
@@ -24115,6 +24123,7 @@ mod tests {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
 
         let config = OrchestrationConfig {
+            default: false,
             name: "test".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
@@ -26352,6 +26361,7 @@ mod tests {
     /// exercised. Mirrors the verified helper in `tab.rs`'s test module.
     fn orch_config_local(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
@@ -27139,6 +27149,7 @@ mod tests {
         // valid role index — otherwise `dashboard_focus_target`'s clamp to
         // `role_count - 1` would mask the leak by coincidentally yielding 1.
         let three_role_orch = OrchestrationConfig {
+            default: false,
             name: "orch".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
@@ -28458,6 +28469,7 @@ mod tests {
 
     fn make_orchestration(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
@@ -30320,6 +30332,7 @@ mod tests {
         // "dot-agent-deck", a worker role `coder` with clear = true (the
         // respawn the bug silently drops on each delegate).
         let config = OrchestrationConfig {
+            default: false,
             name: CONFIG_NAME.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
@@ -30813,6 +30826,7 @@ mod tests {
     fn pane_input_016_orchestrator_prompt_captures_identity_at_tab_creation() {
         let tmp = tempdir().expect("tempdir");
         let config = OrchestrationConfig {
+            default: false,
             name: "capture-at-creation".to_string(),
             roles: vec![OrchestrationRoleConfig {
                 agent: None,
@@ -34600,6 +34614,7 @@ mod tests {
     /// by the lock tests below.
     fn lock_test_orch_config(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {

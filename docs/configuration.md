@@ -55,8 +55,9 @@ watch = false
 | `[[modes]]` | `name` (required), `agent` (optional), `init_command` (optional), `panes`, `rules`, `reactive_panes` (default: 2) |
 | `[[modes.panes]]` | `command` (required), `name` (optional label), `watch` (default: true) |
 | `[[modes.rules]]` | `pattern` (regex, required), `watch` (bool), `interval` (seconds) |
+| `[[orchestrations]]` | `name` (optional), `default` (bool, default: false), `extends` (optional), `roles` |
 
-For the full reference and more examples, see [Workspace Modes](workspace-modes.md). Orchestrations live in the same file under `[[orchestrations]]`; see [Orchestration](orchestration.md#configuration-reference).
+For the full reference and more examples, see [Workspace Modes](workspace-modes.md). Orchestrations live in the same file under `[[orchestrations]]`; see [Orchestration](orchestration.md#configuration-reference). `default` and `extends` only matter to a project that defines **several** orchestrations, and are explained under [More than one orchestration](orchestration.md#more-than-one-orchestration).
 
 ### Naming the agent a command launches
 
@@ -88,4 +89,3 @@ These belong to no block, which makes their placement load-bearing: TOML assigns
 ### Scaffolding
 
 Run `dot-agent-deck init` inside a project directory to generate a starter `.dot-agent-deck.toml`.
-
