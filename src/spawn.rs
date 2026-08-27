@@ -1153,11 +1153,56 @@ async fn deliver(
     // but "can this producer report a submitted prompt at all" — which decides
     // whether an unconfirmed write may be RE-submitted. See
     // [`confirm_prompt_delivery`].
+    // Issue #243: the scheduler shares the delegate path's readiness gate, so it
+    // shares this defect too — the issue measures a 30 s OpenCode cold spawn HERE,
+    // and leaving it would mean OpenCode still paid the full wait every time a
+    // scheduled card fired. The agent type is read from the deck's own frozen
+    // launch-shape record rather than from the observed badge, so no producer can
+    // talk the gate out of waiting (see `spawn_agent_type`).
+    let spawned_agent_type = registry.spawn_agent_type(agent_id);
+    let has_readiness_signal =
+        crate::state::agent_has_pre_prompt_readiness_signal(spawned_agent_type.as_ref());
     let (mut event_rx, observed) = match event_rx {
+        // The declared-no-signal short path. Deliberately NOT a bare write: the
+        // 30 s wait it replaces was, accidentally, also the only thing standing
+        // between the prompt and a still-booting agent, so what it becomes is a
+        // bounded buffer — the ceiling #243 names for an agent with nothing to
+        // wait for. `rx` is kept so delivery confirmation still observes the pane
+        // exactly as it does on the waiting path.
+        Some(rx) if !has_readiness_signal => {
+            // Issue #243, round 4: sized against a real declared-`NoSignal` agent
+            // rather than borrowing the ordinary buffer, which was PRD #249's
+            // "warm-case 500 ms, doubled" and was never measured against one —
+            // see `crate::state::NO_SIGNAL_READINESS_BUFFER`.
+            let buffer = crate::state::no_signal_readiness_buffer().min(remaining_before(deadline));
+            tracing::debug!(
+                pane_id,
+                agent_type = ?spawned_agent_type,
+                buffer_ms = buffer.as_millis(),
+                "scheduled spawn: this agent has DECLARED it emits no pre-prompt \
+                 readiness signal; holding the prompt for the no-signal readiness \
+                 buffer instead of waiting out a SessionStart that cannot arrive"
+            );
+            if !buffer.is_zero() {
+                tokio::time::sleep(buffer).await;
+            }
+            (Some(rx), crate::state::SessionStartWait::default())
+        }
         Some(mut rx) => {
             let timeout = session_start_wait_timeout().min(remaining_before(deadline));
-            let observed =
-                crate::state::wait_for_session_start(&mut rx, pane_id, agent_id, timeout).await;
+            // Issue #243: the scheduler shares the gate, so it shares the
+            // upgrade window — and it needs it at least as much, since this path
+            // applies no post-readiness buffer after a readiness fact at all.
+            // The agent type is the frozen launch record above, not the observed
+            // badge (see `interface_upgrade_window`).
+            let observed = crate::state::wait_for_session_start(
+                &mut rx,
+                pane_id,
+                agent_id,
+                timeout,
+                crate::state::interface_upgrade_window(spawned_agent_type.as_ref()),
+            )
+            .await;
             if !observed.ready {
                 tracing::debug!(
                     pane_id,
@@ -1165,6 +1210,56 @@ async fn deliver(
                     "scheduled spawn: SessionStart wait timed out; \
                      delivering prompt via fallback path"
                 );
+            }
+            // Issue #243, round 3: a gate released by a WRAPPER INTERFACE fact
+            // owes a buffer HERE too, and until this branch existed there was no
+            // fact on this path that could arrive early enough to need one.
+            //
+            // That is the whole reason this is not scope creep. Before this
+            // issue a Codex pane had no pre-prompt readiness signal at all, so
+            // the scheduler waited out `SESSION_START_WAIT_TIMEOUT` and the
+            // agent was long up by the time anything was written — the 30 s
+            // defect was also, accidentally, the thing standing between the
+            // prompt and a booting TUI, exactly as it was on the
+            // declared-no-signal path above. This issue's own commits give the
+            // scheduler an interface fact that fires ~100 ms after fork, so
+            // removing the wait without adding the buffer would move the
+            // scheduler onto the same silent prompt loss the delegate path is
+            // being fixed for, on the same measurement.
+            //
+            // Priced exactly as `crate::state::dispatch_one_owned` prices it,
+            // and scoped the same way — by the frozen launch record, never by
+            // the arriving badge. For a Wrapper-strategy agent every readiness
+            // fact that can arrive pre-prompt IS one of the wrapper's two (the
+            // native start comes with the first turn, which is what this issue
+            // measured), so the agent type is a sufficient discriminator without
+            // widening `SessionStartWait`. The strong fact buys the interface
+            // buffer, anything else the ordinary one, and the timeout keeps
+            // today's behaviour of no buffer at all — a fallback here has
+            // already waited out the full timeout.
+            let buffer = if observed.ready
+                && crate::state::agent_is_wrapper_interface_ready(spawned_agent_type.as_ref())
+            {
+                if observed.observed_interface && registry.agent_spawned_as_wrapper_host(agent_id) {
+                    crate::state::wrapper_interface_readiness_buffer()
+                } else {
+                    crate::state::delegate_readiness_buffer()
+                }
+                .min(remaining_before(deadline))
+            } else {
+                Duration::ZERO
+            };
+            if !buffer.is_zero() {
+                tracing::debug!(
+                    pane_id,
+                    agent_type = ?spawned_agent_type,
+                    observed_interface = observed.observed_interface,
+                    buffer_ms = buffer.as_millis(),
+                    "scheduled spawn: the readiness fact came from the wrapper watching this \
+                     agent's interface, which is not on its own input-readiness; holding the \
+                     prompt for the post-readiness buffer"
+                );
+                tokio::time::sleep(buffer).await;
             }
             (Some(rx), observed)
         }
@@ -1456,9 +1551,13 @@ fn drain_pre_write_events(
                 // call passes a sink it discards — a pre-write drain is pre-write
                 // by construction, so nothing it sees can be evidence about bytes
                 // that do not exist yet.
+                // Issue #243: G is the wrapper discriminator, not the wrapper-FORK
+                // one — an interface-ready start is the deck's own observation of
+                // a child painting, never an agent announcing a conversation it
+                // could report a submission for.
                 if agent_start.is_none()
                     && event.event_type == EventType::SessionStart
-                    && !event.is_wrapper_fork_session_start()
+                    && !event.is_wrapper_session_start()
                 {
                     *agent_start = Some((Instant::now(), event.agent_type.clone()));
                 }
@@ -2903,6 +3002,9 @@ mod tests {
                 &pane_id,
                 &agent_id,
                 Duration::from_millis(20),
+                // No upgrade window: this fixture posts a `wrapper_fork` start,
+                // which the gate SKIPS. Nothing here is a settled interface fact.
+                Duration::ZERO,
             )
             .await;
             assert_eq!(

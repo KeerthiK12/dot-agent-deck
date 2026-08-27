@@ -4503,6 +4503,99 @@ impl AgentPtyRegistry {
             .cloned()
     }
 
+    /// Issue #243: the FROZEN launch-shape identity `agent_id` was spawned as —
+    /// the agent type the spawn site computed from the command it was about to
+    /// exec ([`SpawnOptions::agent_type`]), or `None` for a command the deck could
+    /// not resolve.
+    ///
+    /// Reads [`RunningAgent::spawn_agent_type`], NOT [`RunningAgent::agent_type`],
+    /// and the difference matters for the same reason it does in
+    /// [`Self::agent_spawned_as_reporting_agent`]: the readiness gate uses this to
+    /// decide whether to SHORTEN its wait, and `agent_type` is upgradable in place
+    /// by [`Self::set_agent_type`] from a hook event. Keying off the observed badge
+    /// would let any same-user producer post one `SessionStart` claiming to be an
+    /// agent that declares no pre-prompt signal and thereby talk the gate out of
+    /// waiting — turning a producer assertion into control over when the deck
+    /// writes a prompt. `spawn_agent_type` is what the deck itself exec'd, and no
+    /// hook path can write it.
+    pub fn spawn_agent_type(&self, agent_id: &str) -> Option<AgentType> {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .and_then(|agent| agent.spawn_agent_type.clone())
+    }
+
+    /// Issue #243 (audit F1): did THIS DAEMON spawn `agent_id` under
+    /// `dot-agent-deck wrap` — i.e. is the frozen launch-shape identity an agent
+    /// whose registry strategy is [`crate::agent_registry::IntegrationStrategy::Wrapper`]?
+    ///
+    /// The provenance check for the wrapper's interface-ready marker, and the
+    /// reason the marker can be trusted to select a post-readiness buffer of its
+    /// own at all.
+    /// That marker is NOT authenticated on the wire: the daemon's hook socket
+    /// accepts a raw `AgentEvent` line, `metadata` is free-form, and #243's audit
+    /// reproduced a forged `wrapper_interface_ready` `SessionStart` from a bare
+    /// `python3` with no deck environment. `crate::hook`'s refusal to forward the
+    /// value is real but is not the chokepoint, so the daemon establishes
+    /// provenance itself, at the site that acts on it.
+    ///
+    /// Being fair about the delta this closes: releasing the readiness GATE was
+    /// already forgeable before #243 — a bare unmarked `SessionStart` satisfies
+    /// `crate::state::session_start_means_ready`'s first branch — and this does not
+    /// change that. What #243's round 2 newly granted was the ability to also
+    /// SUPPRESS the buffer, which is the last protection against writing into a
+    /// still-booting agent (#199/#249/#663), and this is what took that back.
+    /// Round 3 retracted the suppression outright — the strong fact now selects a
+    /// LONGER buffer (5000 ms) rather than none — so what a forgery is left
+    /// reaching for is a mis-priced interval, not a suppressed one, and this
+    /// check is what keeps even that out of a producer's hands.
+    ///
+    /// Same field, and the same argument, as [`Self::agent_spawned_as_reporting_agent`]:
+    /// it reads [`RunningAgent::spawn_agent_type`], the launch-shape identity the
+    /// spawn site supplied, which [`Self::set_agent_type`] — the learn-from-hook
+    /// upgrade — never writes. Reading the badge instead would let a producer post
+    /// one event claiming to be Codex and buy back exactly the privilege this
+    /// removes. `false` for a pane the deck could not resolve to an agent, which
+    /// is the direction that grants nothing: the ordinary buffer applies, exactly
+    /// as it did before this issue. Note that since round 3 that is the SHORTER
+    /// of the two intervals, so refusing is no longer automatically the cautious
+    /// answer for an honest agent — see the case it refuses, below, and guard 2's
+    /// alarm in `crate::state::dispatch_one_owned`.
+    ///
+    /// It answers the LAUNCH-SHAPE question rather than the readiness-class one,
+    /// because `wrap_launch_command` keys the wrap decision on the same
+    /// `strategy` field. An agent that declares
+    /// [`crate::agent_registry::PrePromptReadiness::WrapperInterfaceReady`]
+    /// without being wrapper-hosted has no wrapper to observe it, so there is no
+    /// honest event for this to admit.
+    ///
+    /// **One honest case it refuses**, and it refuses it in the safe direction: a
+    /// role command that ALREADY names the wrapper (`dot-agent-deck wrap --agent
+    /// codex -- …`, which `wrap_launch_command` leaves alone rather than
+    /// double-wrapping). `AgentType::from_command` cannot see an agent through
+    /// that shape, so unless the pane was created with an explicit identity the
+    /// frozen record is `None` and this answers `false`. A genuine wrapper is
+    /// running and its event is genuine; it simply costs that pane the interface
+    /// buffer, so it waits the ordinary 1000 ms rather than the 5000 ms measured
+    /// against a full-screen TUI's own initialisation. The deck rewrites the
+    /// command itself on every ordinary path, so this is a hand-written shape,
+    /// and being priced like every non-wrapper agent is the right price for not
+    /// having to trust the marker.
+    pub fn agent_spawned_as_wrapper_host(&self, agent_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .and_then(|agent| agent.spawn_agent_type.as_ref())
+            .is_some_and(|agent_type| {
+                crate::agent_registry::spec(agent_type).strategy
+                    == Some(crate::agent_registry::IntegrationStrategy::Wrapper)
+            })
+    }
+
     /// Issue #570: whether THIS DAEMON spawned `agent_id` as an agent type it
     /// selected itself, and that type reports submitted prompts.
     ///
