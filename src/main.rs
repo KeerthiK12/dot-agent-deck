@@ -441,6 +441,16 @@ enum RemoteCmd {
         /// Friendly name of the registry entry to remove.
         name: String,
     },
+    /// Diagnose a remote's ssh setup: reachability, the deck's install, the
+    /// forwards ssh actually resolved, and the remote sshd policy behind them
+    /// (PRD #345). Read-only — it never edits ssh config, sshd config, the
+    /// registry, or anything on the remote. Exits 0 when the diagnosis is
+    /// clear, 1 when a check failed, and 2 when a check could not be
+    /// determined.
+    Doctor {
+        /// Friendly name of the registry entry to diagnose.
+        name: String,
+    },
     /// Re-run the binary install flow against an existing entry, then bump
     /// the registry's version field.
     Upgrade {
@@ -1295,6 +1305,7 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            RemoteCmd::Doctor { name } => run_remote_doctor(&name),
             RemoteCmd::Upgrade {
                 name,
                 version,
@@ -1705,6 +1716,43 @@ fn spawn_event_subscriber(
             delay = std::cmp::min(delay * 2, max_delay);
         }
     });
+}
+
+/// PRD #345: `remote doctor <name>`. Resolves the registry entry FIRST so an
+/// unknown name costs zero ssh invocations, then runs the read-only probes and
+/// prints one line per check.
+///
+/// **Three exit codes**, so the outcomes a script has to treat differently are
+/// distinguishable:
+///
+/// - **0** — clear. Every check PASSed, or at most raised an advisory WARN.
+/// - **1** — a check FAILed, or the command could not run at all (an unknown
+///   registry name, an unreadable registry).
+/// - **2** — incomplete: no FAIL, but at least one check is UNKNOWN.
+///
+/// Both non-zero codes keep the PRD's promise that an UNKNOWN never reads as
+/// PASS. Separating them makes the single most common real-world outcome — a
+/// healthy tunnel on a host where `sshd -T` needs root you do not have — a
+/// stable, scriptable `2` rather than something indistinguishable from a
+/// broken tunnel. See [`dot_agent_deck::remote_doctor::Verdict::exit_code`].
+fn run_remote_doctor(name: &str) -> ExitCode {
+    let registry_path = dot_agent_deck::remote::default_remotes_path();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match dot_agent_deck::remote_doctor::run_doctor(name, &registry_path, &mut out) {
+        Ok(verdict) => {
+            let _ = out.flush();
+            ExitCode::from(verdict.exit_code())
+        }
+        Err(e) => {
+            let _ = out.flush();
+            eprintln!("{e}");
+            // The diagnosis never started, so there is no verdict to map. `1`
+            // rather than `2`: the command itself failed, which is a different
+            // thing from a diagnosis that ran and could not see everything.
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `dot-agent-deck connect [name]` — PRD #76 M2.9.
