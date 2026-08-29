@@ -131,7 +131,41 @@ done
 exec ar crs "$out" $objs
 SHIM_EOF
 
-chmod +x "$CC_SHIM" "$AR_SHIM"
+# Stand-in Windows resource compiler. `tauri-build` runs `tauri-winres` to
+# compile the app icon into a `.res`, which needs `llvm-rc`; a Linux runner has
+# no reason to carry one, and without it the build script panics with
+# `NotAttempted("llvm-rc")` before any type-checking happens. Same reasoning as
+# the CC/AR shims above: `cargo check` never links, so nothing ever reads the
+# `.res` we fabricate. It must be named exactly `llvm-rc` because tauri-winres
+# looks the tool up on PATH by name rather than through an env override.
+RC_SHIM="$SHIM_DIR/llvm-rc"
+cat >"$RC_SHIM" <<'SHIM_EOF'
+#!/bin/sh
+# Accept llvm-rc's output spellings (`/fo X`, `-fo X`, `/foX`, `-foX`) and
+# create an empty file there. Case-insensitive because rc accepts `/FO` too.
+out=""
+want_out=0
+for arg in "$@"; do
+    if [ "$want_out" = 1 ]; then
+        out="$arg"
+        want_out=0
+        continue
+    fi
+    case "$arg" in
+        /[fF][oO]|-[fF][oO]) want_out=1 ;;
+        /[fF][oO]*) out="${arg#???}" ;;
+        -[fF][oO]*) out="${arg#???}" ;;
+    esac
+done
+# No output path means a version probe; success is the whole answer.
+[ -n "$out" ] || exit 0
+case "$out" in
+    */*) mkdir -p "${out%/*}" || exit 1 ;;
+esac
+: >"$out"
+SHIM_EOF
+
+chmod +x "$CC_SHIM" "$AR_SHIM" "$RC_SHIM"
 
 # A dedicated target dir: this toolchain is a different rustc version than the
 # nix one, so sharing `target/` would make each run invalidate the other's cache
@@ -159,6 +193,7 @@ echo "==> cargo check --workspace --tests --target $TARGET (target-dir: $TARGET_
 # one as a command. Being per-target is what makes them safe: a build script
 # compiling something for the *host* still gets the real toolchain.
 env \
+    "PATH=$SHIM_DIR:$PATH" \
     "CC_${TARGET//-/_}=$CC_SHIM" \
     "AR_${TARGET//-/_}=$AR_SHIM" \
     WINDOWS_CROSS_CHECK_EMPTY_OBJ="$EMPTY_OBJ" \
