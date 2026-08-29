@@ -23,9 +23,7 @@ use dot_agent_deck::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE;
 /// (`state::SESSION_START_WAIT_TIMEOUT`, 30s, pub(crate)) answers a different
 /// question. Kept desktop-local so this client adds no daemon-side surface.
 const SPAWN_TIME_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-use dot_agent_deck::ui::{
-    describe_send_result, is_terminal_send_result, send_retry_delay,
-};
+use dot_agent_deck::ui::{describe_send_result, is_terminal_send_result, send_retry_delay};
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
 
