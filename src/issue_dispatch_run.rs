@@ -42,6 +42,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::broadcast;
 
@@ -54,6 +55,7 @@ use crate::issue_dispatch::{
 };
 use crate::scheduler::{Notifier, NotifyEvent};
 use crate::spawn::{SpawnRequest, spawn};
+use crate::worktree_owner::Creator;
 
 // ---------------------------------------------------------------------------
 // M2.4 — daemon-side worktree registry (close → cleanup plumbing)
@@ -72,21 +74,70 @@ use crate::spawn::{SpawnRequest, spawn};
 /// instant the agent is registered. Wiped on daemon restart; a post-restart
 /// close finds no entry and leaves the worktree in place (reclaimed by the
 /// worktree-exists idempotency signal on the next fire).
-pub type WorktreeRegistry = Arc<Mutex<HashMap<PathBuf, PathBuf>>>;
+pub type WorktreeRegistry = Arc<Mutex<HashMap<PathBuf, WorktreeEntry>>>;
+
+/// What the close handler needs to clean up one recorded worktree: the clone
+/// that owns it (always preserved) and which removal policy applies.
+///
+/// The policy travels WITH the entry because the tab-close handler
+/// (`daemon_protocol.rs`) is shared by both producers and cannot otherwise tell
+/// them apart — it sees only a path. Inferring provenance from the path shape
+/// (`<clone>/.worktrees/issue-<n>` vs. the `<repo>-dispatch-<slug>` sibling)
+/// would silently apply the wrong policy the moment either layout changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    /// The clone that owns the worktree. Preserved by removal.
+    pub clone_dir: PathBuf,
+    /// Removal policy — see [`RemovalPolicy`].
+    pub policy: RemovalPolicy,
+}
+
+/// Whether a recorded worktree may be removed while it still holds
+/// uncommitted work.
+///
+/// The two producers want opposite things, and both are right for their case:
+///
+/// * [`RemovalPolicy::Force`] — PRD #120 issue-dispatch. The worktree lives
+///   inside a daemon-owned `gh repo clone`, never a human checkout, and the
+///   reuse-the-vacated-slot model *depends* on the directory actually going
+///   away: `dispatch_decision` treats a present worktree as "issue already
+///   claimed", so a worktree left behind skips that issue on every later fire,
+///   permanently. Forcing is what keeps the slot reclaimable.
+/// * [`RemovalPolicy::KeepIfDirty`] — PRD #220 dispatch. The name is chosen by
+///   an LLM and the tree is a sibling of the user's own checkout, so Ctrl+W
+///   reads as "close this view", not "destroy uncommitted work". A leaked
+///   worktree costs disk; a force-removed one costs work, and that asymmetry
+///   decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalPolicy {
+    /// Remove unconditionally (`--force`), discarding uncommitted changes.
+    Force,
+    /// Refuse to remove a worktree with uncommitted changes; leave it in place
+    /// and log so the user can recover the work.
+    KeepIfDirty,
+}
 
 /// Construct an empty [`WorktreeRegistry`].
 pub fn new_worktree_registry() -> WorktreeRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// Record a freshly-created per-issue worktree (→ its owning clone) for
+/// Record a freshly-created worktree (→ its owning clone + removal policy) for
 /// tab-close cleanup. Idempotent: a re-recorded worktree just refreshes the
-/// clone mapping.
-pub fn record_worktree(worktrees: &WorktreeRegistry, worktree_dir: &Path, clone_dir: &Path) {
-    worktrees
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(worktree_dir.to_path_buf(), clone_dir.to_path_buf());
+/// entry.
+pub fn record_worktree(
+    worktrees: &WorktreeRegistry,
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    policy: RemovalPolicy,
+) {
+    worktrees.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        worktree_dir.to_path_buf(),
+        WorktreeEntry {
+            clone_dir: clone_dir.to_path_buf(),
+            policy,
+        },
+    );
 }
 
 /// The per-issue worktree a closing agent was dispatched into, derived from its
@@ -101,13 +152,14 @@ pub fn worktree_of_record(record: &AgentRecord) -> Option<PathBuf> {
     }
 }
 
-/// If `worktree_dir` is a dispatched issue worktree, drop its registry entry and
-/// return the owning clone dir; `None` otherwise (an ordinary agent's cwd, or an
-/// entry already taken). The close watcher only calls this once it has confirmed
-/// (via [`worktree_still_in_use`]) that the LAST agent rooted in the worktree has
-/// closed, so for a multi-role orchestration the entry survives every earlier
-/// sibling close and is taken exactly once, on the final close.
-pub fn take_worktree(worktrees: &WorktreeRegistry, worktree_dir: &Path) -> Option<PathBuf> {
+/// If `worktree_dir` is a dispatched worktree, drop its registry entry and
+/// return it (owning clone + removal policy); `None` otherwise (an ordinary
+/// agent's cwd, or an entry already taken). The close watcher only calls this
+/// once it has confirmed (via [`worktree_still_in_use`]) that the LAST agent
+/// rooted in the worktree has closed, so for a multi-role orchestration the
+/// entry survives every earlier sibling close and is taken exactly once, on the
+/// final close.
+pub fn take_worktree(worktrees: &WorktreeRegistry, worktree_dir: &Path) -> Option<WorktreeEntry> {
     worktrees
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -121,28 +173,64 @@ pub fn take_worktree(worktrees: &WorktreeRegistry, worktree_dir: &Path) -> Optio
 /// the just-closed agent was the LAST one in the worktree and it is safe to
 /// remove. While a sibling role is still live the shared worktree must survive.
 pub fn worktree_still_in_use(records: &[AgentRecord], worktree_dir: &Path) -> bool {
+    agents_rooted_in_worktree(records, worktree_dir) > 0
+}
+
+/// How many live agents in `records` are rooted in `worktree_dir` — the counting
+/// form of [`worktree_still_in_use`], which is defined in terms of it so the two
+/// can never disagree about what "rooted in" means.
+///
+/// Issue #575: the dispatch spawn-failure rollback reports the number back to the
+/// caller, because "2 agents are still running in it" tells the user what to close
+/// and a bare "still in use" does not.
+pub fn agents_rooted_in_worktree(records: &[AgentRecord], worktree_dir: &Path) -> usize {
     records
         .iter()
-        .any(|r| worktree_of_record(r).as_deref() == Some(worktree_dir))
+        .filter(|r| worktree_of_record(r).as_deref() == Some(worktree_dir))
+        .count()
 }
 
 /// Remove a dispatched worktree from its clone (`git -C <clone> worktree remove
-/// <worktree> --force`), PRESERVING the clone. Best-effort: a non-zero exit
-/// (already removed, locked) or a spawn error is logged, not fatal — the tab is
-/// already gone.
-pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path) {
-    let res = run_status(
-        "git",
-        &[
-            "-C",
-            &clone_dir.to_string_lossy(),
-            "worktree",
-            "remove",
-            &worktree_dir.to_string_lossy(),
-            "--force",
-        ],
-    )
-    .await;
+/// <worktree>`), PRESERVING the clone. Best-effort: a non-zero exit (already
+/// removed, locked) or a spawn error is logged, not fatal — the tab is already
+/// gone.
+///
+/// `policy` decides what happens when the worktree still holds uncommitted work
+/// — see [`RemovalPolicy`] for why the two producers need opposite answers.
+/// Under [`RemovalPolicy::KeepIfDirty`] a dirty tree (or a status probe that
+/// fails, so dirtiness is unknown) is left in place and logged; under
+/// [`RemovalPolicy::Force`] the tree is removed regardless, which is what keeps
+/// PRD #120's vacated slot reclaimable.
+pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path, policy: RemovalPolicy) {
+    let worktree = worktree_dir.to_string_lossy();
+    if policy == RemovalPolicy::KeepIfDirty {
+        let status = run_capture_args("git", &["-C", &worktree, "status", "--porcelain"]).await;
+        match status {
+            Ok(output) if !output.trim().is_empty() => {
+                tracing::warn!(
+                    worktree = %worktree_dir.display(),
+                    "dispatch: worktree has uncommitted changes; leaving in place"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    worktree = %worktree_dir.display(),
+                    error = %e,
+                    "dispatch: could not check worktree status; leaving in place"
+                );
+                return;
+            }
+        }
+    }
+
+    let clone = clone_dir.to_string_lossy();
+    let mut args = vec!["-C", &clone, "worktree", "remove", &worktree];
+    if policy == RemovalPolicy::Force {
+        args.push("--force");
+    }
+    let res = run_status("git", &args).await;
     match res {
         Ok(()) => tracing::info!(
             worktree = %worktree_dir.display(),
@@ -179,6 +267,10 @@ pub async fn run_issue_dispatch(
     worktrees: &WorktreeRegistry,
     notifier: &dyn Notifier,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
+    // The daemon's `AppState`, so an issue-dispatched ORCHESTRATION's roles are
+    // registered for delegate routing — see
+    // `crate::state::AppState::register_orchestration_role`.
+    state: Option<&crate::state::SharedState>,
 ) {
     // S5 — every derived path (clone, worktree, the spawn's orchestration_cwd)
     // must be absolute: a relative workspace root would double-nest the worktree
@@ -243,6 +335,7 @@ pub async fn run_issue_dispatch(
             worktrees,
             notifier,
             event_tx,
+            state,
         )
         .await
         {
@@ -272,6 +365,10 @@ async fn dispatch_one_issue(
     worktrees: &WorktreeRegistry,
     notifier: &dyn Notifier,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
+    // Threaded to `spawn` so an issue-dispatched ORCHESTRATION's roles land in
+    // the daemon's delegate-routing maps — see
+    // `crate::state::AppState::register_orchestration_role`.
+    state: Option<&crate::state::SharedState>,
 ) -> Result<(), String> {
     let paths = derive_issue_paths(workspace, task_name, issue);
 
@@ -314,9 +411,22 @@ async fn dispatch_one_issue(
     // fire can claim it in the TOCTOU window after the idempotency check above
     // (see `create_worktree`); that benign race is a skip, not a failure —
     // mirroring the `dispatch_decision` worktree-presence skip.
-    match create_worktree(clone_dir, &paths.worktree_dir, &paths.branch).await? {
+    match create_worktree(
+        clone_dir,
+        &paths.worktree_dir,
+        &paths.branch,
+        true,
+        Creator::issue_dispatch(task_name, issue),
+    )
+    .await?
+    {
         WorktreeCreation::Created => {}
-        WorktreeCreation::AlreadyClaimed => {
+        // `reuse_existing_branch: true` above means `BranchExists` is never
+        // returned to this caller — an existing `agent/issue-<n>` is ATTACHED,
+        // which is exactly what keeps the vacated slot reclaimable. Treated as a
+        // skip alongside `AlreadyClaimed` so the match stays exhaustive if that
+        // ever changes.
+        WorktreeCreation::AlreadyClaimed | WorktreeCreation::BranchExists => {
             notifier.notify(NotifyEvent::IssueDispatchSkipped {
                 task: task_name.to_string(),
                 repo: cfg.repo.clone(),
@@ -332,7 +442,16 @@ async fn dispatch_one_issue(
     // from a fast client) well before it returns, so recording after the spawn
     // would race a prompt close. The close watcher matches the agent to this
     // worktree by its record's cwd, not by an agent id we don't have yet.
-    record_worktree(worktrees, &paths.worktree_dir, clone_dir);
+    // `RemovalPolicy::Force`: this worktree lives inside a daemon-owned clone,
+    // and the reuse-the-vacated-slot model depends on the directory actually
+    // going away on tab close — a tree left behind makes `dispatch_decision`
+    // skip the issue on every later fire. See [`RemovalPolicy`].
+    record_worktree(
+        worktrees,
+        &paths.worktree_dir,
+        clone_dir,
+        RemovalPolicy::Force,
+    );
 
     // M2.3 — spawn one agent into the worktree, delivering the substituted
     // prompt. `spawn` branches on the worktree's `.dot-agent-deck.toml`.
@@ -350,8 +469,14 @@ async fn dispatch_one_issue(
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
         command: default_command.map(str::to_string),
         prompt: substitute_issue_number(prompt_template, issue),
+        // `None`: issue-dispatch keeps deriving the shape from the cloned repo's
+        // own config, exactly as before the PRD #220 selector existed.
+        resolved_target: None,
+        // Unchanged behaviour: the prompt is delivered verbatim. Giving this path
+        // the orchestrator context is #222's work, not this PR's.
+        compose_orchestrator_context: false,
     };
-    if let Err(e) = spawn(req, registry, notifier, event_tx, true).await {
+    if let Err(e) = spawn(req, registry, notifier, event_tx, true, state).await {
         // The spawn failed after the worktree was created/recorded: no agent
         // will ever close to trigger cleanup, so drop the registry entry here.
         // The worktree dir itself is left on disk — the next fire's
@@ -576,13 +701,154 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
     Ok(!arr.is_empty())
 }
 
-/// Outcome of [`create_worktree`]: either we created the per-issue worktree, or
-/// a concurrent fire had already claimed it (the benign TOCTOU race below),
-/// which the caller surfaces as a skip rather than a failure.
+/// Outcome of [`create_worktree`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorktreeCreation {
+pub enum WorktreeCreation {
+    /// The worktree was created.
     Created,
+    /// The worktree DIRECTORY is already there — a concurrent fire claimed it in
+    /// the benign TOCTOU window described below. Callers surface this as a skip
+    /// rather than a failure.
     AlreadyClaimed,
+    /// The worktree directory is absent but the head BRANCH already exists, and
+    /// the caller asked not to reuse it (`reuse_existing_branch: false`).
+    ///
+    /// Distinct from [`Self::AlreadyClaimed`] because the two need different
+    /// messages and have different fixes: "another dispatch is using this" (wait
+    /// or pick another name) versus "a previous dispatch left this branch
+    /// behind" (delete the branch, or pick another name). Collapsing them made
+    /// a reused name report a worktree conflict that the user could see was not
+    /// true — the directory is plainly gone — with no hint of the real cause.
+    BranchExists,
+}
+
+/// Attempts (the first included) at `git worktree add` when it fails because a
+/// concurrent add's administrative directory was only half written — issue #541.
+/// Bounded on purpose: the window is microseconds wide in the wild, so a handful
+/// of tries covers a genuine race by orders of magnitude, while a `commondir`
+/// that is permanently unreadable still surfaces as an error instead of being
+/// retried forever.
+const WORKTREE_ADD_ATTEMPTS: u32 = 5;
+
+/// Backoff before retry `attempt` (1-based): 100ms, 200ms, 400ms, 800ms — 1.5s
+/// of cover in total, which is ~six orders of magnitude more than the two-syscall
+/// window it exists for, and is also the entire latency a genuinely broken repo
+/// pays before its error is reported.
+fn worktree_add_backoff(attempt: u32) -> Duration {
+    // Saturating and capped so the arithmetic stays total: at five attempts the
+    // shift never exceeds 3, but raising [`WORKTREE_ADD_ATTEMPTS`] must not be
+    // able to turn a backoff into an overflow panic.
+    Duration::from_millis(100u64 << attempt.saturating_sub(1).min(10))
+}
+
+/// How long to wait for the per-repository worktree lock before giving up on
+/// serialization and creating the worktree unserialized. A stuck holder must
+/// slow a dispatch down, never wedge it forever.
+const WORKTREE_LOCK_WAIT: Duration = Duration::from_secs(60);
+
+/// Issue #541: does this `git worktree add` failure look like the reader side of
+/// a concurrent add rather than a real problem?
+///
+/// `git worktree add` scans the repo's worktree list before creating its own
+/// entry, reading every entry's `commondir`. An add that has created its entry
+/// but not yet written that file makes the read come back short, and git turns
+/// that into `fatal: failed to read '<…>/worktrees/<name>/commondir': Success` —
+/// `strerror(errno)` for an errno nothing ever set, which is the tell that the
+/// read did not actually fail.
+///
+/// Keyed on the FILE NAME, not on git's sentence: both the `die_errno` format
+/// string and `strerror` are localized, so "failed to read" and "Success"
+/// disappear under a non-English locale while `commondir` — a path component —
+/// does not. Deliberately narrow all the same: it matches only failures naming
+/// that one administrative file, and even those are retried a bounded number of
+/// times.
+fn is_worktree_scan_short_read(err: &str) -> bool {
+    err.contains("commondir")
+}
+
+/// Path of the lock that serializes worktree creation for one repository.
+///
+/// Derived from `git rev-parse --git-common-dir` and placed inside it, because
+/// that directory is exactly the contended resource — `worktrees/<name>` lives
+/// there — and because `clone_dir` may itself be a linked worktree, whose `.git`
+/// is a FILE and whose per-worktree admin dir is private. Asking git means every
+/// spelling of one repository (the main checkout, any of its worktrees, a
+/// relative path) maps onto a single lock file, which is what makes the
+/// exclusion hold between separate deck PROCESSES and not merely between tasks
+/// in one.
+///
+/// Returns `None` when the directory cannot be resolved (not a git repo) — the
+/// add itself then fails with git's own message, which is the better error.
+async fn worktree_lock_path(clone_dir: &Path) -> Option<PathBuf> {
+    let common = run_capture_args(
+        "git",
+        &[
+            "-C",
+            &clone_dir.to_string_lossy(),
+            "rev-parse",
+            "--git-common-dir",
+        ],
+    )
+    .await
+    .ok()?;
+    let common = common.trim();
+    if common.is_empty() {
+        return None;
+    }
+    // `--git-common-dir` answers relative to the repository (plain `.git` for an
+    // ordinary checkout), and our cwd is the daemon's, not `clone_dir`'s — so a
+    // relative answer has to be joined here. Resolved this way rather than with
+    // `--path-format=absolute` so the derivation does not depend on git 2.31+.
+    let common = Path::new(common);
+    let path = if common.is_absolute() {
+        common.to_path_buf()
+    } else {
+        clone_dir.join(common)
+    };
+    Some(path.join("dot-agent-deck-worktree.lock"))
+}
+
+/// Serialize `git worktree add` for one repository across processes (issue
+/// #541), so this deck's own concurrent dispatches cannot observe each other's
+/// half-created administrative directories.
+///
+/// Every failure mode degrades to "create the worktree anyway": an unresolvable
+/// repo, an unwritable `.git`, or a holder that never lets go all return `None`,
+/// which is precisely the pre-#541 behaviour that the bounded retry in
+/// [`create_worktree`] already covers. A lock is worth having only while it
+/// cannot itself become the reason a dispatch fails or hangs.
+///
+/// Serialization also does not make the retry redundant, and vice versa: this
+/// only binds processes that take the lock, so an add started by the user or by
+/// another tool still races us, and only the retry survives that.
+async fn acquire_worktree_lock(clone_dir: &Path) -> Option<crate::platform::lock::SpawnLock> {
+    let path = worktree_lock_path(clone_dir).await?;
+    match tokio::time::timeout(
+        WORKTREE_LOCK_WAIT,
+        crate::platform::lock::acquire_spawn_lock(&path),
+    )
+    .await
+    {
+        Ok(Ok(guard)) => Some(guard),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                lock = %path.display(),
+                error = %e,
+                "could not take the per-repository worktree lock; creating the worktree \
+                 unserialized (the bounded retry still covers a concurrent add)"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                lock = %path.display(),
+                waited_secs = WORKTREE_LOCK_WAIT.as_secs(),
+                "timed out waiting for the per-repository worktree lock; creating the \
+                 worktree unserialized rather than wedging the dispatch"
+            );
+            None
+        }
+    }
 }
 
 /// M2.2: create the per-issue worktree on `agent/issue-<n>`. The `.worktrees`
@@ -592,9 +858,13 @@ enum WorktreeCreation {
 /// dispatched, had its tab closed without a PR, and is still open leaves
 /// `agent/issue-<n>` behind. A naive `worktree add -b <branch>` would then fail
 /// ("a branch named … already exists") on EVERY later fire, permanently wedging
-/// the reuse-the-vacated-slot model. So probe for the branch first: attach the
-/// existing branch (no `-b`) when it is already there, and only create it (`-b`)
-/// when it is not.
+/// the reuse-the-vacated-slot model. So probe for the branch first: when
+/// `reuse_existing_branch` is true, attach the existing branch (no `-b`) when it is
+/// already there, and only create it (`-b`) when it is not. When
+/// `reuse_existing_branch` is false, an existing branch is reported as
+/// [`WorktreeCreation::BranchExists`] so the caller can refuse the dispatch and
+/// say WHY — the branch may hold committed work from a previous dispatch of the
+/// same name, so it is never deleted implicitly.
 ///
 /// TOCTOU: the caller only reaches here after [`dispatch_decision`] saw the
 /// worktree dir ABSENT, but a concurrent fire of the same task can create it in
@@ -604,38 +874,147 @@ enum WorktreeCreation {
 /// [`WorktreeCreation::AlreadyClaimed`] (→ skip) instead of a hard failure. A
 /// genuine add failure (bad ref, permissions, …) leaves the dir absent and
 /// still propagates as `Err`.
-async fn create_worktree(
+///
+/// Issue #541 — a SECOND, unrelated concurrency hazard, on a different name.
+/// The one above is two dispatches racing for the same worktree; this one is any
+/// two adds racing on the same *repository*, and it fails the loser even though
+/// nothing about its dispatch is wrong. `git worktree add` scans the repo's
+/// worktree list before creating its own entry and reads every entry's
+/// `commondir`; a concurrent add that has created its entry but not yet written
+/// that file makes the read come back short, and the loser dies with `fatal:
+/// failed to read '…/worktrees/<name>/commondir': Success`. Two defences, and
+/// each covers what the other cannot:
+///
+/// - [`acquire_worktree_lock`] serializes the adds this deck starts, per
+///   repository and across processes, so the deck stops being its own worst
+///   offender (three concurrent dispatches — `scheduler/dispatch/015` — is the
+///   reported case).
+/// - [`is_worktree_scan_short_read`] + [`WORKTREE_ADD_ATTEMPTS`] retry the one
+///   transient signature a bounded number of times, which is the only thing that
+///   can help against an add the deck did not start (the user's own, another
+///   tool's) since those take no lock.
+///
+/// Neither defence swallows anything: a `commondir` that stays unreadable
+/// exhausts the attempts and surfaces as `Err`.
+///
+/// Issue #425 — `creator`. This is the ONLY `git worktree add` in `src/`, so
+/// it is also the only place that can claim a worktree as the deck's own at
+/// the moment it comes into existence. On success it writes the ownership
+/// marker `worktree_reclaim` later reads, recording `creator` so the claim
+/// names the responsible dispatch rather than a bare "the deck". Written on
+/// the `Created` arm only, and best-effort — see [`crate::worktree_owner`] for
+/// why both of those are load-bearing.
+pub async fn create_worktree(
     clone_dir: &Path,
     worktree_dir: &Path,
     branch: &str,
+    reuse_existing_branch: bool,
+    creator: Creator,
 ) -> Result<WorktreeCreation, String> {
     if let Some(parent) = worktree_dir.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create worktree parent {}: {e}", parent.display()))?;
     }
+    // Issue #541: keep this deck's own concurrent creations off each other's
+    // half-created entries. Held across the probe AND the add so the two are
+    // atomic with respect to another dispatch of the same name; released on drop
+    // at the end of the function.
+    let _repo_lock = acquire_worktree_lock(clone_dir).await;
+
     let clone = clone_dir.to_string_lossy();
     let wt = worktree_dir.to_string_lossy();
     let branch_ref = format!("refs/heads/{branch}");
-    let branch_exists = run_status(
-        "git",
-        &[
-            "-C",
-            &clone,
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &branch_ref,
-        ],
-    )
-    .await
-    .is_ok();
-    let add = if branch_exists {
-        run_status("git", &["-C", &clone, "worktree", "add", &wt, branch]).await
-    } else {
-        run_status("git", &["-C", &clone, "worktree", "add", &wt, "-b", branch]).await
+    let mut attempt: u32 = 1;
+    let add = loop {
+        // Re-probed on every attempt, not hoisted out of the loop: a `git
+        // worktree add` that dies on the scan has already CREATED its `-b`
+        // branch (the branch survives the exit-128), so passing `-b` again would
+        // fail with "a branch named … already exists" and turn a transient race
+        // into a hard failure — and, with `reuse_existing_branch: false`, into a
+        // dispatch name the user has to `git branch -D` by hand.
+        let branch_exists = run_status(
+            "git",
+            &[
+                "-C",
+                &clone,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &branch_ref,
+            ],
+        )
+        .await
+        .is_ok();
+        // Only attempt 1 can report BranchExists. Reaching attempt 2 means the
+        // branch was PROVEN absent moments ago, so anything there now was
+        // created either by our own failed attempt or by a dispatch racing us —
+        // never the "may hold committed work from an earlier dispatch" case this
+        // guard exists for. (A branch a racing dispatch is really using fails the
+        // attach with "already used by worktree at …", and its worktree dir is
+        // then present, so the outcome is `AlreadyClaimed` below.)
+        if branch_exists && !reuse_existing_branch && attempt == 1 {
+            // …but only when the worktree really IS gone, which is precisely what
+            // the BranchExists message asserts ("its worktree is already gone",
+            // `dispatch.rs`). A directory that is present is a live claim, and
+            // saying otherwise sends the user to `git branch -D` for a worktree
+            // they can see. Serializing creation made this reachable by design
+            // rather than by luck: the loser of a same-name race now always
+            // probes AFTER the winner created the branch, where before it might
+            // have probed first and been classified (correctly) as
+            // `AlreadyClaimed` by the post-add check below.
+            if worktree_dir.exists() {
+                return Ok(WorktreeCreation::AlreadyClaimed);
+            }
+            return Ok(WorktreeCreation::BranchExists);
+        }
+        let result = if branch_exists {
+            run_status("git", &["-C", &clone, "worktree", "add", &wt, branch]).await
+        } else {
+            run_status("git", &["-C", &clone, "worktree", "add", &wt, "-b", branch]).await
+        };
+        match result {
+            Err(e) if attempt < WORKTREE_ADD_ATTEMPTS && is_worktree_scan_short_read(&e) => {
+                let backoff = worktree_add_backoff(attempt);
+                tracing::warn!(
+                    clone = %clone_dir.display(),
+                    worktree = %worktree_dir.display(),
+                    attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = %e,
+                    "git worktree add read another add's half-created administrative \
+                     directory (issue #541); retrying after a backoff"
+                );
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+            }
+            // Success, a non-transient failure, or the last attempt: the retry
+            // is bounded, so a `commondir` that is genuinely unreadable (a
+            // crashed add left an empty one behind) still surfaces as an error
+            // rather than looping or being swallowed.
+            other => break other,
+        }
     };
     match add {
-        Ok(()) => Ok(WorktreeCreation::Created),
+        Ok(()) => {
+            // Issue #425: claim the worktree we just created, HERE, so no
+            // window exists in which a deck-created worktree is
+            // unrecognisable to `worktree list|reclaim`.
+            //
+            // Only on this arm. `AlreadyClaimed` below means the directory was
+            // already on disk when our add ran, so somebody else created it —
+            // marking it would be the deck asserting ownership of a directory
+            // it did not create, which is the one failure the marker exists to
+            // prevent on a path that deletes directories. (A concurrent
+            // dispatch that really did create it writes its own marker from
+            // its own `Created` arm, so nothing is lost.)
+            //
+            // Best-effort by construction: `write_marker_best_effort` warns
+            // and returns rather than failing the creation. A missing marker
+            // costs one `--yes` confirmation later, which is the fail-safe
+            // direction; a failed dispatch is not.
+            crate::worktree_owner::write_marker_best_effort(worktree_dir, branch, creator).await;
+            Ok(WorktreeCreation::Created)
+        }
         // Concurrent claim (TOCTOU): the dir is present now though we arrived
         // believing it absent — treat as already-claimed. A real failure leaves
         // the dir absent and surfaces as the original error.
@@ -666,7 +1045,7 @@ fn parse_issue_numbers(json: &str) -> Result<Vec<u64>, String> {
 
 /// Run a subprocess that must exit zero; on failure return a message carrying
 /// the program, args, exit status, and any stderr.
-async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
+pub async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
     let output = tokio::process::Command::new(program)
         .args(args)
         .output()
@@ -738,17 +1117,19 @@ mod tests {
         let wt7 = PathBuf::from("/ws/task/.worktrees/issue-7");
         let wt8 = PathBuf::from("/ws/task/.worktrees/issue-8");
         let clone = PathBuf::from("/ws/task");
-        record_worktree(&reg, &wt7, &clone);
-        record_worktree(&reg, &wt8, &clone);
+        record_worktree(&reg, &wt7, &clone, RemovalPolicy::Force);
+        record_worktree(&reg, &wt8, &clone, RemovalPolicy::Force);
 
-        // The registry primitive returns a recorded worktree's clone exactly
-        // once, then drops the entry (a re-take finds nothing). The close watcher
+        // The registry primitive returns a recorded worktree's entry exactly
+        // once, then drops it (a re-take finds nothing). The close watcher
         // only calls `take_worktree` after `worktree_still_in_use` confirms the
         // last rooted agent has closed, so this once-only take is correct even
         // for a multi-role tab. issue-8 is untouched.
-        assert_eq!(take_worktree(&reg, &wt7), Some(clone.clone()));
+        let taken = take_worktree(&reg, &wt7).expect("issue-7 was recorded");
+        assert_eq!(taken.clone_dir, clone);
+        assert_eq!(taken.policy, RemovalPolicy::Force);
         assert_eq!(take_worktree(&reg, &wt7), None);
-        assert_eq!(take_worktree(&reg, &wt8), Some(clone));
+        assert_eq!(take_worktree(&reg, &wt8).map(|e| e.clone_dir), Some(clone));
     }
 
     #[test]
@@ -918,7 +1299,14 @@ mod tests {
         // Simulate the concurrent fire having already created the worktree dir.
         std::fs::create_dir_all(&worktree_dir).unwrap();
 
-        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-7").await;
+        let outcome = create_worktree(
+            &clone_dir,
+            &worktree_dir,
+            "agent/issue-7",
+            false,
+            Creator::issue_dispatch("unit", 7),
+        )
+        .await;
         assert_eq!(
             outcome,
             Ok(WorktreeCreation::AlreadyClaimed),
@@ -936,10 +1324,488 @@ mod tests {
         std::fs::create_dir_all(&clone_dir).unwrap();
         let worktree_dir = clone_dir.join(".worktrees").join("issue-9"); // absent
 
-        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-9").await;
+        let outcome = create_worktree(
+            &clone_dir,
+            &worktree_dir,
+            "agent/issue-9",
+            false,
+            Creator::issue_dispatch("unit", 9),
+        )
+        .await;
         assert!(
             outcome.is_err(),
             "a real add failure with no worktree on disk must propagate as Err, got {outcome:?}"
+        );
+    }
+
+    // --- Issue #541: concurrent `git worktree add` reads a half-created
+    // administrative directory ---
+
+    /// A real git repo with one commit — `git worktree add` needs a commit to
+    /// branch from. Disk-backed (issue #322 / CLAUDE.md rule 14): this fixture
+    /// is a git repository plus its worktrees, not a scratch file.
+    fn init_repo_with_commit(repo: &Path) {
+        std::fs::create_dir_all(repo).expect("create repo dir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main", "--quiet"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        // The dev box may have `commit.gpgsign` on globally; the fixture must
+        // not depend on a signing key being present.
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README.md"), "seed\n").expect("write seed file");
+        git(&["add", "README.md"]);
+        git(&["commit", "--quiet", "-m", "seed"]);
+    }
+
+    /// Stage the state a `git worktree add` leaves in
+    /// `$GIT_COMMON_DIR/worktrees/<name>` *between* creating the entry and
+    /// finishing it — the window issue #541 is about.
+    ///
+    /// The byte sequence is git's own, read off an `strace` of `git worktree
+    /// add` (2.55.0), which in order: `mkdir(worktrees/<name>)`, writes
+    /// `locked`, writes `gitdir`, then `openat("commondir", O_CREAT|O_TRUNC)`
+    /// — and only on the NEXT syscall writes `../..` into it. Every other `git
+    /// worktree add` on the repo scans the worktree list before creating its own
+    /// entry and reads each entry's `commondir`; on a short read git calls
+    /// `die_errno()`, which prints `strerror(errno)` for an errno that was never
+    /// set. That is where the reported message's giveaway `: Success` comes from.
+    ///
+    /// Staged rather than raced because that window is two adjacent syscalls
+    /// wide. It IS reachable by genuine concurrency — measured on this box with
+    /// N concurrent real `git worktree add`s against one repo: 12 failures in 960
+    /// adds at N=64, 7 in 1024 at N=128, 0 in 960 at N=3 and 0 in 400 at N=16,
+    /// every failure carrying the reported `fatal: failed to read
+    /// .git/worktrees/<name>/commondir: Success` verbatim. About a thousand real
+    /// worktree checkouts per observed failure is neither affordable in the fast
+    /// tier nor a reliable gate, so the test stages the identical bytes and
+    /// closes the window on a timer instead of on luck.
+    fn begin_half_created_entry(repo: &Path, name: &str) -> PathBuf {
+        let entry = repo.join(".git").join("worktrees").join(name);
+        std::fs::create_dir_all(&entry).expect("create half-created worktree entry");
+        std::fs::write(entry.join("locked"), "creating\n").expect("write locked");
+        std::fs::write(
+            entry.join("gitdir"),
+            format!("{}\n", repo.join(name).join(".git").display()),
+        )
+        .expect("write gitdir");
+        // The `O_CREAT|O_TRUNC` has happened; the write of `../..` has not.
+        std::fs::write(entry.join("commondir"), b"").expect("create empty commondir");
+        entry
+    }
+
+    /// The writer's very next syscall: `commondir` becomes readable and the
+    /// window closes, exactly as it does when the concurrent add proceeds.
+    fn finish_half_created_entry(entry: &Path) {
+        std::fs::write(entry.join("commondir"), "../..\n").expect("finish commondir");
+    }
+
+    /// Issue #541 — three concurrent dispatches (`scheduler/dispatch/015`'s
+    /// shape) must each end up with their worktree even though an unrelated
+    /// `git worktree add` is mid-flight on the same repo. Each of the three
+    /// scans the half-created entry, so each dies on it before its own worktree
+    /// is created — the reported symptom, in the setup step, before any agent
+    /// runs.
+    ///
+    /// The window is closed by a fourth party that holds no deck lock, so this
+    /// exercises the case serialization alone cannot fix: a `git worktree add`
+    /// the deck did not start (the user's own, or another tool's).
+    ///
+    /// Also pins the second-order defect: the add that dies on the scan has
+    /// ALREADY created its `-b` branch, so a retry has to re-probe and ATTACH
+    /// that branch rather than pass `-b` again — hence the per-dispatch HEAD
+    /// assertion.
+    #[tokio::test]
+    async fn create_worktree_survives_a_concurrent_adds_half_created_entry() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+        let entry = begin_half_created_entry(&repo, "concurrent-add");
+
+        // Closes while the three dispatches are in flight. Not a timing race:
+        // without a retry there is no second attempt for the timer to rescue,
+        // so a slow machine cannot turn this green by accident.
+        let closing = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            finish_half_created_entry(&entry);
+        });
+
+        let mut fires = Vec::new();
+        for name in ["alpha", "beta", "gamma"] {
+            let clone_dir = repo.clone();
+            let worktree_dir = scratch.path().join(format!("repo-dispatch-{name}"));
+            fires.push(tokio::spawn(async move {
+                let branch = format!("agent/dispatch-{name}");
+                let outcome = create_worktree(
+                    &clone_dir,
+                    &worktree_dir,
+                    &branch,
+                    false,
+                    Creator::dispatch("unit"),
+                )
+                .await;
+                (name, worktree_dir, branch, outcome)
+            }));
+        }
+        closing.await.expect("window-closing task");
+
+        for fire in fires {
+            let (name, worktree_dir, branch, outcome) = fire.await.expect("dispatch task");
+            assert_eq!(
+                outcome,
+                Ok(WorktreeCreation::Created),
+                "dispatch '{name}' must get its worktree despite a concurrent add's \
+                 half-created entry; `Err(… commondir …)` is issue #541 itself, and \
+                 `Ok(BranchExists)`/`… already exists` is a retry that failed to \
+                 re-probe the branch its own failed attempt left behind"
+            );
+            assert!(
+                worktree_dir.join("README.md").exists(),
+                "dispatch '{name}' reported Created but its worktree has no checkout at {}",
+                worktree_dir.display()
+            );
+            let head = run_capture_args(
+                "git",
+                &[
+                    "-C",
+                    &worktree_dir.to_string_lossy(),
+                    "branch",
+                    "--show-current",
+                ],
+            )
+            .await
+            .expect("read the new worktree's branch");
+            assert_eq!(
+                head.trim(),
+                branch,
+                "dispatch '{name}' must be checked out on its own branch"
+            );
+        }
+    }
+
+    /// Control for the test above, and the guard on the retry's blast radius: a
+    /// `commondir` that never becomes readable is NOT transient — a crashed add
+    /// leaves exactly this behind — so it must still surface as `Err` naming the
+    /// file, not be retried away or swallowed. Bounds the retry too: if it ever
+    /// became unbounded this test would hang rather than fail.
+    #[tokio::test]
+    async fn create_worktree_surfaces_a_half_created_entry_that_never_completes() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+        let _entry = begin_half_created_entry(&repo, "abandoned-add");
+        let worktree_dir = scratch.path().join("repo-dispatch-stuck");
+
+        let err = create_worktree(
+            &repo,
+            &worktree_dir,
+            "agent/dispatch-stuck",
+            false,
+            Creator::dispatch("stuck"),
+        )
+        .await
+        .expect_err("a permanently unreadable commondir must surface as an error");
+        assert!(
+            err.contains("commondir"),
+            "the error must still name the file git could not read, got: {err}"
+        );
+        assert!(
+            !worktree_dir.exists(),
+            "a failed creation must not leave a worktree behind at {}",
+            worktree_dir.display()
+        );
+    }
+
+    /// Issue #541, the other half of the fix: worktree creation is serialized
+    /// PER REPOSITORY and, because the lock is an `flock(2)` on a file (a named
+    /// mutex on Windows), between separate deck processes rather than merely
+    /// between tasks in one — concurrent dispatches can come from different
+    /// decks, and an in-process mutex would silently not cover them.
+    ///
+    /// Written the way the platform lock's own contract test is: a held lock
+    /// makes the creation block, and releasing it lets the creation complete.
+    /// The lock is taken through the SAME derivation production uses, so a
+    /// change that moved worktree creation off this key would fail here rather
+    /// than quietly stop serializing.
+    #[tokio::test]
+    async fn create_worktree_serializes_per_repository_across_processes() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+
+        let lock_path = worktree_lock_path(&repo)
+            .await
+            .expect("a git repo must resolve a worktree lock path");
+        assert!(
+            lock_path.starts_with(repo.join(".git")),
+            "the lock must live in the repository's git common dir (the contended \
+             directory), got {}",
+            lock_path.display()
+        );
+        let held = crate::platform::lock::acquire_spawn_lock(&lock_path)
+            .await
+            .expect("hold the repository's worktree lock, as another deck process would");
+
+        let clone_dir = repo.clone();
+        let worktree_dir = scratch.path().join("repo-dispatch-serialized");
+        let creating = tokio::spawn(async move {
+            create_worktree(
+                &clone_dir,
+                &worktree_dir,
+                "agent/dispatch-serialized",
+                false,
+                Creator::dispatch("serialized"),
+            )
+            .await
+        });
+        // Long enough to reach the blocking wait. Not a race: while the lock is
+        // held the creation can NEVER finish, so a slow machine also passes.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !creating.is_finished(),
+            "worktree creation must wait while another process holds this \
+             repository's worktree lock; not waiting is how two `git worktree add`s \
+             end up reading each other's half-created entries (#541)"
+        );
+
+        drop(held);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), creating)
+            .await
+            .expect("releasing the lock must let the creation proceed")
+            .expect("the creating task must not panic");
+        assert_eq!(
+            outcome,
+            Ok(WorktreeCreation::Created),
+            "once the lock is released the worktree must be created normally"
+        );
+    }
+
+    /// A dispatch whose name is claimed by a LIVE worktree must be told that,
+    /// not that its branch is left over from a dispatch "whose worktree is
+    /// already gone" — the user can see the directory, and the leftover-branch
+    /// message sends them to `git branch -D` for a tree another dispatch is
+    /// working in.
+    ///
+    /// The mirror image of `dispatch.rs`'s
+    /// `second_dispatch_of_a_name_reports_branch_exists_after_cleanup`, which
+    /// pins the same distinction from the other side (dir gone → BranchExists).
+    /// Serializing creation (#541) is what makes this reachable by design rather
+    /// than by luck: the loser of a same-name race now always probes the branch
+    /// AFTER the winner created it.
+    #[tokio::test]
+    async fn create_worktree_reports_a_live_claim_not_a_leftover_branch() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+        let worktree_dir = scratch.path().join("repo-dispatch-claimed");
+
+        assert_eq!(
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/dispatch-claimed",
+                false,
+                Creator::dispatch("claimed")
+            )
+            .await,
+            Ok(WorktreeCreation::Created),
+            "precondition: the first dispatch claims the name"
+        );
+
+        assert_eq!(
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/dispatch-claimed",
+                false,
+                Creator::dispatch("claimed")
+            )
+            .await,
+            Ok(WorktreeCreation::AlreadyClaimed),
+            "a second dispatch of a name whose worktree is still THERE is a live \
+             claim; reporting BranchExists would tell the user their worktree is \
+             gone while it is in front of them"
+        );
+        assert!(
+            worktree_dir.exists(),
+            "the live claim must be left untouched at {}",
+            worktree_dir.display()
+        );
+    }
+
+    /// The retry predicate matches the reported signature — including the
+    /// `: Success` tell (`strerror` on an errno nothing set) — and does not
+    /// match ordinary `git worktree add` failures, which must stay hard
+    /// failures rather than costing a dispatch 1.5s of pointless backoff.
+    #[test]
+    fn worktree_scan_short_read_matches_only_the_commondir_signature() {
+        // Verbatim from the issue…
+        assert!(is_worktree_scan_short_read(
+            "fatal: failed to read '.git/worktrees/repo-dispatch-alpha/commondir': Success"
+        ));
+        // …and verbatim from a real concurrent reproduction on git 2.55.0,
+        // which prints the path unquoted.
+        assert!(is_worktree_scan_short_read(
+            "`git -C /tmp/repo worktree add /tmp/wt -b agent/x` failed (exit status: 128): \
+             Preparing worktree (new branch 'agent/x')\n\
+             fatal: failed to read .git/worktrees/w-2-2/commondir: Success"
+        ));
+
+        for genuine in [
+            "fatal: a branch named 'agent/dispatch-alpha' already exists",
+            "fatal: '/ws/repo-dispatch-alpha' already exists",
+            "fatal: invalid reference: agent/nope",
+            "fatal: not a git repository (or any of the parent directories): .git",
+            "error: could not create leading directories of '/ws/x': Permission denied",
+        ] {
+            assert!(
+                !is_worktree_scan_short_read(genuine),
+                "a genuine failure must not be retried: {genuine}"
+            );
+        }
+    }
+
+    // --- Issue #425: the ownership marker is written at creation time ---
+
+    /// The marker `worktree_reclaim` reads must actually be written by the one
+    /// code path that runs `git worktree add`, and it must land in the
+    /// worktree's own git metadata dir rather than anywhere in the working
+    /// tree. Both halves matter: a marker inside the tree makes
+    /// `git status --porcelain` non-empty forever, and the reclaim gate keeps
+    /// every dirty worktree — so an in-tree marker would make the worktree
+    /// permanently UNreclaimable, defeating the feature it enables.
+    #[tokio::test]
+    async fn create_worktree_marks_the_worktree_as_deck_owned_without_dirtying_it() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+        let worktree_dir = scratch.path().join("repo-dispatch-marked");
+
+        assert_eq!(
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/dispatch-marked",
+                false,
+                Creator::dispatch("marked"),
+            )
+            .await,
+            Ok(WorktreeCreation::Created)
+        );
+
+        let marker = crate::worktree_owner::marker_path(&worktree_dir)
+            .expect("the created worktree must have a resolvable git metadata dir");
+        assert!(
+            marker.is_file(),
+            "the deck must claim the worktree it just created; no marker at {}",
+            marker.display()
+        );
+        assert!(
+            !marker.starts_with(&worktree_dir),
+            "the marker must live in the worktree's git metadata dir, never inside the \
+             working tree — got {}",
+            marker.display()
+        );
+
+        let status = std::process::Command::new("git")
+            .current_dir(&worktree_dir)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "marking a worktree must not make it dirty — a dirty worktree is kept by the \
+             reclaim gate, so an in-tree marker would make marked worktrees permanently \
+             unreclaimable; got:\n{}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+
+        // Idempotent: a re-created or re-attached worktree must not accumulate
+        // state. Checked by parsing rather than by comparing bytes, because an
+        // APPEND is exactly what would break — two concatenated documents are
+        // not one document — while a legitimate rewrite changes the timestamp.
+        crate::worktree_owner::write_marker(
+            &worktree_dir,
+            "agent/dispatch-marked",
+            &Creator::dispatch("marked"),
+        )
+        .expect("re-marking an already-marked worktree must succeed");
+        let after = std::fs::read_to_string(&marker).expect("read marker again");
+        serde_json::from_str::<serde_json::Value>(&after).unwrap_or_else(|e| {
+            panic!(
+                "re-marking must REPLACE the marker, never append to it: after a second \
+                 write the file must still be one document, but it did not parse ({e}):\n\
+                 {after}"
+            )
+        });
+    }
+
+    /// The dangerous direction. `AlreadyClaimed` means the worktree DIRECTORY
+    /// was already on disk when our `git worktree add` ran, so this process did
+    /// not create it — and the marker is an ownership claim consumed by a path
+    /// that DELETES directories. Claiming a directory we did not create is the
+    /// one failure this marker exists to prevent, so the already-claimed arm
+    /// must leave the marker alone. (A concurrent dispatch that genuinely
+    /// created it writes its own marker from its own `Created` arm.)
+    #[tokio::test]
+    async fn create_worktree_never_marks_a_worktree_it_did_not_create() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+        let worktree_dir = scratch.path().join("repo-dispatch-foreign");
+
+        // Somebody else's worktree, on this same repo, at the path our dispatch
+        // is about to want: a real linked worktree, so it HAS a git metadata
+        // dir a marker could be written into.
+        let add = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "-b", "someone-elses"])
+            .arg(&worktree_dir)
+            .output()
+            .expect("git worktree add");
+        assert!(
+            add.status.success(),
+            "fixture precondition: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        let marker = crate::worktree_owner::marker_path(&worktree_dir)
+            .expect("the foreign worktree must have a resolvable git metadata dir");
+        assert!(
+            !marker.is_file(),
+            "fixture precondition: a plain `git worktree add` leaves no marker"
+        );
+
+        assert_eq!(
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/dispatch-foreign",
+                false,
+                Creator::dispatch("foreign"),
+            )
+            .await,
+            Ok(WorktreeCreation::AlreadyClaimed),
+            "precondition: a present worktree dir is reported as already claimed"
+        );
+        assert!(
+            !marker.is_file(),
+            "a worktree the deck did not create must never be marked as deck-owned — \
+             the marker gates an unattended `git worktree remove`; found one at {}",
+            marker.display()
         );
     }
 

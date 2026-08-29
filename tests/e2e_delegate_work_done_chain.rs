@@ -42,6 +42,7 @@ use tempfile::TempDir;
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::DelegateSignal;
+use spec::spec;
 
 mod common;
 
@@ -282,6 +283,12 @@ async fn delegate_work_done_chain_claude() {
 async fn opencode_auto_submits_daemon_injected_prompt() {
     skip_unless!(common::check_opencode_available());
 
+    // Issue #668: the one test in this file that builds a bare registry instead
+    // of going through `spawn_inprocess_daemon` (which arms it for the others),
+    // so the real OpenCode worker below inherits the wrapped-child lifetime
+    // bound like every other registry-driven spawn in the suite.
+    common::init_test_env();
+
     let registry = Arc::new(AgentPtyRegistry::new());
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd
@@ -305,12 +312,15 @@ async fn opencode_auto_submits_daemon_injected_prompt() {
     // sibling Claude arm pins its own socket for the same reason, and a test
     // that spawns a real agent should never depend on ambient environment.
     let dead_hook_socket = cwd.path().join("no-listener.sock");
+    // OpenCode model ids are provider-qualified (`provider/model`); a bare
+    // `gpt-4o-mini` is rejected as "Invalid model format". A small model is
+    // plenty for a one-line arithmetic reply. Shared with the other real-agent
+    // OpenCode test through `common::opencode_test_model` so both move together
+    // and both honour `DOT_AGENT_DECK_OPENCODE_TEST_MODEL`.
+    let worker_command = format!("opencode --model {}", common::opencode_test_model());
     let worker_agent_id = registry
         .spawn_agent(SpawnOptions {
-            // OpenCode model ids are provider-qualified (`provider/model`); a
-            // bare `gpt-4o-mini` is rejected as "Invalid model format". A small
-            // model is plenty for a one-line arithmetic reply.
-            command: Some("opencode --model openrouter/openai/gpt-4o-mini"),
+            command: Some(worker_command.as_str()),
             cwd: Some(cwd_str.as_str()),
             rows: 40,
             cols: 120,
@@ -355,4 +365,116 @@ async fn opencode_auto_submits_daemon_injected_prompt() {
     );
 
     registry.shutdown_all();
+}
+
+/// Scenario: With the built deck binary's own directory prepended to this
+/// process's `$PATH` — the deck's normal on-`PATH` install shape — delegate a
+/// trivial task to a `cat`-stub worker under the in-process daemon (no real
+/// agent needed; only the generated file matters here) and read the written
+/// `.dot-agent-deck/worker-task-coder.md`. Assert its `work-done` instruction
+/// names the BARE binary (`dot-agent-deck work-done --task-file …`), not the
+/// quoted absolute-path fallback that every other `binary_name()`-adjacent
+/// test in this repo exercises (`orchestration/delegate/016`/`017` and the
+/// `delegate_prompt_injection` integration test all run with their own
+/// throwaway test binary, which is never on `$PATH` either way; `/018`/`/019`
+/// inject a synthetic resolver rather than a real `$PATH` lookup). This is
+/// PR #520's entire motivating scenario — a normal on-`PATH` install — and
+/// nothing exercised it against a real `current_exe()` on a real `$PATH`
+/// until `spawn_inprocess_daemon`'s test-current-exe override made an
+/// in-process daemon name the real built deck binary instead of this test's
+/// own libtest binary.
+#[spec("orchestration/delegate/020")]
+#[test]
+fn delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path() {
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let bin_dir = Path::new(bin)
+        .parent()
+        .expect("test binary has a parent dir")
+        .to_str()
+        .expect("bin dir is UTF-8");
+    let path_with_bin_dir = format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default());
+    // SAFETY: set here, at the very top of the sync test entry point — BEFORE
+    // the tokio runtime (and therefore any daemon worker thread) is created
+    // below — so no concurrent `getenv` can race this `setenv`. nextest runs
+    // each test in its own process, so this never leaks to another test (same
+    // reasoning as `chain_smoke_pi_002`'s `DOT_AGENT_DECK_SEED_FALLBACK_SECS`).
+    unsafe {
+        std::env::set_var("PATH", &path_with_bin_dir);
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path_inner());
+}
+
+async fn delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_str().expect("cwd is UTF-8").to_string();
+
+    let _worker_agent_id = daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(cwd_str.as_str()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn worker stub");
+
+    {
+        let mut st = daemon.state.write().await;
+        st.pane_role_map
+            .insert(ORCH_PANE.to_string(), "orchestrator".to_string());
+        st.pane_role_map
+            .insert(WORKER_PANE.to_string(), WORKER_ROLE.to_string());
+        st.orchestrator_pane_ids.insert(ORCH_PANE.to_string());
+        let orch = dot_agent_deck::state::OrchestrationIdentity::NameCwd {
+            name: "test-orchestration".to_string(),
+            cwd: cwd_str.clone(),
+        };
+        st.pane_orchestration_map
+            .insert(ORCH_PANE.to_string(), orch.clone());
+        st.pane_orchestration_map
+            .insert(WORKER_PANE.to_string(), orch);
+        st.pane_cwd_map
+            .insert(WORKER_PANE.to_string(), cwd_str.clone());
+    }
+
+    let signal = DelegateSignal {
+        pane_id: ORCH_PANE.to_string(),
+        task: "List the files in the current directory.".to_string(),
+        to: vec![WORKER_ROLE.to_string()],
+        timestamp: chrono::Utc::now(),
+    };
+    daemon
+        .state
+        .read()
+        .await
+        .handle_delegate(signal, &daemon.registry, &daemon.event_tx)
+        .await;
+
+    let task_file = cwd
+        .path()
+        .join(".dot-agent-deck")
+        .join("worker-task-coder.md");
+    let ok = common::wait_for_path_async(&task_file, Duration::from_secs(5)).await;
+    assert!(ok, "worker task file was never written at {task_file:?}");
+    let body = std::fs::read_to_string(&task_file).expect("read worker task file");
+
+    assert!(
+        body.contains("dot-agent-deck work-done --task-file"),
+        "expected the bare binary name in the work-done instruction now that the \
+         deck's own directory is on $PATH; got: {body}"
+    );
+    assert!(
+        !body.contains(env!("CARGO_BIN_EXE_dot-agent-deck")),
+        "the absolute-path fallback must not have fired once the deck's own \
+         directory is on $PATH; got: {body}"
+    );
+
+    daemon.registry.shutdown_all();
 }

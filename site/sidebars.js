@@ -12,6 +12,7 @@ const sidebars = {
       items: ['idle-workers-and-notifications'],
     },
     'workspace-modes',
+    'dispatcher-mode',
     'scheduled-tasks',
     'configuration',
     {

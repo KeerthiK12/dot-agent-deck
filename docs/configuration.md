@@ -27,6 +27,7 @@ When `default_command` is **unset or empty**, the new-pane form's Command field 
 | `DOT_AGENT_DECK_CONFIG` | `~/.config/dot-agent-deck/config.toml` | Config file path |
 | `DOT_AGENT_DECK_SESSION` | `~/.config/dot-agent-deck/session.toml` | Session file path |
 | `DOT_AGENT_DECK_LOG` | *(unset)* | When set, enables file-based tracing logs. Empty value or `1` writes to `/tmp/dot-agent-deck.log`; any other value is treated as the target log file path. |
+| `RUST_LOG` | `error,dot_agent_deck=info` | Verbosity of the `DOT_AGENT_DECK_LOG` file, in [`tracing` filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). Layered on top of the default, so `RUST_LOG=dot_agent_deck=debug` raises the deck to debug while an unrelated directive leaves it at `info`. No effect unless `DOT_AGENT_DECK_LOG` is also set. |
 
 ## Project Configuration
 
@@ -51,11 +52,31 @@ watch = false
 
 | Block | Key Fields |
 |---|---|
-| `[[modes]]` | `name` (required), `init_command` (optional), `panes`, `rules`, `reactive_panes` (default: 2) |
+| `[[modes]]` | `name` (required), `agent` (optional), `init_command` (optional), `panes`, `rules`, `reactive_panes` (default: 2) |
 | `[[modes.panes]]` | `command` (required), `name` (optional label), `watch` (default: true) |
 | `[[modes.rules]]` | `pattern` (regex, required), `watch` (bool), `interval` (seconds) |
+| `[[orchestrations]]` | `name` (optional), `default` (bool, default: false), `extends` (optional), `roles` |
 
-For the full reference and more examples, see [Workspace Modes](workspace-modes.md).
+For the full reference and more examples, see [Workspace Modes](workspace-modes.md). Orchestrations live in the same file under `[[orchestrations]]`; see [Orchestration](orchestration.md#configuration-reference). `default` and `extends` only matter to a project that defines **several** orchestrations, and are explained under [More than one orchestration](orchestration.md#more-than-one-orchestration).
+
+### Naming the agent a command launches
+
+The deck identifies which agent a pane runs by reading the first word of its command, so `claude`, `codex`, `opencode --model gpt-4o` and `/usr/local/bin/pi` all resolve by themselves. A command that starts the agent through something else does not — `devbox run -- codex`, `mise exec -- codex`, `nix develop -c codex`, `make codex`, `./run-codex.sh` — because nothing about a launcher reveals what it will end up starting. Such a pane shows **No agent** and gets no status tracking, and for Codex it stays that way until you give it its first task.
+
+The optional `agent` key says what the command cannot. It takes one of `claude`, `opencode`, `pi`, `codex`, `devin`, and it goes on the block that owns the command:
+
+```toml
+[[modes]]
+name = "review"
+agent = "codex"          # this mode's agent pane runs Codex
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run -- codex --sandbox workspace-write"
+agent = "codex"          # …and so does this role
+```
+
+An unrecognised name resolves to no agent rather than to a guess, and `dot-agent-deck validate` warns about it by name. Omitting the key leaves behaviour exactly as before, so no existing config needs to change. Full details in [Orchestration](orchestration.md#declaring-the-agent-behind-a-launcher-command) and [Workspace Modes](workspace-modes.md#declaring-the-agent-behind-a-launcher-command).
 
 ### Top-Level Keys
 
@@ -68,42 +89,3 @@ These belong to no block, which makes their placement load-bearing: TOML assigns
 ### Scaffolding
 
 Run `dot-agent-deck init` inside a project directory to generate a starter `.dot-agent-deck.toml`.
-
-## Idle ASCII Art
-
-When a session has been idle long enough, the dashboard can generate a short, context-aware ASCII art animation on the card using a lightweight LLM call. The feature is opt-in and disabled by default.
-
-### Enabling
-
-```bash
-dot-agent-deck config set idle_art.enabled true
-```
-
-Set the API key for your chosen provider as an environment variable:
-
-```bash
-export ANTHROPIC_API_KEY=sk-...   # for Anthropic (default)
-export OPENAI_API_KEY=sk-...      # for OpenAI
-# Ollama requires no API key
-```
-
-### Options
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `idle_art.enabled` | `false` | Enable idle ASCII art on dashboard cards |
-| `idle_art.provider` | `anthropic` | LLM provider: `anthropic`, `openai`, or `ollama` |
-| `idle_art.model` | `claude-haiku-4-5` | LLM model to use for generation |
-| `idle_art.timeout_secs` | `300` | Seconds a session must be idle before art is triggered |
-
-> **Note:** Idle art only appears in **Spacious** card density. Normal and Compact densities show the standard flashing-dot indicator instead.
-
-### Standalone CLI
-
-You can generate ASCII art outside the dashboard with the `ascii` subcommand:
-
-```bash
-dot-agent-deck ascii --input "debug the login flow" --output "fixed auth token refresh"
-```
-
-Optional `--provider` and `--model` flags override the configured defaults. The CLI works regardless of the `idle_art.enabled` setting.

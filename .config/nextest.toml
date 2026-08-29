@@ -1,10 +1,42 @@
+# ONE profile lives here, `default`, and BOTH `cargo test-fast` and
+# `cargo test-e2e` (aliases in `.cargo/config.toml`) run under it. On
+# `cargo test-e2e`, `--features e2e` selects the CARGO FEATURE named `e2e`;
+# it has nothing to do with a nextest PROFILE of the same name. A nextest
+# profile takes effect only when something passes `-P <name>` /
+# `--profile <name>`, and nothing in this repo does — not the aliases, not
+# `.github/workflows/`. If that ever needs re-deriving: nextest's store
+# directory is `target/nextest/<profile>/`, and a `cargo test-e2e` run
+# creates `target/nextest/default/`, not `target/nextest/e2e/`.
+#
+# Issue #494: a `[profile.e2e]` used to sit at the bottom of this file with
+# its own `120s x 2` window and four `[[profile.e2e.overrides]]`, and nothing
+# ever selected it, so every line of it was dead — a contributor who added a
+# carve-out there believed a long test was protected from the default kill
+# and it was not. Deleted rather than wired up, because wiring it up was the
+# option that would have changed real behaviour: its four overrides were
+# value-identical duplicates of `[[profile.default.overrides]]` entries below,
+# so nothing unique was lost, while selecting it would have MOVED the three
+# carve-outs that had no `e2e` counterpart (`route_001`, `new_pane_016`,
+# `orchestration_dispatch_002`) down from their widened windows to that
+# profile's 240s. So: put every timeout carve-out under `[profile.default]`,
+# and do not add a second profile without also adding the `-P` that selects it.
+
 [profile.default]
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 3 }
 fail-fast = false
 
+# Issue #564: `path` is resolved RELATIVE TO the profile's store directory
+# (`target/nextest/<profile>/`), so the previous value of
+# "target/nextest/default/junit.xml" actually wrote
+# `target/nextest/default/target/nextest/default/junit.xml`. Nothing read the
+# file, so the doubling went unnoticed — and that is the point: this is the one
+# structured, per-test, machine-readable record of a run (per-test durations and
+# the full failure message), and CI now uploads it per run_attempt so that a
+# job-level re-run cannot erase a failing attempt's evidence the way it erased
+# the first `socket_004` occurrence.
 [profile.default.junit]
-path = "target/nextest/default/junit.xml"
+path = "junit.xml"
 
 # PRD #140 M5.1: `orchestration/route/001` boots SIX interactive Haiku panes
 # across two orchestration tabs and drives two concurrent
@@ -16,6 +48,38 @@ path = "target/nextest/default/junit.xml"
 [[profile.default.overrides]]
 filter = 'test(route_001_two_tabs_same_cwd_do_not_cross_deliver)'
 slow-timeout = { period = "60s", terminate-after = 8 }
+
+# PRD #220: `prompt/new-pane/016` drives a REAL interactive agent through a
+# dispatch turn, then waits for the daemon's `git worktree add` to land on disk.
+# An agent that answers instead of acting is re-nudged on a 70s cadence (up to 3
+# rounds), so the honest wall clock can approach 210s plus deck launch — past the
+# default 3 x 60s kill window. Being killed there costs the assertion's grid dump,
+# which is the only way to tell "agent never called dispatch" apart from "dispatch
+# ran and failed" (same reasoning as route_001 above). Scoped by name; still
+# bounded, so a wedged agent cannot run forever.
+#
+# The filter tracks the TEST FUNCTION name, not the `#[spec]` id, so it must be
+# updated in lockstep with any rename — a stale filter matches nothing and
+# silently drops this test back to the 3 x 60s default, killing it mid-wait.
+[[profile.default.overrides]]
+filter = 'test(new_pane_016_dispatcher_opens_dashboard_card_with_real_agent)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# PRD #220: `orchestration/dispatch/002` dispatches an orchestration whose THREE
+# roles are all real interactive Haiku agents, then waits for every one of them to
+# reach live-agent state in the freshly created worktree. Three concurrent claude
+# cold boots in a fresh checkout is the honest cost, and the wait is budgeted at
+# 240s so a slow boot cannot read as a broken one — past the default 3 x 60s kill
+# window. Being killed there costs the per-role diagnostics (which role has no
+# pane, which has a pane but no agent, and the tail of what its PTY printed),
+# which is the entire diagnostic value of the test. Scoped by name; still bounded.
+#
+# The filter tracks the TEST FUNCTION name, not the `#[spec]` id, so it must be
+# updated in lockstep with any rename — a stale filter matches nothing and
+# silently drops this test back to the 3 x 60s default, killing it mid-wait.
+[[profile.default.overrides]]
+filter = 'test(orchestration_dispatch_002_every_real_agent_role_comes_alive)'
+slow-timeout = { period = "60s", terminate-after = 7 }
 
 # Issue #250: `lifecycle/version/001` is the only test that has to `cargo build`
 # the binary itself (with DAD_VERSION / DAD_BUILD_ID pre-set in the build env),
@@ -48,21 +112,113 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 filter = 'test(devin_live_001_real_interactive_turn_drives_the_card_live)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
-[profile.e2e]
-slow-timeout = { period = "120s", terminate-after = 2 }
+# PRD #386, PR #390 maintainer review (Finding 4): `status/shell-activity/006`
+# reproduces a real Claude Bash call crossing Claude Code's 120s default
+# tool-call cap, so its own declared waits already budget far past the
+# default kill window: the prompt-ready wait is 120s, the ToolStart wait is
+# 120s, and the Idle wait is 127s measured + 30s margin — up to 397s, more
+# than 2x the default 3 x 60s = 180s kill. Measured dying mid-wait in a
+# full-tier `cargo test-e2e` run even though it finishes in 129.3s standalone
+# on a quiet machine — the margin the declared waits carry is exactly what a
+# contended run uses. Being killed there costs the PRECONDITION-NOT-MET vs
+# BADGE-WRONG diagnostic distinction the test is built around (same reasoning
+# as the overrides above). Scoped by name; still bounded, so a wedged agent
+# cannot run forever.
+#
+# The filter tracks the TEST FUNCTION name, not the `#[spec]` id, so it must
+# be updated in lockstep with any rename — a stale filter matches nothing and
+# silently drops this test back to the 3 x 60s default, killing it mid-wait.
+[[profile.default.overrides]]
+filter = 'test(shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_working)'
+slow-timeout = { period = "60s", terminate-after = 8 }
 
-# Same carve-out under the `e2e` profile (see the note below on why the default
-# profile's override list is not inherited).
-[[profile.e2e.overrides]]
-filter = 'test(devin_live_001_real_interactive_turn_drives_the_card_live)'
+# PRD #386, PR #390 maintainer review (Finding 4, "worth considering for 005
+# too"): `status/shell-activity/005` stacks two 120s gating waits back to
+# back — the prompt-ready wait and the ToolStart wait — ahead of a 15s
+# ShellBusy wait, the 30s startup wait added for Finding 6, and a 30s soft
+# sentinel-echo wait, for a declared budget of up to 315s
+# (30 + 120 + 120 + 15 + 30), past the default 3 x 60s = 180s kill window on
+# its own — the 120s + 120s pair alone already clears it. Its happy path is
+# ~20-26s, so this only bites under contention or a slow boot, but it is the
+# same shape as 006's problem above. Scoped by name; still bounded, so a
+# wedged agent cannot run forever.
+#
+# The filter tracks the TEST FUNCTION name, not the `#[spec]` id, so it must
+# be updated in lockstep with any rename — a stale filter matches nothing and
+# silently drops this test back to the 3 x 60s default, killing it mid-wait.
+[[profile.default.overrides]]
+filter = 'test(shell_activity_005_real_claude_bash_child_trips_the_descendant_scan)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
-# Same carve-out under the `e2e` profile, for runs that select it explicitly
-# (`cargo test-e2e` uses the default profile; `-P e2e` does not inherit the
-# override list above).
-[[profile.e2e.overrides]]
-filter = 'test(version_001_injected_build_env_reaches_the_binary)'
-slow-timeout = { period = "120s", terminate-after = 10 }
+# Issue #664: `scheduler/dispatch/015` boots THREE real interactive Haiku
+# panes at once and needs each of them to confirm its seed prompt inside a
+# deadline it does NOT control. `AUTOMATIC_PROMPT_DEADLINE` in
+# `src/prompt_delivery.rs` is 60 s, absolute, and captured in `spawn::deliver`
+# BEFORE the readiness wait; on expiry `abandon_spawn_prompt` publishes a
+# delivery notice that turns the card `Error` and stops retrying FOREVER. That
+# is production behaviour the test exercises, not a test budget — which is why
+# widening `slow-timeout` alone could never have fixed this one: the test's own
+# wait is already 150 s, 2.5x the production window, and nothing confirms a
+# delivery that has already been abandoned.
+#
+# Measured on `main` (`e8c443a`): green alone at 32.2 s, red in a full
+# `cargo test-e2e` at 174.1 s with two of the three panes `Error` and their
+# deliveries abandoned. The substantive fix is in the test itself — it was
+# spending half of every 60 s budget on a readiness gate this scenario cannot
+# satisfy; see the `DOT_AGENT_DECK_SESSION_START_WAIT_MS` comment in
+# `tests/e2e_prompt_delivery_confirmation.rs`. What remains here is the
+# concurrency bound the issue asks for, because three real cold boots against a
+# fixed 60 s window are only as fast as the machine underneath them.
+#
+# `threads-required` reserves the whole pool, so nothing else in the tier runs
+# alongside — the mechanism #415 and #502 both name for the PTY-contending
+# suites, applied to one test rather than to the tier. `priority` is
+# load-bearing with it rather than decoration: reached mid-run, an exclusive
+# test makes nextest DRAIN every running test before it can take the pool, and
+# this tier's tail holds 250-320 s tests, so it is scheduled first instead and
+# the reservation costs only its own runtime. Staging the three
+# seeds sequentially was the alternative and was rejected: "three concurrent
+# real dispatches" is the property under test and the field report it
+# reproduces.
+#
+# Issue #666 restaged the launcher: it now swallows BOTH payload attempts
+# rather than one, so each pane's delivery runs one further backoff step before
+# the agent-start rearm authorises the payload that finally lands. The
+# reservation's cost went from the ~6.5 s recorded here under #664 to ~10 s
+# measured on this branch — still a run-start slot rather than a drain of the
+# tier's tail, so nothing above changes. Do not read the old figure as a
+# regression budget: it described a one-swallow fixture that no longer exists.
+#
+# `retries = 1` covers what `threads-required` structurally CANNOT: load that
+# is not the tier's. Measured — with the reservation in place and NOTHING else
+# in the tier running, the test still failed once, because sibling agent
+# worktrees on the same box were mid-`rustc` and the 15-minute load average was
+# 58 on 16 cores. Two attempts is a bounded concession to that, not a
+# rerun-until-green: a genuine regression in the retry path fails BOTH, and
+# nextest reports a recovered run as FLAKY, so a machine that starts needing
+# the second attempt stays visible rather than silently absorbed. This test is
+# already in the flaky-tolerant pre-PR real-agent tier (CLAUDE.md rule 4) and
+# runs in no CI job.
+#
+# `slow-timeout` is widened for the usual reason (see the overrides above) and
+# NOT as a deadline extension — the test's 150 s assertion budget is untouched.
+# It is here because the FAILING path measured 174.1 s against the 3 x 60 s
+# default kill, a 6 s margin, and being killed there costs the per-pane
+# diagnostics that are the whole reason any of the above is known.
+#
+# The filter tracks the TEST FUNCTION name, not the `#[spec]` id, so it must
+# be updated in lockstep with any rename — a stale filter matches nothing and
+# silently drops this test back into the contended pool. A MISSPELLED SETTING
+# degrades the same way: nextest only WARNS on an unrecognised key
+# (`ignoring unknown configuration key: profile.default.overrides.N.<key>`)
+# and carries on, so read that line's absence as the confirmation that
+# `threads-required`, `priority` and `retries` were honoured.
+[[profile.default.overrides]]
+filter = 'test(dispatch_015_three_real_claude_seeds_are_genuinely_confirmed)'
+threads-required = "num-test-threads"
+priority = 50
+retries = 1
+slow-timeout = { period = "60s", terminate-after = 4 }
 
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see

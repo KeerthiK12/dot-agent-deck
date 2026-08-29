@@ -1,6 +1,6 @@
 # dot-agent-deck
 
-A terminal dashboard for monitoring and controlling multiple AI coding agent sessions — with optional AI-generated ASCII art for idle sessions.
+A terminal dashboard for monitoring and controlling multiple AI coding agent sessions.
 
 [![CI](https://github.com/vfarcic/dot-agent-deck/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/vfarcic/dot-agent-deck/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/vfarcic/dot-agent-deck)](https://github.com/vfarcic/dot-agent-deck/releases/latest)
@@ -12,6 +12,18 @@ A terminal dashboard for monitoring and controlling multiple AI coding agent ses
 brew tap vfarcic/tap && brew install dot-agent-deck
 dot-agent-deck hooks install
 dot-agent-deck
+```
+
+With Nix, run it without installing anything:
+
+```bash
+nix run github:vfarcic/dot-agent-deck
+```
+
+Or add it to a flake, for home-manager and NixOS users:
+
+```nix
+inputs.dot-agent-deck.url = "github:vfarcic/dot-agent-deck";
 ```
 
 ## Documentation

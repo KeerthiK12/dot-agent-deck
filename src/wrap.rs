@@ -44,7 +44,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Command as StdCommand, ExitCode, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,13 @@ use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
     AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, EventType, LiveTarget,
     SESSION_START_ORIGIN_METADATA_KEY, TargetKind, WRAPPER_FORK_SESSION_START_ORIGIN, Writable,
+};
+// Issue #243: the interface-origin values are named only by `InterfaceFact`,
+// which reads the inner pty's termios and so exists only where `run_wrap_pty`
+// does. Importing them ungated would be an unused import on Windows.
+#[cfg(unix)]
+use crate::event::{
+    WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN, WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN,
 };
 
 /// A coarse activity state detected from a single line of wrapped output.
@@ -292,8 +299,66 @@ impl Emitter {
         self.emit_with_metadata(EventType::SessionStart, metadata);
     }
 
+    /// Issue #243: the INTERFACE-READY `SessionStart` this wrapper emits once it
+    /// has observed the wrapped child's interface come up — the pre-prompt
+    /// readiness signal a delegate/scheduler gate can actually wait for.
+    ///
+    /// Distinct from BOTH the events that existed before it. It is not
+    /// [`Self::emit_fork_session_start`], which fires at `cmd.spawn()` when the
+    /// child is typically still a launcher; and it is not the agent's own native
+    /// `SessionStart`, which for codex-cli fires when the first TURN starts — a
+    /// consequence of the very prompt the gate is withholding, which is why the
+    /// gate never fast-pathed and every Codex delegate cost ~31 s.
+    ///
+    /// It carries the origin value of the FACT that fired
+    /// ([`InterfaceFact::origin`]) rather than arriving unmarked, so a consumer
+    /// can tell "the deck WATCHED this interface come up" from "an agent session
+    /// announced itself" — and, since issue #243's review, can also tell the
+    /// strong observation (raw input mode) from the weak guess (output settled)
+    /// and price them differently. This event carries the WRAPPER's session id,
+    /// not the agent's, so it must never bind a conversation. See
+    /// [`crate::event::AgentEvent::is_wrapper_session_start`].
+    ///
+    /// **Sent off the supervisory loop** (issue #243 audit F3). Every other
+    /// `Emitter` call site is a tee thread; this one is the wrapper's 50 ms main
+    /// loop, the loop that forwards the user's `Ctrl+C`/SIGTERM to the child
+    /// group, and [`crate::hook::send_to_socket`] is a blocking connect + write
+    /// with no timeout. A wedged, SIGSTOPped or backlogged daemon would stall
+    /// signal forwarding. The per-fact latches bound this to at most TWO threads
+    /// per wrapped session — one for the settle guess, one for the raw-mode
+    /// observation that may upgrade it — and the send is bounded so neither can
+    /// linger either.
+    ///
+    /// `#[cfg(unix)]` because [`InterfaceFact`] is: the watch reads a pty's
+    /// termios, and only `run_wrap_pty` — itself Unix-only — has one.
+    #[cfg(unix)]
+    fn emit_interface_ready(&self, fact: InterfaceFact) {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            fact.origin().to_string(),
+        );
+        let Ok(json) = serde_json::to_string(&self.build_event(EventType::SessionStart, metadata))
+        else {
+            return;
+        };
+        std::thread::spawn(move || {
+            crate::hook::send_to_socket_bounded(&json, INTERFACE_READY_SEND_TIMEOUT);
+        });
+    }
+
     fn emit_with_metadata(&self, event_type: EventType, metadata: HashMap<String, String>) {
-        let event = AgentEvent {
+        let event = self.build_event(event_type, metadata);
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = crate::hook::send_to_socket(&json);
+        }
+    }
+
+    /// Issue #243 audit F3: build the [`AgentEvent`] without sending it, so a
+    /// caller that must not block on the daemon can do the (cheap, pure) build on
+    /// its own thread and hand only the serialized line to a sender.
+    fn build_event(&self, event_type: EventType, metadata: HashMap<String, String>) -> AgentEvent {
+        AgentEvent {
             session_id: self.session_id.clone(),
             agent_type: self.agent_type.clone(),
             event_type,
@@ -311,9 +376,6 @@ impl Emitter {
             // PRD #20 M3: a wrapped session is history-only from the dashboard's
             // perspective (see `Emitter::live_target`).
             live_target: Some(self.live_target),
-        };
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = crate::hook::send_to_socket(&json);
         }
     }
 }
@@ -512,16 +574,20 @@ fn is_wrap_invocation(command: &str) -> bool {
 
 /// Resolve the agent identity emitted events should carry.
 ///
-/// An explicit `--agent` override wins and is resolved through the registry, so
-/// a name the registry doesn't know yet becomes the neutral
-/// [`AgentType::None`] rather than a guess. Otherwise the type is inferred from
-/// the wrapped binary exactly like the TUI spawn sites
-/// ([`AgentType::from_command`]). Either way, with Codex in the registry (M7),
+/// An explicit `--agent` override wins and is resolved through
+/// [`crate::agent_registry::resolve_declared_agent`], so a name the registry
+/// doesn't know yet becomes the neutral [`AgentType::None`] rather than a
+/// guess. That is the SAME function the `agent = "…"` config key resolves
+/// through (issue #308), so the two declaration surfaces cannot drift.
+/// Otherwise the type is inferred from the wrapped binary exactly like the TUI
+/// spawn sites ([`AgentType::from_command`]).
+///
+/// Either way, with Codex in the registry (M7),
 /// `wrap -- codex` (or `--agent codex`) resolves to it and [`ruleset_for`]
 /// selects the [`CODEX`] rules — with no change here.
 fn resolve_agent_type(agent_override: Option<&str>, program: &str) -> AgentType {
     if let Some(name) = agent_override {
-        return crate::agent_registry::detect_from_basename(name).unwrap_or(AgentType::None);
+        return crate::agent_registry::resolve_declared_agent(name);
     }
     AgentType::from_command(Some(program)).unwrap_or(AgentType::None)
 }
@@ -757,12 +823,22 @@ fn arm_wrap_self_defense() {
     let max_lifetime = std::env::var(DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS)
         .ok()
         .and_then(|v| parse_max_lifetime_secs(&v));
-    if !exit_when_orphaned && max_lifetime.is_none() {
+    // `checked_add`, not `+`: `parse_max_lifetime_secs` accepts every positive
+    // `u64`, and `Instant + Duration` PANICS on overflow — so an exported
+    // `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS=18446744073709551615` would abort
+    // the wrapper at startup rather than bound it. An unrepresentable deadline
+    // is one nothing can reach, so it degrades to "no cap", which is what the
+    // absurd value asked for; the guard below then declines to arm a thread
+    // with nothing left to watch instead of leaking one that spins forever.
+    // The harness clamps to 300 s (`tests/common/child_lifetime_bound.rs`)
+    // before this is ever read — this is the path for a value that did not come
+    // from the harness.
+    let deadline = max_lifetime.and_then(|d| Instant::now().checked_add(d));
+    if !exit_when_orphaned && deadline.is_none() {
         return;
     }
 
     let original_ppid = crate::platform::proc::current_ppid();
-    let deadline = max_lifetime.map(|d| Instant::now() + d);
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(1));
@@ -775,6 +851,362 @@ fn arm_wrap_self_defense() {
             }
         }
     });
+}
+
+/// Poll cadence of the forked child-group backstop below.
+///
+/// Also the width of its pid-reuse window, and the honest framing of that is a
+/// **bounded same-UID residual, not an impossibility**. The reaper signals ONLY
+/// at its deadline and only after re-checking that the group is still there, so
+/// for it to reach an unrelated group the original would have to die and the
+/// kernel hand the same number back out inside one tick. At 250 ms that needs
+/// the whole pid space to wrap in a quarter of a second — >130k forks/second
+/// even on a host pinned to the 32768 default, and correspondingly less on a
+/// small pid namespace, which is the case this estimate does not generalise to.
+/// It is a narrow window rather than a closed one: a revalidated numeric PGID
+/// carries no identity, so nothing here can *prove* the group it signals is the
+/// one it armed on. Unix permission checks still rule out signalling another
+/// user; what remains possible is same-UID self-harm inside that window. A
+/// strict guarantee would need an OS-owned containment mechanism that names the
+/// processes rather than a number — a dedicated cgroup or equivalent — which is
+/// a larger change than this backstop. See also `docs/develop/e2e-temp-dirs.md`
+/// on why this codebase refuses to *infer* pid reuse; this bounds the window
+/// instead of guessing at it.
+#[cfg(unix)]
+const CHILD_GROUP_BACKSTOP_POLL: Duration = Duration::from_millis(250);
+
+/// Floor for the forked reaper's fallback close loop: never scan fewer
+/// descriptors than this, whatever `RLIMIT_NOFILE` says. A wrapper holds well
+/// under a dozen (the inner PTY master, the redirected-descriptor pipes, the std
+/// fds), so 1024 covers every one it opened itself; `close(2)` on an
+/// already-closed descriptor is a harmless `EBADF`.
+///
+/// This USED to be the whole story, and it was not enough. Descriptor *count*
+/// does not bound descriptor *number*: a caller can enter `wrap` holding a
+/// non-`CLOEXEC` descriptor above 1023, and once enough low numbers are taken
+/// `openpty` will hand back the inner master up there too. The reaper never
+/// `exec`s, so `FD_CLOEXEC` does nothing for it — anything it keeps open, it
+/// keeps until the cap, which for a retained inner master means postponing the
+/// very hangup this backstop exists to guarantee. Measured on the dev box this
+/// was found on: `RLIMIT_NOFILE` soft is **524288**, i.e. 512x this floor.
+#[cfg(unix)]
+const CHILD_GROUP_BACKSTOP_MIN_FD: libc::c_int = 1024;
+
+/// Ceiling for that same fallback loop, so a container's enormous
+/// `RLIMIT_NOFILE` cannot turn it into a stall.
+///
+/// The loop is one `close(2)` per number and its cost is linear; measured on the
+/// dev box, in a release build: 1024 calls take **0.41 ms**, 65 536 take
+/// **28.8 ms**, and 1 048 576 take **416 ms**. A soft limit of 1 073 741 816 is
+/// an ordinary container setting, so the unclamped loop is minutes of syscalls
+/// in a process whose whole job is to poll every 250 ms. 65 536 keeps the worst
+/// case inside a single poll tick, is paid once per reaper, and still covers
+/// 64x more descriptor space than the old fixed bound.
+///
+/// On Linux none of this runs: `close_range(2)` closes the entire table in one
+/// syscall (measured at **1.4 µs** for `close_range(900, UINT_MAX)`), and the
+/// loop is only reached if that syscall is unavailable — a pre-5.9 kernel, a
+/// seccomp policy that denies it — or the platform is not Linux at all.
+#[cfg(unix)]
+const CHILD_GROUP_BACKSTOP_MAX_FD: libc::c_int = 65_536;
+
+/// How far the forked reaper's fallback close loop should count, read BEFORE the
+/// `fork` so the post-fork path stays async-signal-safe.
+///
+/// `getrlimit` is not on POSIX's async-signal-safe list, and neither is
+/// `sysconf(_SC_OPEN_MAX)`; that is exactly why the old code used a hard-coded
+/// number instead of asking. Asking here and passing the answer down as a plain
+/// integer keeps the child arm to `close`/`syscall` and gets a real bound.
+/// Clamped into [`CHILD_GROUP_BACKSTOP_MIN_FD`]..=[`CHILD_GROUP_BACKSTOP_MAX_FD`]
+/// so neither a tiny limit nor `RLIM_INFINITY` can make it useless or endless.
+#[cfg(unix)]
+fn child_group_backstop_close_ceiling() -> libc::c_int {
+    // SAFETY: `getrlimit` fills the `rlimit` it is handed and touches nothing
+    // else. A failure leaves the zeroed value, which the clamp lifts to the
+    // floor — the old behaviour.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        limit.rlim_cur
+    } else {
+        0
+    };
+    let soft = libc::c_int::try_from(soft).unwrap_or(libc::c_int::MAX);
+    soft.clamp(CHILD_GROUP_BACKSTOP_MIN_FD, CHILD_GROUP_BACKSTOP_MAX_FD)
+}
+
+/// Issue #657: a test-only hard bound on the WRAPPED CHILD's process group that
+/// deliberately does NOT depend on this wrapper staying alive.
+///
+/// [`arm_wrap_self_defense`] bounds the *wrapper*. The child is bounded only
+/// transitively — by a reap loop calling [`kill_pid_group`], which requires the
+/// wrapper to still be running to call it. Every path that ends a wrapper
+/// *without* letting it reap therefore strands the child: an uncatchable
+/// `SIGKILL` (the deck's own escalation past
+/// [`crate::agent_pty::AGENT_TERMINATE_GRACE`], a
+/// registry `force_kill_and_wait`, an OOM kill, a nextest timeout) is not
+/// something [`SignalGuard`] can convert into a tidy teardown. And the child is
+/// [`child_pre_exec`]'d into its own session, so once the wrapper is gone
+/// *nothing above it can signal that group at all* — not the daemon, not the
+/// deck, not the test harness's `killpg` of its own group.
+///
+/// Measured on 2026-08-23: four such Codex children alive at 21–29 minutes with
+/// `ppid=1` and `pgrp == sid == own pid`, and historically one at 8 days, with
+/// 385 directories / 14.2 GB accrued behind them. Note what an orphan does and
+/// does not do to those roots: `cargo xtask clean-e2e-tmp` reads ownership off
+/// the **test process's** pid in the root's NAME, not off the orphan, so a root
+/// whose owning test is dead is `dead-pid` and reapable once the 10-minute floor
+/// passes even with an orphan still sitting in a deleted directory under it.
+/// What the orphan costs instead is a persistent unkillable process, the deleted
+/// files' disk blocks retained for as long as it runs, a polluted `ps` for every
+/// later diagnosis, and the chance of it writing paths back under a root that
+/// was just removed.
+///
+/// So fork a reaper that outlives us. It:
+/// - `setsid`s out of the wrapper's process group FIRST — the deck tears a
+///   wrapper down with `killpg(wrapper_pgid, …)`, which would otherwise take the
+///   reaper down alongside the very wrapper whose death it exists to survive;
+/// - closes every inherited descriptor, so it cannot hold the inner PTY master
+///   or the child's stdin pipe open and suppress the EOF/`SIGHUP` that would
+///   otherwise end the child on its own;
+/// - polls the child's group and exits the moment it is gone — the normal case,
+///   within one [`CHILD_GROUP_BACKSTOP_POLL`] of any clean teardown;
+/// - and, if the group is still alive at the deadline, walks the same
+///   `SIGTERM` → [`crate::agent_pty::WRAP_TERMINATE_GRACE`] → `SIGKILL` path the
+///   reap loop walks.
+///
+/// It is itself bounded by deadline + grace and holds no descriptor, so it can
+/// never become the leak it exists to prevent.
+///
+/// **Telling a reaper apart from the leak it hunts.** It is a `fork` of this
+/// wrapper, so it keeps the wrapper's argv and shows up in `ps` looking like a
+/// second `dot-agent-deck wrap --agent … -- …` at `ppid=1`. Given #657 is partly
+/// a story about stale processes producing misleading evidence, the two
+/// discriminators are worth knowing, and both were measured on a live pair:
+/// a reaper has an **empty** `/proc/<pid>/fd` (it closed everything) where a real
+/// wrapper holds ~9, and its `pgid == sid != its own pid` (it inherited the
+/// intermediate's session) where a stranded wrapper or agent child has
+/// `pgid == sid == its own pid`.
+///
+/// Env-gated on `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` exactly like
+/// [`arm_wrap_self_defense`], and for the same reason: a production wrapper never
+/// sets it, forks nothing, and behaves precisely as before.
+///
+/// Deliberately NOT a substitute for the `setsid` in [`child_pre_exec`]: the
+/// wrapper needs the child in its own group so `killpg` targets the child and
+/// its descendants and nothing else. This adds a second, independent holder of
+/// that same kill rather than trading the grouping away.
+#[cfg(unix)]
+fn arm_child_group_backstop(child_pid: libc::pid_t) {
+    use crate::agent_pty::DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS;
+    use crate::daemon::parse_max_lifetime_secs;
+
+    if child_pid <= 0 {
+        return;
+    }
+    let Some(max_lifetime) = std::env::var(DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS)
+        .ok()
+        .and_then(|v| parse_max_lifetime_secs(&v))
+    else {
+        return;
+    };
+
+    // Read BEFORE the fork: `getrlimit` is not async-signal-safe, and the child
+    // arm below must be. It travels down as a plain integer.
+    let close_ceiling = child_group_backstop_close_ceiling();
+
+    // SAFETY: `fork` from a threaded process is defined as long as the child
+    // touches nothing but async-signal-safe libc calls before `_exit` — which is
+    // all either child arm below does. No allocation, no locks, no `tracing`, no
+    // Rust destructor runs on those paths.
+    let forked = unsafe { libc::fork() };
+    match forked {
+        -1 => {
+            // Non-fatal: the wrapper's own backstop is unaffected, and this net
+            // only exists under test. Say so rather than failing the launch.
+            tracing::warn!(
+                "could not fork the wrapped-child lifetime backstop; a SIGKILL'd \
+                 wrapper may strand its agent child"
+            );
+        }
+        // SAFETY (both child arms): see the note on the `fork` above.
+        0 => unsafe {
+            // Intermediate: escape the wrapper's group, then fork the reaper and
+            // exit at once so the reaper is reparented to init instead of
+            // lingering as a zombie under a wrapper that never waits for it.
+            libc::setsid();
+            if libc::fork() == 0 {
+                child_group_backstop_main(child_pid, max_lifetime, close_ceiling);
+            }
+            libc::_exit(0);
+        },
+        intermediate => {
+            // Reap the intermediate immediately; all it does is `setsid`, fork
+            // and `_exit`, so this cannot block, and targeting its pid cannot
+            // steal the wrapped child's status from the reap loop. `SignalGuard`
+            // is installed by now and deliberately does not set `SA_RESTART`, so
+            // a signal landing in this window would `EINTR` the wait and leave a
+            // zombie behind — retry rather than leak one.
+            let mut status: libc::c_int = 0;
+            loop {
+                // SAFETY: `intermediate` is this process's own child, just forked.
+                let reaped = unsafe { libc::waitpid(intermediate, &mut status, 0) };
+                if reaped >= 0
+                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Body of the forked reaper described on [`arm_child_group_backstop`]. Runs in
+/// a fresh single-threaded process and so restricts itself to async-signal-safe
+/// libc calls (`signal`, `close`, `clock_gettime`, `nanosleep`, `killpg`,
+/// `_exit`). Never returns.
+#[cfg(unix)]
+fn child_group_backstop_main(
+    child_pid: libc::pid_t,
+    max_lifetime: Duration,
+    close_ceiling: libc::c_int,
+) -> ! {
+    // SAFETY: every call here is async-signal-safe, as required after `fork` in
+    // a threaded process. `child_pid` is the wrapper's own child, `setsid`'d in
+    // its pre-exec, so it is also its group id.
+    unsafe {
+        // A forked copy inherits `SignalGuard`'s handlers, and a reaper that
+        // swallows SIGTERM is its own leak.
+        for signo in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            libc::signal(signo, libc::SIG_DFL);
+        }
+        close_all_descriptors(close_ceiling);
+
+        let deadline = monotonic_millis().saturating_add(millis_saturating(max_lifetime));
+        while monotonic_millis() < deadline {
+            if !pid_group_alive(child_pid) {
+                libc::_exit(0);
+            }
+            sleep_millis(millis_saturating(CHILD_GROUP_BACKSTOP_POLL));
+        }
+        if !pid_group_alive(child_pid) {
+            libc::_exit(0);
+        }
+        libc::killpg(child_pid, libc::SIGTERM);
+
+        let escalate = monotonic_millis()
+            .saturating_add(millis_saturating(crate::agent_pty::WRAP_TERMINATE_GRACE));
+        while monotonic_millis() < escalate {
+            if !pid_group_alive(child_pid) {
+                libc::_exit(0);
+            }
+            sleep_millis(50);
+        }
+        libc::killpg(child_pid, libc::SIGKILL);
+        libc::_exit(0);
+    }
+}
+
+/// Close every descriptor the forked reaper inherited, including 0/1/2.
+///
+/// The reaper must hold nothing: a retained inner PTY master would suppress the
+/// hangup that ends the child on its own, and a retained file or socket would
+/// keep a resource alive in a process the wrapper never waits for. It never
+/// `exec`s, so `FD_CLOEXEC` is no help to it — closing is the only lever.
+///
+/// Two strategies, in order. On Linux, `close_range(2)` closes the whole table
+/// in one syscall regardless of how high the numbers go; that is a single trap
+/// with no libc state behind it, so it is safe after `fork`. Everywhere else —
+/// and on a Linux too old for it (pre-5.9) or one whose seccomp policy denies it
+/// — fall back to a bounded `close` loop, counting to a ceiling
+/// [`child_group_backstop_close_ceiling`] read before the fork.
+///
+/// `close(2)` on an already-closed descriptor is a harmless `EBADF`, so the loop
+/// does not need to know which numbers are live. Both arms are
+/// async-signal-safe.
+///
+/// # Safety
+///
+/// Runs after `fork` in a threaded process, so the caller must not rely on any
+/// descriptor afterwards. Every call here is async-signal-safe.
+#[cfg(unix)]
+unsafe fn close_all_descriptors(ceiling: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    {
+        // The raw syscall rather than glibc's `close_range` wrapper: the wrapper
+        // exists only on `target_env = "gnu"`, and this is the same trap on musl.
+        // SAFETY: `close_range` takes three integers and returns one; it touches
+        // no memory of ours.
+        if unsafe { libc::syscall(libc::SYS_close_range, 0_u32, libc::c_uint::MAX, 0_i32) } == 0 {
+            return;
+        }
+    }
+    for fd in 0..ceiling {
+        // SAFETY: `close` on an arbitrary integer is defined — an unopened one
+        // simply returns `EBADF`.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// A [`Duration`] as whole milliseconds in the reaper's `i64` clock domain,
+/// saturating instead of wrapping.
+///
+/// `d.as_millis()` is a `u128`, and a bare `as i64` **truncates**: it keeps the
+/// low 64 bits and reinterprets them signed. So `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`
+/// values that are merely absurd become actively wrong rather than merely large
+/// — `2^54` seconds truncates to a *negative* offset, which makes the deadline
+/// already past and the reaper `SIGTERM`s the child on its first tick. That is
+/// the exact opposite of what an enormous cap asked for, and it is silent.
+/// `i64::MAX` milliseconds is ~292 million years, so saturating is
+/// indistinguishable from "no deadline" in practice while staying total.
+///
+/// Async-signal-safe: pure arithmetic, no allocation, no libc call.
+#[cfg(unix)]
+fn millis_saturating(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// `CLOCK_MONOTONIC` in milliseconds. Async-signal-safe (`clock_gettime` is on
+/// POSIX's list), unlike anything that would allocate or lock — which is why the
+/// reaper carries its own clock instead of using [`Instant`].
+#[cfg(unix)]
+fn monotonic_millis() -> i64 {
+    // SAFETY: `clock_gettime` fills the `timespec` it is handed and touches
+    // nothing else.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    (ts.tv_sec as i64)
+        .saturating_mul(1000)
+        .saturating_add((ts.tv_nsec as i64) / 1_000_000)
+}
+
+/// Async-signal-safe sleep for the forked reaper. A short sleep cut off by a
+/// signal simply shortens one poll tick; both loops re-check their deadline
+/// against the clock rather than counting ticks, so an early return cannot move
+/// a deadline.
+#[cfg(unix)]
+fn sleep_millis(millis: i64) {
+    let ts = libc::timespec {
+        tv_sec: (millis / 1000) as libc::time_t,
+        tv_nsec: ((millis % 1000) * 1_000_000) as _,
+    };
+    // SAFETY: `nanosleep` reads one `timespec` and writes nothing through the
+    // null remainder pointer.
+    unsafe {
+        libc::nanosleep(&ts, std::ptr::null_mut());
+    }
+}
+
+/// Whether any process still belongs to process group `pgid`. A failed
+/// `killpg(pgid, 0)` means `ESRCH` here — the reaper and the group share a uid,
+/// so `EPERM` is not reachable — i.e. the group is gone and there is nothing
+/// left to bound.
+#[cfg(unix)]
+fn pid_group_alive(pgid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 performs the existence/permission check only; it delivers
+    // nothing.
+    unsafe { libc::killpg(pgid, 0) == 0 }
 }
 
 /// PRD #20 finding #12: a RESTORABLE guard that installs async handlers for
@@ -927,6 +1359,46 @@ fn child_pre_exec(ctty_fd: RawFd) -> std::io::Result<()> {
 
 /// Open a fresh inner pseudo-terminal sized to `(rows, cols)`, returning the
 /// owned master and slave descriptors.
+///
+/// Issue #668: the **master** is marked `FD_CLOEXEC` before it can be inherited
+/// by anything. `openpty` hands back a plain descriptor, so without this the
+/// wrapped child inherits the master of the very terminal it is sitting on —
+/// measured on a live stand-in as `fd 3 -> /dev/ptmx` whose `fdinfo`
+/// `tty-index` is its own slave. That keeps the master's reference count off
+/// zero for as long as the child lives, so when the wrapper dies the slave never
+/// hangs up, the child's `read` never returns, and it blocks forever: 221 such
+/// orphans were censused on one dev box, the oldest alive 9.4 days, each still
+/// holding a working directory the tooling had already deleted (they do NOT pin
+/// that root `live-pid` — `clean-e2e-tmp` keys on the test process's pid in the
+/// root's name, not on the orphan; what an orphan actually costs is a persistent unkillable process, the deleted files' disk blocks retained for as long as it runs, a polluted `ps` for every later diagnosis, and the chance of it writing paths back under a root that was just removed).
+/// `portable_pty` — the crate every *unwrapped* pane is spawned through, and
+/// whose panes were measured leaking 0 times in 39 trials — does exactly this at
+/// its `unix.rs:57`, which is why the leak is wrapper-shaped.
+///
+/// This is structural rather than env-gated, so unlike
+/// [`arm_child_group_backstop`] it holds on a Ctrl-C'd developer run, an OOM
+/// kill, a panic-abort and the deck's own `killpg(SIGKILL)` escalation alike. It
+/// is not inert in production, deliberately: a wrapped agent whose wrapper is
+/// `SIGKILL`ed now exits with its terminal instead of surviving as an unkillable
+/// process holding a dead one.
+///
+/// The **slave** is marked too, and for a smaller but real reason. `route` hands
+/// `Stdio` clones of it (`OwnedFd::try_clone` is `F_DUPFD_CLOEXEC`, so the clones
+/// are marked as well), and `std` `dup2`s those onto 0/1/2, which CLEARS
+/// `FD_CLOEXEC` on the copy. So the child keeps its terminal on 0/1/2 and, via
+/// `TIOCSCTTY` in [`child_pre_exec`], its controlling terminal — `pre_exec` runs
+/// *before* exec, so `FD_CLOEXEC` cannot reach its `ioctl` at all. What closes at
+/// exec is only the ORIGINAL, which the child has no use for: measured on a live
+/// stand-in as a fourth `/dev/pts/<n>` entry at fd 4 beside the intended three.
+///
+/// That spare cannot retain the master side, so unlike the master it does not
+/// recreate the self-pinning defect — when the last master closes, every slave
+/// descriptor hangs up together. It is still not merely untidy. It is a
+/// read/write **terminal capability** that survives the child or any descendant
+/// closing or redirecting its standard streams, from which they can go on
+/// reading input or writing wrapper-observed output outside the routes the
+/// wrapper set up, and can hold the slave open long enough to force the bounded
+/// post-exit drain/kill path below.
 #[cfg(unix)]
 fn open_inner_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut master: RawFd = -1;
@@ -954,7 +1426,38 @@ fn open_inner_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) })
+    // SAFETY: `openpty` returned two fresh, valid descriptors; each becomes an
+    // `OwnedFd` exactly once here, so close-on-drop is unambiguous from now on.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    // Owned first, then flagged: if either fails, both descriptors are already
+    // owned and close on the early return instead of leaking (the ordering
+    // `portable_pty` uses at `unix.rs:52-58`, and for the same reason). Both
+    // ends, exactly as `portable_pty` marks both at that line — the master
+    // because inheriting it is the defect, the slave because the child gets its
+    // terminal from the `dup2`'d copies on 0/1/2 and never needs the original.
+    set_cloexec(&master)?;
+    set_cloexec(&slave)?;
+    Ok((master, slave))
+}
+
+/// Mark `fd` close-on-exec, preserving any other descriptor flags.
+///
+/// Read-modify-write rather than a bare `F_SETFD`: `FD_CLOEXEC` is the only
+/// descriptor flag POSIX defines today, but clobbering the word would be a
+/// silent trap for anything a future platform adds there.
+#[cfg(unix)]
+fn set_cloexec(fd: &OwnedFd) -> std::io::Result<()> {
+    // SAFETY: `fd` is a live descriptor this process owns; `F_GETFD`/`F_SETFD`
+    // take and return an int, no pointers.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Resize an open PTY master, which sends `SIGWINCH` to its foreground process
@@ -970,6 +1473,309 @@ fn set_pty_size(fd: RawFd, rows: u16, cols: u16) {
     // SAFETY: `TIOCSWINSZ` reads exactly one `winsize` through the pointer.
     unsafe {
         libc::ioctl(fd, libc::TIOCSWINSZ, &ws);
+    }
+}
+
+/// Issue #243: how long the wrapped child's output must stay QUIET, after it has
+/// written at least one byte, before [`InterfaceWatch`] calls its interface up.
+///
+/// The signal is the SETTLING, not the first byte. A child that is still coming
+/// up is either silent (a launcher that has not printed yet — nothing fires) or
+/// still painting (each chunk pushes the deadline out), so what this detects is
+/// the transition from producing output to waiting for input. 750 ms is far
+/// longer than the gap between two frames of a TUI painting itself and far
+/// shorter than the 30 s fallback it replaces; a settle this long followed by an
+/// injected prompt is exactly the sequence a human performs by hand.
+#[cfg(unix)]
+const INTERFACE_SETTLE_WINDOW: Duration = Duration::from_millis(750);
+
+/// Issue #243 audit F3: how long the interface-ready send may spend on the daemon
+/// before it gives up.
+///
+/// This send is the wrapper's ONLY daemon I/O that originates on its supervisory
+/// loop, so it is the only one whose latency could reach the code that forwards
+/// the user's `Ctrl+C` to the child group. It is already moved off that loop onto
+/// a detached thread ([`Emitter::emit_interface_ready`]); this bounds the thread
+/// so a wedged or SIGSTOPped daemon leaves nothing behind for the life of the
+/// session either.
+///
+/// Five seconds, the same budget `crate::hook`'s request/response paths give a
+/// daemon that is merely busy. Losing the event costs latency and nothing else —
+/// the readiness gate falls back to the behaviour it has without this signal —
+/// so the bound is deliberately generous rather than tight.
+#[cfg(unix)]
+const INTERFACE_READY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Issue #243 (review finding 1): WHICH of [`InterfaceWatch`]'s two facts fired.
+///
+/// Reported rather than collapsed to a bool because the two are not equally
+/// strong and are priced differently by the daemon — see [`InterfaceWatch`] for
+/// what each one is worth and why.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterfaceFact {
+    /// The child cleared `ICANON`/`ECHO` on the inner PTY — fact 1, an
+    /// observation of input-readiness.
+    RawInputMode,
+    /// The child wrote at least one byte and then stayed quiet for
+    /// [`INTERFACE_SETTLE_WINDOW`] — fact 2, a guess.
+    OutputSettled,
+}
+
+#[cfg(unix)]
+impl InterfaceFact {
+    /// The `session_start_origin` value this fact rides to the daemon. Distinct
+    /// per fact so the daemon can price them separately; see
+    /// [`InterfaceWatch`].
+    fn origin(self) -> &'static str {
+        match self {
+            Self::RawInputMode => WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN,
+            Self::OutputSettled => WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN,
+        }
+    }
+
+    /// A short, stable label for the log line — the answer to "why did readiness
+    /// fire on this pane?", which used to be computed and then discarded.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::RawInputMode => "raw-input-mode",
+            Self::OutputSettled => "output-settled",
+        }
+    }
+}
+
+/// Issue #243: the wrapper's answer to "does the child's interface exist yet?".
+///
+/// The wrapper is the only party that can answer this. The daemon sees events;
+/// the wrapper OWNS the inner PTY the child is painting on and reads every byte
+/// that crosses it, so it can watch the interface come up instead of inferring it
+/// from an event that arrives too late (Codex's native `SessionStart`) or never
+/// (OpenCode has none at all).
+///
+/// TWO independent facts are accepted — [`InterfaceFact`] — and they are NOT
+/// equally strong, which is why the watch reports WHICH one fired rather than a
+/// bare bool. They ride distinct `session_start_origin` values so the daemon can
+/// price them separately (issue #243 review finding 1), and they are latched
+/// SEPARATELY so a session that produces the weak one can still produce the
+/// strong one afterwards — which, for the production launch shape, is every
+/// session (see [`InterfaceWatch::claim`]):
+///
+/// 1. **The child took the inner PTY out of cooked mode**
+///    ([`InterfaceFact::RawInputMode`]) — it cleared `ICANON` and/or `ECHO`. A
+///    genuine OBSERVATION, and the strong one: a child reading raw keystrokes is,
+///    by construction, a program that consumes input rather than echoing it, so
+///    this cannot be satisfied by a launcher. `devbox`, a shell script and `node`
+///    starting up never do it; a full-screen TUI does.
+///
+///    **What it observes is the AGENT taking the terminal, not the agent being
+///    ready for a prompt**, and the difference cost this issue two rounds. It was
+///    written here as "a genuine observation of INPUT-READINESS, the exact
+///    inverse of the defect the readiness gate exists to prevent" — PRD #225's
+///    prompt loss being bytes written into a still-canonical line discipline,
+///    echoed back and swallowed. The inverse half is true and the readiness half
+///    is not, because a TUI does this as it INITIALIZES, *before* it paints:
+///    measured on real codex-cli 0.149.0 at 85 ms after a direct exec, and by
+///    `orchestration/delegate/009` at fork + 100 ms, where a prompt written on it
+///    parked unsubmitted in the composer and no turn ever started. So this fact
+///    is the best RELEASE signal the deck has and still owes a post-readiness
+///    buffer on the daemon side; see
+///    `crate::state::WRAPPER_INTERFACE_READINESS_BUFFER`.
+/// 2. **Output SETTLED** ([`InterfaceFact::OutputSettled`]) — the child wrote
+///    something and then stopped for [`INTERFACE_SETTLE_WINDOW`]. The fallback
+///    for an interface that stays in cooked mode (a line-oriented REPL, and the
+///    test stand-ins), and for the redirected-descriptor paths where no inner PTY
+///    termios exists to read.
+///
+///    **This one is a GUESS, and the wrapper cannot make it a better one AT THE
+///    MOMENT IT FIRES.** Silence says the child stopped producing output; it
+///    cannot say whether the thing that stopped is an interface waiting at its
+///    prompt or a LAUNCHER stalled part-way through its own boot. The production
+///    shape is `devbox run codex-big`, which prints one banner line at ~0.1 s and
+///    then evaluates its shellenv in silence for a measured 2750–4132 ms before
+///    `codex` is exec'd at all — so it satisfies this fact while the pty is still
+///    canonical, which is PRD #225 Defect 1 exactly. Nothing observable at this
+///    seam distinguishes the two cases *yet*.
+///
+///    What the wrapper CAN do is not make the guess final. The watch stays armed
+///    after announcing it ([`InterfaceWatch::claim`] latches per fact, not per
+///    session), so if the launcher was merely slow the strong fact follows later
+///    on the same wrapper session — a few seconds warm, and a measured ~15 s on a
+///    cold `devbox` that installs packages first — and the daemon holds an upgrade
+///    window on fact 2 for exactly that reason rather than releasing on it
+///    immediately. See
+///    `crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN` and
+///    `crate::state::INTERFACE_UPGRADE_WINDOW`.
+///
+/// What is deliberately NOT accepted: elapsed time since `exec`, and the child's
+/// FIRST byte. A wall-clock timer fires for a child that has not started, and a
+/// first-byte rule fires for a launcher's `Starting…` banner — both would put the
+/// deck straight back into writing a prompt into something that is not an agent.
+/// A child that writes nothing and never leaves cooked mode is never announced
+/// ready by this watch at all, which is correct: nothing about it is observable,
+/// so the gate falls back to the behaviour it has today.
+///
+/// **What this watch observes is the inner PTY, which is not private to the
+/// child.** A same-uid process can find it (`/proc/<wrapper-pid>/fd` → the pts
+/// node, mode `0620`) and can therefore make either fact fire for a child that is
+/// not ready — `tcsetattr` away `ICANON`/`ECHO`, or write one byte and go quiet.
+/// The wrapper's report would be honest and the fact would be wrong. That costs
+/// nothing beyond what the same process can already do by writing a forged event
+/// straight to the daemon's hook socket (issue #243 audit F1/F2), but it does
+/// mean "observation, not announcement" is a statement about the HONEST case and
+/// not a security property. Do not build a new privilege on it.
+#[cfg(unix)]
+struct InterfaceWatch {
+    /// [`InterfaceFact::RawInputMode`] has been announced. Latching this ends
+    /// the watch outright: nothing the child does afterwards can produce a
+    /// STRONGER fact, and re-announcing the weaker one would be a downgrade.
+    announced_ready: AtomicBool,
+    /// [`InterfaceFact::OutputSettled`] has been announced. Latched SEPARATELY
+    /// from `announced_ready`, which is the whole of issue #243's regression
+    /// fix: a launcher settles, the daemon holds a bounded upgrade window, and
+    /// the real agent then clears `ICANON`/`ECHO` behind it. A single shared
+    /// latch made the weak fact the LAST word for that session, so the strong
+    /// one the wrapper went on to observe was computed and thrown away.
+    announced_settled: AtomicBool,
+    /// [`monotonic_millis`] of the last byte the child wrote, or `0` while it has
+    /// written nothing at all.
+    last_output_ms: AtomicI64,
+    /// The inner PTY's `c_lflag` as `openpty` handed it over, sampled BEFORE the
+    /// child ran, so fact 1 above compares against what this pty actually started
+    /// as rather than against an assumed default. `None` when it could not be
+    /// read, which simply disables fact 1.
+    cooked_lflag: Option<libc::tcflag_t>,
+}
+
+#[cfg(unix)]
+impl InterfaceWatch {
+    fn new(cooked_lflag: Option<libc::tcflag_t>) -> Self {
+        Self {
+            announced_ready: AtomicBool::new(false),
+            announced_settled: AtomicBool::new(false),
+            last_output_ms: AtomicI64::new(0),
+            cooked_lflag,
+        }
+    }
+
+    /// Record that the child produced output. Called from every tee, on the raw
+    /// byte chunk rather than on a classified line: a TUI can paint a whole frame
+    /// of escape sequences without a single `\n` or `\r`, and this must see that.
+    fn note_output(&self) {
+        // A monotonic clock never yields 0 in practice, but clamp anyway so the
+        // "nothing written yet" sentinel cannot be produced by a real write.
+        self.last_output_ms
+            .store(monotonic_millis().max(1), Ordering::SeqCst);
+    }
+
+    /// Has the child cleared `ICANON`/`ECHO` on the inner PTY since it started?
+    ///
+    /// Read from the MASTER descriptor: a pty's termios is one shared structure,
+    /// so the master's `tcgetattr` reports the line discipline the slave-side
+    /// child installed.
+    fn child_took_raw_input(&self, master_fd: RawFd) -> bool {
+        let Some(cooked) = self.cooked_lflag else {
+            return false;
+        };
+        let Some(current) = pty_lflag(master_fd) else {
+            return false;
+        };
+        // Only a CLEARED bit counts. A child that sets additional lflags has not
+        // said anything about whether it consumes keystrokes.
+        (cooked & !current & (libc::ICANON | libc::ECHO)) != 0
+    }
+
+    /// Claim the next unannounced interface fact, returning WHICH one fired.
+    /// `None` while nothing new is observable, and `None` forever once
+    /// [`InterfaceFact::RawInputMode`] has been claimed.
+    ///
+    /// The identity of the fact is part of the answer, not a diagnostic
+    /// afterthought: the two are priced differently downstream (see
+    /// [`InterfaceWatch`]), so a caller that collapses them back to a bool
+    /// reintroduces the launcher-settle hazard fact 2 carries.
+    ///
+    /// **Per fact, not per session** (issue #243 regression fix). This used to
+    /// latch once for the whole wrapper, which made whichever fact happened to
+    /// fire FIRST the only one the daemon would ever hear — and for the
+    /// production launch shape that is always the weak one: `devbox run
+    /// codex-big` prints a banner at ~0.1 s and then computes its shellenv in
+    /// silence for 2750–4132 ms, so the settle guess fires 2005–3370 ms before
+    /// the real `codex` has even been exec'd, let alone taken the terminal out
+    /// of cooked mode. Measured over 13 launcher probes and 8 wrapper spawns:
+    /// output-settled fired 21/21 and raw-input-mode NEVER fired first, not
+    /// once. With one latch the strong fact was computed on the very next tick
+    /// after `codex` came up and silently dropped, and the daemon was left
+    /// pricing a launcher as an interface.
+    ///
+    /// So the ORDER a caller can observe is: nothing, or fact 2, or fact 1, or
+    /// fact 2 then fact 1 — never fact 1 then fact 2. A child that goes raw
+    /// without ever settling still announces only fact 1, exactly as before.
+    ///
+    /// The cost of staying armed is one `tcgetattr` per supervisory tick for a
+    /// child that settles and never goes raw — i.e. forever, for a cooked-mode
+    /// REPL. That is the same order as the up-to-three `terminal_size` ioctls
+    /// the same 50 ms tick already performs unconditionally, and it buys the
+    /// only signal that can tell the two cases apart at all.
+    fn claim(&self, master_fd: RawFd) -> Option<InterfaceFact> {
+        if self.announced_ready.load(Ordering::SeqCst) {
+            return None;
+        }
+        if self.child_took_raw_input(master_fd) {
+            return (!self.announced_ready.swap(true, Ordering::SeqCst))
+                .then_some(InterfaceFact::RawInputMode);
+        }
+        if self.announced_settled.load(Ordering::SeqCst) {
+            return None;
+        }
+        let last = self.last_output_ms.load(Ordering::SeqCst);
+        if last == 0 {
+            return None;
+        }
+        if monotonic_millis().saturating_sub(last) < millis_saturating(INTERFACE_SETTLE_WINDOW) {
+            return None;
+        }
+        (!self.announced_settled.swap(true, Ordering::SeqCst))
+            .then_some(InterfaceFact::OutputSettled)
+    }
+}
+
+/// Read a pty's local-mode flags through `fd`, or `None` when it is not a
+/// terminal / the call fails.
+#[cfg(unix)]
+fn pty_lflag(fd: RawFd) -> Option<libc::tcflag_t> {
+    // SAFETY: `tcgetattr` fills the `termios` it is handed and touches nothing
+    // else; a bad descriptor is reported by the return code, not by a write.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+        return None;
+    }
+    Some(termios.c_lflag)
+}
+
+/// Issue #243: a passthrough writer that tells an [`InterfaceWatch`] the child
+/// produced output.
+///
+/// Wraps the tee's downstream writer rather than changing [`tee`] itself, so the
+/// observation sits on the same bytes the user sees and costs one atomic store
+/// per chunk. The store happens whether or not the downstream write succeeds —
+/// the child wrote those bytes either way, and whether the wrapper could forward
+/// them is a different question.
+#[cfg(unix)]
+struct ActivityWriter<W: Write> {
+    inner: W,
+    watch: Arc<InterfaceWatch>,
+}
+
+#[cfg(unix)]
+impl<W: Write> Write for ActivityWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !buf.is_empty() {
+            self.watch.note_output();
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -1151,6 +1957,12 @@ fn run_wrap_pty(
         }
     };
 
+    // Issue #243: the inner PTY's line discipline as `openpty` handed it over —
+    // sampled BEFORE the child exists, so "the child took the terminal out of
+    // cooked mode" is measured against this pty's real starting state rather than
+    // an assumed default. See `InterfaceWatch::child_took_raw_input`.
+    let interface = Arc::new(InterfaceWatch::new(pty_lflag(master.as_raw_fd())));
+
     // Build the child. `std::process::Command` inherits the wrapper's env (which
     // carries `DOT_AGENT_DECK_PANE_ID` / `_AGENT_ID` injected by the daemon), so
     // the child's own hooks and this wrapper's events attribute to the same pane.
@@ -1220,6 +2032,10 @@ fn run_wrap_pty(
     drop(slave);
 
     let child_pid = child.id() as libc::pid_t;
+    // Issue #657: armed AFTER the slave copies are dropped and before the reap
+    // loop can be interrupted, so the child's group has a bound of its own even
+    // if this wrapper is SIGKILL'd a moment from now. No-op outside tests.
+    arm_child_group_backstop(child_pid);
 
     // Take the pipe ends for any redirected descriptor.
     let pipe_in = if stdin_tty { None } else { child.stdin.take() };
@@ -1281,10 +2097,18 @@ fn run_wrap_pty(
         let emitter = Arc::clone(emitter);
         let detector = Arc::clone(&detector);
         let output_done = Arc::clone(&output_done);
+        let watch = Arc::clone(&interface);
         Some(std::thread::spawn(move || {
-            tee(reader, FdWriter(out_fd), |line| {
-                classify_and_emit(line, &detector, &emitter, is_codex);
-            });
+            tee(
+                reader,
+                ActivityWriter {
+                    inner: FdWriter(out_fd),
+                    watch,
+                },
+                |line| {
+                    classify_and_emit(line, &detector, &emitter, is_codex);
+                },
+            );
             output_done.store(true, Ordering::SeqCst);
         }))
     } else {
@@ -1292,10 +2116,26 @@ fn run_wrap_pty(
     };
 
     // Redirected output descriptors: tee each pipe to the matching real fd.
-    let out_pipe_thread =
-        pipe_out.map(|r| spawn_pipe_tee(r, libc::STDOUT_FILENO, emitter, &detector, is_codex));
-    let err_pipe_thread =
-        pipe_err.map(|r| spawn_pipe_tee(r, libc::STDERR_FILENO, emitter, &detector, is_codex));
+    let out_pipe_thread = pipe_out.map(|r| {
+        spawn_pipe_tee(
+            r,
+            libc::STDOUT_FILENO,
+            emitter,
+            &detector,
+            is_codex,
+            Some(&interface),
+        )
+    });
+    let err_pipe_thread = pipe_err.map(|r| {
+        spawn_pipe_tee(
+            r,
+            libc::STDERR_FILENO,
+            emitter,
+            &detector,
+            is_codex,
+            Some(&interface),
+        )
+    });
 
     // Input pump (outer stdin → inner master when stdin is a terminal, else →
     // the child's stdin pipe). Detached: on child exit the main loop returns and
@@ -1357,6 +2197,43 @@ fn run_wrap_pty(
 
         // finding #12: forward a pending signal to the child group and escalate.
         fwd.tick();
+
+        // Issue #243: the pre-prompt readiness signal. Polled here rather than
+        // pushed from the tee threads because one of the two facts it reads —
+        // the inner PTY's line discipline — is state, not an event, and because
+        // the settle window has to be noticed by SOMEBODY once the output stops
+        // (the tee is blocked in `read` at exactly that moment, so it cannot
+        // notice its own silence). This loop already ticks every 50 ms for
+        // resizes and child reaping, so the watch costs one atomic load plus, at
+        // most, one `tcgetattr` per tick and nothing at all once it has fired.
+        //
+        // Issue #243 review finding 4 / audit closing note: the FACT is logged as
+        // well as acted on. It used to be computed and then dropped
+        // (`let _ = reason;`), which threw away the single most useful field
+        // diagnostic this mechanism produces — "was this a genuine TUI raw-mode
+        // release, or the settle guess?" — at the one place that knows.
+        //
+        // `info!`, not `debug!`, and the level is load-bearing. The default
+        // filter is `dot_agent_deck=info` (`crate::logging`), so a `debug!` here
+        // would reach a log file only for an operator who already knew to set
+        // `RUST_LOG` — and `crate::state::dispatch_one_owned` tells the reader
+        // this fact IS in the wrapper's log, as the alternative to a tuning knob.
+        // It fires at most twice per wrapped session (see
+        // `InterfaceWatch::claim`), so the volume argument for `debug!` does not
+        // apply. Nothing is printed to the terminal in any case: `main`'s
+        // `init_logging_from_env` installs a FILE subscriber or none at all, so
+        // this cannot put a byte into the pane the child is painting.
+        //
+        // Called on every tick even after the settle guess has fired, because the
+        // strong fact usually arrives SECOND — see `InterfaceWatch::claim`.
+        if let Some(fact) = interface.claim(master_fd) {
+            tracing::info!(
+                reason = fact.reason(),
+                origin = fact.origin(),
+                "wrap: observed the child's interface; announcing pre-prompt readiness"
+            );
+            emitter.emit_interface_ready(fact);
+        }
 
         // R20-001: the terminal output pump ended while the child is still alive
         // → the downstream terminal consumer closed; after a short settle window
@@ -1470,6 +2347,8 @@ fn run_wrap_pipe(
         }
     };
     let child_pid = child.id() as libc::pid_t;
+    // Issue #657: same independent bound on the child's group as the PTY path.
+    arm_child_group_backstop(child_pid);
 
     // PRD #225 M3: same fork-time card-surfacing event as the PTY path, and the
     // same marker — it says "a session exists", not "the agent is ready".
@@ -1492,6 +2371,7 @@ fn run_wrap_pipe(
         emitter,
         &detector,
         is_codex,
+        None,
     );
     let err_thread = spawn_pipe_tee(
         child_stderr,
@@ -1499,6 +2379,7 @@ fn run_wrap_pipe(
         emitter,
         &detector,
         is_codex,
+        None,
     );
 
     // Input pump (outer stdin → child stdin, verbatim). On EOF/close of our
@@ -1577,13 +2458,30 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
     emitter: &Arc<Emitter>,
     detector: &Arc<Mutex<Detector>>,
     is_codex: bool,
+    interface: Option<&Arc<InterfaceWatch>>,
 ) -> std::thread::JoinHandle<()> {
     let emitter = Arc::clone(emitter);
     let detector = Arc::clone(detector);
-    std::thread::spawn(move || {
-        tee(reader, FdWriter(out_fd), |line| {
+    // Issue #243: `Some` on the interactive path, where a redirected descriptor
+    // is still one of the ways a wrapped child's interface can reach the user, so
+    // its bytes count as the child painting. `None` on the wholly non-interactive
+    // pipe path: there is no terminal there for an interface to exist on, and a
+    // batch `codex exec --json` run is never the target of a readiness gate.
+    let interface = interface.map(Arc::clone);
+    std::thread::spawn(move || match interface {
+        Some(watch) => tee(
+            reader,
+            ActivityWriter {
+                inner: FdWriter(out_fd),
+                watch,
+            },
+            |line| {
+                classify_and_emit(line, &detector, &emitter, is_codex);
+            },
+        ),
+        None => tee(reader, FdWriter(out_fd), |line| {
             classify_and_emit(line, &detector, &emitter, is_codex);
-        });
+        }),
     })
 }
 
@@ -1594,6 +2492,51 @@ mod tests {
     // Pure-data pattern-detection tests — plain `#[test]` unit tests (no
     // `#[spec]` / CATALOG reproducer needed: these assert a pure function, not
     // runtime TUI behaviour).
+
+    /// The forked reaper's fallback close loop counts to a real limit, but a
+    /// bounded one: never below the old fixed 1024 (so it can only improve on
+    /// it), never above 65 536 (so a container's `RLIMIT_NOFILE` of ~1e9 cannot
+    /// turn a 250 ms-poll process into 416 ms of `close(2)` calls at startup).
+    ///
+    /// Issue #668, audit Low 4. Asserts the bracket rather than the value,
+    /// because the value is whatever this host's soft limit happens to be — on
+    /// the box this was found on, 524 288, which clamps down to the ceiling.
+    #[cfg(unix)]
+    #[test]
+    fn child_group_backstop_close_ceiling_is_clamped_both_ways() {
+        let ceiling = child_group_backstop_close_ceiling();
+
+        assert!(
+            ceiling >= CHILD_GROUP_BACKSTOP_MIN_FD,
+            "the reaper must still close at least the {CHILD_GROUP_BACKSTOP_MIN_FD} \
+             descriptors the old fixed bound covered, got {ceiling}"
+        );
+        assert!(
+            ceiling <= CHILD_GROUP_BACKSTOP_MAX_FD,
+            "an unbounded ceiling makes the fallback loop a startup stall, got \
+             {ceiling}"
+        );
+    }
+
+    /// Milliseconds out of a `Duration` saturate instead of truncating.
+    ///
+    /// Issue #668, audit Medium 2: `d.as_millis()` is a `u128` and a bare
+    /// `as i64` keeps the low 64 bits, so a cap large enough to set bit 63
+    /// lands NEGATIVE — a deadline already in the past, which makes the reaper
+    /// signal the child on its first tick instead of bounding it generously.
+    /// That is the opposite of what an enormous cap asked for, and silent.
+    #[cfg(unix)]
+    #[test]
+    fn millis_saturating_never_wraps_a_huge_duration() {
+        assert_eq!(millis_saturating(Duration::from_millis(0)), 0);
+        assert_eq!(millis_saturating(Duration::from_secs(300)), 300_000);
+        assert_eq!(millis_saturating(Duration::from_secs(u64::MAX)), i64::MAX);
+        // The specific shape that used to invert: `as i64` on this value is
+        // negative, so the old code produced an already-expired deadline.
+        let inverting = Duration::from_millis(1 << 63);
+        assert!((inverting.as_millis() as i64) < 0, "precondition");
+        assert_eq!(millis_saturating(inverting), i64::MAX);
+    }
 
     /// A normal, substantive output line classifies as `Working`.
     #[test]

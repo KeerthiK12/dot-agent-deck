@@ -437,6 +437,24 @@ impl DaemonClient {
     /// input; a pre-PRD-20 daemon omits the field, which we read as
     /// [`SendResult::Applied`] (the legacy fire-and-forget assumption). A
     /// transport/`ok=false` failure still surfaces as `Err`.
+    ///
+    /// Issue #608: a write through this identity-less door is refused by a
+    /// current daemon (`no-live-target`, nothing written). On the PANED arm that
+    /// is the change — an absent `expected_agent_id` no longer degrades to
+    /// pane-only authorization. On the PANE-LESS arm nothing changed, because it
+    /// never accepted this shape: `<no-pane>` has always been routed by agent
+    /// identity, so a request naming no agent has always resolved to
+    /// `Writable::None` there.
+    ///
+    /// Issue #608 audit, finding 5: this doc used to say the method was kept for
+    /// PANE-LESS callers, which was never true — that arm declines this shape as
+    /// firmly as the paned one now does. What it is actually kept for is a
+    /// pre-PRD-20 daemon: naming no identity is what keeps
+    /// [`Self::write_and_submit_with_identity`]'s guarded-send capability probe
+    /// out of the way, so this remains the legacy-compatible fire-and-forget
+    /// door. Against a current daemon every caller wants the identity-bearing
+    /// sibling, paned or not; in-tree the only remaining caller of this one is a
+    /// unit test.
     pub async fn write_and_submit(
         &self,
         pane_id: &str,
@@ -844,6 +862,24 @@ impl AttachConnection {
     /// concurrently (the typical pane wiring).
     pub fn into_split(self) -> (IpcReadHalf, IpcWriteHalf) {
         (self.rd, self.wr)
+    }
+
+    /// Test-only: an `AttachConnection` over an already-connected in-process
+    /// socket pair, so a unit test can drive code that *takes* one without a
+    /// daemon, a listener, or a filesystem path. The returned peer half is the
+    /// other end — hold it to keep the connection open, drop it to give the
+    /// reader EOF.
+    ///
+    /// `#[cfg(test)]`, so it is absent from the release library: PRD #341's
+    /// finding was that release-exposed test seams are a real attack surface,
+    /// and this deliberately is not one. Unix-only because
+    /// [`tokio::net::UnixStream::pair`] is; the Windows named-pipe backend has
+    /// no in-process equivalent, and the only consumer is likewise Unix-gated.
+    #[cfg(all(test, unix))]
+    pub(crate) fn connected_pair_for_test() -> (Self, tokio::net::UnixStream) {
+        let (ours, peer) = tokio::net::UnixStream::pair().expect("socket pair for test");
+        let (rd, wr) = ours.into_split();
+        (Self { rd, wr }, peer)
     }
 }
 

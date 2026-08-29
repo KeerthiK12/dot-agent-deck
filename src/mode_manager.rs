@@ -201,8 +201,9 @@ impl ModeManager {
 
                 for pane_cfg in &config.panes {
                     let effective_cmd = if pane_cfg.watch {
-                        let exe = std::env::current_exe()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("dot-agent-deck"));
+                        let exe = std::env::current_exe().unwrap_or_else(|_| {
+                            std::path::PathBuf::from(crate::platform::paths::DEFAULT_BINARY_NAME)
+                        });
                         format!(
                             "{} watch --interval 10 {:?}",
                             exe.display(),
@@ -420,8 +421,9 @@ impl ModeManager {
         let interval = mode.compiled_rules[rule_idx].interval;
 
         let pane_cmd = if watch {
-            let exe = std::env::current_exe()
-                .unwrap_or_else(|_| std::path::PathBuf::from("dot-agent-deck"));
+            let exe = std::env::current_exe().unwrap_or_else(|_| {
+                std::path::PathBuf::from(crate::platform::paths::DEFAULT_BINARY_NAME)
+            });
             let interval_secs = interval.unwrap_or(5);
             format!(
                 "{} watch --interval {} {:?}",

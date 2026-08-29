@@ -7,6 +7,8 @@ title: Workspace Modes
 
 Modes are config-driven workspaces that pair an AI agent with live command output in side panes. Each mode activation creates a new tab — a self-contained workspace with the agent pane on the left (50%) and side panes stacked on the right (50%). Modes are defined per-project in a `.dot-agent-deck.toml` file at the project root.
 
+Besides the modes you define here, the **Mode** field also offers built-in options: `schedule` for authoring a [scheduled task](scheduled-tasks.md), and `dispatcher` for starting work in an isolated copy of the repo — see [Dispatcher Mode](dispatcher-mode.md).
+
 ![A mode tab in action — agent pane on the left, with live Git status, kubectl pods, and kubectl events stacked on the right](/img/modes.png)
 
 ## Concepts
@@ -37,10 +39,30 @@ Persistent panes claim the first slots and are never overwritten. Reactive comma
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | yes | — | Display name shown in the tab bar |
+| `agent` | string | no | — | Which agent this mode's **agent pane** runs, when the command you enter for it cannot say so itself — one of `claude`, `opencode`, `pi`, `codex`, `devin`. See [Declaring the agent behind a launcher command](#declaring-the-agent-behind-a-launcher-command). |
 | `init_command` | string | no | — | Setup command run once in every pane before its own command (e.g., `devbox shell`) |
 | `panes` | array | no | `[]` | Persistent pane definitions |
 | `rules` | array | no | `[]` | Reactive command-routing rules |
 | `reactive_panes` | integer | no | `2` | Number of reactive pane slots for command routing |
+
+### Declaring the agent behind a launcher command
+
+A mode tab has one **agent pane** — the pane you type a command into when you open the tab — alongside its persistent and reactive side panes. The deck identifies the agent in that pane by reading the first word of the command you entered, so `claude`, `codex` and `opencode` resolve on their own, while a command that runs the agent through something else does not: `devbox run -- codex`, `mise exec -- codex`, `make codex` or `./run-codex.sh` all name a launcher, and nothing about a launcher says what it will start.
+
+An unidentified agent pane shows **No agent** and no status. For **Codex** it also stays that way until you send it something to do — Codex announces itself only when its first turn begins, and identifying it at launch is what would otherwise let the deck see it earlier.
+
+`agent` answers that, on the mode itself:
+
+```toml
+[[modes]]
+name = "review"
+agent = "codex"
+reactive_panes = 2
+```
+
+The key belongs on `[[modes]]` and not on `[[modes.panes]]`: the side panes run tools, not agents. The command still comes from the new-pane form — `agent` only says what that command ends up launching.
+
+The rules are the same as for an orchestration role, including that an unrecognised name gives you **no agent rather than a guess**, and that omitting the key leaves behaviour exactly as it was. See [Declaring the agent behind a launcher command](orchestration.md#declaring-the-agent-behind-a-launcher-command) for the full list.
 
 ### `[[modes.panes]]`
 
@@ -149,13 +171,15 @@ Side panes in a mode tab support focus, selection, and direct interaction.
 
 A **thicker border** (`┃` rather than `│`) marks the currently focused pane. Use `j`/`k` (or `Down`/`Up`) to cycle focus through all panes — agent and side panes — in a continuous loop. Press `Esc` to jump focus back to the agent pane. You can also click any pane to focus it.
 
-The focused pane's border **turns cyan only while you are typing into it**. In command mode every border — focused pane included — shows its agent's status color instead: green for working, blue for thinking, yellow for waiting on you, red for an error, gray for idle. So the border's *weight* tells you which pane `Enter` / `Ctrl+d` will drop you into, and its *color* tells you whether your keystrokes are reaching it yet.
+The focused pane's border **turns cyan only while you are typing into it**. In command mode every border — focused pane included — shows its agent's status color instead: green for working, blue for thinking, magenta for waiting on you, red for an error, gray for idle. So the border's *weight* tells you which pane `Enter` / `Ctrl+d` will drop you into, and its *color* tells you whether your keystrokes are reaching it yet.
 
-The border is not the only signal: a chip at the left of the bottom bar names the current mode — ` COMMAND ` or ` TYPING ` — in the same place on every tab, the focused pane carries a cursor only while you are typing into it, and entering command mode dims that pane and briefly overlays a `COMMAND MODE · Ctrl+D to type` banner. See [Which mode you're in](keyboard-shortcuts.md#which-mode-youre-in).
+The border is not the only signal: a chip at the left of the bottom bar names the current mode — ` COMMAND ` or ` TYPING ` — in the same place on every tab, the focused pane carries a cursor only while you are typing into it, and entering command mode dims that pane and briefly overlays a `COMMAND MODE — Ctrl+D to type` banner. See [Which mode you're in](keyboard-shortcuts.md#which-mode-youre-in).
 
 ### Reading a Pane in Command Mode
 
 Command mode is the safe resting state — the one mode in which a stray keystroke cannot reach an agent — and you can read in it. Pane content stays fully readable (dimmed, never blanked), and the focused agent pane scrolls there, by wheel and by `PageUp` / `PageDown`, just as side panes do in any mode. The wheel is never forwarded to the agent's mouse protocol in command mode, so a full-screen TUI running in the pane cannot scroll under you while you read.
+
+How far back a pane scrolls is decided by the agent running in it, not by the mode: an agent that repaints its transcript in place rather than letting lines scroll off the top leaves nothing to scroll back through, in command mode or any other. See [How far back you can scroll depends on the agent](keyboard-shortcuts.md#how-far-back-you-can-scroll-depends-on-the-agent).
 
 ### Typing Into a Pane
 

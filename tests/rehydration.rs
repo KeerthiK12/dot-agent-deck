@@ -26,8 +26,25 @@
 
 #![cfg(unix)]
 
+// Issue #322. This crate is fast-tier and deliberately does NOT link
+// `tests/common/mod.rs`; pulling the PTY harness in would duplicate its ~530
+// executions here. But its eight scratch dirs each hold an `attach.sock`, so
+// they were the largest single source of live `/tmp/.tmp*` directories during a
+// recorded `cargo test-e2e` — sampling attributed most of the 49 observed to
+// this file. Sharing the ~40-line crate-internal resolver by path costs one
+// module and two extra test executions instead. See
+// `docs/develop/e2e-temp-dirs.md`.
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+// Issue #668: same shape, same reason — the wrapped-child lifetime bound this
+// file's registry spawns and in-process daemon need, in a file small enough to
+// include on its own instead of pulling in the harness. `common::init_test_env`
+// calls the same `arm()`.
+#[path = "common/child_lifetime_bound.rs"]
+mod child_lifetime_bound;
+
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,15 +54,17 @@ use tokio::task::JoinHandle;
 
 use chrono::Utc;
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, AgentRecord, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+    AgentPtyRegistry, AgentRecord, DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, SpawnOptions,
+    TabMembership,
 };
+use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_REQ, KIND_RESP, bind_attach_listener, read_frame,
     serve_attach, serve_attach_with_counter, write_frame,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType, Writable};
+use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType, Writable};
 use dot_agent_deck::state::{
     ActiveTool, AppState, OrchestrationIdentity, SessionSnapshot, SessionState, SessionStatus,
     SharedState,
@@ -76,11 +95,137 @@ impl Drop for Server {
     }
 }
 
+const CLI_REHYDRATION_PANE: &str = "live-cli-rehydrate-pane-53d9a7";
+
+/// Full in-process daemon used only by `session/live/011`: unlike this file's
+/// attach-only servers, it owns both the hook socket consumed by the real
+/// `agent-event` CLI and the attach socket consumed by a fresh TUI hydrate.
+struct AgentEventDaemon {
+    _dir: TempDir,
+    hook_path: PathBuf,
+    attach_path: PathBuf,
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: tokio::sync::broadcast::Sender<BroadcastMsg>,
+    handle: JoinHandle<()>,
+}
+
+impl Drop for AgentEventDaemon {
+    fn drop(&mut self) {
+        self.handle.abort();
+        self.registry.shutdown_all();
+    }
+}
+
+async fn start_agent_event_daemon() -> AgentEventDaemon {
+    // Issue #668: this harness runs a real daemon in-process and hands its
+    // registry to the test, so arm the wrapped-child lifetime bound before
+    // anything it spawns exists.
+    child_lifetime_bound::arm();
+
+    let dir = test_temp::tempdir().expect("allocate real-agent-event daemon tempdir");
+    let hook_path = dir.path().join("hook.sock");
+    let attach_path = dir.path().join("attach.sock");
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let daemon = Daemon::with_attach(state, attach_path.clone())
+        .with_idle_shutdown(None)
+        .with_lock_dir_override(Some(dir.path().join("locks")));
+    let registry = daemon.pty_registry.clone();
+    let event_tx = daemon.event_tx.clone();
+    let hook_for_task = hook_path.clone();
+    let handle = tokio::spawn(async move {
+        let _ = run_daemon_with(&hook_for_task, daemon).await;
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let hook_ready = tokio::net::UnixStream::connect(&hook_path).await.is_ok();
+        let attach_ready = tokio::net::UnixStream::connect(&attach_path).await.is_ok();
+        if hook_ready && attach_ready {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "full in-process daemon sockets were not accepting connections within 5s: hook={} attach={}",
+            hook_path.display(),
+            attach_path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    AgentEventDaemon {
+        _dir: dir,
+        hook_path,
+        attach_path,
+        registry,
+        event_tx,
+        handle,
+    }
+}
+
+/// Run the real lifecycle CLI with exactly the pane/agent identity a daemon
+/// injects, then await its daemon broadcast so hydration cannot race ingestion.
+async fn run_real_agent_event(
+    daemon: &AgentEventDaemon,
+    pane_id: &str,
+    agent_id: &str,
+    cwd: &Path,
+) -> AgentEvent {
+    let mut events = daemon.event_tx.subscribe();
+    let hook_path = daemon.hook_path.clone();
+    let pane_id_owned = pane_id.to_string();
+    let agent_id_owned = agent_id.to_string();
+    let cwd = cwd.to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .arg("agent-event")
+            .arg("--type")
+            .arg("running")
+            .current_dir(&cwd)
+            .env_clear()
+            .env("HOME", &cwd)
+            .env("DOT_AGENT_DECK_SOCKET", &hook_path)
+            .env(DOT_AGENT_DECK_PANE_ID, &pane_id_owned)
+            .env(DOT_AGENT_DECK_AGENT_ID, &agent_id_owned)
+            .output()
+            .expect("run real agent-event CLI for reconnect")
+    })
+    .await
+    .expect("agent-event subprocess task did not panic");
+    assert!(
+        output.status.success(),
+        "real `agent-event --type running` failed: status={:?} stdout={:?} stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(BroadcastMsg::Event(event))
+                    if event.pane_id.as_deref() == Some(pane_id)
+                        && event.agent_id.as_deref() == Some(agent_id) =>
+                {
+                    break event;
+                }
+                Ok(_) => continue,
+                Err(error) => panic!("daemon event broadcast closed before CLI event: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("daemon did not broadcast the real CLI event within 5s")
+}
+
 async fn start_real_server() -> Server {
+    // Issue #668: the arming point for the twelve tests that reach a registry
+    // through this harness.
+    child_lifetime_bound::arm();
+
     let registry = Arc::new(AgentPtyRegistry::new());
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = bind_attach_listener(&path).expect("bind attach listener");
         (dir, path, listener)
@@ -112,7 +257,7 @@ async fn start_server_with_state(
 ) -> (TempDir, PathBuf, JoinHandle<()>) {
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = bind_attach_listener(&path).expect("bind attach listener");
         (dir, path, listener)
@@ -199,7 +344,7 @@ async fn start_dummy_server_on(
 ) -> (TempDir, PathBuf, JoinHandle<()>) {
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = bind_attach_listener(&path).expect("bind attach listener");
         (dir, path, listener)
@@ -239,6 +384,7 @@ fn make_session(
         pane_id: Some(pane_id.to_string()),
         agent_id: Some(agent_id.to_string()),
         display_name: None,
+        shell_synthetic_working: false,
     }
 }
 
@@ -382,7 +528,7 @@ async fn hydrate_treats_list_agents_failure_as_empty() {
     // No daemon running at the configured path: list_agents will fail with
     // ECONNREFUSED / ENOENT. The TUI must not error out — log and treat as
     // empty so the user can reconnect.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_temp::tempdir().unwrap();
     let missing = dir.path().join("does-not-exist.sock");
 
     let ctrl = Arc::new(EmbeddedPaneController::new(
@@ -580,7 +726,7 @@ async fn hydrate_falls_back_to_allocated_id_for_legacy_daemon() {
     // matches the pre-fix behavior, but startup must not regress.
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = UnixListener::bind(&path).expect("bind mock attach socket");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -650,7 +796,7 @@ async fn hydrate_treats_list_agents_timeout_as_empty() {
     // user can see the dashboard and reconnect.
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = UnixListener::bind(&path).expect("bind mock attach socket");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -694,7 +840,7 @@ async fn hydrate_skips_agent_that_disappears_between_list_and_attach() {
     // whole rehydration.
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = UnixListener::bind(&path).expect("bind mock attach socket");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1813,6 +1959,10 @@ fn live_002_list_agents_attaches_live_snapshot() {
 }
 
 async fn live_002_list_agents_attaches_live_snapshot_inner() {
+    // Issue #668: bare registry, so it arms the wrapped-child lifetime bound
+    // itself rather than inheriting it from `start_real_server`.
+    child_lifetime_bound::arm();
+
     let registry = Arc::new(AgentPtyRegistry::new());
     let pane = "pane-live";
 
@@ -1924,6 +2074,9 @@ fn live_003_join_picks_newest_last_activity() {
 }
 
 async fn live_003_join_picks_newest_last_activity_inner() {
+    // Issue #668: bare registry, as in `live_002` above.
+    child_lifetime_bound::arm();
+
     let registry = Arc::new(AgentPtyRegistry::new());
     let pane = "pane-dup";
     let agent_id = registry
@@ -2016,6 +2169,11 @@ fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback() {
 }
 
 async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner() {
+    // Issue #668: bare registry, as in `live_002` / `live_003` above —
+    // `start_server_with_state` takes the registry from its caller, so the
+    // caller is where the bound has to be armed.
+    child_lifetime_bound::arm();
+
     let registry = Arc::new(AgentPtyRegistry::new());
     let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
     let (_dir, path, handle) = start_server_with_state(registry.clone(), state.clone()).await;
@@ -2418,7 +2576,7 @@ fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot() {
 async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner() {
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = UnixListener::bind(&path).expect("bind mock attach socket");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -2533,6 +2691,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         pane_id: Some(pane.to_string()),
         agent_id: Some(agent_id.to_string()),
         display_name: None,
+        shell_synthetic_working: false,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as
@@ -2620,4 +2779,84 @@ fn live_010_rehydrate_preserves_history_and_view_only_writability() {
             "reconnecting {writable} pane {pane_id} must preserve its input refusal"
         );
     }
+}
+
+/// Scenario: Spawn a managed pane through the daemon attach API, drive it to `Thinking` through the real `agent-event --type running` CLI with the daemon-injected pane and agent ids, then hydrate a fresh TUI controller. Assert the rebuilt card restores `Thinking` rather than falling back to the bare `Idle` placeholder.
+#[spec("session/live/011")]
+#[test]
+fn live_011_real_agent_event_cli_status_survives_reconnect() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build real-agent-event reconnect runtime");
+    rt.block_on(live_011_real_agent_event_cli_status_survives_reconnect_inner());
+}
+
+async fn live_011_real_agent_event_cli_status_survives_reconnect_inner() {
+    let daemon = start_agent_event_daemon().await;
+    let cwd = test_temp::tempdir().expect("allocate real-agent-event pane cwd");
+    let client = DaemonClient::new(daemon.attach_path.clone());
+    let agent_id = client
+        .start_agent(StartAgentOptions {
+            command: Some("cat".to_string()),
+            cwd: Some(cwd.path().to_string_lossy().into_owned()),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                CLI_REHYDRATION_PANE.to_string(),
+            )],
+            agent_type: Some(AgentType::Pi),
+            ..StartAgentOptions::default()
+        })
+        .await
+        .expect("spawn the pane through the TUI's StartAgent attach path");
+    let observed = run_real_agent_event(&daemon, CLI_REHYDRATION_PANE, &agent_id, cwd.path()).await;
+    assert_eq!(observed.event_type, EventType::Thinking);
+    assert_eq!(observed.pane_id.as_deref(), Some(CLI_REHYDRATION_PANE));
+    assert_eq!(observed.agent_id.as_deref(), Some(agent_id.as_str()));
+
+    let controller = Arc::new(EmbeddedPaneController::new(
+        daemon.attach_path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let controller = controller.clone();
+        tokio::task::spawn_blocking(move || controller.hydrate_from_daemon())
+            .await
+            .expect("fresh TUI hydration task did not panic")
+    };
+    let pane = hydrated
+        .iter()
+        .find(|pane| pane.agent_id == agent_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "fresh TUI did not hydrate the CLI-driven agent {agent_id:?}; hydrated={hydrated:?}"
+            )
+        });
+
+    let mut fresh_tui_state = AppState::default();
+    fresh_tui_state.register_pane(pane.pane_id.clone());
+    fresh_tui_state.seed_hydrated_session(
+        pane.pane_id.clone(),
+        pane.cwd.clone(),
+        pane.agent_type.clone(),
+        Some(pane.agent_id.clone()),
+        pane.live.as_ref(),
+    );
+    let rebuilt = fresh_tui_state
+        .sessions
+        .values()
+        .find(|session| session.pane_id.as_deref() == Some(CLI_REHYDRATION_PANE))
+        .expect("fresh TUI must rebuild one card for the CLI-driven pane");
+    assert_eq!(
+        rebuilt.status,
+        SessionStatus::Thinking,
+        "the real CLI event reached the daemon with pane_id={:?} agent_id={:?}, but reconnect rebuilt the card as {:?} from hydrated.live={:?}",
+        observed.pane_id,
+        observed.agent_id,
+        rebuilt.status,
+        pane.live
+    );
+
+    drop(controller);
 }

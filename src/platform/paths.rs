@@ -14,7 +14,7 @@
 //! that consumes these paths stays in `daemon*`/`hook`/`ui` until M2 abstracts
 //! the transport.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Home directory used to anchor config/state/cache paths.
 ///
@@ -253,6 +253,478 @@ fn current_user_sid_string() -> std::io::Result<String> {
     Ok(sid_string)
 }
 
+/// The crate's own package name — the literal fallback [`binary_name`] returns
+/// when `current_exe()` is unavailable or genuinely unusable (an error, an
+/// empty or non-UTF-8 path), and the single source of truth every other such
+/// fallback in the crate should read rather than re-typing the literal
+/// `"dot-agent-deck"`.
+pub const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// The command name this build was invoked as — the file name component of
+/// [`std::env::current_exe`] — for generated text that tells an agent to run
+/// the deck **by name through `$PATH`** (the `delegate` / `work-done` CLI
+/// examples in `orchestrator_context::build_orchestrator_context` and
+/// `state::work_done_footer`). A build installed under a different file name
+/// must generate instructions naming ITSELF, not a baked-in literal —
+/// otherwise the generated command resolves to a different binary than the
+/// one that wrote it.
+///
+/// **Symlink resolution is platform-dependent — this is a fact about the
+/// platform, not a choice this function makes, and any doc comment asserting
+/// a single cross-platform behavior here is wrong on one of the two.** On
+/// macOS `current_exe()` is backed by `_NSGetExecutablePath`, which reports
+/// the path the process was INVOKED as: a symlink stays a symlink, confirmed
+/// directly (not assumed) with a four-way probe on this crate's dev machine
+/// covering direct invocation, a same-directory symlink, an absolute-target
+/// symlink in another directory, and `$PATH` lookup of a symlink name — all
+/// four returned the symlink's own path, never the target. On Linux
+/// `current_exe()` reads `/proc/self/exe`, which the kernel resolves fully: a
+/// symlink returns its TARGET's path. So `~/bin/deck ->
+/// /opt/x/dot-agent-deck` generates `deck` (still on `$PATH`) on macOS but
+/// `dot-agent-deck` (possibly not on `$PATH` at all) on Linux, for the exact
+/// same install.
+///
+/// Two gates keep the bare file name usable rather than merely well-formed
+/// (issue prageethw/dot-agent-deck#253 review/audit, tightened again by a later issue prageethw/dot-agent-deck#253 pass once
+/// the review/audit gate itself turned out to prove only *resolvability*, not
+/// *identity* — see the `$PATH` identity bullet below for what changed and
+/// why the earlier gate was not enough):
+///
+/// - **`$PATH` identity.** The bare file name is used ONLY when a `$PATH`
+///   lookup for it, walked with the SAME first-match semantics a shell uses
+///   (the first entry containing an executable of that name wins; a later,
+///   truly-matching entry is irrelevant), lands on the exact file THIS
+///   PROCESS is running — not merely *some* executable sharing its name
+///   ([`resolves_on_path`]). Resolvability alone used to be the whole gate;
+///   it is not enough, because "some executable earlier on `$PATH`" can be a
+///   stale build, an unrelated program, or — with a `$PATH` entry like `.` —
+///   a file an attacker placed in whatever directory the deck process
+///   happened to be running from. Identity is proven by canonicalizing both
+///   the `$PATH` candidate and `current_exe()` (resolving symlinks on both
+///   sides) and comparing the results ([`same_binary_identity`]). An empty or
+///   relative `$PATH` entry is never trusted for this comparison even when it
+///   contains a matching executable: a shell resolves it against ITS OWN
+///   current directory, a value this process cannot observe and cannot
+///   assume matches the consuming agent's shell, so no identity claim can be
+///   proven through it — this is what closes the `PATH=.:/usr/bin` case.
+/// - **Shell safety.** A name outside [`is_safe_binary_name`]'s conservative
+///   allowlist is rejected — not quoted — for the same reason `wrap.rs`'s
+///   `usable()` rejects rather than quotes: the bare name is interpolated
+///   UNQUOTED into ```` ```bash ```` blocks an agent executes verbatim, and
+///   quoting an unsafe *bare name* would still resolve to nothing on a normal
+///   `$PATH` — converting an injection into a silent no-op rather than a
+///   name that at least works.
+///
+/// When either gate rejects the bare file name, this does **not** fall back to
+/// [`DEFAULT_BINARY_NAME`] — the deck process's own `$PATH` is only a *proxy*
+/// for the consuming agent's (agents commonly run through a login shell that
+/// sources profile files this process never saw), so a bare name this process
+/// could not verify may still be perfectly runnable there, and conversely a
+/// literal `dot-agent-deck` fallback can name a binary that was never
+/// installed at all. Instead this falls back to `current_exe()`'s own
+/// **absolute path**, spelled and quoted for a POSIX shell by
+/// [`posix_command_word`] so a path containing whitespace still parses as one
+/// argument — a path is independent of whatever `$PATH` *or cwd* the agent's
+/// shell ends up with, and it names this exact running binary rather than
+/// whatever `$PATH` might resolve that name to, so it resolves correctly
+/// regardless of which proxy this process's own `$PATH` turned out to be.
+///
+/// **That last claim is only true because the path is absolutised here, and
+/// it was not before (issue #560).** `current_exe()` is not documented to
+/// return an absolute path and on macOS does not: it is backed by
+/// `_NSGetExecutablePath`, which reports the path the process was INVOKED as
+/// (the same platform fact the symlink paragraph above records), so a deck
+/// launched as `./target/release/dot-agent-deck` used to emit exactly that
+/// relative word into the worker task footer. The worker then resolved it
+/// against ITS OWN cwd — an orchestration directory or a git worktree, never
+/// the deck's launch directory — and the command failed, silently, for the
+/// reason the last paragraph below gives. Linux never exhibited it, because
+/// `/proc/self/exe` is kernel-resolved and therefore always absolute; the
+/// defect was invisible on the platform the project develops on.
+/// [`std::path::absolute`] is what closes it: purely lexical plus the cwd, no
+/// filesystem access, and — unlike [`std::fs::canonicalize`] — it does not
+/// resolve symlinks, so it makes "absolute" true by construction without
+/// silently taking a position on the platform-dependent symlink behaviour
+/// documented above.
+///
+/// **The emitted word targets a POSIX shell on every platform, including
+/// Windows (issue #561).** That is not a default — it is what the text this
+/// word is interpolated into already says: both consumers fence it in
+/// ```` ```bash ```` and `state::work_done_footer` instructs the worker in
+/// prose to run it "via Bash". `cmd.exe` and PowerShell are deliberately NOT
+/// targeted, and neither could be by quoting alone: PowerShell needs the `&`
+/// call operator before a quoted string for it to be a command at all, and
+/// this repo implements no PowerShell quoting anywhere to borrow from.
+/// (`hooks_manage`'s `#[cfg(windows)]` `shell_quote_if_needed` is a `cmd.exe`
+/// quoter, but it is for a different consumer — a hook command line Claude
+/// Code hands to the *native* shell — and its own doc records that `cmd.exe`
+/// expands `%VAR%` even inside double quotes, which quoting cannot undo.)
+///
+/// Targeting POSIX is not enough on its own, though, because a POSIX shell
+/// will not treat a backslash-separated Windows path as a **path** however
+/// well it is quoted: POSIX (XCU 2.9.1.1) makes a command word containing at
+/// least one `/` a pathname and every other command word a `$PATH` lookup, so
+/// `'C:\Users\me\dot-agent-deck.exe'` is looked up in `$PATH` and reported as
+/// `command not found` — measured against real bash, not assumed. So the
+/// fallback respells a Windows path with `/` separators before quoting it,
+/// which is lossless (`/` is not a legal character in a Windows file name),
+/// is the spelling `shell_quote_if_needed`'s own safe set already treats as
+/// needing no quotes at all, and is what git-bash / WSL / MSYS want.
+///
+/// [`DEFAULT_BINARY_NAME`] remains the fallback only when `current_exe()`
+/// itself is unusable: an error, an empty file name, (Unix) a file name that
+/// is not valid UTF-8, a path that cannot be made absolute, or a Windows path
+/// with no POSIX spelling (see [`posix_command_word`]). The fallback matters
+/// more here than at most other `current_exe()` call sites: `delegate` and
+/// `work-done` write to the unversioned hook socket, both call sites are
+/// fire-and-forget, and the daemon drops any frame it cannot parse without
+/// logging it — so a name that resolves to a binary that cannot run produces
+/// no error anywhere, only a signal that silently never arrives.
+pub fn binary_name() -> String {
+    resolve_binary_name(effective_current_exe(), resolves_on_path)
+}
+
+/// `current_exe()`, or — only under the `e2e` feature, and only once
+/// [`set_test_current_exe_override`] has been called — the injected test
+/// override. [`spawn_inprocess_daemon`]'s test harness (`tests/common/mod.rs`)
+/// calls the setter with `env!("CARGO_BIN_EXE_dot-agent-deck")` before driving
+/// `handle_delegate`, because a `handle_delegate` run entirely in-process
+/// makes the CALLING process the libtest binary, not the deck — libtest's own
+/// file name is shell-safe but never on `$PATH`, so without this override
+/// [`binary_name`] would (correctly, for that process) name the libtest
+/// binary itself, and an agent told to run it hits libtest's CLI parser
+/// instead of the deck's (issue prageethw/dot-agent-deck#253 round-4 verification, finding 1).
+///
+/// This mechanism is gated behind the `e2e` Cargo feature rather than a
+/// runtime env var — Greptile's P2 on this issue's round 2 was exactly that a
+/// prior env-var seam (`DOT_AGENT_DECK_TEST_BINARY_ON_PATH`) stayed
+/// "production-active": present, and consultable, in every build. Gating on
+/// `e2e` instead means the override, the setter, and this indirection do not
+/// exist in the compiled artifact at all for a release build or even a plain
+/// `cargo test-fast` run (`e2e` is off for both) — there is no code path for
+/// production to accidentally take, because there is no code.
+#[cfg(feature = "e2e")]
+fn effective_current_exe() -> std::io::Result<PathBuf> {
+    match TEST_CURRENT_EXE_OVERRIDE.get() {
+        Some(path) => Ok(path.clone()),
+        None => std::env::current_exe(),
+    }
+}
+
+#[cfg(not(feature = "e2e"))]
+fn effective_current_exe() -> std::io::Result<PathBuf> {
+    std::env::current_exe()
+}
+
+/// Backing store for [`set_test_current_exe_override`]. A plain [`OnceLock`]
+/// is enough: every call site within a given test process passes the same
+/// compile-time constant (`env!("CARGO_BIN_EXE_dot-agent-deck")`), so a
+/// second `set` call — if it ever happens — is safely redundant, not a race.
+/// `cargo nextest` gives each test its own process, so a value set here can
+/// never leak into a different test's process.
+///
+/// [`OnceLock`]: std::sync::OnceLock
+#[cfg(feature = "e2e")]
+static TEST_CURRENT_EXE_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Test-only: make [`binary_name`] resolve as though `current_exe()` were
+/// `path`, for the remainder of this process. Exists only under the `e2e`
+/// feature (see [`effective_current_exe`]) and nothing under `src/` calls
+/// it — only the e2e test harness does, from `spawn_inprocess_daemon()`.
+#[cfg(feature = "e2e")]
+pub fn set_test_current_exe_override(path: PathBuf) {
+    let _ = TEST_CURRENT_EXE_OVERRIDE.set(path);
+}
+
+/// Pure seam behind [`binary_name`]. `path_identity_matches` is injected so
+/// both the malformed-input fallback ([`delegate/018`]) and the two bare-name
+/// usability gates (shell safety, `$PATH` identity) are unit-testable with a
+/// synthetic `current_exe()` and a synthetic resolver, without needing a real
+/// unusable `current_exe()` or a real `$PATH` entry. The seam takes both the
+/// candidate `name` and the resolved `current_exe()` path — proving identity
+/// needs both sides of the comparison, not just the name.
+fn resolve_binary_name(
+    current_exe: std::io::Result<PathBuf>,
+    path_identity_matches: impl Fn(&str, &Path) -> bool,
+) -> String {
+    let Ok(path) = current_exe else {
+        return DEFAULT_BINARY_NAME.to_string();
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return DEFAULT_BINARY_NAME.to_string();
+    };
+    if is_safe_binary_name(name) && path_identity_matches(name, &path) {
+        return name.to_string();
+    }
+    // Issue #560: absolutise BEFORE quoting. `current_exe()` is only
+    // guaranteed absolute on Linux (`/proc/self/exe`); on macOS it reports the
+    // invocation path, so this is where a relative `./target/release/…` would
+    // otherwise reach the generated command word. Purely lexical plus the cwd,
+    // and deliberately not `canonicalize` — see [`binary_name`]'s doc.
+    let Ok(absolute) = std::path::absolute(&path) else {
+        return DEFAULT_BINARY_NAME.to_string();
+    };
+    match absolute.to_str() {
+        Some(path_str) => posix_command_word(path_str, cfg!(windows))
+            .unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string()),
+        None => DEFAULT_BINARY_NAME.to_string(),
+    }
+}
+
+/// Spell `path` — already absolute — as a command word a **POSIX shell** will
+/// execute, or `None` when it has no such spelling. Issue #561.
+///
+/// `windows_host` says whether `path` is in the Windows dialect. It is a
+/// parameter rather than a `#[cfg]` so both branches are unit-testable from
+/// any host: neither defect in this function's history could be reproduced on
+/// the platform this project is developed on, and a `#[cfg(windows)]` branch
+/// would have been type-checked by CI but exercised by nothing. Production
+/// passes `cfg!(windows)`, which is a compile-time constant, so the branch
+/// costs nothing at runtime.
+///
+/// POSIX is the target on every platform because that is what the text this
+/// word lands in already promises: `state::work_done_footer` and
+/// `orchestrator_context::build_orchestrator_context` both fence it in
+/// ```` ```bash ```` and the former tells the worker in prose to run it "via
+/// Bash". See [`binary_name`]'s doc for why `cmd.exe` and PowerShell are not
+/// targeted and cannot be reached by quoting anyway.
+///
+/// On a Windows path two things happen before [`shell_quote_if_needed`]:
+///
+/// - **A verbatim or device path is refused** (`\\?\…`, `\\.\…`). Those
+///   prefixes are defined to disable all path normalization, so `/` is *not*
+///   accepted as a separator inside them and respelling one changes which
+///   file it names. There is no POSIX-shell spelling of such a path, and
+///   [`resolve_binary_name`] therefore falls back to [`DEFAULT_BINARY_NAME`]
+///   rather than emit a word that would be misparsed — a bare name the
+///   agent's `$PATH` may well resolve beats a path that is silently wrong.
+/// - **`\` becomes `/`.** Lossless, because `/` is not a legal character in a
+///   Windows file name, and necessary rather than cosmetic: a POSIX shell
+///   picks pathname-vs-`$PATH`-lookup on whether the word contains at least
+///   one `/` (POSIX XCU 2.9.1.1), so a backslash path is looked up in `$PATH`
+///   and reported `command not found` no matter how correctly it is quoted.
+///   `C:\Users\me\deck.exe`
+///   becomes `C:/Users/me/deck.exe`, which needs no quoting at all under
+///   `shell_quote_if_needed`'s existing safe set, and `\\server\share\…`
+///   becomes `//server/share/…`, which is the UNC spelling MSYS/Cygwin use.
+///
+/// The final `contains('/')` guard makes "this is a pathname, not a `$PATH`
+/// lookup" true by construction rather than by assumption about what shapes
+/// `current_exe()` can return.
+fn posix_command_word(path: &str, windows_host: bool) -> Option<String> {
+    if !windows_host {
+        return Some(shell_quote_if_needed(path));
+    }
+    if path.starts_with(r"\\?\") || path.starts_with(r"\\.\") {
+        return None;
+    }
+    let respelled = path.replace('\\', "/");
+    if !respelled.contains('/') {
+        return None;
+    }
+    Some(shell_quote_if_needed(&respelled))
+}
+
+/// Whether `name` is safe to interpolate UNQUOTED into the generated `bash`
+/// command examples [`binary_name`] feeds (issue prageethw/dot-agent-deck#253 review F2 / audit F1):
+/// a conservative ALLOWLIST rather than a denylist, since the failure mode
+/// this guards against is an agent's shell reinterpreting whatever falls
+/// outside it. Rejects an empty name, a leading `-` (would be read as a flag
+/// by whatever runs the generated line), and anything outside ASCII
+/// alphanumerics plus `-`, `_`, `.`, `+` — which also rejects the mundane
+/// motivating cases (`dot-agent-deck (1)` from a browser download,
+/// `dot-agent-deck copy` from a Finder duplicate) alongside the adversarial
+/// ones (`;`, `` ` ``, `$`, a literal newline).
+fn is_safe_binary_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
+}
+
+/// Whether `name`'s `$PATH` lookup identifies the SAME running executable as
+/// `exe_path` — the real resolver [`binary_name`] injects into
+/// [`resolve_binary_name`] (issue prageethw/dot-agent-deck#253's identity-verification tightening of
+/// the earlier resolvability-only gate; see [`binary_name`]'s doc for why
+/// resolvability alone was insufficient). The lookup walks `$PATH` with
+/// shell-equivalent FIRST-MATCH semantics via [`first_path_match`] — the
+/// first entry containing an executable `name` wins, exactly as a shell's
+/// command lookup would, so a later, truly-matching entry is irrelevant if an
+/// earlier one already shadows it. A match is an identity match only when:
+///
+/// - it was found via an absolute `$PATH` entry, never an empty or relative
+///   one ([`is_untrustworthy_path_entry`]) — a shell resolves those against
+///   ITS OWN current directory, a value this process cannot observe and
+///   cannot assume matches the consuming agent's shell (this is what closes
+///   the `PATH=.:/usr/bin` case: the `.` entry is checked first, and finding
+///   an executable there stops the walk without ever claiming a match);
+/// - the file it names is a genuinely **executable** file — same exec-bit
+///   check as `orchestrator_ext`'s `is_executable_file`: `is_file()` plus, on
+///   Unix, at least one exec permission bit; non-Unix has no cheap exec-bit
+///   probe, so a regular file is accepted there. Unlike `wrap.rs`'s
+///   `usable()`, a bare existence probe (`is_file()`) is not enough on its
+///   own: `binary_name()` feeds an agent's shell a bare command name it is
+///   expected to *run*, so a readable-but-not-executable regular file of that
+///   name earlier on `$PATH` must not report success (issue prageethw/dot-agent-deck#253 review);
+///   and
+/// - it canonicalizes to the same file as `exe_path`, symlinks resolved on
+///   both sides — [`same_binary_identity`].
+///
+/// No test-only override is needed: under `cargo test`/`cargo nextest`, each
+/// test's own throwaway binary under `target/<profile>/deps/` is never on
+/// `$PATH` either way, so [`resolve_binary_name`] naturally takes its
+/// absolute-path fallback branch — which is itself the RUNNING binary's own
+/// path, not the [`DEFAULT_BINARY_NAME`] literal — and that is exactly what
+/// `orchestration/delegate/016`–`017` assert.
+fn resolves_on_path(name: &str, exe_path: &Path) -> bool {
+    match std::env::var_os("PATH") {
+        Some(paths) => path_identity_match(&paths, name, exe_path),
+        None => false,
+    }
+}
+
+/// Whether `dir` — a single entry from splitting a `$PATH`-shaped value — is
+/// one a shell resolves against ITS OWN current directory rather than a fixed
+/// location: an empty entry (POSIX shells treat `PATH=a::b` and a leading or
+/// trailing `:` as `.`) or an explicitly relative one (`PATH=bin:/usr/bin`).
+/// Neither can be trusted for an identity comparison made from this process,
+/// because the consuming agent's shell may have a different current
+/// directory than this one — the mechanism the `PATH=.:/usr/bin` case in
+/// issue prageethw/dot-agent-deck#253 depends on.
+fn is_untrustworthy_path_entry(dir: &Path) -> bool {
+    dir.as_os_str().is_empty() || dir.is_relative()
+}
+
+/// Outcome of walking a `$PATH`-shaped value for `name` with shell
+/// first-match semantics: the walk stops at the first entry containing an
+/// executable `name`, exactly as a shell's command lookup would — a later
+/// entry is never consulted once an earlier one has matched.
+enum FirstPathMatch {
+    /// The first match was found via an absolute entry — trustworthy enough
+    /// to canonicalize and compare against `current_exe()`.
+    Absolute(PathBuf),
+    /// The first match was found via an empty or relative entry
+    /// ([`is_untrustworthy_path_entry`]): a shell would still select this
+    /// file, but this process cannot vouch for which file that is.
+    Untrustworthy,
+    /// No `$PATH` entry contains an executable `name`.
+    None,
+}
+
+/// Scan a `PATH`-shaped value for an executable file named `name`, stopping
+/// at the first match with shell-equivalent first-match semantics. Pure over
+/// its `path` argument (no environment read), matching `orchestrator_ext`'s
+/// `path_contains_binary` precedent, so this is unit-testable with a
+/// synthetic `PATH` value rather than by mutating the process-global `PATH`
+/// env var.
+fn first_path_match(path: &std::ffi::OsStr, name: &str) -> FirstPathMatch {
+    for dir in std::env::split_paths(path) {
+        let candidate = dir.join(name);
+        if !is_executable_file(&candidate) {
+            continue;
+        }
+        return if is_untrustworthy_path_entry(&dir) {
+            FirstPathMatch::Untrustworthy
+        } else {
+            FirstPathMatch::Absolute(candidate)
+        };
+    }
+    FirstPathMatch::None
+}
+
+/// Whether `path` contains an executable `name` at all, regardless of
+/// identity — the resolvability half of the original (issue prageethw/dot-agent-deck#253
+/// review/audit) gate, kept so the exec-bit requirement stays testable in
+/// isolation from the identity comparison [`path_identity_match`] adds on
+/// top of it. Test-only: production code goes through [`path_identity_match`]
+/// exclusively, since resolvability without identity is exactly the gate
+/// issue prageethw/dot-agent-deck#253's `$PATH`-identity pass closed.
+#[cfg(test)]
+fn path_contains_executable(path: &std::ffi::OsStr, name: &str) -> bool {
+    !matches!(first_path_match(path, name), FirstPathMatch::None)
+}
+
+/// Whether `name`'s first match on `path` (shell first-match semantics) is
+/// the SAME file as `exe_path`, symlinks resolved on both sides. An
+/// untrustworthy first match (empty/relative `$PATH` entry) or no match at
+/// all is never an identity match.
+fn path_identity_match(path: &std::ffi::OsStr, name: &str, exe_path: &Path) -> bool {
+    match first_path_match(path, name) {
+        FirstPathMatch::Absolute(candidate) => same_binary_identity(&candidate, exe_path),
+        FirstPathMatch::Untrustworthy | FirstPathMatch::None => false,
+    }
+}
+
+/// Whether `candidate` and `exe_path` name the same underlying file,
+/// resolving symlinks on both sides. `std::fs::canonicalize` rather than a
+/// raw device+inode comparison: it is available on every target this crate
+/// builds for (device+inode is Unix-only and would need a second code path
+/// for Windows), and it is sufficient for the threat this closes — a `$PATH`
+/// entry pointing at an unrelated file. (A hard link sharing `exe_path`'s
+/// inode canonicalizes to a different path and is treated as a non-match;
+/// that is conservative, not a gap — a hard link is byte-identical content
+/// under a different name, not a spoof.) A canonicalization failure (dangling
+/// symlink, permission denied, removed between the executable-bit check and
+/// here) is treated as "not a match" rather than propagated: the caller's
+/// fallback to the absolute path is always safe, so failing closed here costs
+/// nothing.
+fn same_binary_identity(candidate: &Path, exe_path: &Path) -> bool {
+    match (
+        std::fs::canonicalize(candidate),
+        std::fs::canonicalize(exe_path),
+    ) {
+        (Ok(candidate_real), Ok(exe_real)) => candidate_real == exe_real,
+        _ => false,
+    }
+}
+
+/// Whether `candidate` is a regular file that is *also* executable. Same
+/// rationale and shape as `orchestrator_ext::is_executable_file`: `is_file()`
+/// alone would accept a same-named regular-but-non-executable file earlier on
+/// `$PATH`. On Unix this additionally requires at least one exec bit
+/// (`mode & 0o111 != 0`); on non-Unix targets there is no cheap exec-bit
+/// check, so a regular file is accepted.
+fn is_executable_file(candidate: &std::path::Path) -> bool {
+    if !candidate.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(candidate) {
+            Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Single-quote `path` for a POSIX shell only when it contains a character
+/// outside a conservative safe set; otherwise return it unchanged. Canonical
+/// copy of the identical helper duplicated in `codex_hooks_manage.rs` and
+/// `devin_hooks_manage.rs`, which both call this one rather than defining
+/// their own (issue prageethw/dot-agent-deck#253: [`binary_name`]'s absolute-path fallback needed the
+/// same quoting, so the third call site is what pushed the helper here rather
+/// than re-duplicating it a third time).
+pub(crate) fn shell_quote_if_needed(path: &str) -> String {
+    fn is_safe(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b':' | b'@' | b'%' | b','
+            )
+    }
+    if !path.is_empty() && path.bytes().all(is_safe) {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', r"'\''"))
+    }
+}
+
 /// Hook-ingestion endpoint. Unix: a Unix-domain-socket path
 /// (`$XDG_RUNTIME_DIR/dot-agent-deck.sock` else `/tmp/dot-agent-deck-{uid}.sock`).
 /// Windows: the named-pipe `\\.\pipe\dot-agent-deck-{user}-hook`, where
@@ -448,6 +920,506 @@ fn state_dir_platform_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
+
+    /// Scenario: Drive `resolve_binary_name` — the pure seam behind
+    /// `binary_name` — directly with a synthetic `current_exe()` result for
+    /// each unusable case a real call can produce: an `Err`, a path with no
+    /// file name (`/`), and (Unix-only) a file name that is not valid UTF-8.
+    /// Every case must fall back to `DEFAULT_BINARY_NAME`, never panic or
+    /// produce an empty string.
+    #[spec("orchestration/delegate/018")]
+    #[test]
+    fn delegate_018_binary_name_falls_back_to_the_default_literal_when_current_exe_is_unusable() {
+        // The resolver is irrelevant to every case here — each fails before
+        // `resolve_binary_name` would ever consult it — so an always-true
+        // stub isolates that these are genuinely malformed-input failures,
+        // not incidental `$PATH`/shell-safety/identity rejections.
+        assert_eq!(
+            resolve_binary_name(Err(std::io::Error::other("no such process")), |_, _| true),
+            DEFAULT_BINARY_NAME,
+            "an current_exe() error must fall back to the default literal"
+        );
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from("/")), |_, _| true),
+            DEFAULT_BINARY_NAME,
+            "a path with no file name component must fall back to the default literal"
+        );
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            // 0xFF is not valid UTF-8 in any position, so `into_string()` fails.
+            let invalid = OsStr::from_bytes(&[0xFF]);
+            assert_eq!(
+                resolve_binary_name(Ok(PathBuf::from("/usr/local/bin").join(invalid)), |_, _| {
+                    true
+                }),
+                DEFAULT_BINARY_NAME,
+                "a non-UTF-8 file name must fall back to the default literal"
+            );
+        }
+    }
+
+    /// Reviewer finding F5: nothing previously pinned the SUCCESS branch, so
+    /// a `resolve_binary_name` that returned the full path (instead of just
+    /// the file name) would have passed the entire suite — every other test
+    /// only exercises fallback inputs. This asserts the happy path returns a
+    /// BARE file name, not an absolute path.
+    #[test]
+    fn resolve_binary_name_returns_the_bare_file_name_on_the_success_path() {
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from("/usr/local/bin/deck-x")), |_, _| true),
+            "deck-x",
+            "the success branch must return a bare file name, not the full path"
+        );
+    }
+
+    /// Reviewer F2 / auditor F1, updated for issue prageethw/dot-agent-deck#253's Greptile P1: a
+    /// well-formed name that WOULD resolve on `$PATH` must still be rejected
+    /// when it is not shell-safe — the shell-safety gate has to reject
+    /// independently of the `$PATH` gate, not rely on an unsafe name also
+    /// happening to be absent from `$PATH`. It no longer falls back to
+    /// [`DEFAULT_BINARY_NAME`], though: since `current_exe()` is otherwise
+    /// usable, it falls back to that absolute path instead, quoted exactly
+    /// like [`shell_quote_if_needed`] would quote it directly.
+    ///
+    /// **Split by host dialect since #560.** The injected path has to be
+    /// absolute IN THE HOST'S DIALECT, because [`std::path::absolute`] is the
+    /// host's: a driveless `/usr/local/bin/x` is rooted but NOT absolute on
+    /// Windows, where it acquires the current drive and comes back as
+    /// `D:/usr/local/bin/x`. Before #560 nothing absolutised, so one set of
+    /// POSIX-shaped literals happened to pass on every platform; that is no
+    /// longer true and pretending otherwise is what `build-windows` caught.
+    /// Each arm keeps hand-written expected strings rather than composing them
+    /// through the production helpers, for the reason
+    /// [`EXPECTED_SAFE_PUNCTUATION`] gives.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_shell_unsafe() {
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from("/usr/local/bin/dot-agent-deck (1)")),
+                |_, _| true
+            ),
+            "'/usr/local/bin/dot-agent-deck (1)'",
+            "a name containing shell metacharacters must fall back to the quoted absolute \
+             path even when it resolves on $PATH"
+        );
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from("/usr/local/bin/dot-agent-deck copy")),
+                |_, _| true
+            ),
+            "'/usr/local/bin/dot-agent-deck copy'",
+            "a name containing whitespace must fall back to the quoted absolute path \
+             (the Finder-duplicate case)"
+        );
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from("/usr/local/bin/-rf")), |_, _| true),
+            "/usr/local/bin/-rf",
+            "a name with a leading '-' must fall back to the absolute path — unquoted, \
+             since as a full path argument (not a bare token) a leading '-' in the file \
+             name component is not read as a flag"
+        );
+        // Issue #560: every case above injects a path that is ALREADY absolute,
+        // so all three passed before anything enforced absoluteness. A relative
+        // `current_exe()` is the shape macOS actually produces, and the name
+        // "falls back to the absolute path" has to hold for it too.
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from("./bin/dot-agent-deck copy")), |_, _| true),
+            format!(
+                "'{}'",
+                std::env::current_dir()
+                    .expect("a cwd")
+                    .join("bin/dot-agent-deck copy")
+                    .display()
+            ),
+            "a relative current_exe() must be absolutised before quoting, not emitted as-is"
+        );
+    }
+
+    /// Windows arm of the test above (#560/#561). Same three gate cases with
+    /// drive-qualified inputs, and the expected strings carry the forward-slash
+    /// respelling `posix_command_word` applies — which is the whole of #561
+    /// observed at the seam rather than in the helper.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_shell_unsafe() {
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(
+                    r"C:\Program Files\deck\dot-agent-deck (1).exe"
+                )),
+                |_, _| true
+            ),
+            "'C:/Program Files/deck/dot-agent-deck (1).exe'",
+            "a name containing shell metacharacters must fall back to the absolute path, \
+             respelled with '/' and quoted for the space"
+        );
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(r"C:\deck\dot-agent-deck copy.exe")),
+                |_, _| true
+            ),
+            "'C:/deck/dot-agent-deck copy.exe'",
+            "a name containing whitespace must fall back to the respelled, quoted path"
+        );
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from(r"C:\deck\-rf.exe")), |_, _| true),
+            "C:/deck/-rf.exe",
+            "a name with a leading '-' must fall back to the respelled path — unquoted, \
+             since as a full path argument a leading '-' in the file name is not a flag"
+        );
+        // Issue #560's half, in the Windows dialect: a relative `current_exe()`
+        // must be anchored before it is spelled.
+        let expected = std::env::current_dir()
+            .expect("a cwd")
+            .join(r"bin\dot-agent-deck copy.exe")
+            .to_str()
+            .expect("a UTF-8 cwd")
+            .replace('\\', "/");
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(r".\bin\dot-agent-deck copy.exe")),
+                |_, _| true
+            ),
+            format!("'{expected}'"),
+            "a relative current_exe() must be absolutised before spelling, not emitted as-is"
+        );
+    }
+
+    /// Reviewer F1 / auditor F1, updated for issue prageethw/dot-agent-deck#253's Greptile P1 and
+    /// again for the `$PATH`-identity tightening: a well-formed, shell-safe
+    /// name whose `$PATH` lookup does NOT identity-match `current_exe()`
+    /// (here: an injected resolver that always reports "no match", standing
+    /// in for "not found" as well as "found the wrong file" — both take this
+    /// branch) must still avoid emitting an unrunnable or wrong-binary
+    /// command — this is the case that regressed from "wrong but runnable by
+    /// accident" to "resolves to nothing, or resolves to something else"
+    /// before the gate existed. It no longer falls back to
+    /// [`DEFAULT_BINARY_NAME`] (a proxy for the CONSUMING agent's `$PATH`,
+    /// which the deck process's own `$PATH` cannot reliably stand in for);
+    /// it falls back to the absolute `current_exe()` path instead, which
+    /// resolves regardless of either process's `$PATH`.
+    ///
+    /// Split by host dialect since #560, for the reason the shell-unsafe test
+    /// above records: the injected path must be absolute in the HOST's dialect.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_not_on_path() {
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from("/opt/build/worker-agent-deck")), |_, _| {
+                false
+            }),
+            "/opt/build/worker-agent-deck",
+            "a well-formed name whose $PATH lookup does not identity-match must fall back \
+             to the (unquoted, since it needs no quoting) absolute path"
+        );
+        // Issue #560, on the branch that matters most: this is the exact case
+        // the fallback exists to serve (a build that is not on `$PATH`), and it
+        // is the one a macOS `./target/release/dot-agent-deck` launch lands in.
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from("./target/release/dot-agent-deck")),
+                |_, _| false
+            ),
+            std::env::current_dir()
+                .expect("a cwd")
+                .join("target/release/dot-agent-deck")
+                .display()
+                .to_string(),
+            "the emitted word must not be resolvable against the WORKER's cwd — it has to \
+             be absolute so it means the same thing in every directory"
+        );
+    }
+
+    /// Windows arm of the test above (#560/#561).
+    #[cfg(windows)]
+    #[test]
+    fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_not_on_path() {
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(r"C:\build\worker-agent-deck.exe")),
+                |_, _| false
+            ),
+            "C:/build/worker-agent-deck.exe",
+            "a well-formed name whose $PATH lookup does not identity-match must fall back \
+             to the respelled absolute path, which needs no quoting"
+        );
+        let expected = std::env::current_dir()
+            .expect("a cwd")
+            .join(r"target\release\dot-agent-deck.exe")
+            .to_str()
+            .expect("a UTF-8 cwd")
+            .replace('\\', "/");
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(r".\target\release\dot-agent-deck.exe")),
+                |_, _| false
+            ),
+            expected,
+            "the emitted word must not be resolvable against the WORKER's cwd — it has to \
+             be absolute so it means the same thing in every directory"
+        );
+    }
+
+    /// Issue prageethw/dot-agent-deck#253 Greptile P1: when `current_exe()` itself is fine but
+    /// neither gate is satisfied, the fallback must be the absolute path,
+    /// never the generic [`DEFAULT_BINARY_NAME`] literal — an absolute path
+    /// is independent of whatever `$PATH` the CONSUMING agent's login shell
+    /// ends up with, whereas the deck process's own `$PATH` (what the two
+    /// gates check) is only a proxy for it and a `DEFAULT_BINARY_NAME`
+    /// fallback can name a binary that was never installed under that name
+    /// at all.
+    ///
+    /// The injected literal is host-dialect since #560 (see the shell-unsafe
+    /// test above); the property being asserted is identical on both.
+    #[test]
+    fn resolve_binary_name_absolute_path_fallback_is_never_the_default_literal() {
+        #[cfg(unix)]
+        let (injected, expected) = (
+            "/opt/build/worker-agent-deck",
+            "/opt/build/worker-agent-deck",
+        );
+        #[cfg(windows)]
+        let (injected, expected) = (
+            r"C:\build\worker-agent-deck.exe",
+            "C:/build/worker-agent-deck.exe",
+        );
+
+        let fallback = resolve_binary_name(Ok(PathBuf::from(injected)), |_, _| false);
+        assert_ne!(fallback, DEFAULT_BINARY_NAME);
+        assert_eq!(fallback, expected);
+    }
+
+    /// Issue #560, stated as the invariant rather than as one example: whatever
+    /// shape `current_exe()` comes back in, the fallback command word must
+    /// resolve to the same file from any working directory. That is the whole
+    /// justification the doc comment, the #520 changelog entry and the review
+    /// thread all give for preferring a path over [`DEFAULT_BINARY_NAME`], and
+    /// until this landed nothing enforced it — every existing test injected an
+    /// already-absolute path, so a `current_exe()` of the shape macOS actually
+    /// returns (`_NSGetExecutablePath` reports the INVOCATION path) sailed
+    /// through and the worker resolved it against its own cwd.
+    ///
+    /// **`..` is handled differently per platform, and that is why it is only
+    /// checked for absoluteness here.** [`std::path::absolute`] is purely
+    /// lexical on Unix and deliberately KEEPS `..`, because collapsing it would
+    /// change which file the path names when a component is a symlink; on
+    /// Windows it follows `GetFullPathNameW` and DOES collapse it, so the
+    /// result is no longer anchored under the cwd at all. Absoluteness holds
+    /// either way, and absoluteness is the property #560 is about — so the
+    /// cwd-anchoring assertion is applied only to the shapes where "anchored at
+    /// the cwd" is well defined on both platforms.
+    ///
+    /// The comparison is against a dialect-appropriate prefix: on Windows the
+    /// emitted word carries `/` separators (#561) while `current_dir()` returns
+    /// `\`, so the raw cwd string is not a prefix of it.
+    #[test]
+    fn resolve_binary_name_fallback_is_absolute_for_every_relative_current_exe_shape() {
+        let cwd = std::env::current_dir().expect("a cwd");
+        let cwd_str = cwd.to_str().expect("a UTF-8 cwd");
+        let cwd_prefix = if cfg!(windows) {
+            cwd_str.replace('\\', "/")
+        } else {
+            cwd_str.to_string()
+        };
+
+        for (relative, anchored_at_cwd) in [
+            ("./target/release/dot-agent-deck", true),
+            ("target/release/dot-agent-deck", true),
+            ("dot-agent-deck", true),
+            // Absolute on both platforms; anchored under the cwd only where
+            // `..` survives, i.e. not on Windows — see the doc above.
+            ("../sibling/dot-agent-deck", false),
+        ] {
+            let fallback = resolve_binary_name(Ok(PathBuf::from(relative)), |_, _| false);
+            let unquoted = parse_as_one_shell_word(&fallback)
+                .unwrap_or_else(|| panic!("{fallback} must parse as exactly one POSIX word"));
+            assert!(
+                Path::new(&unquoted).is_absolute(),
+                "current_exe() of {relative:?} produced {fallback}, which is not absolute — a \
+                 worker would resolve it against ITS OWN cwd"
+            );
+            if anchored_at_cwd {
+                assert!(
+                    unquoted.starts_with(&cwd_prefix),
+                    "{fallback} must be {relative:?} anchored at this process's cwd"
+                );
+            }
+            assert_ne!(
+                fallback, DEFAULT_BINARY_NAME,
+                "absolutising must not degrade the fallback to the generic literal"
+            );
+        }
+    }
+
+    /// Issues #560 and #561 together, on the helper that emits the word: the
+    /// two defects were in one expression and the fallback is only correct when
+    /// both hold at once, so this asserts the combined post-condition across
+    /// both host dialects. Whatever the dialect, the emitted word must be
+    /// exactly one POSIX shell word, absolute, and containing a `/` — the last
+    /// because a POSIX shell resolves a `/`-free command word through `$PATH`
+    /// instead of as a path, which is what made a correctly-quoted Windows path
+    /// unrunnable even in git-bash. (The absoluteness of what reaches this
+    /// helper is [`resolve_binary_name`]'s job and is asserted by the test
+    /// above; here the inputs stand in for what it passes down.)
+    #[test]
+    fn posix_command_word_always_emits_one_absolute_pathname_word() {
+        for (path, windows_host) in [
+            ("/opt/my deck/dot-agent-deck", false),
+            ("/opt/build/dot-agent-deck (1)", false),
+            (r"C:\Users\somebody\bin\dot-agent-deck.exe", true),
+            (r"C:\Program Files\deck\dot-agent-deck.exe", true),
+            (r"\\server\share\dot-agent-deck.exe", true),
+        ] {
+            let word = posix_command_word(path, windows_host)
+                .unwrap_or_else(|| panic!("{path} must have a POSIX spelling"));
+            let literal = parse_as_one_shell_word(&word)
+                .unwrap_or_else(|| panic!("{word} must parse as exactly one POSIX word"));
+            assert!(
+                literal.contains('/'),
+                "{word} must resolve as a pathname, not a $PATH lookup"
+            );
+            assert!(
+                literal.starts_with('/') || literal.as_bytes().get(1) == Some(&b':'),
+                "{word} must be absolute — rooted, or drive-qualified on Windows"
+            );
+        }
+    }
+
+    /// Issue prageethw/dot-agent-deck#253 Greptile P1 (the smaller half): [`path_contains_executable`]
+    /// (the pure helper behind [`resolves_on_path`]) must require the execute
+    /// bit, not just file existence — a readable but non-executable regular
+    /// file must not be treated as resolving, since `binary_name()` feeds an
+    /// agent's shell a bare name it is expected to *run*. Same distinction
+    /// `orchestrator_ext`'s `is_executable_file` already draws for `pi`
+    /// discovery. Driven through a synthetic `PATH` value rather than the
+    /// real process-global `PATH`, so no env-var lock is needed.
+    #[cfg(unix)]
+    #[test]
+    fn path_contains_executable_requires_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let candidate = tmp.path().join("not-a-real-binary-253");
+        std::fs::write(&candidate, b"#!/bin/sh\n").unwrap();
+        let mut perms = std::fs::metadata(&candidate).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&candidate, perms.clone()).unwrap();
+
+        let synthetic_path = tmp.path().as_os_str();
+        assert!(
+            !path_contains_executable(synthetic_path, "not-a-real-binary-253"),
+            "a regular, non-executable file on $PATH must not resolve"
+        );
+
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&candidate, perms).unwrap();
+        assert!(
+            path_contains_executable(synthetic_path, "not-a-real-binary-253"),
+            "the same file, once executable, must resolve"
+        );
+    }
+
+    /// Issue prageethw/dot-agent-deck#253's `$PATH`-identity tightening: an empty or relative `$PATH`
+    /// entry can never be trusted for an identity comparison (a shell
+    /// resolves either against ITS OWN current directory, which this process
+    /// cannot observe), while an absolute entry can. Pure data, no
+    /// filesystem access needed. The "absolute" fixture is platform-gated:
+    /// `Path::is_absolute()` requires a drive or UNC prefix on Windows, so a
+    /// bare leading slash is merely rooted there, not absolute.
+    #[test]
+    fn is_untrustworthy_path_entry_rejects_empty_and_relative_but_accepts_absolute() {
+        assert!(is_untrustworthy_path_entry(Path::new("")));
+        assert!(is_untrustworthy_path_entry(Path::new(".")));
+        assert!(is_untrustworthy_path_entry(Path::new("bin")));
+        #[cfg(unix)]
+        assert!(!is_untrustworthy_path_entry(Path::new("/usr/local/bin")));
+        #[cfg(windows)]
+        assert!(!is_untrustworthy_path_entry(Path::new(
+            r"C:\Windows\System32"
+        )));
+    }
+
+    /// Scenario: Build two directories on a synthetic `$PATH`, each holding an
+    /// executable file with the SAME basename but different content — a
+    /// "shadow" binary listed first and the "real" (`current_exe()`-standing-in)
+    /// binary listed second, reproducing the `PATH=.:/usr/bin`-style shadowing
+    /// issue prageethw/dot-agent-deck#253 flags. Drive both the pure `path_identity_match` helper and
+    /// the full `resolve_binary_name` seam directly with this synthetic `$PATH`
+    /// (never the real process-global `PATH`) and assert the shadowing
+    /// candidate is rejected — `resolve_binary_name` must fall back to the
+    /// quoted absolute path rather than emit a bare name that a consuming
+    /// shell would resolve to the wrong (shadow) binary.
+    #[spec("orchestration/delegate/019")]
+    #[test]
+    fn delegate_019_shadowed_path_match_is_rejected_and_falls_back_to_the_absolute_path() {
+        let root = tempfile::tempdir().unwrap();
+        let shadow_dir = root.path().join("shadow");
+        let real_dir = root.path().join("real");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+
+        let name = "delegate-019-shared-name";
+        let shadow_candidate = shadow_dir.join(name);
+        let real_candidate = real_dir.join(name);
+        std::fs::write(&shadow_candidate, b"#!/bin/sh\necho shadow\n").unwrap();
+        std::fs::write(&real_candidate, b"#!/bin/sh\necho real\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for candidate in [&shadow_candidate, &real_candidate] {
+                let mut perms = std::fs::metadata(candidate).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(candidate, perms).unwrap();
+            }
+        }
+
+        // Shadow first, exactly like `PATH=.:/usr/bin` puts the attacker- (or
+        // stale-build-) controlled entry ahead of the real binary's own location.
+        let shadow_first = std::env::join_paths([&shadow_dir, &real_dir]).unwrap();
+
+        assert!(
+            !path_identity_match(&shadow_first, name, &real_candidate),
+            "the same-named file earlier on $PATH must not be treated as an identity match \
+             for the running binary merely because the basename matches"
+        );
+
+        // Sanity check, roles reversed: with the real binary first on $PATH, identity
+        // DOES match — proves the rejection above is genuinely about identity (shadowed
+        // vs. not), not merely "the file could not be found at all".
+        let real_first = std::env::join_paths([&real_dir, &shadow_dir]).unwrap();
+        assert!(
+            path_identity_match(&real_first, name, &real_candidate),
+            "the running binary's own first-$PATH-match must be recognized as itself"
+        );
+
+        // End-to-end: `resolve_binary_name` must reject the shadow and fall back to the
+        // absolute path, never the bare name a consuming shell would resolve to the
+        // shadowing binary instead.
+        let resolved =
+            resolve_binary_name(Ok(real_candidate.clone()), |candidate_name, exe_path| {
+                path_identity_match(&shadow_first, candidate_name, exe_path)
+            });
+        // #561: on Windows the fallback carries the forward-slash respelling, so
+        // the expectation is spelled here rather than taken from the raw path —
+        // deriving it through `posix_command_word` would make this agree with
+        // whatever that helper does instead of pinning what it should do.
+        let expected_path = if cfg!(windows) {
+            real_candidate.to_str().unwrap().replace('\\', "/")
+        } else {
+            real_candidate.to_str().unwrap().to_string()
+        };
+        assert_eq!(
+            resolved,
+            shell_quote_if_needed(&expected_path),
+            "a name shadowed earlier on $PATH must fall back to the quoted absolute path, \
+             never the bare name a shell would resolve to the shadowing binary instead"
+        );
+    }
 
     /// The Windows per-user pipe segment must be a *non-colliding*, namespace-safe
     /// token (PRD #163). Pure data, so the rule is checked on Linux CI too.
@@ -594,5 +1566,467 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+    }
+
+    /// The safe punctuation set [`shell_quote_if_needed`] documents, re-declared
+    /// here **independently of the production predicate** (issue #563). A test
+    /// that reused `is_safe` would agree with whatever the helper currently
+    /// does rather than pin what it is supposed to do; spelling the set out a
+    /// second time is what makes a future narrowing *or* widening of it fail an
+    /// assertion instead of silently changing every generated command line.
+    const EXPECTED_SAFE_PUNCTUATION: &[char] = &['/', '.', '_', '-', '+', '=', ':', '@', '%', ','];
+
+    /// Alphanumerics plus [`EXPECTED_SAFE_PUNCTUATION`] — the bytes that must
+    /// survive [`shell_quote_if_needed`] unquoted.
+    fn is_expected_safe(c: char) -> bool {
+        c.is_ascii_alphanumeric() || EXPECTED_SAFE_PUNCTUATION.contains(&c)
+    }
+
+    /// Minimal POSIX word reader used to prove a quoted result is still ONE
+    /// shell word whose literal value is the original path. Returns `None` when
+    /// the input would split into more than one word, ends inside an
+    /// unterminated quote, or leaves a byte unquoted that a real shell would
+    /// treat as anything other than a literal.
+    ///
+    /// Deliberately narrow: it understands exactly the two constructs
+    /// [`shell_quote_if_needed`] can emit — bare safe bytes, and single-quoted
+    /// runs spliced together with `'\''` — so anything else is reported as
+    /// unsafe rather than quietly accepted. Pure data: no shell is spawned.
+    fn parse_as_one_shell_word(s: &str) -> Option<String> {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                // Single-quoted run: every byte up to the next `'` is literal,
+                // and no escape is recognized inside it (POSIX 2.2.2).
+                '\'' => loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(inner) => out.push(inner),
+                        // Unterminated quote — the shell would keep reading.
+                        None => return None,
+                    }
+                },
+                // Outside quotes a backslash escapes exactly the next byte;
+                // this is the `\'` in the middle of the `'\''` splice.
+                '\\' => out.push(chars.next()?),
+                c if is_expected_safe(c) => out.push(c),
+                // A word separator, or an unquoted metacharacter the shell
+                // would expand or act on rather than pass through literally.
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// Issue #563: a path built only from safe bytes comes back BYTE-FOR-BYTE
+    /// unchanged. The no-gratuitous-quotes half is worth pinning because all
+    /// three call sites write the result into text a user reads and an agent
+    /// runs — the two hook installers' generated config among it — so starting
+    /// to quote paths that never needed it would rewrite every one of those
+    /// lines. That should be a deliberate edit, not a side effect.
+    #[test]
+    fn shell_quote_if_needed_returns_a_safe_path_unchanged() {
+        for input in [
+            "/usr/local/bin/dot-agent-deck",
+            "dot-agent-deck",
+            "/home/somebody/.cargo/bin/dot-agent-deck",
+            // Every safe punctuation byte at once, in a plausible path shape.
+            "/opt/a+b=c:d@e%f,g/bin/x_1-2.3",
+            // Backslash-free Windows-style path: the drive colon and the
+            // forward slashes are all in the safe set, so this one does NOT
+            // quote — see the backslash test below for the contrast.
+            "C:/Users/somebody/bin/dot-agent-deck.exe",
+        ] {
+            assert_eq!(
+                shell_quote_if_needed(input),
+                input,
+                "a path of only safe bytes must be returned unchanged, not quoted"
+            );
+        }
+    }
+
+    /// Issue #563: a path containing a space is single-quoted, and the quoted
+    /// form still reads as a single shell word rather than two.
+    #[test]
+    fn shell_quote_if_needed_single_quotes_a_path_containing_a_space() {
+        for input in [
+            "/Applications/My App/bin/dot-agent-deck",
+            " leading",
+            "trailing ",
+        ] {
+            let quoted = shell_quote_if_needed(input);
+            assert_eq!(
+                quoted,
+                format!("'{input}'"),
+                "a space must force the single-quoted form"
+            );
+            assert_eq!(
+                parse_as_one_shell_word(&quoted).as_deref(),
+                Some(input),
+                "the quoted form must still be one word with the original value"
+            );
+        }
+    }
+
+    /// Issue #563: an embedded single quote is escaped as `'\''` — close the
+    /// run, emit an escaped quote, reopen — and the result still parses as ONE
+    /// shell word whose value is the original path. This is the one input where
+    /// a naive `format!("'{path}'")` would produce a *syntactically broken*
+    /// command rather than merely an ugly one.
+    #[test]
+    fn shell_quote_if_needed_escapes_an_embedded_single_quote_into_one_word() {
+        assert_eq!(
+            shell_quote_if_needed("/home/o'brien/bin/dot-agent-deck"),
+            r"'/home/o'\''brien/bin/dot-agent-deck'",
+            "an embedded single quote must be spliced as '\\'', not passed through"
+        );
+
+        for input in [
+            "/home/o'brien/bin/dot-agent-deck",
+            "'",
+            "''",
+            "'leading",
+            "trailing'",
+            "a'b'c",
+            // The nastiest realistic shape: a quote next to a space, so the
+            // splice and the reason for quoting are different bytes.
+            "/tmp/it's here/dot-agent-deck",
+        ] {
+            let quoted = shell_quote_if_needed(input);
+            assert_eq!(
+                parse_as_one_shell_word(&quoted).as_deref(),
+                Some(input),
+                "{quoted:?} must parse back to exactly one word equal to {input:?}"
+            );
+        }
+    }
+
+    /// Issue #563: the empty string is quoted (`''`) rather than returned bare.
+    /// The `!path.is_empty()` guard in the helper already makes this true;
+    /// nothing asserted it. It matters more than its size suggests — a bare
+    /// empty string interpolated into command text expands to *nothing*, so the
+    /// next word silently becomes the command, which is precisely the class of
+    /// failure the shell-safety work exists to prevent.
+    #[test]
+    fn shell_quote_if_needed_quotes_the_empty_string_rather_than_returning_it_bare() {
+        assert_eq!(
+            shell_quote_if_needed(""),
+            "''",
+            "the empty string must survive as an explicit empty word"
+        );
+    }
+
+    /// Issue #563: every byte of the documented safe set — alphanumerics plus
+    /// `/ . _ - + = : @ % ,` — stays unquoted, both on its own and inside a
+    /// path. Narrowing the set (dropping, say, `%` or `,`) would otherwise add
+    /// quotes to a large share of generated paths with no test noticing.
+    #[test]
+    fn shell_quote_if_needed_leaves_every_byte_of_the_safe_set_unquoted() {
+        let alphanumerics = ['a', 'z', 'A', 'Z', '0', '9'];
+        for c in EXPECTED_SAFE_PUNCTUATION.iter().chain(alphanumerics.iter()) {
+            let alone = c.to_string();
+            assert_eq!(
+                shell_quote_if_needed(&alone),
+                alone,
+                "{c:?} is in the safe set, so it must not be quoted on its own"
+            );
+
+            let in_path = format!("/bin/dot{c}agent{c}deck");
+            assert_eq!(
+                shell_quote_if_needed(&in_path),
+                in_path,
+                "{c:?} is in the safe set, so a path containing it must not be quoted"
+            );
+        }
+    }
+
+    /// Issue #563, the other direction: sweep the whole ASCII range and assert
+    /// the safe/unsafe split matches the documented set exactly. Widening the
+    /// set is the more dangerous edit of the two — letting `$`, `` ` ``, `;` or
+    /// a space through unquoted turns an interpolated path into shell syntax —
+    /// and a per-byte allowlist test alone would not catch it.
+    #[test]
+    fn shell_quote_if_needed_quotes_every_ascii_byte_outside_the_safe_set() {
+        for byte in 0u8..=0x7f {
+            let c = byte as char;
+            let input = c.to_string();
+            let quoted = shell_quote_if_needed(&input);
+
+            if is_expected_safe(c) {
+                assert_eq!(
+                    quoted, input,
+                    "byte {byte:#04x} ({c:?}) is in the documented safe set and must stay unquoted"
+                );
+                continue;
+            }
+
+            assert_ne!(
+                quoted, input,
+                "byte {byte:#04x} ({c:?}) is outside the documented safe set and must be quoted"
+            );
+            assert!(
+                quoted.starts_with('\'') && quoted.ends_with('\''),
+                "byte {byte:#04x} ({c:?}) must produce the single-quoted form, got {quoted:?}"
+            );
+            assert_eq!(
+                parse_as_one_shell_word(&quoted).as_deref(),
+                Some(input.as_str()),
+                "byte {byte:#04x} ({c:?}) must survive quoting as one word with its original value"
+            );
+        }
+    }
+
+    /// Issue #563: the safe-set predicate works on BYTES while a path is UTF-8,
+    /// so every byte of a multi-byte character is >= 0x80 and therefore outside
+    /// the set — a non-ASCII path always quotes. Worth its own case because the
+    /// ASCII sweep above cannot reach these bytes, and because quoting must
+    /// splice around whole characters rather than cutting one in half.
+    #[test]
+    fn shell_quote_if_needed_quotes_a_non_ascii_path_without_mangling_it() {
+        for input in [
+            "/home/josé/bin/dot-agent-deck",
+            "/srv/项目/bin/dot-agent-deck",
+            "/tmp/naïve café/dot-agent-deck",
+        ] {
+            let quoted = shell_quote_if_needed(input);
+            assert_eq!(
+                quoted,
+                format!("'{input}'"),
+                "a non-ASCII path is outside the byte-wise safe set, so it must be quoted"
+            );
+            assert_eq!(
+                parse_as_one_shell_word(&quoted).as_deref(),
+                Some(input),
+                "quoting must leave every multi-byte character intact"
+            );
+        }
+    }
+
+    /// Issue #563 pinned the treatment of backslashes here as merely *observed*
+    /// pending issue #561; #561 is now resolved, and this is the assertion of
+    /// the settled behavior. The settled behavior is that
+    /// [`shell_quote_if_needed`] keeps doing exactly this: `\` stays out of
+    /// the safe set, so a backslash-bearing path is single-quoted, and a
+    /// single-quoted POSIX run takes no escapes so every backslash survives
+    /// literally rather than being consumed as one. That is *correct* POSIX
+    /// quoting and the other call site depends on it:
+    /// `agent_hook_config::build_command` writes the Codex and Devin hook
+    /// command lines. Devin's installer is `#[cfg(unix)]` and can only ever see
+    /// a POSIX path; Codex's is NOT — `codex_home` honours `$CODEX_HOME` on
+    /// every platform — so that one can be reached on Windows. Whether a Codex
+    /// hook command needs a different dialect there is a question about a
+    /// third-party tool's own execution model, not about this quoter, and it is
+    /// deliberately out of scope for #561, which is about `binary_name`'s
+    /// fallback.
+    ///
+    /// What #561 actually diagnosed is one layer up, and is fixed there rather
+    /// than here: quoting alone never made a Windows path *runnable*, because a
+    /// POSIX shell decides pathname-vs-`$PATH`-lookup on whether the command
+    /// word contains a `/`. So the perfectly-quoted result asserted below is
+    /// still `command not found` when used as a command word — which is why
+    /// [`posix_command_word`] respells the separators before calling this, and
+    /// why the fix did NOT belong in the quoter.
+    #[test]
+    fn shell_quote_if_needed_keeps_backslashes_literal_in_a_posix_word() {
+        assert_eq!(
+            shell_quote_if_needed(r"\"),
+            r"'\'",
+            "backslash is outside the safe set, so it is quoted"
+        );
+        assert_eq!(
+            shell_quote_if_needed(r"C:\Users\somebody\bin\dot-agent-deck.exe"),
+            r"'C:\Users\somebody\bin\dot-agent-deck.exe'",
+            "a backslash-bearing path is single-quoted"
+        );
+        assert_eq!(
+            shell_quote_if_needed(r"\\server\share\dot-agent-deck.exe"),
+            r"'\\server\share\dot-agent-deck.exe'",
+            "a UNC path is single-quoted"
+        );
+
+        // A single-quoted run takes no escapes (POSIX 2.2.2), so each backslash
+        // survives literally rather than being consumed as one.
+        assert_eq!(
+            parse_as_one_shell_word(&shell_quote_if_needed(
+                r"C:\Users\somebody\bin\dot-agent-deck.exe"
+            ))
+            .as_deref(),
+            Some(r"C:\Users\somebody\bin\dot-agent-deck.exe"),
+            "the quoted Windows path is one word with its backslashes intact"
+        );
+
+        // The half that made #561 a defect rather than a style question: the
+        // word above is a correctly-quoted *literal*, and a correctly-quoted
+        // literal with no `/` in it is a `$PATH` lookup, not a path. Nothing
+        // this function can do changes that, which is what moves the fix to
+        // `posix_command_word`.
+        assert!(
+            !parse_as_one_shell_word(&shell_quote_if_needed(
+                r"C:\Users\somebody\bin\dot-agent-deck.exe"
+            ))
+            .expect("the quoted form parses as one word")
+            .contains('/'),
+            "the quoted Windows path contains no '/', so a POSIX shell resolves it \
+             through $PATH rather than as a pathname"
+        );
+    }
+
+    /// Issue #561, the fix side: [`posix_command_word`] is what turns an
+    /// absolute path into a word a POSIX shell will actually execute, and the
+    /// `windows_host` parameter is what makes the Windows branch reachable from
+    /// a Linux CI host. On a POSIX host it is a pass-through to
+    /// [`shell_quote_if_needed`]; on a Windows path it respells `\` as `/`
+    /// FIRST, which both makes the word a pathname and — for an ordinary
+    /// drive-letter path — removes the need to quote it at all.
+    #[test]
+    fn posix_command_word_respells_a_windows_path_with_forward_slashes() {
+        assert_eq!(
+            posix_command_word(r"C:\Users\somebody\bin\dot-agent-deck.exe", true).as_deref(),
+            Some("C:/Users/somebody/bin/dot-agent-deck.exe"),
+            "a drive-letter path is respelled and then needs no quoting"
+        );
+        assert_eq!(
+            posix_command_word(r"\\server\share\dot-agent-deck.exe", true).as_deref(),
+            Some("//server/share/dot-agent-deck.exe"),
+            "a UNC path becomes the //server/share form MSYS and Cygwin use"
+        );
+        assert_eq!(
+            posix_command_word(r"C:\Program Files\deck\dot-agent-deck.exe", true).as_deref(),
+            Some("'C:/Program Files/deck/dot-agent-deck.exe'"),
+            "a respelled path containing a space is still single-quoted"
+        );
+
+        // Every emitted word is one shell word whose literal value contains a
+        // `/` — i.e. a pathname, not a $PATH lookup. This is the property the
+        // test above proves the quoter alone cannot deliver.
+        for windows_path in [
+            r"C:\Users\somebody\bin\dot-agent-deck.exe",
+            r"\\server\share\dot-agent-deck.exe",
+            r"C:\Program Files\deck\dot-agent-deck.exe",
+            r"C:\Users\o'brien\dot-agent-deck.exe",
+        ] {
+            let word = posix_command_word(windows_path, true).expect("a spellable Windows path");
+            let literal = parse_as_one_shell_word(&word)
+                .unwrap_or_else(|| panic!("{word} must parse as exactly one POSIX word"));
+            assert!(
+                literal.contains('/'),
+                "{word} must resolve as a pathname, not a $PATH lookup"
+            );
+            assert!(
+                !literal.contains('\\'),
+                "{word} must carry no backslash separators into the shell"
+            );
+        }
+    }
+
+    /// Issue #561: a `\\?\` verbatim or `\\.\` device path is REFUSED rather
+    /// than respelled. Those prefixes are defined to disable path
+    /// normalization, so `/` is not a separator inside them and swapping the
+    /// separators would name a different file — emitting something that might
+    /// be misparsed into a command an agent executes is worse than declining.
+    /// [`resolve_binary_name`] turns the `None` into [`DEFAULT_BINARY_NAME`],
+    /// whose worst case is a `$PATH` lookup that may well succeed.
+    #[test]
+    fn posix_command_word_refuses_a_windows_path_with_no_posix_spelling() {
+        for unspellable in [
+            r"\\?\C:\Users\somebody\dot-agent-deck.exe",
+            r"\\?\UNC\server\share\dot-agent-deck.exe",
+            r"\\.\C:\Users\somebody\dot-agent-deck.exe",
+            // No separator at all: respelling would leave a bare word, which a
+            // POSIX shell resolves through $PATH rather than as a path.
+            "dot-agent-deck.exe",
+        ] {
+            assert_eq!(
+                posix_command_word(unspellable, true),
+                None,
+                "{unspellable} has no POSIX-shell spelling and must be refused"
+            );
+        }
+    }
+
+    /// Issue #561: on a POSIX host nothing changes — [`posix_command_word`] is
+    /// a pass-through to [`shell_quote_if_needed`], including for the paths a
+    /// Unix filesystem genuinely allows to contain a backslash. Pinning this is
+    /// the guard that the Windows branch never leaks onto Unix: `\` is a legal
+    /// character in a Unix file name, so respelling one there would name a
+    /// different file.
+    #[test]
+    fn posix_command_word_is_a_pass_through_on_a_posix_host() {
+        for input in [
+            "/usr/local/bin/dot-agent-deck",
+            "/opt/my deck/dot-agent-deck",
+            r"/opt/back\slash/dot-agent-deck",
+            "/home/o'brien/bin/dot-agent-deck",
+        ] {
+            assert_eq!(
+                posix_command_word(input, false).as_deref(),
+                Some(shell_quote_if_needed(input).as_str()),
+                "on a POSIX host the word is exactly what shell_quote_if_needed produces"
+            );
+        }
+        assert_eq!(
+            posix_command_word(r"/opt/back\slash/dot-agent-deck", false).as_deref(),
+            Some(r"'/opt/back\slash/dot-agent-deck'"),
+            "a backslash in a Unix path is quoted, never respelled"
+        );
+    }
+
+    /// Issue #561: the four characters whose handling has to be stated exactly,
+    /// because this word is written into a task file an agent then EXECUTES and
+    /// a mis-quote there is a command-injection surface rather than a display
+    /// bug. Pinned as literal expected strings, in both dialects, so any future
+    /// change to the safe set or the respelling has to restate them.
+    ///
+    /// - **space** — outside the safe set, so the whole word is single-quoted
+    ///   and stays one argument.
+    /// - **`'`** — ends the quoted run, so it is spliced as `'\''`: close,
+    ///   escaped literal quote, reopen. Still one word.
+    /// - **`\`** — a legal character in a Unix file name and never a separator
+    ///   there, so on Unix it is quoted and preserved verbatim (a single-quoted
+    ///   POSIX run takes no escapes). On Windows it can only ever be a
+    ///   separator (it is not legal in a file name), so it is respelled to `/`
+    ///   and no literal backslash reaches the shell at all.
+    /// - **`%`** — in the safe set and left bare, which is correct because a
+    ///   POSIX shell gives `%` no meaning in a command word. This is precisely
+    ///   where the POSIX target is load-bearing: `cmd.exe` expands `%VAR%` even
+    ///   inside double quotes, so no amount of quoting would make this word
+    ///   safe there — see [`binary_name`]'s doc for why `cmd.exe` is not the
+    ///   target.
+    #[test]
+    fn posix_command_word_handles_space_quote_backslash_and_percent() {
+        let unix = r"/opt/my deck/o'brien/50%/back\slash/dot-agent-deck";
+        assert_eq!(
+            posix_command_word(unix, false).as_deref(),
+            Some(r"'/opt/my deck/o'\''brien/50%/back\slash/dot-agent-deck'"),
+            "on Unix: space and quote force quoting, the backslash is preserved verbatim, \
+             and % is inert"
+        );
+        assert_eq!(
+            parse_as_one_shell_word(&posix_command_word(unix, false).expect("a POSIX spelling"))
+                .as_deref(),
+            Some(unix),
+            "the quoted Unix path is exactly one word whose literal value is the path"
+        );
+
+        let windows = r"C:\Program Files\o'brien\50%\dot-agent-deck.exe";
+        assert_eq!(
+            posix_command_word(windows, true).as_deref(),
+            Some(r"'C:/Program Files/o'\''brien/50%/dot-agent-deck.exe'"),
+            "on Windows: separators become '/', space and quote force quoting, % is inert"
+        );
+        assert_eq!(
+            parse_as_one_shell_word(&posix_command_word(windows, true).expect("a POSIX spelling"))
+                .as_deref(),
+            Some("C:/Program Files/o'brien/50%/dot-agent-deck.exe"),
+            "the quoted Windows path is one word carrying no backslash into the shell"
+        );
+
+        assert_eq!(
+            posix_command_word(r"C:\Users\50%\dot-agent-deck.exe", true).as_deref(),
+            Some("C:/Users/50%/dot-agent-deck.exe"),
+            "with no space and no quote, a respelled Windows path needs no quoting even \
+             though it carries a %"
+        );
     }
 }

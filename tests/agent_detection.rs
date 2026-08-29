@@ -47,6 +47,11 @@ impl WrapBinOverride {
         // guard rather than cascading one real failure into three confusing
         // ones.
         let exclusive = WRAP_BIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Issue #668: every spawning test in this file goes through this
+        // constructor, so this is the file's single arming point for the
+        // wrapped-child lifetime bound. Under the exclusion guard, which is
+        // also what makes its `set_var` sound.
+        common::init_test_env();
         // SAFETY: the guard above excludes every other test in this binary, so
         // nothing else reads or writes the environment while this runs.
         unsafe {
@@ -134,8 +139,9 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 #[cfg(unix)]
 fn spawn_005_respawn_wraps_codex() {
     use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use std::sync::Arc;
 
-    let fixture = tempfile::tempdir().expect("respawn recorder fixture");
+    let fixture = common::harness_tempdir().expect("respawn recorder fixture");
     let bin_dir = fixture.path().join("bin");
     let record = fixture.path().join("respawn.log");
     std::fs::create_dir(&bin_dir).expect("create respawn bin dir");
@@ -166,7 +172,7 @@ fn spawn_005_respawn_wraps_codex() {
         .build()
         .expect("build respawn runtime");
     runtime.block_on(async {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         registry
             .spawn_agent(SpawnOptions {
                 command: Some("cat"),
@@ -210,8 +216,9 @@ fn spawn_005_respawn_wraps_codex() {
 #[cfg(unix)]
 fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
     use dot_agent_deck::agent_pty::{AgentPtyRegistry, SpawnOptions};
+    use std::sync::Arc;
 
-    let fixture = tempfile::tempdir().expect("explicit Codex identity fixture");
+    let fixture = common::harness_tempdir().expect("explicit Codex identity fixture");
     let bin_dir = fixture.path().join("bin");
     let record = fixture.path().join("spawn.log");
     std::fs::create_dir(&bin_dir).expect("create explicit identity bin dir");
@@ -234,7 +241,7 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
     // fake `dot-agent-deck` on the child's PATH is no longer what runs —
     // this override is the seam for observing it.
     let _wrap_bin = WrapBinOverride::pointing_at(&bin_dir.join("dot-agent-deck"));
-    let registry = AgentPtyRegistry::new();
+    let registry = Arc::new(AgentPtyRegistry::new());
     registry
         .spawn_agent(SpawnOptions {
             command: Some("devbox run codex-big"),
@@ -278,8 +285,9 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
 #[cfg(unix)]
 fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
     use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use std::sync::Arc;
 
-    let fixture = tempfile::tempdir().expect("stable respawn fixture");
+    let fixture = common::harness_tempdir().expect("stable respawn fixture");
     let bin_dir = fixture.path().join("bin");
     let record = fixture.path().join("launch.log");
     std::fs::create_dir_all(&bin_dir).expect("create stable respawn bin dir");
@@ -312,7 +320,7 @@ fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
         .build()
         .expect("build stable respawn runtime");
     runtime.block_on(async {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         registry
             .spawn_agent(SpawnOptions {
                 command: Some("devbox run codex-big"),
@@ -361,8 +369,9 @@ fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
 #[cfg(unix)]
 fn spawn_008_respawn_wrap_decision_follows_the_launched_command() {
     use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use std::sync::Arc;
 
-    let fixture = tempfile::tempdir().expect("launch-shape coherence fixture");
+    let fixture = common::harness_tempdir().expect("launch-shape coherence fixture");
     let bin_dir = fixture.path().join("bin");
     let record = fixture.path().join("launch.log");
     std::fs::create_dir_all(&bin_dir).expect("create launch-shape bin dir");
@@ -398,7 +407,7 @@ fn spawn_008_respawn_wrap_decision_follows_the_launched_command() {
         .build()
         .expect("build launch-shape coherence runtime");
     runtime.block_on(async {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         registry
             .spawn_agent(SpawnOptions {
                 command: Some("devbox run codex-big"),
@@ -458,6 +467,135 @@ fn spawn_008_respawn_wrap_decision_follows_the_launched_command() {
             badge,
             Some(AgentType::ClaudeCode),
             "the badge must follow the newly launched command too, not keep advertising the replaced agent"
+        );
+    });
+}
+
+/// Scenario: Launch a pane whose declared Codex identity conflicts with a
+/// Claude-derived command, then remove and re-create that same pane twice as a
+/// `clear = true` delegate can. The declaration must win every launch, while a
+/// conflicting learned badge update must never rewrite the replacement exec line.
+#[spec("codex/spawn/010")]
+#[test]
+#[cfg(unix)]
+fn spawn_010_declared_identity_wins_spawn_recreate_and_learning() {
+    use dot_agent_deck::agent_pty::{
+        AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, PaneRecreateIdentity, SpawnOptions,
+    };
+    use std::sync::Arc;
+
+    let fixture = common::harness_tempdir().expect("declared identity precedence fixture");
+    let bin_dir = fixture.path().join("bin");
+    let record = fixture.path().join("launch.log");
+    std::fs::create_dir_all(&bin_dir).expect("create declared identity bin dir");
+    write_executable(
+        &bin_dir.join("claude"),
+        "#!/bin/sh\nprintf 'BARE claude %s\\n' \"$*\" >> \"$DECLARED_PRECEDENCE_RECORD\"\nexec cat\n",
+    );
+    write_executable(
+        &bin_dir.join("dot-agent-deck"),
+        "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$DECLARED_PRECEDENCE_RECORD\"\nexec cat\n",
+    );
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").expect("test runner PATH")
+    );
+    let _wrap_bin = WrapBinOverride::pointing_at(&bin_dir.join("dot-agent-deck"));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build declared identity precedence runtime");
+    runtime.block_on(async {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let command = "claude --model haiku";
+        let pane_id = "declared-precedence-pane";
+        let env = vec![
+            (DOT_AGENT_DECK_PANE_ID.into(), pane_id.into()),
+            ("PATH".into(), path),
+            (
+                "DECLARED_PRECEDENCE_RECORD".into(),
+                record.to_string_lossy().into_owned(),
+            ),
+        ];
+
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(command),
+                env: env.clone(),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn command with declared Codex identity");
+        expect_launch_lines(&record, 1);
+
+        // Model the `clear = true` recovery seam where the old registry entry
+        // disappeared before dispatch could replace it. The caller has just
+        // re-read this identity from the role config, so it is current rather
+        // than the frozen spawn-time fallback guarded by spawn/008.
+        let initial_id = registry.agent_records()[0].id.clone();
+        registry
+            .close_agent(&initial_id)
+            .expect("remove initial declared pane record");
+        let recreate_identity = PaneRecreateIdentity {
+            agent_type: Some(AgentType::Codex),
+            env: env.clone(),
+            ..PaneRecreateIdentity::default()
+        };
+        let first_recreate = registry
+            .respawn_or_recreate_agent_for_pane(pane_id, command, &recreate_identity)
+            .await
+            .expect("re-create declared pane for clear=true");
+        assert!(
+            first_recreate.recreated,
+            "the fixture must exercise the missing-record re-create seam"
+        );
+        expect_launch_lines(&record, 2);
+
+        // A hook observation is display-side only. For a pane whose declared
+        // identity already populated the badge this conflicting observation is
+        // intentionally a no-op, and in either case it must not influence the
+        // next launch decision.
+        registry.set_agent_type(pane_id, &AgentType::OpenCode);
+        let badge_after_learning = registry.agent_records()[0].agent_type.clone();
+
+        let first_recreated_id = registry.agent_records()[0].id.clone();
+        registry
+            .close_agent(&first_recreated_id)
+            .expect("remove learned-badge pane record");
+        let second_recreate = registry
+            .respawn_or_recreate_agent_for_pane(pane_id, command, &recreate_identity)
+            .await
+            .expect("re-create declared pane after learned badge update");
+        assert!(
+            second_recreate.recreated,
+            "the learned-badge leg must exercise the same re-create seam"
+        );
+        expect_launch_lines(&record, 3);
+
+        let launched = std::fs::read_to_string(&record)
+            .expect("read declared identity precedence recorder");
+        let final_badge = registry.agent_records()[0].agent_type.clone();
+        registry.shutdown_all();
+
+        assert_eq!(
+            (
+                launched.lines().collect::<Vec<_>>(),
+                badge_after_learning,
+                final_badge,
+            ),
+            (
+                vec![
+                    "WRAPPED wrap --agent codex -- claude --model haiku",
+                    "WRAPPED wrap --agent codex -- claude --model haiku",
+                    "WRAPPED wrap --agent codex -- claude --model haiku",
+                ],
+                Some(AgentType::Codex),
+                Some(AgentType::Codex),
+            ),
+            "the current config declaration must beat command derivation on spawn and every missing-record clear=true re-create, while learned display identity never changes the exec line; observed {launched:?}"
         );
     });
 }

@@ -28,7 +28,7 @@ Earlier versions of this page blamed Ghostty for intercepting the keystroke and 
 
 Hooks are **auto-installed on every startup** — most users never need to think about them. The CLI detects which agents are present and installs hooks accordingly:
 
-- **Claude Code** (`~/.claude/` detected) — writes entries into `~/.claude/settings.json` for hook types: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, PreCompact, SubagentStart, SubagentStop.
+- **Claude Code** (`~/.claude/` detected) — writes entries into `~/.claude/settings.json` for hook types: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, PreCompact, SubagentStart, SubagentStop. Only the deck's own hook commands are touched; your `model`, `env`, `permissions` and every other setting survive byte-for-byte, and if you put one of your own hooks in the same rule object as the deck's, `hooks uninstall` removes only the deck's command and leaves yours (with its matcher) in place. The read-modify-write is serialized by an in-process mutex and published atomically (temp file + `rename`), so a crash mid-write never leaves a truncated file, and the file keeps its existing permissions (a settings file the deck creates itself is owner-only). A `settings.json` the deck cannot parse — one trailing comma is enough — is backed up to `settings.json.bak` and the install *or uninstall* errors out rather than clobbering it. A `settings.json` that is a **symlink** (a dotfiles arrangement) is refused for the same reason: the deck will neither replace your link with a regular file nor write through it to a path outside `~/.claude/`. Point it at a real file, or edit the linked file's hooks yourself.
 - **OpenCode** (`~/.opencode/` detected) — creates a JS plugin at `~/.opencode/plugin/dot-agent-deck/index.js` that forwards session, tool, and permission events.
 - **Codex** (`codex` found on `PATH`) — writes a `hooks.json` into your Codex home (`$CODEX_HOME`, or `~/.codex`) whose hooks forward prompt, tool, and turn events to the dashboard, and records trust for **exactly those hooks** in that home's `config.toml` (Codex only runs hooks it trusts). Both happen at startup and again whenever the deck launches a Codex pane, so they work however you launch Codex. Your own hooks are preserved (the deck merges, it never overwrites), and `config.toml` is edited surgically — comments, your model choice, and any trust records you made yourself are left byte-for-byte intact. The deck never trusts a hook it didn't author: a third-party hook sitting in the same file stays untrusted.
 - **Devin** (`devin` found on `PATH`) — merges a `"hooks"` object into Devin's user config, whose commands shell `dot-agent-deck hook --agent devin`. The config is located the way Devin locates it: `$XDG_CONFIG_HOME/devin/config.json` when that variable is set, and `~/.config/devin/config.json` otherwise. Devin ships a Claude-Code-compatible hooks engine, so its native command hooks post the same stdin JSON shape Claude's do and ride the existing hook socket — no wrapper, no trust ceremony. Only the `"hooks"` key is touched; your `agent` (model), `permissions`, `mcpServers`, `theme_mode`, and every other setting survive byte-for-byte. The read-modify-write is serialized by an in-process mutex and published atomically (temp file + `rename`), so a crash mid-write never leaves a truncated config, and the file keeps its existing permissions (a config the deck creates itself is owner-only). Devin documents its config as JSON *with comment support*, which the deck's parser cannot edit in place: a config it cannot parse is backed up to `config.json.bak` and the install errors rather than clobbering it.
@@ -174,6 +174,26 @@ scp ~/Desktop/screenshot.png my-vm:/tmp/
 
 See [Remote Environments › Getting files to the remote](remote-environments.md#getting-files-to-the-remote) for the full explanation and the ssh-config note.
 
+## A remote will not connect, or an ssh tunnel to it is not working
+
+Ask the deck instead of guessing:
+
+```bash
+dot-agent-deck remote doctor my-vm
+```
+
+It runs a fixed ordered list of read-only checks — ssh reachability and auth, whether the deck is installed on the remote, the forwards `ssh -G` actually resolved, the remote's own `AllowTcpForwarding` and `ClientAliveInterval` from `sshd -T`, and whether a configured forward is really bound — and prints each as PASS / WARN / FAIL / UNKNOWN with the directive and file to change. Three exit codes: `0` clear, `1` a check failed, `2` a check could not be determined — so an incomplete diagnosis never reads as all-clear, and is still distinguishable from a broken one. It writes nothing: not your ssh config, not the remote's `sshd_config`, not the registry, not the remote — and the ssh sessions it opens clear all forwardings, so it does not even create the tunnel it is inspecting.
+
+It earns its keep on one case in particular. `AllowTcpForwarding no` on the remote and a port collision produce **byte-identical** errors from ssh, so no client-side message can separate them; the doctor reads the remote's own sshd policy and tells you which one you have. See [Reverse tunnels › Troubleshooting with `remote doctor`](remote-recipes.md#troubleshooting-with-remote-doctor) for annotated output of every case.
+
+## The deck is missing cards — a role or session I know is running has no card
+
+Check the deck's title row first. If it reads something like `dot-agent-deck — 7 session(s)  (↓2)`, nothing is wrong with the agents: the count is right, and the `(↓2)` says two cards are below the bottom of the window. `(↑2)` means two are above it, and both appear together when you are scrolled into the middle. Move the selection with `j` / `k` (or the arrow keys) to bring them into view, or give the terminal a few more rows and they all fit again.
+
+The deck fits as many cards as it can before it resorts to this. It picks the number of card columns and the card size together, widening the grid to a second or third column when that is what it takes to show every card, so the marker only appears on a window genuinely too small for the cards at any layout — a very short terminal, or a very large number of sessions.
+
+If there is **no** marker and a card you expect is still absent, the count in the title is the thing to read next: it is the number of sessions the deck actually knows about, and `dot-agent-deck daemon status` lists what the daemon has. A role present in your `.dot-agent-deck.toml` but missing from both is one that never started — check its `command` (see [a bare command fails to spawn](#a-bare-command-like-claude-opencode-pi-codex-or-devin-fails-to-spawn)).
+
 ## Enabling Debug Logs
 
 When something goes wrong and the dashboard's status messages aren't enough to diagnose it, set the `DOT_AGENT_DECK_LOG` environment variable to capture tracing output to a file:
@@ -187,3 +207,17 @@ DOT_AGENT_DECK_LOG=/tmp/my-debug.log dot-agent-deck
 ```
 
 The log file captures session events, hook activity, mode-tab restoration, and any errors logged by the daemon. Attach the relevant excerpt when filing an issue. See [Configuration › Environment Variables](configuration.md#environment-variables) for the full list of variables.
+
+### Turning the verbosity up
+
+The log is written at `info` for the deck itself and `error` for its dependencies. `RUST_LOG` overrides that, using the standard [`tracing` filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html):
+
+```bash
+# Everything the deck logs, at debug
+RUST_LOG=dot_agent_deck=debug DOT_AGENT_DECK_LOG=1 dot-agent-deck
+
+# Just one subsystem, to keep the file readable
+RUST_LOG=dot_agent_deck::daemon=debug DOT_AGENT_DECK_LOG=1 dot-agent-deck
+```
+
+`RUST_LOG` on its own does nothing — it selects *what* is logged, while `DOT_AGENT_DECK_LOG` decides *whether* there is a log file at all, so the two go together. A directive naming the `dot_agent_deck` target replaces the built-in default; anything else (a bare level such as `RUST_LOG=debug`, or a different crate) is layered alongside it, so the deck stays at `info` unless you name it.

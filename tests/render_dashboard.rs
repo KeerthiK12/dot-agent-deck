@@ -9,13 +9,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN;
+use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
     CardDensityKind, UiMode, card_stats_border_label, render_card_for_mode_to_buffer,
-    render_card_to_buffer, render_config_gen_prompt_to_buffer, render_dashboard_cards_to_buffer,
+    render_card_grid_to_buffer, render_card_to_buffer, render_card_with_declared_agent_to_buffer,
+    render_config_gen_prompt_to_buffer, render_dashboard_cards_to_buffer,
     render_quit_confirm_to_buffer, render_star_prompt_to_buffer, render_stats_bar_to_buffer,
     render_stop_confirm_to_buffer, sync_and_derive_selection,
 };
@@ -92,6 +94,7 @@ fn pane_004_card_title_row() {
         pane_id: Some("pane-1".to_string()),
         agent_id: Some("1".to_string()),
         display_name: None,
+        shell_synthetic_working: false,
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
     // title. Height comes from the density tier itself so the snapshot's
@@ -135,6 +138,7 @@ fn card_stats_session(cwd: &str) -> SessionState {
         pane_id: Some("pane-card-stats".to_string()),
         agent_id: Some("agent-card-stats".to_string()),
         display_name: Some("api-svc".to_string()),
+        shell_synthetic_working: false,
     }
 }
 
@@ -517,6 +521,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         pane_id: None,
         agent_id: None,
         display_name: None,
+        shell_synthetic_working: false,
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -561,14 +566,13 @@ fn contrast_001_overlays_reference_frame() {
 /// the keyboard drives the deck), then assert two terminal-relative
 /// properties. (a) NO rendered cell across any surface has a `Color::Rgb(..)`
 /// background — backgrounds must be `Color::Reset` so the terminal's own
-/// background shows through. (b) Selection is cued the PRD #155 Option-A way —
-/// a `▸ ` title prefix plus a `Color::Magenta` + `Modifier::BOLD` border — NOT
-/// an absolute background tint, and Magenta is the dedicated `selected` accent
-/// role so it never collides with a status color (green/blue/yellow/red) or the
-/// `focused` cyan: the selected card's border style must differ from the
-/// unselected card's and be magenta-bold. A regression that filled any surface
-/// with an absolute background, or that reverted the selection border to a
-/// status/focus color, would fail one of these assertions.
+/// background shows through. (b) Selection is cued by a `▸ ` title prefix, a
+/// border in the terminal's own foreground (`Color::Reset`), and a THICKER glyph
+/// (`┃` where an unselected card draws `│`) — never an absolute background tint
+/// and never a DIM. A regression that filled any surface with an absolute
+/// background, or that let the selected border fall back to a fixed White/Black
+/// or a low-contrast status colour, would fail one of these assertions (issue
+/// #442).
 #[spec("theme/guard/001")]
 #[test]
 fn guard_001_no_absolute_backgrounds() {
@@ -589,35 +593,41 @@ fn guard_001_no_absolute_backgrounds() {
         );
     }
 
-    // (b) PRD #155 Option A: selection is signalled by a `▸ ` title prefix and a
-    //     Magenta+BOLD border — a terminal-relative cue, NOT an absolute
-    //     background. Read the left-border cell (`│`, at a mid-height row) of
-    //     each card: the selected one must DIFFER from the unselected one and
-    //     be Color::Magenta + Modifier::BOLD. Magenta is the dedicated
-    //     `selected` accent role; it deliberately does not reuse the working
-    //     status green or the focused-pane cyan. (The unselected placeholder
-    //     border is a dimmed terminal foreground.) PRD #341 M4: BOLD is the
-    //     command-mode strength — `mode/deck/001` owns the PaneInput recipe.
-    let border_style = |buf: &ratatui::buffer::Buffer| {
+    // (b) Selection is signalled by a `▸ ` title prefix, the terminal's own
+    //     foreground on the border, and a THICKER glyph — all terminal-relative
+    //     cues, NOT an absolute background fill. Read the left-border cell (at a
+    //     mid-height row) of each card: the selected one must DIFFER from the
+    //     unselected one, must be `Color::Reset` (which contrasts on any theme,
+    //     unlike a fixed White/Black or a low-contrast status colour), must not
+    //     be DIM, and must thicken. Issue #442; `mode/deck/001` owns the
+    //     command-vs-PaneInput emphasis recipe.
+    let border_cell = |buf: &ratatui::buffer::Buffer| {
         let y = buf.area().height / 2;
         let cell = &buf[(0, y)];
-        (cell.fg, cell.modifier)
+        (cell.fg, cell.modifier, cell.symbol().to_string())
     };
-    let (unsel_fg, unsel_mod) = border_style(&unselected);
-    let (sel_fg, sel_mod) = border_style(&selected);
+    let (unsel_fg, unsel_mod, unsel_sym) = border_cell(&unselected);
+    let (sel_fg, sel_mod, sel_sym) = border_cell(&selected);
     assert_ne!(
-        (sel_fg, sel_mod),
-        (unsel_fg, unsel_mod),
+        (sel_fg, sel_mod, sel_sym.clone()),
+        (unsel_fg, unsel_mod, unsel_sym.clone()),
         "selected card border must differ from the unselected card border"
     );
     assert_eq!(
         sel_fg,
-        Color::Magenta,
-        "selected card border must use the `selected` role (Color::Magenta), not a status/focus color (Option-A selection cue)"
+        Color::Reset,
+        "the selected card's border must be the terminal's own foreground, so it \
+         contrasts on light and dark alike — not an absolute tint, not a \
+         low-contrast status colour (issue #442), got {sel_fg:?}"
     );
     assert!(
-        sel_mod.contains(Modifier::BOLD),
-        "selected card border must be BOLD (Option-A selection cue)"
+        !sel_mod.contains(Modifier::DIM),
+        "the selected card's border must not be DIM, got {sel_mod:?}"
+    );
+    assert_eq!(
+        (unsel_sym.as_str(), sel_sym.as_str()),
+        ("│", "┃"),
+        "selection must also thicken the border: unselected `│`, selected `┃`"
     );
 
     // The `▸ ` selection prefix appears only on the selected card's title row.
@@ -699,6 +709,7 @@ fn pane_007_pi_card_shows_pi_identity() {
         // No friendly name → the title uses the `<agent_type> · <id>` form,
         // which is where the Pi identity surfaces.
         display_name: None,
+        shell_synthetic_working: false,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -764,6 +775,7 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         pane_id: Some("codex-pane-1".to_string()),
         agent_id: Some("1".to_string()),
         display_name: None,
+        shell_synthetic_working: false,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -964,8 +976,9 @@ fn pane_009_history_only_card_marks_and_dims_input_affordance() {
 
 // ---------------------------------------------------------------------------
 // PRD #155 — centralized color palette (Option A). Border encodes STATUS in
-// BOTH deck cards and embedded panes; the dedicated `selected` (Magenta) and
-// `focused` (Cyan) accent roles never reuse a status color. These tests read
+// BOTH deck cards and embedded panes; the dedicated `selected` (`Color::Reset`
+// since issue #442) and `focused` (Cyan) accent roles never reuse a status
+// color. These tests read
 // the resolved border color out of the rendered buffer (the observable
 // end-state) so they survive the palette module's exact API — except
 // `theme/guard/003`, which is a deliberate source lint.
@@ -992,6 +1005,7 @@ fn palette_session(status: SessionStatus) -> SessionState {
         pane_id: Some("pane-1".to_string()),
         agent_id: Some("1".to_string()),
         display_name: None,
+        shell_synthetic_working: false,
     }
 }
 
@@ -1091,9 +1105,17 @@ fn border_glyph_at_mid(buffer: &ratatui::buffer::Buffer) -> String {
 
 /// The six status roles in the centralized palette and the named-ANSI color each
 /// must resolve to (PRD #155 locked plan): working=Green, thinking=Blue,
-/// compacting=Blue (shares the thinking role), waiting=Yellow, error=Red,
+/// compacting=Blue (shares the thinking role), waiting=Magenta, error=Red,
 /// idle=DarkGray. The single source of truth shared by the deck-card (T1) and
 /// embedded-pane (T2) assertions.
+///
+/// Waiting left Yellow in issue #579: yellow measured 1.70:1 against a white
+/// terminal background (1.07:1 when a terminal renders the badge's BOLD as the
+/// bright variant), far under WCAG AA. Magenta was free — issue #442 had already
+/// retired it as the selection accent — and is the only unclaimed slot that
+/// clears AA on a light *and* a dark terminal. `theme/contrast/002` asserts the
+/// ratios; these tests keep asserting identity, which is what makes the two
+/// complementary rather than redundant.
 fn status_role_colors() -> [(SessionStatus, Color); 6] {
     [
         (SessionStatus::Working, Color::Green),
@@ -1103,7 +1125,7 @@ fn status_role_colors() -> [(SessionStatus, Color); 6] {
         // introducing a sixth status color — so it must render Blue in both the
         // deck card and the embedded pane, never an accent (Magenta/Cyan).
         (SessionStatus::Compacting, Color::Blue),
-        (SessionStatus::WaitingForInput, Color::Yellow),
+        (SessionStatus::WaitingForInput, Color::Magenta),
         (SessionStatus::Error, Color::Red),
         (SessionStatus::Idle, Color::DarkGray),
     ]
@@ -1113,8 +1135,8 @@ fn status_role_colors() -> [(SessionStatus, Color); 6] {
 /// (working/thinking/compacting/waiting/error/idle), none selected or focused,
 /// and assert the card's border color is the matching centralized status role —
 /// working=Green, thinking=Blue, compacting=Blue (it shares the thinking role),
-/// waiting=Yellow, error=Red, idle=DarkGray. Also assert each status border is a
-/// status role and never an accent role (Magenta=selected, Cyan=focused), so a
+/// waiting=Magenta, error=Red, idle=DarkGray. Also assert each status border is a
+/// status role and never an accent role (Reset=selected, Cyan=focused), so a
 /// status can never collide with selection/focus. This pins PRD #155 Option A:
 /// the deck-card border encodes status via the centralized palette roles.
 #[spec("theme/palette/001")]
@@ -1127,13 +1149,14 @@ fn palette_001_deck_card_border_is_status_role() {
             "deck card border for {status:?} must use the centralized status role color \
              {role:?}, got {fg:?}"
         );
-        // A status role must never collide with an accent role: Magenta is
-        // `selected`, Cyan is `focused` (PRD #155 criterion #3). This catches a
-        // status (notably Compacting) drifting onto an accent color.
+        // A status role must never collide with an accent role: `Color::Reset`
+        // (the terminal's own foreground) is `selected` since issue #442, Cyan
+        // is `focused` (PRD #155 criterion #3). This catches a status (notably
+        // Compacting) drifting onto an accent color.
         assert_ne!(
             fg,
-            Color::Magenta,
-            "status {status:?} border must not reuse the `selected` accent (Magenta)"
+            Color::Reset,
+            "status {status:?} border must not reuse the `selected` accent (Color::Reset)"
         );
         assert_ne!(
             fg,
@@ -1169,15 +1192,17 @@ fn palette_002_pane_border_matches_deck_status_color() {
 }
 
 /// Scenario: Render a SELECTED deck card in **command mode** (`UiMode::Normal`)
-/// and assert its border is the dedicated `selected` accent role —
-/// Color::Magenta + Modifier::BOLD — plus the `▸ ` title marker, and that this
-/// color is NOT a status color (≠ green) and NOT the focused accent (≠ cyan).
-/// This pins the Option-A rule that selection is conveyed by a non-status accent
-/// that never collides with the palette, at the full strength command mode gets
-/// (PRD #341 M4 de-emphasises the same accent in PaneInput — `mode/deck/001`).
+/// for a Working agent and assert its border is the terminal's own foreground
+/// (`Color::Reset`) rather than the working-status Green, carried together with
+/// a thick `┃` glyph, `Modifier::BOLD` and the `▸ ` title marker — three cues,
+/// none of which can be dimmed or camouflaged away. Also assert the border is
+/// neither the waiting-status Magenta (which is what the retired selection
+/// accent became in issue #579) nor the focused-pane Cyan. This pins
+/// the issue #442 rule that a selected card must be visible whatever its agent
+/// is doing (`mode/deck/001` owns the PaneInput half of the recipe).
 #[spec("theme/palette/003")]
 #[test]
-fn palette_003_selected_card_border_is_magenta_bold_marker() {
+fn palette_003_selected_card_border_is_terminal_fg_thick_marker() {
     let session = palette_session(SessionStatus::Working);
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1196,22 +1221,39 @@ fn palette_003_selected_card_border_is_magenta_bold_marker() {
     let (fg, modifier) = border_style_at_mid(&buffer);
     assert_eq!(
         fg,
-        Color::Magenta,
-        "selected card border must use the `selected` role (Color::Magenta), got {fg:?}"
-    );
-    assert!(
-        modifier.contains(Modifier::BOLD),
-        "selected card border must be BOLD, got {modifier:?}"
+        Color::Reset,
+        "a selected card's border must be the terminal's own foreground, which \
+         contrasts on light and dark alike, got {fg:?}"
     );
     assert_ne!(
         fg,
         Color::Green,
-        "the selected accent must not reuse the working-status green"
+        "a selected card must not rest on its status colour — for idle that would \
+         be DarkGray, invisible on a dark background (issue #442)"
+    );
+    assert!(
+        modifier.contains(Modifier::BOLD),
+        "command-mode selection must be BOLD, got {modifier:?}"
+    );
+    assert!(
+        !modifier.contains(Modifier::DIM),
+        "selection must never DIM a card (issue #442), got {modifier:?}"
+    );
+    assert_eq!(
+        buffer[(0, buffer.area().height / 2)].symbol(),
+        "┃",
+        "selection must also be carried by a thick border glyph"
+    );
+    assert_ne!(
+        fg,
+        Color::Magenta,
+        "selection must not reuse Magenta — issue #442 retired it as the selection \
+         accent, and issue #579 reassigned it to the waiting status"
     );
     assert_ne!(
         fg,
         Color::Cyan,
-        "the selected accent must not reuse the focused-pane cyan"
+        "a card border must not reuse the focused-pane cyan"
     );
     assert!(
         buffer_to_text(&buffer).contains('▸'),
@@ -1222,9 +1264,10 @@ fn palette_003_selected_card_border_is_magenta_bold_marker() {
 /// Scenario: Render a FOCUSED, LIVE (`UiMode::PaneInput`) embedded pane and
 /// assert its border is the dedicated `focused` accent role — Color::Cyan — and
 /// that this color is distinct from every status role
-/// (green/blue/yellow/red/dark-gray) and from the `selected` accent (magenta).
-/// This pins the Option-A split that keeps focus on Cyan while selection moves
-/// to Magenta, so status/selection/focus are provably distinct. Then render a
+/// (green/blue/magenta/red/dark-gray) and from the `selected` accent
+/// (`Color::Reset`, the terminal's own foreground). This pins the Option-A split
+/// that keeps focus on its own accent, so status/selection/focus are provably
+/// distinct. Then render a
 /// pane that is focused AND live AND carries a real `Working` status and assert
 /// its border is still Cyan (the focused accent), NOT Green (the Working status
 /// color) — locking the precedence invariant that focus OVERRIDES a present
@@ -1242,10 +1285,10 @@ fn palette_004_focused_pane_border_is_cyan_distinct() {
     for collide in [
         Color::Green,
         Color::Blue,
-        Color::Yellow,
+        Color::Magenta,
         Color::Red,
         Color::DarkGray,
-        Color::Magenta,
+        Color::Reset,
     ] {
         assert_ne!(
             fg, collide,
@@ -1346,6 +1389,92 @@ fn palette_005_command_mode_focused_pane_drops_cyan_accent() {
             "an unfocused pane must keep the thin border (input_active={input_active}), \
              got {glyph:?}"
         );
+    }
+}
+
+/// Scenario: For every agent status, and in BOTH command and PaneInput mode,
+/// render the same deck card selected and unselected and compare the two
+/// borders. A selected card must be visible whatever its agent is doing: its
+/// border takes the terminal's OWN foreground (`Color::Reset`) — near-white on a
+/// dark theme, near-black on a light one — thickens from `│` to `┃`, and never
+/// carries `Modifier::DIM`. The control in the same loop is that an UNSELECTED
+/// card is untouched and still reports its status role, so an idle agent keeps
+/// receding. Guards issue #442 both ways: the selected card must not fade
+/// (the original DIM-magenta report) and must not inherit the low-contrast
+/// `palette::STATUS_IDLE` (DarkGray), which on a dark background left a selected
+/// idle card as invisible as an unselected one however thick its border was.
+#[spec("theme/palette/006")]
+#[test]
+fn palette_006_selection_is_visible_at_every_status() {
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+
+    for (status, role) in status_role_colors() {
+        for mode in [UiMode::Normal, UiMode::PaneInput] {
+            let session = palette_session(status.clone());
+            let render = |selected: bool| {
+                render_card_for_mode_to_buffer(
+                    &session,
+                    Some("example-agent"),
+                    Some(1),
+                    density,
+                    0,
+                    selected,
+                    mode,
+                    width,
+                    height,
+                )
+            };
+            let unselected = render(false);
+            let selected = render(true);
+            let y = height / 2;
+            let (unsel, sel) = (&unselected[(0, y)], &selected[(0, y)]);
+            let context = format!("{status:?} in {mode:?}");
+
+            // The reported symptom: a selected card whose border colour is the
+            // status colour is only as visible as that status colour, and
+            // `STATUS_IDLE` on a dark ground is barely visible at all. The
+            // terminal's own foreground is the one colour guaranteed to contrast
+            // with the terminal's own background, on either theme.
+            assert_eq!(
+                sel.fg,
+                Color::Reset,
+                "{context}: a selected card's border must use the terminal's own \
+                 foreground so it contrasts on every theme, got {:?}",
+                sel.fg
+            );
+            assert_ne!(
+                sel.fg, role,
+                "{context}: a selected border must not inherit the status colour — \
+                 for idle that is DarkGray, which is invisible on a dark background \
+                 no matter how thick the border is (issue #442)"
+            );
+
+            // CONTROL: selection changed, the resting state did not. An
+            // unselected idle card must still recede exactly as before.
+            assert_eq!(
+                unsel.fg, role,
+                "{context}: an UNSELECTED card must still report its status role"
+            );
+            assert_eq!(
+                unsel.symbol(),
+                "│",
+                "{context}: an unselected card must keep the thin border"
+            );
+
+            assert_eq!(
+                sel.symbol(),
+                "┃",
+                "{context}: selection must also thicken the border glyph"
+            );
+            assert!(
+                !sel.modifier.contains(Modifier::DIM),
+                "{context}: a selected border must never be DIM — that is what made \
+                 it read as an idle card (issue #442), got {:?}",
+                sel.style()
+            );
+        }
     }
 }
 
@@ -1567,6 +1696,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         pane_id: Some(pane.to_string()),
         agent_id: Some(name.to_string()),
         display_name: None,
+        shell_synthetic_working: false,
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
@@ -1608,6 +1738,80 @@ fn pane_005_highlight_follows_selected_session_id() {
         80,
     );
     insta::assert_snapshot!(buffer_to_text(&buffer));
+}
+
+/// Scenario: A pane is spawned (tagged placeholder card) and then a legacy hook
+/// reports on it without an `agent_id`. The dashboard must still draw exactly
+/// ONE card for that pane — before issue #398 the untagged event minted a second
+/// session and the deck rendered two cards for the one pane.
+#[spec("dashboard/pane/010")]
+#[test]
+fn pane_010_untagged_event_keeps_one_card_on_the_pane() {
+    // Issue #398. The bug lived in `AppState::apply_event`, but what the user
+    // actually saw was the card grid, so this drives the REAL state transition
+    // and renders whatever it produces — rather than handing the renderer a
+    // card list built by the test, which would assert nothing about the defect.
+    const PANE: &str = "2";
+
+    let mut state = AppState::default();
+    state.register_pane(PANE.to_string());
+    // The pane as it exists right after a daemon spawn: one tagged placeholder.
+    state.insert_placeholder_session(
+        PANE.to_string(),
+        Some("/home/dev/worker".to_string()),
+        Some(AgentType::ClaudeCode),
+        Some("agent-42".to_string()),
+    );
+
+    // A pre-F9 / un-envied hook reports on the same pane, naming no generation.
+    state.apply_event(AgentEvent {
+        session_id: "legacy-hook-session".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::WaitingForInput,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some(PANE.to_string()),
+        agent_id: None,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    });
+
+    // The card list the dashboard would build for this pane.
+    let on_pane: Vec<&SessionState> = state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(PANE))
+        .collect();
+    assert_eq!(
+        on_pane.len(),
+        1,
+        "one pane must yield one card; {} sessions claim pane {PANE}",
+        on_pane.len()
+    );
+
+    // And the surviving card carries the status the hook reported, so the fix
+    // suppressed a duplicate rather than suppressing the update itself.
+    assert_eq!(
+        on_pane[0].status,
+        SessionStatus::WaitingForInput,
+        "the single card must show the status the untagged hook reported"
+    );
+
+    let cards: [(&SessionState, Option<&str>); 1] = [(on_pane[0], Some("worker"))];
+    let buffer = render_dashboard_cards_to_buffer(&cards, Some(0), CardDensityKind::Normal, 0, 80);
+    let rendered = buffer_to_text(&buffer);
+    // The status badge is per-card, so counting it counts cards — and keeps the
+    // assertion readable without committing another snapshot file.
+    assert_eq!(
+        rendered.matches("Needs Input").count(),
+        1,
+        "exactly one card should render for the pane:\n{rendered}"
+    );
 }
 
 /// Build one event-rich session fixture that fills `render_session_card`
@@ -1682,6 +1886,7 @@ fn filled_session() -> SessionState {
         pane_id: Some("pane-1".to_string()),
         agent_id: Some("1".to_string()),
         display_name: None,
+        shell_synthetic_working: false,
     }
 }
 
@@ -1760,6 +1965,108 @@ fn density_004_no_trailing_blank_rows() {
             buffer_to_text(&buffer)
         );
     }
+}
+
+/// Turn the fully-populated [`filled_session`] fixture into a long-idle one:
+/// same 3 prompts and 3 tool calls, `Idle` status, and a `last_activity` an
+/// hour in the past. This is exactly the state the removed ASCII-art overlay
+/// used to `Clear` and paint over at Spacious density.
+fn filled_idle_session() -> SessionState {
+    SessionState {
+        status: SessionStatus::Idle,
+        active_tool: None,
+        last_activity: chrono::Utc::now() - chrono::Duration::hours(1),
+        display_name: Some("example-coder".to_string()),
+        ..filled_session()
+    }
+}
+
+/// Scenario: Render a long-idle, fully-populated session card at Spacious
+/// density at the flash-on tick and again at the flash-off tick, and render the
+/// same session at Normal density for comparison. The Spacious card must keep
+/// all of its ordinary content — three prompt lines, three tool lines, the dir
+/// line and the title — and carry an `Idle` badge whose leading dot is inked at
+/// tick 0 and blank at tick 30, exactly as Normal renders it.
+#[spec("dashboard/density/005")]
+#[test]
+fn density_005_spacious_idle_shows_flashing_dot_over_card_content() {
+    // Issue #519: Spacious used to be the ONE density where an idle card could
+    // stop showing card content — `render_session_card` ran `Clear` over the
+    // inner area and painted generated ASCII-art frames on top. That branch is
+    // gone, so all three densities now share the flashing-dot indicator. This
+    // pins the surviving behavior at the density that used to diverge; without
+    // it the only Spacious assertion left is `density_004`'s trailing-blank-row
+    // count, which a re-introduced full-area overlay would still satisfy.
+    let session = filled_idle_session();
+    let width: u16 = 80;
+    let density = CardDensityKind::Spacious;
+
+    let render_at = |tick: u64, density: CardDensityKind| {
+        buffer_to_text(&render_card_to_buffer(
+            &session,
+            Some("example-coder"),
+            Some(1),
+            density,
+            tick,
+            false, // not selected
+            width,
+            density.rendered_height(),
+        ))
+    };
+
+    // `flash_dot` inks the dot for the first half of each 60-tick period and
+    // blanks it for the second, so tick 0 and tick 30 straddle one flash.
+    let flash_on = render_at(0, density);
+    let flash_off = render_at(30, density);
+
+    assert!(
+        flash_on.contains("● Idle"),
+        "Spacious idle card should ink the status dot at the flash-on tick:\n{flash_on}"
+    );
+    assert!(
+        !flash_off.contains("● Idle") && flash_off.contains("Idle"),
+        "Spacious idle card should blank the status dot at the flash-off tick, \
+         keeping the Idle label:\n{flash_off}"
+    );
+
+    // The overlay used to Clear the inner area, so content presence — not just
+    // the badge — is what distinguishes the fallback from a re-introduced art
+    // pane. Spacious is the tier that shows the fixture at full capacity.
+    for (label, rendered) in [("flash-on", &flash_on), ("flash-off", &flash_off)] {
+        for needle in [
+            "first prompt",
+            "second prompt",
+            "third prompt",
+            "Read",
+            "Edit",
+            "Bash",
+            "example-project",
+            "example-coder",
+        ] {
+            assert!(
+                rendered.contains(needle),
+                "{label} Spacious idle card should still show {needle:?}:\n{rendered}"
+            );
+        }
+    }
+
+    // Same indicator as the densities that never had an art path, so the three
+    // tiers cannot drift apart again.
+    assert!(
+        render_at(0, CardDensityKind::Normal).contains("● Idle"),
+        "Normal density should render the same idle indicator as Spacious"
+    );
+    assert!(
+        render_at(0, CardDensityKind::Compact).contains("● Idle"),
+        "Compact density should render the same idle indicator as Spacious"
+    );
+
+    assert_eq!(
+        flash_on.lines().count(),
+        density.rendered_height() as usize,
+        "the Spacious card should occupy exactly its declared height"
+    );
+    insta::assert_snapshot!(flash_on);
 }
 
 /// Replicate `choose_density`'s tier selection using the public
@@ -1846,5 +2153,624 @@ fn layout_001_seven_decks_fit_single_column() {
     assert!(
         many_visible < MANY,
         "with {MANY} decks scrolling must still engage (only {many_visible} fit)"
+    );
+}
+
+/// The longest prefix of `s` that fits in `max` bytes without splitting a
+/// character, computed by walking characters rather than by slicing bytes —
+/// deliberately a different algorithm from the production truncator, so the
+/// expectation is an independent statement of what a char-boundary cut is
+/// rather than a restatement of the code under test.
+///
+/// Deliberately duplicated in `tests/mouse_dispatch.rs` rather than shared: see
+/// the note there.
+fn char_boundary_prefix(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        if out.len() + ch.len_utf8() > max {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Expand `s` the way a ratatui buffer holds it: a double-width character
+/// occupies two cells, and `buffer_to_text` joins the second (padding) cell in
+/// as a space. Without this a sweep over wide characters would compare the
+/// rendered title against a string the renderer never produces.
+fn as_rendered_cells(s: &str) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        out.push(ch);
+        for _ in 1..ch.to_string().width().max(1) {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+/// Scenario: A hook posts a session whose id is nine `α` characters, so byte 11
+/// — where the card title cuts the id — falls inside a character. Render that
+/// card between two healthy ones: the deck must draw all three cards with the
+/// Unicode id cut on a character boundary, instead of panicking the render loop
+/// and taking every other agent's card down with it. Repeated for 2-, 3- and
+/// 4-byte characters at every offset that puts byte 11 mid-character.
+#[spec("dashboard/pane/011")]
+#[test]
+fn pane_011_multibyte_session_id_renders_the_whole_deck() {
+    // Issue #574. `&session.session_id[..11]` is a BYTE index, and `str`
+    // indexing panics when it lands inside a character. The id is
+    // producer-controlled — `apply_event` keys the session map on whatever the
+    // hook socket sent, with no length, charset or boundary check anywhere in
+    // between — so this drives the real state transition first and renders
+    // whatever it produces, rather than hand-building the card list.
+    //
+    // The blast radius is the point: the slice runs inside the render loop, so
+    // one bad id killed EVERY frame. That is why the assertion is made on a
+    // three-card deck and not on the poisoned card alone.
+    const POISONED_ID: &str = "ααααααααα"; // 9 chars x 2 bytes = 18; byte 11 is mid-char
+    assert!(
+        !POISONED_ID.is_char_boundary(11),
+        "the fixture only reproduces the defect if byte 11 splits a character"
+    );
+
+    let mut state = AppState::default();
+    state.register_pane("2".to_string());
+    state.apply_event(AgentEvent {
+        session_id: POISONED_ID.to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::WaitingForInput,
+        tool_name: None,
+        tool_detail: None,
+        cwd: Some("/home/dev/worker".to_string()),
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("2".to_string()),
+        agent_id: None,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    });
+    let poisoned = state
+        .sessions
+        .get(POISONED_ID)
+        .expect("apply_event keys the session map on the producer's id verbatim")
+        .clone();
+
+    // Two ordinary neighbours, so a panic in the middle card is visible as the
+    // loss of cards that have nothing wrong with them.
+    let mut healthy_a = poisoned.clone();
+    healthy_a.session_id = "sess-alpha".to_string();
+    healthy_a.pane_id = Some("1".to_string());
+    let mut healthy_b = poisoned.clone();
+    healthy_b.session_id = "sess-gamma".to_string();
+    healthy_b.pane_id = Some("3".to_string());
+
+    // No display name on the poisoned card: the id is what the title renders
+    // only when the card has no friendlier label.
+    let cards: [(&SessionState, Option<&str>); 3] = [
+        (&healthy_a, Some("example-alpha")),
+        (&poisoned, None),
+        (&healthy_b, Some("example-gamma")),
+    ];
+    let rendered = buffer_to_text(&render_dashboard_cards_to_buffer(
+        &cards,
+        Some(0),
+        CardDensityKind::Normal,
+        0,
+        80,
+    ));
+
+    // One status badge per card, so counting badges counts surviving cards.
+    assert_eq!(
+        rendered.matches("Needs Input").count(),
+        3,
+        "one bad session id must not cost the other agents their cards:\n{rendered}"
+    );
+    let expected = format!(
+        "{}…",
+        as_rendered_cells(&char_boundary_prefix(POISONED_ID, 11))
+    );
+    assert!(
+        rendered.contains(&expected),
+        "the title must cut the id on a character boundary and mark the cut, expected `{expected}`:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("example-alpha") && rendered.contains("example-gamma"),
+        "both neighbouring cards must still render their titles:\n{rendered}"
+    );
+
+    // Property sweep: every character width, at every ASCII offset that moves
+    // the cut inside a character. `session_id` is arbitrary bytes from the
+    // socket, so no single fixture proves the render is boundary-safe.
+    for filler in ['α', 'あ', '𝄞', '😀'] {
+        for pad in 0..4usize {
+            let id: String = "x".repeat(pad) + &filler.to_string().repeat(12);
+            let mut session = poisoned.clone();
+            session.session_id = id.clone();
+            let card = buffer_to_text(&render_card_to_buffer(
+                &session,
+                None,
+                Some(1),
+                CardDensityKind::Normal,
+                0,
+                false,
+                80,
+                CardDensityKind::Normal.rendered_height(),
+            ));
+            let want = format!("{}…", as_rendered_cells(&char_boundary_prefix(&id, 11)));
+            assert!(
+                card.contains(&want),
+                "id `{id}` must render as `{want}`:\n{card}"
+            );
+        }
+    }
+}
+
+/// Scenario: A hook posts a `display_name` carrying an ESC sequence, a NUL, a
+/// DEL, an embedded newline and a right-to-left override, and a second hook
+/// posts a 400-character one. Render both cards between healthy neighbours: the
+/// names stored on the sessions must come back scrubbed and length-clamped, no
+/// planted character may reach a rendered cell anywhere in the deck, and each
+/// neighbouring card must still draw its own title and status badge.
+#[spec("dashboard/pane/012")]
+#[test]
+fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
+    // Issue #670. `display_name` arrives in `event.metadata` over the hook
+    // socket — a surface every agent on the deck can post to — and used to be
+    // stored behind nothing but an is-empty filter, then drawn straight into a
+    // card title. So this drives the real `AppState::apply_event` transition
+    // instead of hand-building a `SessionState`: the defect is in the INGEST,
+    // and a fixture that assigned `display_name` directly would keep passing
+    // with the bug still in place.
+    //
+    // The blast radius is why the assertions run over a four-card deck rather
+    // than the poisoned card alone. An ESC that reaches a cell is written to
+    // the real terminal on flush, where it repaints whatever it likes; a
+    // U+202E reorders the text after it, which on a stacked deck means the
+    // neighbouring cards' titles.
+
+    // Listed literally so the assertion never consults the sanitizer it is
+    // checking. One representative of each class: ESC (C0, and the one that
+    // starts an ANSI sequence), NUL, CR and LF, DEL, and a right-to-left
+    // override — the last of which `char::is_control` does NOT catch.
+    const PLANTED: [char; 6] = ['\u{1b}', '\u{0}', '\r', '\n', '\u{7f}', '\u{202e}'];
+    const HOSTILE_NAME: &str = "\u{1b}[31m dispatch\u{0}-\u{202e}670 \u{7f}\r\nsweep";
+
+    let mut state = AppState::default();
+    let mut post = |session_id: &str, pane_id: &str, name: &str| {
+        state.register_pane(pane_id.to_string());
+        let mut metadata = HashMap::new();
+        metadata.insert(DISPLAY_NAME_METADATA_KEY.to_string(), name.to_string());
+        state.apply_event(AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::WaitingForInput,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/home/dev/worker".to_string()),
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some(pane_id.to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        state
+            .sessions
+            .get(session_id)
+            .expect("apply_event keys the session map on the producer's id verbatim")
+            .clone()
+    };
+
+    let healthy_a = post("sess-alpha", "1", "example-alpha");
+    let hostile = post("sess-hostile", "2", HOSTILE_NAME);
+    // Well past `DISPLAY_NAME_MAX_LEN`, and multi-byte so the clamp has to snap
+    // back to a character boundary instead of slicing one in half.
+    let overlong_raw = "μ".repeat(400);
+    let overlong = post("sess-overlong", "3", &overlong_raw);
+    let healthy_b = post("sess-gamma", "4", "example-gamma");
+
+    // --- ingest ------------------------------------------------------------
+    let stored = hostile
+        .display_name
+        .as_deref()
+        .expect("a name with printable content survives as a name");
+    // The printable payload of the ESC sequence stays, by design: `[31m` is
+    // ordinary text once the ESC that would have made a terminal act on it is
+    // gone. Stripping the payload too would mean parsing ANSI, and would eat
+    // legitimate names containing brackets.
+    assert_eq!(
+        stored, "[31m dispatch-670 sweep",
+        "the stored name must be the scrubbed, trimmed text"
+    );
+    assert!(
+        !stored.chars().any(char::is_control),
+        "no control character may survive ingest: {stored:?}"
+    );
+    for c in PLANTED {
+        assert!(
+            !stored.contains(c),
+            "U+{:04X} survived ingest: {stored:?}",
+            c as u32
+        );
+    }
+
+    let clamped = overlong
+        .display_name
+        .as_deref()
+        .expect("an over-long name is repaired, not dropped");
+    let body = clamped
+        .strip_suffix('…')
+        .expect("a clamped name is marked as cut");
+    assert!(
+        body.len() <= DISPLAY_NAME_MAX_LEN,
+        "the stored name must be clamped to the daemon's own ceiling, got {} bytes",
+        body.len()
+    );
+    assert!(
+        body.chars().all(|c| c == 'μ'),
+        "the clamp must snap back to a character boundary: {body:?}"
+    );
+    assert!(
+        overlong_raw.len() > DISPLAY_NAME_MAX_LEN,
+        "the fixture only exercises the clamp if it exceeds the ceiling"
+    );
+
+    // --- render ------------------------------------------------------------
+    // Through `render_card_grid_to_buffer` — the seam that runs the deck's own
+    // `ui.display_names.get(id).or(session.display_name)` resolution — with no
+    // entry in `ui.display_names` for any of the four. That is the live
+    // scheduler-spawn case this metadata key exists to serve, and the only one
+    // in which `SessionState.display_name` titles a card at all.
+    let cards: [(&SessionState, Option<&str>); 4] = [
+        (&healthy_a, None),
+        (&hostile, None),
+        (&overlong, None),
+        (&healthy_b, None),
+    ];
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 80, 40);
+    let rendered = buffer_to_text(&buffer);
+
+    // One status badge per card, so counting badges counts surviving cards.
+    assert_eq!(
+        rendered.matches("Needs Input").count(),
+        4,
+        "one hostile display name must not cost the other agents their cards:\n{rendered}"
+    );
+    // Asserted over the CELLS, not over `buffer_to_text`'s joined form — that
+    // helper separates rows with a real `\n`, so a planted newline would hide
+    // inside the separators it adds.
+    let area = *buffer.area();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            for c in buffer[(x, y)].symbol().chars() {
+                assert!(
+                    !c.is_control() && !PLANTED.contains(&c),
+                    "U+{:04X} reached cell ({x}, {y}), where a flush writes it to the real \
+                     terminal:\n{rendered}",
+                    c as u32
+                );
+            }
+        }
+    }
+    assert!(
+        rendered.contains("dispatch-670 sweep"),
+        "the readable remainder of the name must still title its card:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("example-alpha") && rendered.contains("example-gamma"),
+        "both neighbouring cards must still render their own titles:\n{rendered}"
+    );
+}
+
+/// Scenario: Render a neutral session with a declared Codex identity, then
+/// render the same card after it reports ClaudeCode. The declaration must fill
+/// only the initial `No agent` badge and yield to the observed agent identity.
+#[spec("dashboard/pane/013")]
+#[test]
+fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
+    let now = chrono::Utc::now();
+    let mut session = SessionState {
+        session_id: "declared-agent".to_string(),
+        agent_type: AgentType::None,
+        cwd: Some("/home/dev/workspace".to_string()),
+        status: SessionStatus::Idle,
+        active_tool: None,
+        started_at: now,
+        last_activity: now + chrono::Duration::seconds(30),
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: None,
+        first_prompts: Vec::new(),
+        pane_id: Some("pane-declared-agent".to_string()),
+        agent_id: Some("agent-declared-agent".to_string()),
+        display_name: Some("reviewer".to_string()),
+        shell_synthetic_working: false,
+    };
+    let density = CardDensityKind::Normal;
+    let render = |session: &SessionState, declared_agent_type: Option<&AgentType>| {
+        buffer_to_text(&render_card_with_declared_agent_to_buffer(
+            session,
+            Some("reviewer"),
+            Some(1),
+            density,
+            0,
+            false,
+            UiMode::Normal,
+            declared_agent_type,
+            80,
+            density.rendered_height(),
+        ))
+    };
+
+    let declared = render(&session, Some(&AgentType::Codex));
+    assert!(
+        declared.contains("Codex · reviewer"),
+        "an unidentified session must render its declared Codex badge:\n{declared}"
+    );
+    assert!(
+        !declared.contains("No agent"),
+        "a declared Codex pane must not retain the placeholder badge or status:\n{declared}"
+    );
+
+    session.agent_type = AgentType::ClaudeCode;
+    let observed = render(&session, Some(&AgentType::Codex));
+    assert!(
+        observed.contains("ClaudeCode · reviewer"),
+        "an observed ClaudeCode identity must override the Codex declaration:\n{observed}"
+    );
+    assert!(
+        !observed.contains("Codex"),
+        "a stale declaration must not relabel an agent that identified itself:\n{observed}"
+    );
+
+    session.agent_type = AgentType::None;
+    let baseline = render(&session, None);
+    assert!(
+        baseline.contains("No agent"),
+        "without an observation or declaration the pre-#308 placeholder remains:\n{baseline}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// dashboard/grid — the card grid's joint column/density layout (issue #588)
+// ---------------------------------------------------------------------------
+
+/// The seven roles of the orchestration that reported issue #588, in the order
+/// its `.dot-agent-deck.toml` listed them. Positions 6 and 7 — `researcher` and
+/// `documenter` — are the two that were never painted.
+const REPORTED_ROLES: [&str; 7] = [
+    "orchestrator",
+    "developer",
+    "tester",
+    "reviewer",
+    "releaser",
+    "researcher",
+    "documenter",
+];
+
+/// One live role card. `last_activity` is nudged 30s into the future for the
+/// reason `pane_004_card_title_row` documents: `Last:` is computed from
+/// `Utc::now()` at render time, so an equal timestamp sits on the `0s`/`1s`
+/// boundary and tips snapshots under parallel test load.
+fn role_session(index: usize, role: &str) -> SessionState {
+    let now = chrono::Utc::now();
+    SessionState {
+        session_id: format!("sess-role-{index:02}"),
+        agent_type: AgentType::ClaudeCode,
+        cwd: Some("/home/dev/dot-agent-deck".to_string()),
+        status: SessionStatus::Idle,
+        active_tool: None,
+        started_at: now,
+        last_activity: now + chrono::Duration::seconds(30),
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: None,
+        first_prompts: Vec::new(),
+        pane_id: Some(format!("pane-role-{index:02}")),
+        agent_id: Some(format!("agent-role-{index:02}")),
+        display_name: Some(role.to_string()),
+        shell_synthetic_working: false,
+    }
+}
+
+fn reported_role_sessions() -> Vec<SessionState> {
+    REPORTED_ROLES
+        .iter()
+        .enumerate()
+        .map(|(i, role)| role_session(i, role))
+        .collect()
+}
+
+fn as_cards(sessions: &[SessionState]) -> Vec<(&SessionState, Option<&str>)> {
+    sessions
+        .iter()
+        .map(|s| (s, s.display_name.as_deref()))
+        .collect()
+}
+
+/// How many cards the buffer actually shows: each card contributes exactly one
+/// top-left corner — `┌`, or `┏` when it is selected and drawn thick.
+///
+/// Counted from the drawn cells rather than asked of the layout code, so every
+/// assertion built on it is a statement about what reached the screen.
+fn drawn_cards(rendered: &str) -> usize {
+    rendered
+        .lines()
+        .map(|line| line.matches('┌').count() + line.matches('┏').count())
+        .sum()
+}
+
+/// How many card columns the buffer shows, from the widest card row. Same
+/// corner-counting witness as [`drawn_cards`], per row instead of in total.
+fn drawn_columns(rendered: &str) -> usize {
+    rendered
+        .lines()
+        .map(|line| line.matches('┌').count() + line.matches('┏').count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Scenario: Render the reported seven-role orchestration into a 90x27 deck —
+/// too short for seven single-column cards at any density — and assert every one
+/// of the seven role names is on screen. A 90x60 control deck, which already
+/// fitted them before the fix, renders the same seven.
+#[spec("dashboard/grid/001")]
+#[test]
+fn grid_001_short_deck_still_paints_every_role() {
+    let sessions = reported_role_sessions();
+    let cards = as_cards(&sessions);
+
+    // The reported geometry. 27 rows less the title and stats-bar rows leaves
+    // 25 for cards; seven single-column Compact cards need 7*5 = 35, so the old
+    // width-only column choice sliced to the five rows that fit and painted
+    // `orchestrator … releaser`, dropping `researcher` and `documenter`. Two
+    // columns need only 7.div_ceil(2) * 5 = 20 rows, and 90 columns is two cards
+    // of 45 — comfortably past MIN_CARD_W.
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 27);
+    let rendered = buffer_to_text(&buffer);
+
+    for role in REPORTED_ROLES {
+        assert!(
+            rendered.contains(role),
+            "every role of a seven-role orchestration must be painted on a 90x27 deck; \
+             `{role}` is missing:\n{rendered}"
+        );
+    }
+    assert_eq!(
+        drawn_cards(&rendered),
+        REPORTED_ROLES.len(),
+        "no card may be sliced off when a layout exists that fits them all:\n{rendered}"
+    );
+    assert_eq!(
+        drawn_columns(&rendered),
+        2,
+        "fitting seven cards in 25 rows takes a second column:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+
+    // Control: the same seven roles on a deck tall enough that one column always
+    // fitted them. If this one failed too, the fixture — not the height — would
+    // be what the assertion above is really measuring.
+    let (tall_buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 60);
+    let tall = buffer_to_text(&tall_buffer);
+    for role in REPORTED_ROLES {
+        assert!(
+            tall.contains(role),
+            "control: a tall deck must still paint `{role}`:\n{tall}"
+        );
+    }
+    assert_eq!(
+        drawn_columns(&tall),
+        1,
+        "control: a deck that already fits one column must keep one column — \
+         widening is only ever spent on completeness:\n{tall}"
+    );
+    assert_eq!(drawn_cards(&tall), REPORTED_ROLES.len());
+}
+
+/// Scenario: Sweep deck geometries from one column to an escalated two, and for
+/// each compare `UiState::columns` — the value left/right card navigation reads
+/// — against the number of card columns actually drawn in the buffer. Selection
+/// movement and the rendered grid must never disagree about the column count.
+#[spec("dashboard/grid/002")]
+#[test]
+fn grid_002_nav_columns_match_the_drawn_grid() {
+    let sessions = reported_role_sessions();
+
+    // (cards, width, height, what the case exercises)
+    let cases: [(usize, u16, u16, &str); 6] = [
+        (3, 90, 40, "narrow deck, everything fits in one column"),
+        (
+            7,
+            90,
+            60,
+            "narrow deck, tall enough for seven single-column cards",
+        ),
+        (
+            7,
+            90,
+            27,
+            "narrow deck escalated to two columns to fit all seven",
+        ),
+        (7, 120, 27, "wide deck already at two columns"),
+        (7, 200, 20, "three columns from width alone"),
+        (
+            7,
+            90,
+            12,
+            "nothing fits — the grid stays sliced at one column",
+        ),
+    ];
+
+    for (count, width, height, what) in cases {
+        let cards = as_cards(&sessions[..count]);
+        let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, width, height);
+        let rendered = buffer_to_text(&buffer);
+        assert_eq!(
+            probe.nav_columns,
+            drawn_columns(&rendered),
+            "{what}: card navigation reads {} columns while {} were drawn at {width}x{height} \
+             — arrow-key movement would step somewhere the user is not looking:\n{rendered}",
+            probe.nav_columns,
+            drawn_columns(&rendered),
+        );
+    }
+}
+
+/// Scenario: Render seven roles into a 90x12 deck, too small for them at any
+/// column count the width allows, and assert the two cards that do fit are
+/// accompanied by a `(↓5)` marker in the title. A hidden role must never be
+/// silently indistinguishable from a role that failed to start.
+#[spec("dashboard/grid/003")]
+#[test]
+fn grid_003_unavoidable_overflow_is_signalled() {
+    let sessions = reported_role_sessions();
+    let cards = as_cards(&sessions);
+
+    // 12 rows less title and stats bar leaves 10: two Compact cards. Two columns
+    // would need 7.div_ceil(2) * 5 = 20, so no layout 90 columns allows fits.
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 12);
+    let rendered = buffer_to_text(&buffer);
+    let title = rendered.lines().next().expect("a rendered title row");
+
+    assert_eq!(
+        drawn_cards(&rendered),
+        2,
+        "fixture must genuinely overflow — five of the seven cards unpainted — \
+         or this test proves nothing:\n{rendered}"
+    );
+    assert!(
+        title.contains("(↓5)"),
+        "a sliced grid must count the cards it is not showing in its title:\n{title}"
+    );
+    assert!(
+        title.contains("7 session(s)"),
+        "the title must still name the full role count:\n{title}"
+    );
+    assert_eq!(
+        drawn_columns(&rendered),
+        1,
+        "when no layout fits, the deck keeps the columns it has always had — \
+         narrowing every card buys nothing once completeness is out of reach:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+
+    // Scrolled to the bottom: the marker must flip to counting what is above.
+    let (scrolled, _) = render_card_grid_to_buffer(&cards, Some(6), 0, 90, 12);
+    let scrolled_title = buffer_to_text(&scrolled)
+        .lines()
+        .next()
+        .expect("a rendered title row")
+        .to_string();
+    assert!(
+        scrolled_title.contains("(↑5)"),
+        "selecting the last card scrolls five cards above the window, and the \
+         title must say so:\n{scrolled_title}"
     );
 }

@@ -14,9 +14,9 @@ use dot_agent_deck::daemon_client::{DaemonClient, EventSubscription, StartAgentO
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{AgentType, BroadcastMsg, EventType, SendResult};
 use dot_agent_deck::project_config::{OrchestrationConfig, load_project_config};
+use dot_agent_deck::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE;
 use dot_agent_deck::ui::{
-    AUTOMATIC_PROMPT_DEADLINE, SPAWN_TIME_READINESS_TIMEOUT, describe_send_result,
-    is_terminal_send_result, send_retry_delay,
+    SPAWN_TIME_READINESS_TIMEOUT, describe_send_result, is_terminal_send_result, send_retry_delay,
 };
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
@@ -155,13 +155,22 @@ fn prepare_workflow_launch(
     }
     let (config, roles) = validate_workflow_against_project(name, cwd, requested)?;
     validate_desktop_coordinator(&roles)?;
-    let seed = dot_agent_deck::ui::prepare_orchestrator_prompt(&config, cwd).ok_or_else(|| {
+    // Upstream #222 moved context composition into `orchestrator_context` and
+    // gave it the task parameter, so the daemon spawn path and this one compose
+    // identically — the manual "## User task" concat this used to do is now
+    // the function's own job.
+    let seed = dot_agent_deck::orchestrator_context::prepare_orchestrator_prompt(
+        &config,
+        cwd,
+        Some(task_prompt),
+    )
+    .ok_or_else(|| {
         format!(
             "could not prepare coordinator context at {}/.dot-agent-deck/orchestrator-context.md; workflow was not started",
             safe_message(cwd)
         )
     })?;
-    Ok((roles, format!("{seed}\n\n## User task\n\n{task_prompt}\n")))
+    Ok((roles, seed))
 }
 
 fn validate_desktop_coordinator(roles: &[WorkflowRoleInput]) -> Result<&WorkflowRoleInput, String> {
@@ -1159,6 +1168,7 @@ mod tests {
 
     fn config_role(name: &str, start: bool) -> OrchestrationRoleConfig {
         OrchestrationRoleConfig {
+            agent: None,
             name: name.into(),
             command: "configured-command".into(),
             start,
@@ -1171,6 +1181,7 @@ mod tests {
     #[test]
     fn workflow_roles_follow_config_order_but_keep_launch_commands() {
         let config = OrchestrationConfig {
+            default: false,
             name: "loop".into(),
             roles: vec![config_role("planner", true), config_role("builder", false)],
         };
@@ -1196,6 +1207,7 @@ mod tests {
     #[test]
     fn workflow_roles_reject_missing_or_mismatched_start_role() {
         let config = OrchestrationConfig {
+            default: false,
             name: "loop".into(),
             roles: vec![config_role("planner", true), config_role("builder", false)],
         };
@@ -1274,8 +1286,9 @@ description = "Implements the requested change"
         assert_eq!(roles[1].role, "builder");
         assert_eq!(roles[1].command, "codex --model gpt-5.6-sol");
         assert!(seed.contains(".dot-agent-deck/orchestrator-context.md"));
-        assert!(seed.contains("## User task"));
-        assert!(seed.contains("Build the requested feature."));
+        // Upstream #222: the seed is now a short pointer and the task itself
+        // lands in the context FILE under "## Your task" — asserted below.
+        assert!(seed.contains("## Your task"));
 
         let context =
             std::fs::read_to_string(project_dir.join(".dot-agent-deck/orchestrator-context.md"))
@@ -1283,6 +1296,8 @@ description = "Implements the requested change"
         assert!(context.contains("Coordinate through the configured team."));
         assert!(context.contains("**builder**: Implements the requested change"));
         assert!(context.contains("## Delegation protocol"));
+        assert!(context.contains("## Your task"));
+        assert!(context.contains("Build the requested feature."));
 
         std::fs::remove_dir_all(project_dir).unwrap();
     }

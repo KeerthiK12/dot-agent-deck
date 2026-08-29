@@ -22,13 +22,33 @@ pub enum EventType {
     /// any attached client can render who delegated what to whom and whether
     /// it actually arrived. Payload details travel in [`AgentEvent::metadata`]
     /// (see [`AgentEvent::handoff`]), keeping the record shape unchanged.
-    /// Adding variants changes the `KIND_EVENT` vocabulary an older peer can
-    /// parse, hence the PROTOCOL_VERSION bump that shipped with them.
+    /// Additive under the `#[serde(other)]` catch-all below — an older reader
+    /// degrades these to `Unknown` rather than failing the frame, so no
+    /// `PROTOCOL_VERSION` bump is required.
     DelegationDispatched,
     DelegationDelivered,
     DelegationFailed,
     WorkerRespawned,
     WorkDoneReceived,
+    /// PRD #370 M2: synthesized daemon-side (never sent by an agent's own
+    /// hooks/wrapper) when a pane's agent process has a transitive descendant
+    /// running in a POSIX session of its own — i.e. a shelled-out command is
+    /// actively running with no agent-emitted event to say so. See
+    /// [`crate::state::AppState::apply_event`]'s `ShellBusy`/`ShellIdle` arms
+    /// for the precedence rules against real, agent-emitted status.
+    ShellBusy,
+    /// PRD #370 M2: the paired synthesized event — the detached descendant is
+    /// gone, i.e. the previously-running foreground command has finished. See
+    /// [`ShellBusy`](Self::ShellBusy).
+    ShellIdle,
+    /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
+    /// forward-compat catch-all for a future/unknown `event_type` string on
+    /// the wire, so a build newer than THIS one can add further variants
+    /// without another `PROTOCOL_VERSION` bump. Deserialize-only — never
+    /// produced by this build. Treated as a no-op wherever `EventType` is
+    /// matched (never proof of agent activity, never changes `SessionStatus`).
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -425,16 +445,42 @@ pub fn agent_event_type_from_state(state: &str) -> Option<EventType> {
 /// don't emit it; consumers treat its absence as "no friendly name known".
 pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
 
+/// `AgentEvent.metadata` key carrying a DAEMON-AUTHORED report that an
+/// automatic prompt delivery failed on this pane (issue #424).
+///
+/// Only [`crate::daemon`] sets it, on one synthetic [`EventType::Error`] event
+/// bound to the pane's existing card; no agent ever emits it. Consumers that
+/// don't know the key ignore it (the documented `metadata` contract), which is
+/// why reporting this way needs no protocol change: the value rides the same
+/// free-form map `DISPLAY_NAME_METADATA_KEY` and
+/// [`SESSION_START_ORIGIN_METADATA_KEY`] already use.
+///
+/// The value is FIXED daemon text. Nothing a repository, a prompt or a role
+/// controls is interpolated into it — the same rule that governed the in-pane
+/// notice this replaced, kept because the text still reaches a human.
+pub const DELIVERY_NOTICE_METADATA_KEY: &str = "delivery_notice";
+
 /// `AgentEvent.metadata` key declaring WHERE a `SessionStart` came from (PRD
-/// #225 M3). Only the wrapper adapter sets it, with the single value
-/// [`WRAPPER_FORK_SESSION_START_ORIGIN`]; every other producer omits it, and
-/// consumers read an absent key as "this `SessionStart` came from an
+/// #225 M3). The wrapper adapter is the only INTENDED producer, with one of the
+/// three values [`WRAPPER_FORK_SESSION_START_ORIGIN`] /
+/// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] /
+/// [`WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`]; every other producer omits
+/// it, and consumers read an absent key as "this `SessionStart` came from an
 /// initialized session".
 ///
-/// Additive on the wire in both directions: an OLD wrapper emits no key and a
-/// new daemon treats its event exactly as it does today; a NEW wrapper's key is
-/// ignored by an old daemon. That is a semantic no-op, not a
-/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump.
+/// "Intended" is not "enforced". `metadata` is a free-form, unvalidated map on an
+/// unauthenticated socket, so any same-uid process can write any of these values
+/// (issue #243 audit F1, reproduced). Anything a consumer GRANTS on the strength
+/// of a value here has to establish provenance for itself — see
+/// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`].
+///
+/// Additive on the wire in both directions: an OLD wrapper emits no key (or only
+/// the fork one) and a new daemon treats its events exactly as it does today; a
+/// NEW wrapper's key is ignored by an old daemon. The KEY is therefore not a
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump — but issue #243's second
+/// value is a semantic change behind that stable wire, because a wrapper now
+/// emits TWO `SessionStart` events where it emitted one. See
+/// `changelog.d/243.breaking.md`.
 pub const SESSION_START_ORIGIN_METADATA_KEY: &str = "session_start_origin";
 
 /// The [`SESSION_START_ORIGIN_METADATA_KEY`] value meaning "this `SessionStart`
@@ -446,6 +492,108 @@ pub const SESSION_START_ORIGIN_METADATA_KEY: &str = "session_start_origin";
 /// interactivity for an agent that will emit a genuine native `SessionStart`
 /// later.
 pub const WRAPPER_FORK_SESSION_START_ORIGIN: &str = "wrapper_fork";
+
+/// The [`SESSION_START_ORIGIN_METADATA_KEY`] value meaning "`dot-agent-deck wrap`
+/// watched the wrapped child take the inner PTY OUT OF COOKED MODE" (issue #243).
+///
+/// This is the pre-prompt readiness signal the delegate and scheduler gates were
+/// missing. Codex posts its own native `SessionStart` when the first *turn*
+/// starts — i.e. as a consequence of the very prompt the gate is withholding —
+/// so before this the gate had nothing to release on and paid
+/// [`crate::state::SESSION_START_WAIT_TIMEOUT`] in full on every `clear = true`
+/// delegate.
+///
+/// **One fact, not two.** The wrapper observes the child two ways
+/// (`InterfaceWatch` in [`crate::wrap`]) and they carry DIFFERENT values, because
+/// they are not equally strong. This value is fact 1 — the child cleared
+/// `ICANON`/`ECHO`, a genuine observation that the child consumes keystrokes
+/// rather than echoing them. Fact 2 — output went quiet for a while — carries
+/// [`WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`] instead and buys strictly
+/// less; see that constant for why.
+///
+/// **What this fact does NOT establish: that the child will accept a submit.**
+/// It was read that way for two rounds of this issue — as the exact inverse of
+/// the PRD #225 defect where a prompt was echoed away by a still-canonical line
+/// discipline, and therefore as proof that no blind interval was left to pay.
+/// Measurement retracts that. A full-screen TUI enables raw mode at INIT, before
+/// it paints: real codex-cli 0.149.0 does it 85 ms after a direct exec, and
+/// `orchestration/delegate/009` recorded fork + 100 ms on both the original
+/// worker and its `clear = true` replacement, then lost the pointer into an
+/// unsubmitted composer. Raw mode is NECESSARY for input-readiness and not
+/// SUFFICIENT — it says the AGENT owns the terminal, not that the composer is
+/// listening — so this value RELEASES the readiness gate (it is the best release
+/// signal the deck has) and still owes a post-readiness buffer, sized against the
+/// initialisation it announces the start of. See
+/// [`crate::state::WRAPPER_INTERFACE_READINESS_BUFFER`].
+///
+/// It is still WRAPPER PROVENANCE rather than an agent conversation: the session
+/// id on it is the wrapper's own, not the agent's, so it must never bind a
+/// delivery's generation or move a pane's hook session. That is what
+/// [`AgentEvent::is_wrapper_session_start`] separates from
+/// [`AgentEvent::is_wrapper_fork_session_start`], which stays fork-only so the
+/// readiness gate can still tell the wrapper's events apart.
+///
+/// **What carrying this value does NOT establish: that a wrapper wrote it.**
+/// `dot-agent-deck hook` refuses to forward it (`crate::hook` narrows that
+/// forwarding to the fork value alone), and that narrowing is worth keeping — but
+/// it is not the trust boundary, because the daemon's hook socket ALSO accepts a
+/// raw [`AgentEvent`] JSON line whose `metadata` map is free-form and
+/// unvalidated. Any same-uid process can therefore post an event carrying this
+/// value; it was reproduced during issue #243's audit from a bare `python3` with
+/// no deck environment at all. Provenance is established by the DAEMON, at the
+/// site that acts on it — `crate::state::dispatch_one_owned` prices this value as
+/// a real TUI's initialisation only for an agent this daemon itself spawned as a
+/// Wrapper-strategy agent
+/// (`crate::agent_pty::AgentPtyRegistry::agent_spawned_as_wrapper_host`, read
+/// from the frozen launch-shape record no hook path can write). What a forgery
+/// can buy is bounded by what this value grants, and since it no longer
+/// suppresses a buffer the answer is a gate release that a bare unmarked
+/// `SessionStart` already bought before this issue. Do not add a new privilege
+/// keyed on this value without going through that check too — and do not
+/// reintroduce one that a blind interval no longer covers.
+pub const WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN: &str = "wrapper_interface_ready";
+
+/// The [`SESSION_START_ORIGIN_METADATA_KEY`] value meaning "`dot-agent-deck wrap`
+/// saw the wrapped child's output SETTLE" — it wrote something and then went
+/// quiet for `INTERFACE_SETTLE_WINDOW` (750 ms; `crate::wrap`) (issue #243).
+///
+/// The weaker of the wrapper's two interface facts, and split out from
+/// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] because settling is a GUESS
+/// where raw-input mode is an observation. Silence means "stopped producing
+/// output"; whether the thing that stopped is an interface waiting at its prompt
+/// or a LAUNCHER stalled part-way through its own boot is precisely what it
+/// cannot tell you. The production launch shape is `devbox run codex-big`, which
+/// prints one banner line at ~0.1 s and then computes its shellenv in SILENCE for
+/// a measured 2750–4132 ms before `codex` is exec'd at all — so it satisfies this
+/// fact while the pty is still in cooked mode, which is PRD #225 Defect 1
+/// exactly.
+///
+/// **It is therefore PROVISIONAL, not a release.** That distinction was learned
+/// the expensive way. The two facts do not arrive in order of strength: measured
+/// over 13 launcher probes and 8 wrapper spawns, this one fired 21/21 and the
+/// strong observation never fired first, arriving 2005–3370 ms later. A gate that
+/// released here and paid the 1000 ms buffer still wrote at +1.85 s into the
+/// launcher's own line discipline, and 3/3 production runs left the pointer
+/// parked unsubmitted in Codex's composer with no turn ever starting. So for a
+/// Wrapper-strategy agent the gate holds this fact for
+/// [`crate::state::INTERFACE_UPGRADE_WINDOW`] to see whether
+/// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] is still coming, and releases
+/// on it only when the window expires — with the post-readiness buffer
+/// ([`crate::state::DELEGATE_READINESS_BUFFER`]) still on, since it never skips
+/// that. A settled launcher and a settled REPL stay indistinguishable at this
+/// seam; what the window buys is the later evidence that tells them apart, and
+/// what the buffer covers is the case where none arrives.
+///
+/// Waiting forever is still worse than releasing on a guess, which is why the
+/// window is a bound and not a condition. The bound is
+/// [`crate::state::SESSION_START_WAIT_TIMEOUT`] itself, so a wrapped agent whose
+/// strong fact never arrives reaches its prompt at the same instant it did
+/// before this issue: the fallback costs the wait this issue opened on, and
+/// never a second more.
+///
+/// Everything said about provenance on
+/// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] applies to this value too.
+pub const WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN: &str = "wrapper_interface_settled";
 
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
@@ -641,6 +789,99 @@ impl AgentEvent {
             live_target: None,
         }
     }
+
+    /// Issue #243: does this event carry the wrapper's INTERFACE-READY origin
+    /// marker (see [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`])?
+    ///
+    /// The strongest readiness marker in the system: the wrapper watched this
+    /// child clear `ICANON`/`ECHO` on the inner PTY, as opposed to "a session
+    /// object exists". It is the only marker for which a readiness gate may drop
+    /// the blind post-signal buffer — and even then only after the gate has
+    /// established that the agent it names is one THIS daemon spawned as a
+    /// wrapper, because the marker itself is producer-writable (see the
+    /// constant).
+    ///
+    /// Narrower than the question most callers want. "Did the wrapper observe
+    /// the interface at all" — either fact, which is what RELEASES the gate — is
+    /// [`Self::is_wrapper_interface_session_start`].
+    pub fn is_wrapper_interface_ready_session_start(&self) -> bool {
+        self.metadata
+            .get(SESSION_START_ORIGIN_METADATA_KEY)
+            .is_some_and(|origin| origin == WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN)
+    }
+
+    /// Issue #243 (review): does this event carry the wrapper's OUTPUT-SETTLED
+    /// origin marker (see [`WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`])?
+    ///
+    /// The weaker interface fact — the child wrote something and then went quiet.
+    /// Enough to release a readiness gate that would otherwise wait 30 s for a
+    /// signal that never comes; NOT enough to drop the post-readiness buffer,
+    /// because a stalled launcher settles exactly like a REPL waiting at its
+    /// prompt.
+    pub fn is_wrapper_interface_settled_session_start(&self) -> bool {
+        self.metadata
+            .get(SESSION_START_ORIGIN_METADATA_KEY)
+            .is_some_and(|origin| origin == WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN)
+    }
+
+    /// Issue #243: did the wrapper observe this child's interface AT ALL —
+    /// either fact?
+    ///
+    /// This is the READINESS question, and it is the one the gate asks: both
+    /// facts mean the wrapper saw something happen to the child that a bare
+    /// fork-time event does not, so both release the wait. What they do not share
+    /// is how much they prove, which is why the buffer keys on the narrower
+    /// [`Self::is_wrapper_interface_ready_session_start`] instead.
+    pub fn is_wrapper_interface_session_start(&self) -> bool {
+        self.is_wrapper_interface_ready_session_start()
+            || self.is_wrapper_interface_settled_session_start()
+    }
+
+    /// Issue #243: was this `SessionStart` authored by `dot-agent-deck wrap`
+    /// ABOUT ITS OWN CHILD — any of its origins — rather than by an initialized
+    /// agent session announcing itself?
+    ///
+    /// This is the "is it a conversation" question, and it is NOT the same as the
+    /// readiness question. Every wrapper event carries the wrapper's own session
+    /// id, so none may bind a delivery's generation, move a pane's hook session,
+    /// or arm a re-submission — while the interface ones *do* satisfy the
+    /// readiness gate and the fork-time one usually does not. Every
+    /// site that previously asked `!is_wrapper_fork_session_start()` to mean
+    /// "genuine conversation" asks this instead; the two sites that genuinely
+    /// mean "fork-time boot provenance" keep asking the narrower question.
+    ///
+    /// `false` for every event without the key — including everything an older
+    /// wrapper, a native hook or a future producer emits — so the absent-key
+    /// default stays "a genuine, session-derived event".
+    pub fn is_wrapper_session_start(&self) -> bool {
+        self.is_wrapper_fork_session_start() || self.is_wrapper_interface_session_start()
+    }
+
+    /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than
+    /// produced by the pane's agent?
+    ///
+    /// The daemon emits identified events of its own through the same pipeline
+    /// real hook events take — [`EventType::ShellBusy`]/[`EventType::ShellIdle`]
+    /// from the shell-activity monitor (PRD #370/#386), and the delivery-notice
+    /// [`EventType::Error`] (issue #424). They carry the pane's registry
+    /// `agent_id` because that is how they land on the right card, and that is
+    /// exactly what made them indistinguishable from producer evidence to
+    /// `crate::ui::evidence_channel_is_unidentified`: one of them arriving was
+    /// enough to conclude the pane has a tagged reporting channel, when it proves
+    /// only that the DAEMON can tag its own events. A pane behind a legacy
+    /// untagged hook then resumed retyping through a channel that still could not
+    /// confirm anything.
+    ///
+    /// The delivery-notice half is recognized by its metadata key, and that is
+    /// safe in the only direction it can be abused: a forged event claiming the
+    /// key is EXCLUDED from the evidence channel, i.e. it loses standing rather
+    /// than gaining any. The key is not, and must not be treated as, an
+    /// authentication marker (auditor) — a forged raw `Error` without it marks a
+    /// card exactly as it did before.
+    pub fn is_daemon_synthetic(&self) -> bool {
+        matches!(self.event_type, EventType::ShellBusy | EventType::ShellIdle)
+            || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+    }
 }
 
 /// Envelope for messages sent to the daemon over the Unix socket.
@@ -672,6 +913,24 @@ pub enum DaemonMessage {
     /// and does NOT move the attach `PROTOCOL_VERSION`.
     #[serde(rename = "get_seed")]
     GetSeed(GetSeedRequest),
+    /// PRD #220: agent-callable dispatch — creates a git worktree and spawns a
+    /// fully-isolated orchestration inside it. One-step parallel line of work:
+    /// the agent calls `dispatch <name>` and the daemon handles worktree
+    /// lifecycle (create, spawn, cleanup on tab close).
+    #[serde(rename = "dispatch")]
+    Dispatch(DispatchSignal),
+    /// PRD #220: read-only request for the spawn targets available to a pane's
+    /// repo. Like [`Self::GetSeed`], the daemon writes a
+    /// [`ListTargetsResponse`] JSON line back on the same connection; every other
+    /// message on this socket is fire-and-forget.
+    ///
+    /// Answered by the DAEMON rather than computed in the CLI so the menu comes
+    /// from the same cwd and the same config the dispatch will use — a listing
+    /// that can disagree with the spawn is worse than no listing. Additive on the
+    /// hook socket, so it does NOT move the attach `PROTOCOL_VERSION`; an older
+    /// daemon simply never replies, which the CLI degrades on.
+    #[serde(rename = "list_targets")]
+    ListTargets(ListTargetsRequest),
 }
 
 /// PRD #201: payload of [`DaemonMessage::GetSeed`] — the pane whose pending
@@ -691,6 +950,141 @@ pub struct GetSeedRequest {
 pub struct GetSeedResponse {
     #[serde(default)]
     pub seed: Option<String>,
+}
+
+/// PRD #220: payload of [`DaemonMessage::ListTargets`] — the pane whose repo's
+/// spawn targets the caller wants listed.
+///
+/// Pane-scoped rather than carrying a directory, deliberately: the daemon
+/// resolves the caller's cwd from the PTY registry's `AgentRecord.cwd`, which is
+/// the SAME source `dispatch` itself uses. An earlier cut read the CLI process's
+/// own `current_dir()` locally, which diverged from the dispatch whenever the
+/// agent had `cd`'d — the listing then advertised targets the dispatch could not
+/// start, or reported none where the repo defined them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListTargetsRequest {
+    pub pane_id: String,
+}
+
+/// PRD #220: the daemon's reply to a [`DaemonMessage::ListTargets`], one JSON
+/// line back on the hook-socket connection (the [`GetSeedResponse`] pattern).
+///
+/// `rendered` is the human-readable listing the dispatcher agent relays to the
+/// user; `orchestrations` carries the same data structurally so a caller can act
+/// on it without parsing prose. `error` is set when the repo's
+/// `.dot-agent-deck.toml` exists but could not be parsed — distinguishing "no
+/// orchestrations" from "your config is broken", which a bare empty list cannot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListTargetsResponse {
+    pub rendered: String,
+    #[serde(default)]
+    pub orchestrations: Vec<ListedOrchestration>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// One spawnable orchestration in a [`ListTargetsResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedOrchestration {
+    pub name: String,
+    pub roles: usize,
+    /// Issue #704: is this the one a dispatch with no `--orchestration <name>`
+    /// (and a scheduled task rooted here) would open?
+    ///
+    /// Additive and `#[serde(default)]`, so an older daemon's reply — which omits
+    /// the key entirely — still parses, with `false` for every entry. That reads
+    /// as "this build cannot tell you which is the default", which is exactly
+    /// true of it, so no `PROTOCOL_VERSION` bump: the wire SHAPE is unchanged for
+    /// every peer that does not know the field.
+    #[serde(default)]
+    pub default: bool,
+}
+
+/// The daemon's reply to a [`DaemonMessage::Delegate`], one JSON line back on
+/// the hook-socket connection (the [`GetSeedResponse`] / [`ListTargetsResponse`]
+/// pattern).
+///
+/// `delegate` used to be fire-and-forget, and that is half of a reported bug: an
+/// orchestration started by `dispatch --orchestration` could not delegate at all,
+/// yet every `dot-agent-deck delegate` it ran printed nothing and exited 0. The
+/// orchestrator therefore announced that its worker was working and waited
+/// forever for a `work-done` that could not arrive. A delegation that reached
+/// nobody has to be distinguishable from one that reached somebody, and the only
+/// place that distinction exists is the daemon.
+///
+/// `error` is a routing failure that stopped the delegate outright (the sender is
+/// not a pane the daemon holds a role for, or is not an orchestrator).
+/// `unresolved_roles` is the partial case: the sender was fine, but one or more
+/// `--to` roles matched no worker pane. They are kept separate so the message can
+/// say which happened, and because they carry different verdicts: `error` means
+/// nothing landed, while `unresolved_roles` alongside a non-empty `delivered` is
+/// a delegate that HALF landed — see the `Delegate` arm of `main.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegateResponse {
+    /// Affirmative discriminator, always [`DELEGATE_RESPONSE_KIND`] on a reply
+    /// this daemon wrote.
+    ///
+    /// PR #466 review: without it, success was *residual* rather than
+    /// affirmative. Every other field is `#[serde(default)]`, so
+    /// `from_str::<DelegateResponse>` succeeds on ANY JSON object — `{}`, or
+    /// another verb's reply such as `{"seed":null}` — and yields empty
+    /// `delivered`, empty `unresolved_roles`, no `error`: indistinguishable
+    /// from a clean success. The one verb whose whole purpose is answering
+    /// "did this land?" answered yes whenever it could not tell. A reply that
+    /// does not carry this marker is now treated exactly like
+    /// [`crate::hook::SocketReply::NoReply`] — a daemon we do not understand,
+    /// which is not proof of failure but is not evidence of success either.
+    ///
+    /// `Option<String>` and `#[serde(default)]` on purpose: the field must
+    /// deserialize to `None` when absent (that is the whole point), while the
+    /// hand-written [`Default`] impl below stamps it on every response the
+    /// daemon builds, including the `..Default::default()` early returns.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Roles whose dispatch was queued to a worker pane.
+    ///
+    /// "Queued to a pane that resolved at delegate time" is the exact claim —
+    /// the fan-out is detached (see [`crate::state::AppState::handle_delegate`]),
+    /// so no synchronous reply can promise the worker read it. A role whose
+    /// worker exited WITHOUT going through the `StopAgent` close path also still
+    /// resolves here, because only that path calls `AppState::unregister_pane`
+    /// (greptile P1 on PR #466, deferred to issue #524 — the liveness of a
+    /// registered pane is not decidable here, since a `clear = true` role's dead
+    /// pane is legitimately respawned by the dispatch rather than being a miss).
+    #[serde(default)]
+    pub delivered: Vec<String>,
+    /// Roles named by `--to` that resolved to no worker pane in this
+    /// orchestration.
+    #[serde(default)]
+    pub unresolved_roles: Vec<String>,
+    /// Set when the delegate could not be routed at all.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The value [`DelegateResponse::kind`] carries on every reply this daemon
+/// writes. Bumping or renaming it would make every older CLI stop trusting the
+/// reply and fall back to "delivered, unverifiable" — a safe degradation, but a
+/// deliberate one.
+pub const DELEGATE_RESPONSE_KIND: &str = "delegate";
+
+impl Default for DelegateResponse {
+    fn default() -> Self {
+        Self {
+            kind: Some(DELEGATE_RESPONSE_KIND.to_string()),
+            delivered: Vec::new(),
+            unresolved_roles: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+impl DelegateResponse {
+    /// Whether this parsed reply positively identifies itself as a delegate
+    /// response. See [`Self::kind`].
+    pub fn is_delegate_reply(&self) -> bool {
+        self.kind.as_deref() == Some(DELEGATE_RESPONSE_KIND)
+    }
 }
 
 /// Signal sent by the orchestrator via `dot-agent-deck delegate`.
@@ -773,6 +1167,43 @@ pub struct OrchestrationSurfaceRole {
     pub role_name: String,
     /// Whether this is the start (orchestrator) role.
     pub is_start_role: bool,
+}
+
+/// PRD #220: signal sent by an agent via `dot-agent-deck dispatch`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchSignal {
+    pub pane_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub task: Option<String>,
+    /// PRD #220: the shape the USER chose for this unit — `single` for one
+    /// agent, `orchestration[:name]` for a team. Absent means "whatever the
+    /// dispatched worktree's config implies", the pre-selector behaviour.
+    ///
+    /// `#[serde(default)]` keeps this additive: an older daemon that never knew
+    /// the field is unaffected (it rejects the whole `dispatch` variant anyway),
+    /// and an older CLI omitting it still deserializes against a newer daemon.
+    /// So the hook-socket shape is unchanged and `PROTOCOL_VERSION` does not move.
+    #[serde(default)]
+    pub shape: Option<DispatchShape>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// PRD #220: the wire form of the user's single-vs-orchestration choice.
+///
+/// Its own type rather than a bare string so an unrecognised value fails at
+/// deserialization instead of being silently read as "use the default" — the
+/// selector exists to remove exactly that class of surprise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DispatchShape {
+    /// One agent, even where the dir defines `[[orchestrations]]`.
+    SingleAgent,
+    /// A full orchestration; `name` absent = the dir's first.
+    Orchestration {
+        #[serde(default)]
+        name: Option<String>,
+    },
 }
 
 /// Signal sent by a worker via `dot-agent-deck work-done`.
@@ -943,13 +1374,52 @@ mod tests {
 
     #[test]
     fn reject_invalid_event_type() {
+        // PRD #370 (rule-12 wire safety, same class as PRD #201's `AgentType`
+        // precedent immediately below): `EventType` gained a `#[serde(other)]`
+        // catch-all alongside its new `ShellBusy`/`ShellIdle` variants, so an
+        // unrecognized `event_type` no longer fails the whole `AgentEvent`
+        // decode — it deserializes to `EventType::Unknown` instead. This test
+        // used to assert the OPPOSITE (a hard decode error); the change is
+        // deliberate forward-compat, not a regression — see
+        // `unknown_event_type_deserializes_to_the_catch_all` below for the
+        // dedicated coverage this rename hands off to.
         let json = r#"{
             "session_id": "abc-123",
             "agent_type": "claude_code",
             "event_type": "unknown_type",
             "timestamp": "2026-03-22T10:00:00Z"
         }"#;
-        assert!(serde_json::from_str::<AgentEvent>(json).is_err());
+        let event: AgentEvent = serde_json::from_str(json).expect("must decode, not error");
+        assert_eq!(event.event_type, EventType::Unknown);
+    }
+
+    // PRD #370 (rule-12 wire safety): `EventType` gained wire-serialized
+    // `ShellBusy`/`ShellIdle` variants (the daemon-synthesized "a foreground
+    // shell command is running" signal). Without a `#[serde(other)]`
+    // fallback, a NEWER daemon emitting one would break an OLDER reader's
+    // WHOLE-frame decode (the `KIND_EVENT` broadcast), stranding its event
+    // stream — the exact class of break PRD #201 fixed for `AgentType`
+    // above. The catch-all makes any unrecognized value — one of these two
+    // new variants at a pre-#370 reader, OR a future event type at today's
+    // build — deserialize to the neutral `Unknown` placeholder instead of
+    // erroring, so this class of break can never repeat for a future type.
+    #[test]
+    fn unknown_event_type_deserializes_to_the_catch_all() {
+        let ty: EventType = serde_json::from_str("\"some_future_event_type\"").unwrap();
+        assert_eq!(ty, EventType::Unknown);
+
+        // Deserialize-only: `Unknown` is never produced by this build, so it
+        // has no "own" wire name to round-trip through — unlike
+        // `AgentType::None`, which legitimately serializes as `"none"`.
+        // Confirm the REAL variants this build DOES produce still round-trip
+        // cleanly, so the catch-all didn't disturb ordinary encode/decode.
+        assert_eq!(
+            serde_json::from_str::<EventType>(
+                &serde_json::to_string(&EventType::ShellBusy).unwrap()
+            )
+            .unwrap(),
+            EventType::ShellBusy
+        );
     }
 
     // PRD #76 M2.13: pin the AgentType::from_command inference rules.

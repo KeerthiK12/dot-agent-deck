@@ -136,8 +136,10 @@ Also gate before commit (per `CLAUDE.md`):
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features e2e -- -D warnings
 ```
+
+`--features e2e` is not optional (issue #407): without it every `tests/e2e_*.rs` compiles to an empty crate, so clippy reports clean over code it never saw.
 
 ## Gotchas
 

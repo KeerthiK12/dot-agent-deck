@@ -59,7 +59,7 @@ Aider      →  log-watcher strategy  (THIS PRD)  →  AgentEvent  →  daemon
 - A log-watched Aider session renders view-only / history-only (no live-input affordance), and an input attempt returns an honest `send_result`.
 - Claude Code, OpenCode, Pi, Codex, and Gemini integrations continue to work unchanged — the existing test suite passes without edits.
 - A real Aider agent on a cheap model performs a directory listing whose structured log the watcher parses, surfacing a fixture sentinel, in a PTY-attached e2e.
-- `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test-fast` pass; `cargo test-e2e` passes before the PR.
+- `cargo fmt --check`, `cargo clippy --all-targets --features e2e -- -D warnings`, and `cargo test-fast` pass; `cargo test-e2e` passes before the PR.
 
 ## Milestones
 

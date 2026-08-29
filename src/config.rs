@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -25,19 +25,6 @@ pub const CONFIG_KEYS: &[(&str, &str)] = &[
         "Bell when session goes idle (default: false)",
     ),
     ("bell.on_error", "Bell on agent error (default: true)"),
-    (
-        "idle_art.enabled",
-        "Enable ASCII art in dashboard idle cards (default: false)",
-    ),
-    (
-        "idle_art.provider",
-        "LLM provider: anthropic (ANTHROPIC_API_KEY), openai (OPENAI_API_KEY), ollama (no key needed) (default: anthropic)",
-    ),
-    ("idle_art.model", "LLM model (default: claude-haiku-4-5)"),
-    (
-        "idle_art.timeout_secs",
-        "Seconds idle before triggering art (default: 300)",
-    ),
 ];
 
 pub fn config_keys_help() -> String {
@@ -107,34 +94,15 @@ impl BellConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct IdleArtConfig {
-    pub enabled: bool,
-    pub provider: String,
-    pub model: String,
-    pub timeout_secs: u64,
-}
-
-const MAX_IDLE_ART_TIMEOUT_SECS: u64 = i64::MAX as u64;
-
-impl Default for IdleArtConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            provider: "anthropic".to_string(),
-            model: "claude-haiku-4-5".to_string(),
-            timeout_secs: 300,
-        }
-    }
-}
-
+/// Issue #519: the removed `[idle_art]` section is deliberately NOT declared
+/// here as an accepted-and-ignored field. `DashboardConfig` sets no
+/// `#[serde(deny_unknown_fields)]`, so serde drops unknown tables silently and
+/// a `config.toml` still carrying `[idle_art]` keeps loading unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DashboardConfig {
     pub default_command: String,
     pub bell: BellConfig,
-    pub idle_art: IdleArtConfig,
     pub auto_config_prompt: bool,
 }
 
@@ -143,7 +111,6 @@ impl Default for DashboardConfig {
         Self {
             default_command: String::new(),
             bell: BellConfig::default(),
-            idle_art: IdleArtConfig::default(),
             auto_config_prompt: true,
         }
     }
@@ -187,10 +154,6 @@ impl DashboardConfig {
             "bell.on_waiting_for_input" => Ok(self.bell.on_waiting_for_input.to_string()),
             "bell.on_idle" => Ok(self.bell.on_idle.to_string()),
             "bell.on_error" => Ok(self.bell.on_error.to_string()),
-            "idle_art.enabled" => Ok(self.idle_art.enabled.to_string()),
-            "idle_art.provider" => Ok(self.idle_art.provider.clone()),
-            "idle_art.model" => Ok(self.idle_art.model.clone()),
-            "idle_art.timeout_secs" => Ok(self.idle_art.timeout_secs.to_string()),
             "auto_config_prompt" => Ok(self.auto_config_prompt.to_string()),
             _ => Err(format!("Unknown config key: {key}\n{}", config_keys_help())),
         }
@@ -219,30 +182,6 @@ impl DashboardConfig {
             }
             "bell.on_error" => {
                 self.bell.on_error = parse_bool(value)?;
-                Ok(())
-            }
-            "idle_art.enabled" => {
-                self.idle_art.enabled = parse_bool(value)?;
-                Ok(())
-            }
-            "idle_art.provider" => {
-                self.idle_art.provider = value.to_string();
-                Ok(())
-            }
-            "idle_art.model" => {
-                self.idle_art.model = value.to_string();
-                Ok(())
-            }
-            "idle_art.timeout_secs" => {
-                let secs: u64 = value
-                    .parse()
-                    .map_err(|_| format!("Invalid number: {value}"))?;
-                if secs > MAX_IDLE_ART_TIMEOUT_SECS {
-                    return Err(format!(
-                        "idle_art.timeout_secs must be <= {MAX_IDLE_ART_TIMEOUT_SECS}"
-                    ));
-                }
-                self.idle_art.timeout_secs = secs;
                 Ok(())
             }
             "auto_config_prompt" => {
@@ -1172,17 +1111,136 @@ pub fn resolve_features(file: crate::features::Features) -> crate::features::Fea
 }
 
 /// Path of the `.dot-agent-deck.toml` whose `[features]` table backs the
-/// flag — the file in the current working directory, so the TUI and daemon
-/// (launched in the same dir) read the same source of truth.
-/// `DOT_AGENT_DECK_FEATURES_CONFIG` is an explicit override so tests never
-/// touch the real cwd.
-pub fn features_config_path() -> PathBuf {
+/// flag: the file in `project_dir`, the directory the CALLER has decided is
+/// the project.
+///
+/// Issue #577: this used to join [`std::env::current_dir`] unconditionally,
+/// making it the only config read in the deck keyed to the process's own
+/// working directory rather than to a directory it was handed — every other
+/// one goes through [`crate::project_config::load_project_config`] with an
+/// explicit dir. A deck launched anywhere but its project therefore read the
+/// `[features]` table from the launch directory's file (usually one that does
+/// not exist), so every experimental surface silently resolved OFF and the
+/// symptom was indistinguishable from the feature having been removed. The
+/// cwd read now happens once at the entry point (`launch_project_dir` in
+/// `main.rs`), where it is a deliberate choice rather than a hidden default.
+///
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` names the file outright and still wins
+/// over `project_dir`, so tests — and an operator pointing the flag at one
+/// specific file — depend on no directory at all.
+pub fn features_config_path(project_dir: &Path) -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG") {
         return PathBuf::from(p);
     }
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(crate::project_config::CONFIG_FILE_NAME)
+    project_dir.join(crate::project_config::CONFIG_FILE_NAME)
+}
+
+/// Decide whether a candidate `.dot-agent-deck.toml` found by the ancestor
+/// walk may be trusted, given the uid that owns it and the uid we are running
+/// as (issue #577).
+///
+/// The pure-data core of the walk's trust check, split out so its rules are
+/// unit-testable on every platform — the same shape as
+/// [`crate::platform::fsperm::endpoint_owner_is_trusted`], and for the same
+/// reason: a decision this small should not need a foreign-owned file (or
+/// root) to exercise.
+///
+/// Walking upward means considering directories the operator did not name and
+/// may not own — `/tmp/project` sits under a world-writable `/tmp`, where any
+/// local user can create `/tmp/.dot-agent-deck.toml`. Ownership is the check
+/// that matters: an attacker cannot create a file owned by *us*. It fails
+/// closed, so an ancestor we cannot vouch for is skipped and the walk
+/// continues past it rather than adopting it.
+/// `cfg_attr` rather than a `#[cfg(unix)]` on the function: the rule is
+/// platform-independent and its test runs everywhere, but the only production
+/// caller is inside `config_candidate_is_trusted`'s `#[cfg(unix)]` arm, so on
+/// Windows this is dead code to a build that does not compile the tests —
+/// which `build-windows` is, since it runs bare `cargo clippy -- -D warnings`
+/// without `--all-targets` (CLAUDE.md rule 2). Same shape, mirror-image
+/// platform, as `fsperm::endpoint_owner_is_trusted`'s
+/// `#[cfg_attr(not(windows), allow(dead_code))]`.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn config_owner_is_trusted(file_uid: u32, our_uid: u32) -> bool {
+    file_uid == our_uid
+}
+
+/// The project directory the deck's process-global config reads key off:
+/// `start` if it holds a trusted `.dot-agent-deck.toml`, else the nearest
+/// ancestor that does, else `start` unchanged.
+///
+/// Issue #577: the deck used to key the `[features]` table to its own working
+/// directory, so running it from anywhere below the project root — `repo/src`,
+/// `repo/docs`, a nested crate — read a `.dot-agent-deck.toml` that is not
+/// there and silently resolved every experimental surface OFF. Walking up is
+/// how a project-scoped config is normally found, and it makes the flag depend
+/// on which PROJECT you are in rather than on which of its directories you
+/// happened to be standing in.
+///
+/// Two deliberate limits:
+///
+/// - A candidate must be a regular file owned by the current uid
+///   ([`config_owner_is_trusted`]); anything else is skipped and the walk
+///   continues. `metadata` follows symlinks, so the ownership answer is about
+///   the resolved target, matching [`load_features_file`]'s own `is_file()`
+///   check.
+/// - When nothing qualifies the result is `start` itself, so the resulting
+///   path is byte-identical to the pre-#577 behaviour and a deck launched
+///   outside any project reads exactly what it read before.
+///
+/// This does NOT make the flag per-project — it stays one process-global
+/// toggle (CLAUDE.md rule 9). A deck launched entirely outside its project,
+/// with panes pointed into it, still reads the launch directory's file;
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` is the escape hatch there.
+pub fn resolve_project_dir(start: &Path) -> PathBuf {
+    // `ancestors()` yields `start` first, so a project whose config sits in
+    // the launch directory itself resolves without walking anywhere and keeps
+    // exactly its pre-#577 behaviour. It is lexical rather than symlink-
+    // resolving, which is what we want: `current_dir()` already hands us the
+    // physical path on Unix, and re-resolving would report a project root the
+    // operator never typed.
+    for dir in start.ancestors() {
+        if config_candidate_is_trusted(&dir.join(crate::project_config::CONFIG_FILE_NAME)) {
+            return dir.to_path_buf();
+        }
+    }
+    start.to_path_buf()
+}
+
+/// Whether `path` is a `.dot-agent-deck.toml` the ancestor walk may stop at:
+/// a regular file owned by the current user. Anything else — absent, a
+/// directory, a foreign-owned file — is skipped so the walk continues past it.
+///
+/// `metadata` follows symlinks, so a symlink to a foreign-owned file is judged
+/// by its target, and a dangling one is simply absent. This is the same
+/// stat-then-read shape [`load_features_file`] already uses; it is not a
+/// TOCTOU guarantee and does not need to be, because the loader re-validates
+/// (regular file, size cap, parse) before it trusts a byte of the content.
+/// This check decides only WHICH directory is the project.
+fn config_candidate_is_trusted(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        config_owner_is_trusted(metadata.uid(), crate::platform::paths::current_uid())
+    }
+    // Windows has no uid, and the file analogue of the SID check in
+    // `platform::fsperm` takes a kernel HANDLE rather than a path — it is
+    // built for the named pipe and the spawn mutex, not for stat-ing a config.
+    // The exposure it would close is also structurally smaller here: the walk
+    // climbs through the per-user profile (`C:\Users\<me>\…`), which is
+    // ACL'd to that user, before reaching `C:\`, which is admin-writable by
+    // default — there is no world-writable `/tmp` equivalent on the way up.
+    // So Windows accepts any regular file, and the property that differs is
+    // recorded here rather than left to be inferred from the `cfg`.
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Upper bound on the `.dot-agent-deck.toml` the feature-flag loader will
@@ -1284,6 +1342,31 @@ pub fn load_features_file(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// The pure trust rule the ancestor walk stops on (issue #577). Split out
+    /// of the filesystem check so the deletion-unsafe direction — adopting an
+    /// ancestor config we do not own — is exercised without needing a
+    /// foreign-owned file or root, mirroring how
+    /// `platform::fsperm::endpoint_owner_is_trusted` is tested. Ownership is
+    /// the check that matters when walking upward: `/tmp/project` sits under a
+    /// world-writable `/tmp` where any local user can drop a
+    /// `/tmp/.dot-agent-deck.toml`, and an attacker cannot create a file owned
+    /// by us.
+    #[test]
+    fn ancestor_config_is_trusted_only_when_we_own_it() {
+        assert!(
+            config_owner_is_trusted(1000, 1000),
+            "our own file is trusted"
+        );
+        assert!(
+            !config_owner_is_trusted(0, 1000),
+            "a root-owned config planted above us is not adopted"
+        );
+        assert!(
+            !config_owner_is_trusted(1001, 1000),
+            "another local user's config planted above us is not adopted"
+        );
+    }
 
     /// Scenario: Drive a `SnapshotCoalescer` (interval 500ms) synchronously with
     /// a 50-change burst all observed at the same instant — after each
@@ -1719,61 +1802,51 @@ command = "vim"
         }
     }
 
+    /// Issue #519: a `config.toml` written before the idle-art removal still
+    /// carries an `[idle_art]` section. `DashboardConfig` sets no
+    /// `#[serde(deny_unknown_fields)]`, so the stale table must be dropped
+    /// silently — a hard parse failure here would print "Invalid config" and
+    /// reset every OTHER key to its default on startup.
     #[test]
-    fn idle_art_config_defaults() {
-        let config = IdleArtConfig::default();
-        assert!(!config.enabled);
-        assert_eq!(config.provider, "anthropic");
-        assert_eq!(config.model, "claude-haiku-4-5");
-        assert_eq!(config.timeout_secs, 300);
-    }
-
-    #[test]
-    fn dashboard_config_without_idle_art() {
-        let dc: DashboardConfig = toml::from_str("").unwrap();
-        assert!(!dc.idle_art.enabled);
-        assert_eq!(dc.idle_art.provider, "anthropic");
-        assert_eq!(dc.idle_art.model, "claude-haiku-4-5");
-    }
-
-    #[test]
-    fn dashboard_config_with_idle_art() {
+    fn dashboard_config_ignores_removed_idle_art_section() {
         let toml_str = r#"
+default_command = "claude"
+auto_config_prompt = false
+
 [idle_art]
 enabled = true
 provider = "openai"
 model = "gpt-4o-mini"
 timeout_secs = 600
 "#;
-        let dc: DashboardConfig = toml::from_str(toml_str).unwrap();
-        assert!(dc.idle_art.enabled);
-        assert_eq!(dc.idle_art.provider, "openai");
-        assert_eq!(dc.idle_art.model, "gpt-4o-mini");
-        assert_eq!(dc.idle_art.timeout_secs, 600);
+        let dc: DashboardConfig =
+            toml::from_str(toml_str).expect("a stale [idle_art] section must not fail the load");
+        assert_eq!(dc.default_command, "claude");
+        assert!(!dc.auto_config_prompt);
     }
 
+    /// Issue #519: the four `idle_art.*` keys are gone from [`CONFIG_KEYS`], so
+    /// `config get` / `config set` now report them as unknown rather than
+    /// accepting a setting nothing reads.
     #[test]
-    fn idle_art_get_set_fields() {
+    fn idle_art_config_keys_are_unknown() {
         let mut dc = DashboardConfig::default();
-        assert_eq!(dc.get_field("idle_art.enabled").unwrap(), "false");
-        assert_eq!(dc.get_field("idle_art.provider").unwrap(), "anthropic");
-        assert_eq!(dc.get_field("idle_art.model").unwrap(), "claude-haiku-4-5");
-        assert_eq!(dc.get_field("idle_art.timeout_secs").unwrap(), "300");
-
-        dc.set_field("idle_art.enabled", "true").unwrap();
-        assert!(dc.idle_art.enabled);
-
-        dc.set_field("idle_art.provider", "ollama").unwrap();
-        assert_eq!(dc.idle_art.provider, "ollama");
-
-        dc.set_field("idle_art.model", "llama3").unwrap();
-        assert_eq!(dc.idle_art.model, "llama3");
-
-        dc.set_field("idle_art.timeout_secs", "120").unwrap();
-        assert_eq!(dc.idle_art.timeout_secs, 120);
-
-        assert!(dc.set_field("idle_art.enabled", "notabool").is_err());
-        assert!(dc.set_field("idle_art.timeout_secs", "notanumber").is_err());
+        for key in [
+            "idle_art.enabled",
+            "idle_art.provider",
+            "idle_art.model",
+            "idle_art.timeout_secs",
+        ] {
+            assert!(dc.get_field(key).is_err(), "get_field({key}) should fail");
+            assert!(
+                dc.set_field(key, "true").is_err(),
+                "set_field({key}) should fail"
+            );
+        }
+        assert!(
+            !CONFIG_KEYS.iter().any(|(k, _)| k.starts_with("idle_art.")),
+            "no idle_art.* key should remain in the `config set --help` listing"
+        );
     }
 
     #[test]

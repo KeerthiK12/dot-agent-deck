@@ -111,7 +111,7 @@ It does not re-implement the TUI's rendering, does not hold orchestration logic,
 - Clicking a node in the graph focuses that agent's pane; a hand-off animates an edge in real time.
 - The GUI raises an OS-native notification when an agent needs input or finishes while the window is unfocused.
 - Maturity is enforced by packaging: the GUI is a separate artifact, absent from the default release, and documented as opt-in/preview.
-- `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test-fast` pass for the Rust crates; the GUI's own test suite passes; `cargo test-e2e` passes before the PR (CLAUDE.md rules 2 & 5).
+- `cargo fmt --check`, `cargo clippy --all-targets --features e2e -- -D warnings`, and `cargo test-fast` pass for the Rust crates; the GUI's own test suite passes; `cargo test-e2e` passes before the PR (CLAUDE.md rules 2 & 5).
 
 ## Milestones
 

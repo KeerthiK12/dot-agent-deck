@@ -1,8 +1,16 @@
 # PRD #53: AI-Generated ASCII Art for Idle Dashboard Cards
 
-**Status**: Done
+**Status**: Removed (2026-08-14, issue #519) — shipped, then deleted outright
 **Priority**: Low
 **Created**: 2026-04-08
+
+## Removal
+
+Everything below is a historical record of a feature that no longer exists. Issue #519 deleted it in full: `src/llm.rs`, `src/ascii_art.rs`, `assets/idle-art-prompt.md`, the `[idle_art]` config section and its four `config get`/`set` keys, the `dot-agent-deck ascii` subcommand, and the dashboard render path. Idle cards fall back to the flashing-dot indicator that Normal and Compact density already used.
+
+The reason is the collision this PRD's own "Opt-in by default" decision anticipated but only half-solved. Defaulting `enabled` to `false` stopped the deck from *spending* a user's key without consent; it did nothing about the other direction — that merely **having** `ANTHROPIC_API_KEY` exported for idle art overrides a Claude.ai subscription inside Claude Code, silently switching the user to API billing. A workaround teaching the resolver `DOT_AGENT_DECK_`-prefixed key names landed in `5f1f1fd` and was reverted in `23f5374`: an off-by-default cosmetic feature is not worth an API-key code path in a tool whose entire job is to spawn agents that authenticate themselves. This was the only LLM client in the repository, and nothing in the daemon, orchestration, hooks, scheduler, or dispatch path ever made an LLM call.
+
+It also never earned coverage under rule 4 — no file under `tests/` referenced `idle_art` or `ascii_art`, so there was no L1 or L2 suite to retire and no PTY test showing it as a user actually saw it.
 
 ## Problem
 

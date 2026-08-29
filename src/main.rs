@@ -6,6 +6,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
+use dot_agent_deck::bounded_read::read_task_input;
 use dot_agent_deck::build_version_handshake;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
@@ -72,21 +73,6 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Generate ASCII art from session context via LLM
-    Ascii {
-        /// User prompts / session input context
-        #[arg(long)]
-        input: String,
-        /// Agent response / session output context
-        #[arg(long)]
-        output: String,
-        /// LLM provider (overrides config; e.g., anthropic, openai, ollama)
-        #[arg(long)]
-        provider: Option<String>,
-        /// LLM model (overrides config; e.g., claude-haiku-4-5, gpt-4o-mini)
-        #[arg(long)]
-        model: Option<String>,
-    },
     /// Generate a .dot-agent-deck.toml template in the current or specified directory
     Init {
         /// Target directory (defaults to current directory)
@@ -116,12 +102,59 @@ enum Commands {
         /// Read the task text verbatim from a file (or `-` for stdin). The
         /// shell-safe way to pass a task containing backticks, quotes, `$VAR`,
         /// or newlines, which --task would otherwise let the caller's shell
-        /// mangle. Mutually exclusive with --task.
+        /// mangle. PATH must be a regular file, not a FIFO or a device; pass
+        /// `-` to read a pipe. At most 1 MiB, from a file or from stdin.
+        /// Mutually exclusive with --task.
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
         /// Role name(s) to delegate to (repeatable)
         #[arg(long)]
         to: Vec<String>,
+    },
+    /// Create a git worktree and start an isolated line of work inside it.
+    /// Agent-callable, one step (PRD #220).
+    Dispatch {
+        /// Short name for the dispatch unit (used for worktree naming).
+        /// Omit it only with --list-targets.
+        #[arg(required_unless_present = "list_targets")]
+        name: Option<String>,
+        /// Task description with context, file paths, and constraints.
+        /// Mutually exclusive with --task-file.
+        #[arg(long, conflicts_with = "task_file")]
+        task: Option<String>,
+        /// Read the task text verbatim from a file (or `-` for stdin). PATH
+        /// must be a regular file, not a FIFO or a device; pass `-` to read a
+        /// pipe. At most 1 MiB, from a file or from stdin. Mutually exclusive
+        /// with --task.
+        #[arg(long = "task-file", value_name = "PATH")]
+        task_file: Option<String>,
+        /// Start ONE agent, even where this repo defines `[[orchestrations]]`.
+        /// Mutually exclusive with --orchestration.
+        #[arg(long, conflicts_with = "orchestration")]
+        single: bool,
+        /// Start a full orchestration by name (`--orchestration review`), or this
+        /// repo's DEFAULT one (`--orchestration=` with an empty value) — the block
+        /// carrying `default = true`, else the first with roles.
+        /// Mutually exclusive with --single.
+        ///
+        /// The value is REQUIRED rather than optional: with `num_args = 0..=1` clap
+        /// consumes the next bare token, so `dispatch --orchestration my-unit
+        /// --task "…"` silently bound the UNIT NAME as the orchestration name and
+        /// then aborted for a missing positional. Requiring it makes that
+        /// invocation unambiguous.
+        #[arg(long, value_name = "NAME")]
+        orchestration: Option<String>,
+        /// Print the spawn targets available in this repo, then exit. Ask the
+        /// user which one they want before dispatching.
+        ///
+        /// Conflicts with every dispatch argument: combined, it used to print the
+        /// listing and exit 0 WITHOUT dispatching, so an agent that merged the two
+        /// usage lines reported a unit as started that never existed.
+        #[arg(
+            long,
+            conflicts_with_all = ["name", "task", "task_file", "single", "orchestration"]
+        )]
+        list_targets: bool,
     },
     /// Signal task completion back to the orchestrator
     WorkDone {
@@ -131,7 +164,9 @@ enum Commands {
         task: Option<String>,
         /// Read the summary text verbatim from a file (or `-` for stdin). The
         /// shell-safe way to pass a summary containing backticks, quotes,
-        /// `$VAR`, or newlines. Mutually exclusive with --task.
+        /// `$VAR`, or newlines. PATH must be a regular file, not a FIFO or a
+        /// device; pass `-` to read a pipe. At most 1 MiB, from a file or from
+        /// stdin. Mutually exclusive with --task.
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
         /// Signal that the entire orchestration is complete (orchestrator only)
@@ -198,6 +233,15 @@ enum Commands {
     Snapshot {
         #[command(subcommand)]
         cmd: SnapshotCmd,
+    },
+    /// Reclaim git worktrees whose PR is merged, whose tree is clean, and
+    /// which the deck can prove it created. Never inspects git ancestry for
+    /// merge state — squash-merges never enter `main`'s ancestry, and an
+    /// ancestor branch with no PR must never be removed. The branch always
+    /// survives; only the worktree directory is removed.
+    Worktree {
+        #[command(subcommand)]
+        cmd: WorktreeCmd,
     },
     /// Wrap an agent command, passing its stdio through transparently while
     /// tee-ing output through pattern detection into `AgentEvent`s (PRD #20 M6
@@ -340,6 +384,18 @@ enum DaemonCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Print a read-only snapshot of the daemon's managed agents: pane id,
+    /// label, cwd, orchestration role, live status, and active tool. Fork
+    /// #47: a CLI consumer of the existing `AttachRequest::ListAgents` — it
+    /// never starts, stops, attaches to, resizes, writes to, or subscribes
+    /// to any agent, and a missing/unreachable daemon is reported rather
+    /// than lazily spawned.
+    Status {
+        /// Emit a versioned JSON document (`{schema_version, agents}`)
+        /// instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -385,6 +441,16 @@ enum RemoteCmd {
         /// Friendly name of the registry entry to remove.
         name: String,
     },
+    /// Diagnose a remote's ssh setup: reachability, the deck's install, the
+    /// forwards ssh actually resolved, and the remote sshd policy behind them
+    /// (PRD #345). Read-only — it never edits ssh config, sshd config, the
+    /// registry, or anything on the remote. Exits 0 when the diagnosis is
+    /// clear, 1 when a check failed, and 2 when a check could not be
+    /// determined.
+    Doctor {
+        /// Friendly name of the registry entry to diagnose.
+        name: String,
+    },
     /// Re-run the binary install flow against an existing entry, then bump
     /// the registry's version field.
     Upgrade {
@@ -412,6 +478,32 @@ enum SnapshotCmd {
 }
 
 #[derive(Subcommand)]
+enum WorktreeCmd {
+    /// List every linked worktree with its resolved PR state, cleanliness,
+    /// ownership, and gate verdict (remove/ask/keep) with a reason. Read-only
+    /// — never removes anything.
+    List {
+        /// Emit a versioned JSON document (`{schema_version, worktrees}`)
+        /// instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove every worktree the gate marks `remove` (deck-owned, merged,
+    /// clean) unconditionally. A worktree the deck cannot prove it created is
+    /// reported as reclaimable-pending-confirmation and left alone unless
+    /// `--yes` is passed. A dirty worktree, an open/closed-unmerged PR, or an
+    /// unresolvable PR state always keeps, `--yes` or not. Never deletes the
+    /// branch.
+    Reclaim {
+        /// Authorize removing worktrees the deck did NOT prove it created
+        /// (the `ask` verdict), in addition to the ones it did. Has no effect
+        /// on worktrees the gate already keeps for another reason.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum HooksAction {
     /// Install hooks for an agent
     Install {
@@ -431,12 +523,12 @@ enum HooksAction {
 enum ConfigAction {
     /// Get a configuration value
     Get {
-        /// Configuration key (e.g., default_command, idle_art.provider)
+        /// Configuration key (e.g., default_command, bell.on_idle)
         key: String,
     },
     /// Set a configuration value
     Set {
-        /// Configuration key (e.g., default_command, idle_art.provider)
+        /// Configuration key (e.g., default_command, bell.on_idle)
         key: String,
         /// Value to set
         value: String,
@@ -452,6 +544,14 @@ enum ConfigAction {
 /// command-substitute the backticks before we ever run). `--task-file -` reads
 /// stdin instead. clap's `conflicts_with` already rejects passing *both*; this
 /// function rejects passing *neither* and surfaces file/stdin read errors.
+///
+/// Both reads are size-bounded at
+/// [`MAX_TASK_BYTES`](dot_agent_deck::bounded_read::MAX_TASK_BYTES) and
+/// refused — never
+/// truncated — past it, and the path branch additionally requires a **regular
+/// file** (issue #328): a FIFO with no writer would otherwise block the CLI
+/// forever inside `open`, and a character device such as `/dev/zero` never
+/// ends. See [`read_task_input`].
 fn resolve_task(
     task: Option<String>,
     task_file: Option<String>,
@@ -459,7 +559,7 @@ fn resolve_task(
 ) -> Result<String, String> {
     match (task, task_file) {
         (Some(t), None) => Ok(t),
-        (None, Some(path)) => read_task_file(&path, stdin),
+        (None, Some(path)) => read_task_input(&path, stdin),
         // clap `conflicts_with` normally prevents this; kept as a defensive
         // guard so the invariant holds even if the two are ever resolved
         // outside clap parsing.
@@ -473,15 +573,99 @@ fn resolve_task(
     }
 }
 
-/// Read task text verbatim from `path`, or from `stdin` when `path` is `-`.
-fn read_task_file(path: &str, mut stdin: impl std::io::Read) -> Result<String, String> {
-    if path == "-" {
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut stdin, &mut buf)
-            .map_err(|e| format!("failed to read task from stdin: {e}"))?;
-        Ok(buf)
-    } else {
-        std::fs::read_to_string(path).map_err(|e| format!("failed to read task file '{path}': {e}"))
+/// What `dot-agent-deck delegate` should print and exit with, for one daemon
+/// reply. See [`delegate_verdict`].
+#[derive(Debug, PartialEq, Eq)]
+struct DelegateVerdict {
+    /// `true` → `ExitCode::FAILURE`. Under this command's contract that means
+    /// "nothing landed", which is what makes a retry safe.
+    failed: bool,
+    /// Printed to stderr verbatim when set. `None` only for a delegate that
+    /// reached every role it named.
+    message: Option<String>,
+}
+
+/// Parse one line of daemon reply into a [`DelegateResponse`], or `None` when
+/// the line is not a delegate reply this build understands.
+///
+/// PR #466 review: `None` covers BOTH a line that fails to parse and a line that
+/// parses but carries no [`DELEGATE_RESPONSE_KIND`] marker. Every field of
+/// `DelegateResponse` is `#[serde(default)]`, so without the marker check `{}`
+/// and `{"seed":null}` both parse into a pristine "nothing failed" response and
+/// the caller reports success it has no evidence for. Callers treat `None` as
+/// [`dot_agent_deck::hook::SocketReply::NoReply`] — delivered, unverifiable.
+fn parse_delegate_reply(line: &str) -> Option<dot_agent_deck::event::DelegateResponse> {
+    serde_json::from_str::<dot_agent_deck::event::DelegateResponse>(line)
+        .ok()
+        .filter(|r| r.is_delegate_reply())
+}
+
+/// Decide what `delegate` reports for a daemon reply it does understand.
+///
+/// Pure, and separate from the `Delegate` arm, so the contract below is pinned
+/// by unit tests in this file — the tier that actually gates a merge. The e2e
+/// assertions that cover it live in `tests/e2e_dispatcher_mode.rs`, which CI
+/// compiles to nothing (`#![cfg(feature = "e2e")]` + no `--features e2e` in any
+/// build job), so a refactor that made the rejection silent again would
+/// otherwise pass every gate (PR #466 review).
+///
+/// Three outcomes, and the middle one is the whole point:
+///
+/// * `error` — routing failed outright, nothing was dispatched. **Failure.**
+/// * `unresolved_roles` with an EMPTY `delivered` — every named role missed.
+///   **Failure**, and the message must not assert a cause it has not
+///   established: a role can be missing from the toml, BE the sending
+///   orchestrator (which `delegate_targets` excludes by design), or have had its
+///   worker pane closed. "Check the role names" is right for only the first.
+/// * `unresolved_roles` with a NON-EMPTY `delivered` — the delegate HALF landed.
+///   **Not a failure**: the task really is in the delivered panes' PTYs and
+///   their idle-worker records are armed, so an orchestrator applying the
+///   contract "non-zero ⇒ it did not land" would retry and dispatch those panes
+///   a second time, arming two records for one pane. The message names both
+///   sides so a retry can be aimed at just the roles that missed.
+fn delegate_verdict(
+    pane_id: &str,
+    resp: &dot_agent_deck::event::DelegateResponse,
+) -> DelegateVerdict {
+    if let Some(error) = resp.error.as_deref() {
+        return DelegateVerdict {
+            failed: true,
+            message: Some(format!(
+                "Error: delegate from pane {pane_id} failed: {error}"
+            )),
+        };
+    }
+    if resp.unresolved_roles.is_empty() {
+        return DelegateVerdict {
+            failed: false,
+            message: None,
+        };
+    }
+    let unresolved = resp.unresolved_roles.join(", ");
+    // The three causes, stated as the three causes rather than as the one that
+    // happens to be most common.
+    let causes = "(A role reaches no worker when it is absent from \
+                  .dot-agent-deck.toml, when it is the delegating orchestrator \
+                  itself — an orchestrator cannot delegate to itself — or when \
+                  its worker pane has been closed.)";
+    if resp.delivered.is_empty() {
+        return DelegateVerdict {
+            failed: true,
+            message: Some(format!(
+                "Error: delegate from pane {pane_id} reached no worker for role(s): \
+                 {unresolved}. No role in this orchestration received it. {causes}"
+            )),
+        };
+    }
+    DelegateVerdict {
+        failed: false,
+        message: Some(format!(
+            "Warning: delegate from pane {pane_id} reached no worker for role(s): \
+             {unresolved}. It WAS delivered to: {}. Retry only the roles that \
+             missed — re-sending the whole delegate would dispatch the delivered \
+             roles a second time. {causes}",
+            resp.delivered.join(", ")
+        )),
     }
 }
 
@@ -568,28 +752,6 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Some(Commands::Ascii {
-            input,
-            output,
-            provider,
-            model,
-        }) => {
-            let config = DashboardConfig::load();
-            let mut idle_art = config.idle_art;
-            if let Some(p) = provider {
-                idle_art.provider = p;
-            }
-            if let Some(m) = model {
-                idle_art.model = m;
-            }
-            match run_ascii(&input, &output, &idle_art) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         Some(Commands::Config { action }) => match action {
             ConfigAction::Get { key } => {
                 let config = DashboardConfig::load();
@@ -646,6 +808,11 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // Kept for the error messages below — the signal is moved into the
+            // wire message, and a failure has to name the pane and the roles it
+            // could not reach.
+            let pane_id_for_report = pane_id.clone();
+            let signal_roles = to.clone();
             let signal = dot_agent_deck::event::DelegateSignal {
                 pane_id,
                 task,
@@ -660,11 +827,178 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
-                eprintln!("Failed to send delegate signal to daemon socket.");
-                return ExitCode::FAILURE;
+            // A REQUEST, not a fire-and-forget send. The daemon is the only place
+            // that knows whether this delegate resolved to a worker, and until it
+            // answered, `delegate` printed nothing and exited 0 no matter what
+            // happened on the other side — so an orchestrator whose delegation was
+            // dropped announced that its worker was working and then waited
+            // forever for a `work-done` that could not arrive.
+            //
+            // `send_and_await_reply`, not `request_from_socket`: the latter folds
+            // "no daemon" and "old daemon that does not answer this verb" into one
+            // `None`, and those must not be reported the same way — the first is a
+            // real failure, the second has to stay a success or every delegate
+            // against an older daemon reports a phantom error.
+            use dot_agent_deck::hook::SocketReply;
+            let line = match dot_agent_deck::hook::send_and_await_reply(&json) {
+                SocketReply::Unreachable => {
+                    eprintln!(
+                        "Error: could not reach the dot-agent-deck daemon socket, so the \
+                         delegate to {} was NOT delivered.",
+                        signal_roles.join(", ")
+                    );
+                    return ExitCode::FAILURE;
+                }
+                // Handed to the socket of a daemon that answered nothing
+                // readable in `DELEGATE_REPLY_TIMEOUT` — usually one predating
+                // this response. Pre-response contract: unverifiable, and the
+                // caller must not turn that into a phantom failure. See
+                // `SocketReply::NoReply`.
+                SocketReply::NoReply => return ExitCode::SUCCESS,
+                SocketReply::Line(line) => line,
+            };
+            let Some(resp) = parse_delegate_reply(&line) else {
+                // Same reasoning as `NoReply`: a line we cannot parse — or one
+                // that never identifies itself as a delegate reply — is a daemon
+                // we do not understand, not a proven failure.
+                return ExitCode::SUCCESS;
+            };
+            let verdict = delegate_verdict(&pane_id_for_report, &resp);
+            if let Some(message) = verdict.message {
+                eprintln!("{message}");
             }
-            ExitCode::SUCCESS
+            if verdict.failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Some(Commands::Dispatch {
+            name,
+            task,
+            task_file,
+            single,
+            orchestration,
+            list_targets,
+        }) => {
+            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!(
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\n\
+                         This command should be run from within a dot-agent-deck managed pane."
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            // `--list-targets` is a READ-ONLY daemon round-trip (the `get-seed`
+            // pattern): the daemon answers from the PANE's cwd and config, which is
+            // the same basis the dispatch itself resolves from. Computing it here
+            // from the CLI's own `current_dir()` diverged whenever the agent had
+            // `cd`'d, and offered targets the dispatch could not start.
+            //
+            // Exits after printing. clap's `conflicts_with_all` guarantees no
+            // dispatch arguments were supplied, so this cannot silently swallow a
+            // real dispatch and still exit 0.
+            if list_targets {
+                let req = dot_agent_deck::event::DaemonMessage::ListTargets(
+                    dot_agent_deck::event::ListTargetsRequest { pane_id },
+                );
+                let json = match serde_json::to_string(&req) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!("Failed to serialize list-targets request: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                match dot_agent_deck::hook::request_from_socket(&json) {
+                    Some(line) if !line.trim().is_empty() => {
+                        match serde_json::from_str::<dot_agent_deck::event::ListTargetsResponse>(
+                            &line,
+                        ) {
+                            Ok(resp) => {
+                                print!("{}", resp.rendered);
+                                // A broken config is reported as a FAILURE so the
+                                // agent cannot read "no orchestrations here" out of
+                                // an error it never noticed.
+                                if resp.error.is_some() {
+                                    return ExitCode::FAILURE;
+                                }
+                                ExitCode::SUCCESS
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to parse the daemon's list-targets reply: {e}");
+                                ExitCode::FAILURE
+                            }
+                        }
+                    }
+                    // No reply: no daemon, or one predating this verb. Say so rather
+                    // than printing a confident empty list the caller would act on.
+                    _ => {
+                        eprintln!(
+                            "Error: the daemon did not answer list-targets (not running, or an \
+                             older build). Dispatch `--single` to start one agent, or \
+                             `--orchestration <name>` if you know the name."
+                        );
+                        ExitCode::FAILURE
+                    }
+                }
+            } else {
+                // `required_unless_present = "list_targets"` guarantees this.
+                let Some(name) = name else {
+                    eprintln!("Error: a dispatch name is required.");
+                    return ExitCode::FAILURE;
+                };
+                let task_text = match resolve_task(task, task_file, std::io::stdin().lock()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                // clap's `conflicts_with` already rejects both flags together. A bare
+                // `--orchestration` arrives as `Some("")` via `default_missing_value`
+                // and means "this repo's first (role-bearing) one".
+                //
+                // The retained name is TRIMMED: an LLM-emitted `--orchestration "review "`
+                // otherwise travels to the daemon with its whitespace, fails the exact
+                // name comparison, and is refused with "no orchestration named 'review ';
+                // available: review" — after a full worktree round trip.
+                let shape = match (single, orchestration) {
+                    (true, _) => Some(dot_agent_deck::event::DispatchShape::SingleAgent),
+                    (false, Some(n)) => Some(dot_agent_deck::event::DispatchShape::Orchestration {
+                        name: {
+                            let n = n.trim();
+                            if n.is_empty() {
+                                None
+                            } else {
+                                Some(n.to_string())
+                            }
+                        },
+                    }),
+                    (false, None) => None,
+                };
+                let signal = dot_agent_deck::event::DispatchSignal {
+                    pane_id,
+                    name,
+                    task: Some(task_text),
+                    shape,
+                    timestamp: chrono::Utc::now(),
+                };
+                let msg = dot_agent_deck::event::DaemonMessage::Dispatch(signal);
+                let json = match serde_json::to_string(&msg) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!("Failed to serialize dispatch signal: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if dot_agent_deck::hook::send_to_socket(&json).is_none() {
+                    eprintln!("Failed to send dispatch signal to daemon socket.");
+                    return ExitCode::FAILURE;
+                }
+                ExitCode::SUCCESS
+            }
         }
         Some(Commands::WorkDone {
             task,
@@ -910,6 +1244,7 @@ fn main() -> ExitCode {
             DaemonCmd::Hello => run_daemon_hello_cli(),
             DaemonCmd::Stop { force } => run_daemon_stop_cli(force),
             DaemonCmd::Restart { force } => run_daemon_restart_cli(force),
+            DaemonCmd::Status { json } => run_daemon_status_cli(json),
         },
         Some(Commands::Remote { cmd }) => match cmd {
             RemoteCmd::Add {
@@ -970,6 +1305,7 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            RemoteCmd::Doctor { name } => run_remote_doctor(&name),
             RemoteCmd::Upgrade {
                 name,
                 version,
@@ -991,6 +1327,10 @@ fn main() -> ExitCode {
                     }
                 }
             }
+        },
+        Some(Commands::Worktree { cmd }) => match cmd {
+            WorktreeCmd::List { json } => run_worktree_list_cli(json),
+            WorktreeCmd::Reclaim { yes } => run_worktree_reclaim_cli(yes),
         },
         Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
@@ -1038,15 +1378,71 @@ fn main() -> ExitCode {
                     }
                 }
                 Err(e) => {
+                    // Issue #308 follow-up: the config failed to PARSE, so the
+                    // `toml` error quotes the offending source line verbatim and
+                    // this is an untrusted-bytes sink like the issue loop above.
+                    // Neutralised at the seam, not here —
+                    // `ProjectConfigError`'s `Display` escapes control, C1 and
+                    // bidi characters while keeping the error frame's own
+                    // newlines, exactly as `ValidationIssue`'s `Display` does
+                    // for the single-line case. See both impls for why the
+                    // escaping lives there rather than at each `eprintln!`.
                     eprintln!("{e}");
                     ExitCode::FAILURE
                 }
             }
         }
         Some(Commands::Wrap { agent, command }) => {
+            // Issue #243: the wrapper LOGS. Until this call it did not — the
+            // subcommand went straight into `run_wrap`, so the two `tracing`
+            // lines the interface watch emits (which of its two facts fired, the
+            // single most useful field diagnostic the readiness mechanism
+            // produces) were dropped on the floor by the no-op global
+            // subscriber, and `crate::state::dispatch_one_owned`'s claim that
+            // the fact is "in the wrapper's log" was false. Diagnosing a Codex
+            // delegate that never got its prompt meant reading the wire.
+            //
+            // Safe in a pane. `init_logging_from_env` installs a subscriber ONLY
+            // when `DOT_AGENT_DECK_LOG` is set, and only ever writes to that
+            // file — never to stdout or stderr — so a wrapper whose descriptors
+            // ARE the agent's terminal cannot paint a log line into it. The
+            // daemon fork-execs `dot-agent-deck wrap` without clearing the
+            // environment, so an operator who enabled the daemon's log gets the
+            // wrapper's half of the story in the same file, correlated by
+            // timestamp against the gate lines that read these events.
+            init_logging_from_env();
             dot_agent_deck::wrap::run_wrap(agent.as_deref(), &command)
         }
     }
+}
+
+/// The deck's project directory for the process-global config reads that have
+/// no narrower directory to key off — today just the `[features]` table
+/// (issue #577).
+///
+/// Resolved ONCE here, at the entry point, and handed to
+/// `features::init_and_watch` as an explicit directory — the same shape as
+/// `examine_worktrees(&cwd)` and `run_reclaim(&cwd, …)` below, and as
+/// `load_project_config(dir)` everywhere else. `features_config_path` no
+/// longer reaches for the process cwd itself, so nothing downstream of this
+/// call silently depends on where the process happens to be running.
+///
+/// The launch directory is where the search STARTS, not where it ends:
+/// `resolve_project_dir` walks up to the nearest ancestor holding a trusted
+/// `.dot-agent-deck.toml`, so a deck started at `repo/src` finds `repo`'s
+/// flags instead of silently finding none. With no config at or above the
+/// launch directory it returns that directory unchanged, which is the
+/// pre-#577 path exactly.
+fn launch_project_dir() -> std::path::PathBuf {
+    let start = std::env::current_dir().unwrap_or_else(|e| {
+        // Not fatal: `.` preserves the pre-#577 fallback, and a deck that
+        // cannot resolve its own cwd still starts with the flag OFF.
+        tracing::warn!(
+            "failed to resolve the launch directory ({e}); reading [features] relative to \".\""
+        );
+        std::path::PathBuf::from(".")
+    });
+    dot_agent_deck::config::resolve_project_dir(&start)
 }
 
 #[tokio::main]
@@ -1079,10 +1475,7 @@ fn init_logging_from_env() {
         {
             Ok(log_file) => {
                 tracing_subscriber::fmt()
-                    .with_env_filter(
-                        tracing_subscriber::EnvFilter::from_default_env()
-                            .add_directive("dot_agent_deck=info".parse().unwrap()),
-                    )
+                    .with_env_filter(dot_agent_deck::logging::env_filter_from_env())
                     .with_writer(log_file)
                     .with_ansi(false)
                     .init();
@@ -1110,8 +1503,10 @@ async fn run_tui_session() -> ExitCode {
     // `.dot-agent-deck.toml` `[features]` (env override wins) and start the
     // live re-read watcher. The startup state is recorded via a single
     // `tracing::info!` line, which surfaces only when file logging is enabled
-    // (`DOT_AGENT_DECK_LOG`); it is never printed to the terminal.
-    dot_agent_deck::features::init_and_watch();
+    // (`DOT_AGENT_DECK_LOG`); it is never printed to the terminal. The project
+    // directory is resolved HERE, at the entry point, and passed down (issue
+    // #577) — see `launch_project_dir`.
+    dot_agent_deck::features::init_and_watch(&launch_project_dir());
 
     let state = Arc::new(RwLock::new(AppState::default()));
     let attach_path = attach_socket_path();
@@ -1323,6 +1718,43 @@ fn spawn_event_subscriber(
     });
 }
 
+/// PRD #345: `remote doctor <name>`. Resolves the registry entry FIRST so an
+/// unknown name costs zero ssh invocations, then runs the read-only probes and
+/// prints one line per check.
+///
+/// **Three exit codes**, so the outcomes a script has to treat differently are
+/// distinguishable:
+///
+/// - **0** — clear. Every check PASSed, or at most raised an advisory WARN.
+/// - **1** — a check FAILed, or the command could not run at all (an unknown
+///   registry name, an unreadable registry).
+/// - **2** — incomplete: no FAIL, but at least one check is UNKNOWN.
+///
+/// Both non-zero codes keep the PRD's promise that an UNKNOWN never reads as
+/// PASS. Separating them makes the single most common real-world outcome — a
+/// healthy tunnel on a host where `sshd -T` needs root you do not have — a
+/// stable, scriptable `2` rather than something indistinguishable from a
+/// broken tunnel. See [`dot_agent_deck::remote_doctor::Verdict::exit_code`].
+fn run_remote_doctor(name: &str) -> ExitCode {
+    let registry_path = dot_agent_deck::remote::default_remotes_path();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match dot_agent_deck::remote_doctor::run_doctor(name, &registry_path, &mut out) {
+        Ok(verdict) => {
+            let _ = out.flush();
+            ExitCode::from(verdict.exit_code())
+        }
+        Err(e) => {
+            let _ = out.flush();
+            eprintln!("{e}");
+            // The diagnosis never started, so there is no verdict to map. `1`
+            // rather than `2`: the command itself failed, which is a different
+            // thing from a diagnosis that ran and could not see everything.
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `dot-agent-deck connect [name]` — PRD #76 M2.9.
 ///
 /// Resolves the remote (via lookup or picker), probes the remote
@@ -1373,6 +1805,79 @@ fn run_connect(name: Option<String>) -> ExitCode {
     }
 }
 
+/// `dot-agent-deck worktree list [--json]`. Pure CLI-subprocess operation
+/// over `git`/`gh` in the current directory's repo — no daemon involved, so
+/// this is plain synchronous code, no `#[tokio::main]`. Row shaping and the
+/// gate itself live in [`dot_agent_deck::worktree_reclaim`]; this wrapper
+/// only translates the outcome into stdout/stderr text and an exit code.
+fn run_worktree_list_cli(json: bool) -> ExitCode {
+    use dot_agent_deck::worktree_reclaim::{
+        WorktreeListDocument, examine_worktrees, format_list_human,
+    };
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("worktree list: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reports = match examine_worktrees(&cwd) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("worktree list: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if json {
+        match serde_json::to_string(&WorktreeListDocument::new(reports)) {
+            Ok(j) => {
+                println!("{j}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("worktree list: failed to serialize JSON: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        print!("{}", format_list_human(&reports));
+        ExitCode::SUCCESS
+    }
+}
+
+/// `dot-agent-deck worktree reclaim [--yes]`. Removes every worktree the
+/// gate marks `remove` (deck-owned, merged PR, clean tree) unconditionally,
+/// and — only with `--yes` — also those it marks `ask` (merged and clean,
+/// but the deck cannot prove it created them). Without `--yes`, `ask`-verdict
+/// worktrees are left alone and reported as a pending decision that leads
+/// the output, naming their exact paths and the ready-to-copy `--yes`
+/// command. Always exits successfully once it has finished examining and
+/// acting on every worktree; only a failure to enumerate worktrees at all
+/// (e.g. not a git repo) is reported as failure.
+fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
+    use dot_agent_deck::worktree_reclaim::{format_reclaim_human, run_reclaim};
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("worktree reclaim: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match run_reclaim(&cwd, yes) {
+        Ok(outcome) => {
+            print!("{}", format_reclaim_human(&outcome));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("worktree reclaim: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `dot-agent-deck daemon hello` — PRD #76 M2.21 protocol-version handshake.
 /// Prints a JSON-encoded [`dot_agent_deck::daemon_protocol::AttachResponse`]
 /// carrying `server_version = PROTOCOL_VERSION` (and, per PRD #103 M1.3,
@@ -1402,6 +1907,67 @@ fn run_daemon_hello_cli() -> ExitCode {
     };
     println!("{json}");
     ExitCode::SUCCESS
+}
+
+/// `dot-agent-deck daemon status [--json]`. Read-only CLI
+/// consumer of the existing `AttachRequest::ListAgents`
+/// ([`dot_agent_deck::daemon_client::DaemonClient::list_agents`]) — no new
+/// attach request type, and therefore no `PROTOCOL_VERSION` bump: this command
+/// puts nothing new on the wire, so an older daemon answers a newer CLI's
+/// status query exactly as it always did (issue #459 — this rationale used to
+/// cite a design note under the gitignored `.dot-agent-deck/`, which no reader
+/// of the merged source could open). The `--json` document has its own,
+/// separate [`dot_agent_deck::daemon_status::SCHEMA_VERSION`]; that is what
+/// moves when the document shape changes. Row
+/// shaping lives in [`dot_agent_deck::daemon_status`]; this wrapper only
+/// bounds the round trip with [`dot_agent_deck::daemon_status::STATUS_REQUEST_TIMEOUT`]
+/// and translates the outcome into stdout/stderr text and an exit code.
+///
+/// "Unavailable" (no daemon, a transport error, or a timed-out request) is
+/// reported as failure — a status query that got no answer learned nothing,
+/// unlike `daemon stop`'s idempotent "no daemon running" — but deliberately
+/// never with clap's own exit code 2, so a caller can tell "this build
+/// doesn't understand the request" apart from "the daemon didn't answer".
+/// Never spawns, retries, or otherwise perturbs the daemon it's asking
+/// about: a timeout abandons the query rather than looping.
+#[tokio::main]
+async fn run_daemon_status_cli(json: bool) -> ExitCode {
+    use dot_agent_deck::daemon_status::{
+        STATUS_REQUEST_TIMEOUT, StatusDocument, build_status_agents, format_human,
+    };
+
+    let client = DaemonClient::new(attach_socket_path());
+    let records = match tokio::time::timeout(STATUS_REQUEST_TIMEOUT, client.list_agents()).await {
+        Ok(Ok(records)) => records,
+        Ok(Err(e)) => {
+            eprintln!("daemon status: unavailable ({e})");
+            return ExitCode::FAILURE;
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                "daemon status: unavailable (no response within {}s)",
+                STATUS_REQUEST_TIMEOUT.as_secs()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let agents = build_status_agents(records);
+    if json {
+        match serde_json::to_string(&StatusDocument::new(agents)) {
+            Ok(j) => {
+                println!("{j}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("daemon status: failed to serialize JSON: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        print!("{}", format_human(&agents));
+        ExitCode::SUCCESS
+    }
 }
 
 /// `dot-agent-deck daemon stop [--force]` — PRD #103 Phase 3 (M3.2).
@@ -1495,8 +2061,11 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // `tracing` global-default init would panic).
     // PRD #139 M1.2/M2.1: the daemon reads the experimental flag from the same
     // `.dot-agent-deck.toml` source of truth and watches it independently of
-    // the TUI (the file is the contract; no cross-process sync).
-    dot_agent_deck::features::init_and_watch();
+    // the TUI (the file is the contract; no cross-process sync). The detached
+    // spawn in `platform::detach` sets no `current_dir`, so the daemon
+    // inherits the launching TUI's directory and the two agree on the file by
+    // construction.
+    dot_agent_deck::features::init_and_watch(&launch_project_dir());
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();
     let attach_path = attach_socket_path();
@@ -1672,27 +2241,143 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-#[tokio::main]
-async fn run_ascii(
-    input: &str,
-    output: &str,
-    config: &dot_agent_deck::config::IdleArtConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let result = dot_agent_deck::ascii_art::generate_ascii_art(input, output, config).await?;
-    for (i, frame) in result.frames.iter().enumerate() {
-        if i > 0 {
-            println!("---FRAME---");
-        }
-        print!("{frame}");
-    }
-    println!();
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+    use dot_agent_deck::bounded_read::MAX_TASK_BYTES;
+
+    // --- PRD #220: the dispatch shape selector's parsing ---
+
+    fn parse_dispatch(
+        args: &[&str],
+    ) -> (Option<String>, Option<String>, bool, Option<String>, bool) {
+        let mut argv = vec!["dot-agent-deck", "dispatch"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv)
+            .expect("dispatch args should parse")
+            .command
+            .expect("a subcommand")
+        {
+            Commands::Dispatch {
+                name,
+                task,
+                single,
+                orchestration,
+                list_targets,
+                ..
+            } => (name, task, single, orchestration, list_targets),
+            // `Commands` deliberately derives no `Debug`, so this cannot print the
+            // variant it got — the arm is unreachable anyway, since the argv above
+            // always names `dispatch`.
+            _ => panic!("expected the Dispatch subcommand"),
+        }
+    }
+
+    /// `--orchestration` REQUIRES its value, so it can never consume the unit name.
+    ///
+    /// With `num_args = 0..=1` clap consumed the next bare token, so
+    /// `dispatch --orchestration my-unit --task "…"` bound the UNIT NAME as the
+    /// orchestration and aborted for a missing positional. A required value makes
+    /// both orderings unambiguous.
+    #[test]
+    fn orchestration_value_is_required_so_it_cannot_eat_the_unit_name() {
+        // Flag-first with a name still binds correctly: `probe` is the VALUE, and
+        // the missing positional is a real error rather than a silent mis-bind.
+        assert!(
+            Cli::try_parse_from([
+                "dot-agent-deck",
+                "dispatch",
+                "--orchestration",
+                "probe",
+                "--task",
+                "t",
+            ])
+            .is_err(),
+            "no positional NAME was supplied, so this must be rejected outright"
+        );
+
+        // A bare `--orchestration` with nothing after it is now an error, not a
+        // silent \"this repo\'s first\".
+        assert!(
+            Cli::try_parse_from(["dot-agent-deck", "dispatch", "unit", "--orchestration"]).is_err(),
+            "--orchestration now requires a value"
+        );
+
+        // The explicit empty value is how \"this repo\'s first\" is requested.
+        let (name, _, _, orch, _) = parse_dispatch(&["unit", "--orchestration="]);
+        assert_eq!(name.as_deref(), Some("unit"));
+        assert_eq!(orch.as_deref(), Some(""));
+
+        // And --task is never swallowed.
+        let (name, task, _, orch, _) =
+            parse_dispatch(&["unit", "--orchestration=review", "--task", "hello"]);
+        assert_eq!(name.as_deref(), Some("unit"));
+        assert_eq!(task.as_deref(), Some("hello"));
+        assert_eq!(orch.as_deref(), Some("review"));
+    }
+
+    /// `--list-targets` cannot be combined with dispatch arguments. Combined, the
+    /// early branch printed the listing and exited 0 WITHOUT dispatching, so an
+    /// agent that merged the seed\'s two usage lines reported a unit as started
+    /// that never existed.
+    #[test]
+    fn list_targets_conflicts_with_every_dispatch_argument() {
+        for extra in [
+            vec!["unit"],
+            vec!["unit", "--task", "t"],
+            vec!["--single"],
+            vec!["--orchestration=review"],
+        ] {
+            let mut argv = vec!["dot-agent-deck", "dispatch", "--list-targets"];
+            argv.extend(extra.iter().copied());
+            assert!(
+                Cli::try_parse_from(argv.clone()).is_err(),
+                "--list-targets must conflict with {extra:?}"
+            );
+        }
+        // Alone, it parses and needs no name.
+        let (name, _, _, _, list) = parse_dispatch(&["--list-targets"]);
+        assert!(name.is_none() && list);
+    }
+
+    #[test]
+    fn dispatch_named_orchestration_and_single_parse_as_expected() {
+        let (_, _, single, orch, _) = parse_dispatch(&["unit", "--orchestration=review"]);
+        assert!(!single);
+        assert_eq!(orch.as_deref(), Some("review"));
+
+        let (_, _, single, orch, _) = parse_dispatch(&["unit", "--single", "--task", "t"]);
+        assert!(single);
+        assert_eq!(orch, None);
+    }
+
+    /// The two shape flags are mutually exclusive, so a caller can never express
+    /// an ambiguous choice.
+    #[test]
+    fn dispatch_rejects_single_and_orchestration_together() {
+        assert!(
+            Cli::try_parse_from([
+                "dot-agent-deck",
+                "dispatch",
+                "unit",
+                "--single",
+                "--orchestration=review",
+            ])
+            .is_err(),
+            "--single and --orchestration must conflict"
+        );
+    }
+
+    /// `--list-targets` is the one form that needs no name; every other form does,
+    /// so a missing name can never be read as an empty dispatch name.
+    #[test]
+    fn dispatch_name_is_required_except_for_list_targets() {
+        assert!(
+            Cli::try_parse_from(["dot-agent-deck", "dispatch", "--task", "t"]).is_err(),
+            "a dispatch with no name and no --list-targets must be rejected"
+        );
+    }
 
     // PRD #127 B1 — `schedule add --new-tab-per-fire` must accept an explicit
     // `<true|false>` value (ArgAction::Set), matching `update`, the authoring
@@ -1822,6 +2507,79 @@ mod tests {
         );
     }
 
+    // ---- Issue #328: both reads are bounded, and a non-regular path is
+    // refused rather than opened. The per-shape refusals (FIFO, symlink to a
+    // FIFO, character device, endless stream) are unit-tested against the
+    // helper in `dot_agent_deck::bounded_read`; what these pin is that
+    // `resolve_task` — the seam every `delegate` / `work-done` call goes
+    // through — actually routes into it.
+
+    #[test]
+    fn task_file_over_the_size_limit_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("huge-task.md");
+        std::fs::write(&path, "x".repeat(MAX_TASK_BYTES as usize + 1)).expect("write");
+
+        let err = resolve_task(
+            None,
+            Some(path.to_str().unwrap().to_string()),
+            std::io::empty(),
+        )
+        .expect_err("a task file over the cap must be refused");
+        assert!(
+            err.contains("exceeds the") && err.contains("limit"),
+            "over-limit error should state the cap: {err}"
+        );
+    }
+
+    #[test]
+    fn task_file_at_the_size_limit_is_still_accepted() {
+        // The cap refuses only what is genuinely past it — an input sitting
+        // exactly on the boundary is a legitimate task, not a pathological one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big-task.md");
+        let text = "x".repeat(MAX_TASK_BYTES as usize);
+        std::fs::write(&path, &text).expect("write");
+
+        let got = resolve_task(
+            None,
+            Some(path.to_str().unwrap().to_string()),
+            std::io::empty(),
+        )
+        .expect("a task file exactly at the cap must be accepted");
+        assert_eq!(got.len(), MAX_TASK_BYTES as usize);
+    }
+
+    #[test]
+    fn stdin_over_the_size_limit_is_refused() {
+        // `-` keeps working (see `task_file_dash_reads_task_verbatim_from_stdin`),
+        // but the same cap applies to it.
+        let oversized = "x".repeat(MAX_TASK_BYTES as usize + 1);
+        let err = resolve_task(None, Some("-".to_string()), oversized.as_bytes())
+            .expect_err("oversized stdin must be refused");
+        assert!(
+            err.contains("task from stdin") && err.contains("exceeds the"),
+            "over-limit stdin error should name stdin and the cap: {err}"
+        );
+    }
+
+    #[test]
+    fn task_file_pointing_at_a_non_regular_file_is_refused() {
+        // A directory is the portable stand-in for the whole class; the FIFO
+        // and character-device cases live in the `bounded_read` unit tests.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = resolve_task(
+            None,
+            Some(dir.path().to_str().unwrap().to_string()),
+            std::io::empty(),
+        )
+        .expect_err("a non-regular --task-file target must be refused");
+        assert!(
+            err.contains("--task-file needs a regular file") && err.contains("--task-file -"),
+            "refusal should say what is required and point at the stdin alternative: {err}"
+        );
+    }
+
     #[test]
     fn task_and_task_file_both_set_is_rejected() {
         // Defensive guard inside resolve_task (clap also rejects this at parse
@@ -1928,5 +2686,115 @@ mod tests {
             clap::error::ErrorKind::ArgumentConflict,
             "expected a clap ArgumentConflict, got: {err}"
         );
+    }
+
+    // ---- PR #466 review: what `delegate` reports for a daemon reply --------
+    //
+    // The e2e assertions that cover this (`orchestration/dispatch/001`) live
+    // behind `#![cfg(feature = "e2e")]`, and no CI build job passes
+    // `--features e2e`, so they compile to nothing where it counts. These pin
+    // the same contract in the tier that gates a merge.
+
+    use dot_agent_deck::event::{DELEGATE_RESPONSE_KIND, DelegateResponse};
+
+    fn reply(delivered: &[&str], unresolved: &[&str], error: Option<&str>) -> DelegateResponse {
+        DelegateResponse {
+            delivered: delivered.iter().map(|s| s.to_string()).collect(),
+            unresolved_roles: unresolved.iter().map(|s| s.to_string()).collect(),
+            error: error.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn delegate_verdict_reports_a_full_delivery_silently() {
+        let v = delegate_verdict("pane-1", &reply(&["coder", "tester"], &[], None));
+        assert!(!v.failed, "every named role resolved — this is a success");
+        assert_eq!(v.message, None, "a clean delegate prints nothing");
+    }
+
+    #[test]
+    fn delegate_verdict_fails_a_routing_error() {
+        let v = delegate_verdict("xcaller", &reply(&[], &[], Some("no orchestration role")));
+        assert!(v.failed, "a routing error means nothing was dispatched");
+        let msg = v.message.expect("a routing error must be reported");
+        assert!(
+            msg.contains("xcaller") && msg.contains("no orchestration role"),
+            "the message must name the pane and the daemon's reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn delegate_verdict_fails_when_nothing_landed() {
+        let v = delegate_verdict("pane-1", &reply(&[], &["ghost"], None));
+        assert!(v.failed, "no role received the task — non-zero is correct");
+        let msg = v.message.expect("an unreached delegate must be reported");
+        assert!(
+            msg.contains("ghost"),
+            "the message must name the role that missed: {msg}"
+        );
+        // The three causes, not the one that happens to be most common: the
+        // old message told the user to go check role names in the toml even
+        // when the role was sitting there correctly and was simply the
+        // orchestrator itself, or had had its worker pane closed.
+        assert!(
+            msg.contains(".dot-agent-deck.toml")
+                && msg.contains("orchestrator cannot delegate to itself")
+                && msg.contains("worker pane has been closed"),
+            "the message must state all three causes, not assert one: {msg}"
+        );
+    }
+
+    // THE blocker of the PR #466 review. `--to coder --to tester` with only a
+    // `coder` pane really does write the task into the coder's PTY and arm its
+    // idle-worker record. Reporting that as a failure invites the orchestrator
+    // to retry — under this command's own new contract, non-zero means it did
+    // not land — and the coder gets the same task twice, arming two records for
+    // one pane.
+    #[test]
+    fn delegate_verdict_does_not_fail_a_partial_delivery() {
+        let v = delegate_verdict("pane-1", &reply(&["coder"], &["tester"], None));
+        assert!(
+            !v.failed,
+            "a delegate that half landed must NOT exit non-zero: a retry would \
+             dispatch `coder` a second time"
+        );
+        let msg = v
+            .message
+            .expect("a partial delivery must still be reported");
+        assert!(
+            msg.contains("tester") && msg.contains("coder"),
+            "a partial delivery must name BOTH what missed and what landed, or \
+             a retry cannot be aimed safely: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_delegate_reply_requires_the_delegate_marker() {
+        let good = serde_json::to_string(&reply(&["coder"], &[], None)).expect("serialize");
+        assert!(
+            good.contains(DELEGATE_RESPONSE_KIND),
+            "the daemon's own reply must carry the marker: {good}"
+        );
+        let parsed = parse_delegate_reply(&good).expect("a real delegate reply must parse");
+        assert_eq!(parsed.delivered, vec!["coder".to_string()]);
+
+        // Every field is `#[serde(default)]`, so each of these DESERIALIZES
+        // fine and yields a pristine "nothing failed" response. Accepting one
+        // is how the verb whose purpose is answering "did this land?" answers
+        // yes when it cannot tell.
+        for line in [
+            "{}",
+            r#"{"seed":null}"#,
+            r#"{"kind":"get-seed"}"#,
+            "",
+            "not json",
+        ] {
+            assert!(
+                parse_delegate_reply(line).is_none(),
+                "a reply that does not identify itself as a delegate response \
+                 must be treated as unverifiable, not as success: {line}"
+            );
+        }
     }
 }

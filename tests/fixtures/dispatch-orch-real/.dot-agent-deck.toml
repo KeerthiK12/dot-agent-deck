@@ -1,0 +1,40 @@
+# Fixture for `orchestration/dispatch/002` — the REAL-agent half of the PRD #220
+# dispatch coverage.
+#
+# `orch-deck` (used by `orchestration/dispatch/001`) runs `cat` for every role.
+# That proves the wire, the worktree and the tab, and it is exactly why three
+# real defects shipped green: `cat` starts instantly, needs no credentials, has
+# no cold start, and cannot tell an agent apart from a `$SHELL`. A user's roles
+# are real agents, and "every role pane exists" is NOT the same claim as "every
+# role's AGENT actually started".
+#
+# So every role here is a REAL, fully interactive Claude Code pane pinned to
+# Haiku — no `-p`, no stand-in — and there are THREE of them, because the
+# reported symptom (panes up, no agent ever starts) is a CONTENTION shape: it
+# does not appear with one role. Cost stays low: the roles only have to boot,
+# and the dispatched task is a single trivial turn.
+[[orchestrations]]
+name = "real-team"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash"
+start = true
+
+# `clear = true` on the WORKER is load-bearing, not incidental (issue #584).
+# A dispatched orchestration's delegate goes through
+# `respawn_agent_for_pane` — the previous worker is killed and a fresh one
+# spawned before the task pointer is written — and that respawn is where #584's
+# failure lives. With `clear = false` this test delegated to an ALREADY-RUNNING
+# worker and never touched the respawn at all, so the dispatch path's `clear =
+# true` delegate had no real-agent coverage anywhere in the suite. It costs one
+# extra Haiku cold boot on the coder.
+[[orchestrations.roles]]
+name = "coder"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write"
+clear = true
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write"
+clear = false

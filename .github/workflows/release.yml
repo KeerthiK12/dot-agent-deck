@@ -24,9 +24,41 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       changelog: ${{ steps.changelog.outputs.changelog }}
     steps:
+      # Fail here, not 20 steps later at the push. This job commits the
+      # changelog straight to `main`, which only an admin identity may do:
+      # `main` is ruleset-protected and `github-actions[bot]` is deliberately
+      # NOT a bypass actor (GITHUB_TOKEN cannot be one on a user-owned repo).
+      # RELEASE_TOKEN is the admin PAT that bypasses it.
+      #
+      # This step replaces a `|| github.token` fallback that was correct when
+      # written and is now a trap. Its stated purpose was to keep the workflow
+      # "behaving exactly as it does today while the secret is unset, so this
+      # change is safe to merge before `main` is protected" — both conditions
+      # have since flipped (`main` protected 2026-08-08, secret set the same
+      # day). All the fallback can do now is turn an unset or empty secret into
+      # a silent downgrade to an identity that cannot push, surfacing as the
+      # v0.35.6 `GH006` failure after the release is already half-done.
+      #
+      # What this guard does NOT cover: it tests emptiness, so a token that is
+      # present but expired, revoked or under-scoped passes it and still fails
+      # later at the push, with the tag cut and the changelog written. Probing
+      # the token would cost an API call and add a failure mode of its own on
+      # the release path, so the cheap check is deliberate. The old fallback did
+      # not cover that case either -- GitHub's `||` returns the left operand
+      # whenever it is non-empty, so an expired PAT went straight through.
+      - name: Verify RELEASE_TOKEN is present
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_TOKEN}" ]; then
+            echo "::error::RELEASE_TOKEN is unset or empty. This job pushes the changelog commit to the protected \`main\` branch and needs the admin PAT to bypass the ruleset; GITHUB_TOKEN cannot. Set the RELEASE_TOKEN secret and re-run. See CLAUDE.md rule 8."
+            exit 1
+          fi
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
       - name: Extract version
         id: version
         # Every GitHub-context value a `run:` script in this workflow consumes
@@ -104,6 +136,80 @@ jobs:
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Verify the flake version matches the release
+        # flake.nix pins the released version in a let-binding and hands it to
+        # the build as DAD_VERSION, because a `nix run github:...` build gets a
+        # source tarball with no `.git` for `build.rs` to describe and would
+        # otherwise fall back to the `0.1.0` placeholder. That pin is a
+        # hand-maintained line: a release that bumps the tag without bumping the
+        # flake ships a source build reporting the wrong version, which is the
+        # same class of bug the DAD_VERSION seam (#250) was added to prevent, and
+        # the `Build` job below already uses that seam for the same reason.
+        # Fail the release loudly here rather than publish the mismatch.
+        #
+        # Bound through `env:` for the reason spelled out on the step above: a
+        # `${{ }}` expression is substituted as raw text before bash parses the
+        # line, so nothing from the GitHub context is ever shell code.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # `export` does not cross into another `run:` block, so the `LC_ALL=C`
+          # pinned in the step above is not in scope here. Nothing below is
+          # locale-sensitive today; pinned for the same reason it is pinned
+          # there, so nothing added to this step later can introduce a
+          # locale-dependent match.
+          export LC_ALL=C
+          # A grep/sed over flake.nix, not `nix eval --raw
+          # .#packages.x86_64-linux.default.version`. The eval is the robust read
+          # but it needs Nix on the runner, and `prepare` is a short metadata job
+          # with no Nix: installing it and evaluating the flake would put minutes
+          # on the critical path of every release to read one string literal. The
+          # `nix` job in ci.yml already proves the flake evaluates and builds; all
+          # this step has to do is compare a version.
+          #
+          # The cheap read is only worth it if it cannot silently match nothing,
+          # or match the wrong line, and pass. So the pattern is anchored to a
+          # whole line and the match count is asserted to be exactly 1: an empty
+          # or ambiguous extraction is a hard failure, not a pass.
+          matches=$(grep -cE '^[[:space:]]*version = "[^"]+";[[:space:]]*$' flake.nix || true)
+          if [ "${matches:-0}" -ne 1 ]; then
+            echo "::error::Refusing to release: expected exactly one anchored 'version = \"...\";' line in flake.nix, found ${matches:-0}. The extraction pattern in this step no longer fits the file, so the version pin cannot be checked."
+            exit 1
+          fi
+          # Same pattern as the guard, character for character: a `[^"]*`
+          # extractor would be a strict superset of a `[^"]+` guard, so it could
+          # also print a `version = "";` line the guard did not count and the
+          # captured value would carry a leading newline.
+          FLAKE_VERSION=$(sed -nE 's/^[[:space:]]*version = "([^"]+)";[[:space:]]*$/\1/p' flake.nix)
+          if [ -z "$FLAKE_VERSION" ]; then
+            echo "::error::Refusing to release: the pinned version in flake.nix extracted as an empty string."
+            exit 1
+          fi
+          if [ "$FLAKE_VERSION" != "$VERSION" ]; then
+            # Both values are safe to interpolate into the message: VERSION
+            # passed the SemVer gate above, and FLAKE_VERSION was extracted with
+            # the same pattern the guard counted, so "exactly one line matched"
+            # and "exactly one clean extraction" are the same statement, and
+            # `[^"]+` excludes quotes and newlines alike. Neither value can
+            # start a line with `::` and forge a workflow command.
+            echo "::error::Refusing to release: flake.nix pins version '$FLAKE_VERSION' but the release is '$VERSION'. Bump the version let-binding in flake.nix so the Nix build reports the release it actually is."
+            exit 1
+          fi
+          # A matching pin is necessary but not sufficient. `version` is only a
+          # let-binding, and everything above still passes if the derivation has
+          # stopped handing it to the build: `DAD_VERSION = "0.1.0";` next to
+          # `version = "0.35.7";` agrees with the tag and ships a binary
+          # reporting the placeholder, which is precisely the bug this step
+          # exists to catch. So assert the wire too, under the same anchoring
+          # discipline as the pin: exactly one whole-line `DAD_VERSION =
+          # version;`, with zero or several a hard failure rather than a pass.
+          wired=$(grep -cE '^[[:space:]]*DAD_VERSION = version;[[:space:]]*$' flake.nix || true)
+          if [ "${wired:-0}" -ne 1 ]; then
+            echo "::error::Refusing to release: expected exactly one anchored 'DAD_VERSION = version;' line in flake.nix, found ${wired:-0}. The pinned version is no longer wired to the build, so the Nix build reports whatever that env value now says rather than the release it claims to be."
+            exit 1
+          fi
+          echo "flake.nix pins '$FLAKE_VERSION', which matches the release, and hands it to the build as DAD_VERSION."
       - name: Assemble changelog
         id: changelog
         env:
@@ -173,7 +279,14 @@ jobs:
           key: ${{ matrix.target }}
       - name: Install cross
         if: matrix.use_cross
-        run: cargo install cross --locked
+        # Issue #323: `--locked` pins cross's own dependency GRAPH, not the
+        # version of cross being installed, so without `--version` this resolved
+        # whatever crates.io called newest. 0.2.5 is not an arbitrary choice —
+        # it is the version the `CROSS_BUILD_ENV_PASSTHROUGH` measurement below
+        # was taken on, and an unpinned install is what let that measurement
+        # silently stop describing the binary actually running. The same pin is
+        # in aarch64-crossbuild-check.yml, which exists to mirror this leg.
+        run: cargo install cross --locked --version 0.2.5
       - name: Build
         # Issue #250: bake the version being released into the binary rather than
         # letting `build.rs` re-derive it from the checkout.
@@ -200,8 +313,8 @@ jobs:
           # `build.env.passthrough` in a `Cross.toml` (whitespace-separated
           # list) and is inert for the plain `cargo build` targets.
           #
-          # MEASURED, not assumed (cross 0.2.5, the version `cargo install cross
-          # --locked` resolves to today): with this set, the build script inside
+          # MEASURED, not assumed (cross 0.2.5, now the version the install step
+          # above pins explicitly): with this set, the build script inside
           # the aarch64 container observes DAD_VERSION and resolves
           # `source=INJECTED`; with it unset the variable is absent inside the
           # container and the script falls back to the checkout's git tag. That
@@ -211,9 +324,11 @@ jobs:
           CROSS_BUILD_ENV_PASSTHROUGH: DAD_VERSION
           # Second, independent channel for the same value, because the line
           # above is the only thing standing between a dispatch release and a
-          # mislabeled ARM64 binary, and `cargo install cross --locked` is NOT
-          # version-pinned — a future cross release could rename or retire its
+          # mislabeled ARM64 binary — a cross release could rename or retire its
           # passthrough allowlist and this leg would go quiet rather than fail.
+          # Since #323 the install is version-pinned, so such a change can now
+          # only arrive with a visible bump to that pin rather than on its own;
+          # this channel stays as the second, independent line of defense.
           # `CROSS_CONTAINER_OPTS` is appended to cross's `docker run` argv, so
           # `-e DAD_VERSION` forwards the host value through docker itself,
           # below cross's own config layer. Measured to be sufficient ON ITS OWN
@@ -379,8 +494,26 @@ jobs:
   docs:
     needs: [prepare, finalize]
     uses: ./.github/workflows/docs-publish.yml
+    # A reusable workflow invoked via `uses:` receives NO secrets unless the
+    # caller forwards them, so without this line `secrets.RELEASE_TOKEN` is
+    # empty inside docs-publish.yml and its push to `main` cannot bypass the
+    # `main-protected` ruleset. That is exactly how v0.35.9's "Commit chart
+    # changes" step failed, with `GH013: … Changes must be made through a pull
+    # request` — and because the image had already reached GHCR by then, the
+    # symptom was a docs site that never rolled forward rather than an
+    # obviously broken release. (The callee now guards for an empty token in
+    # its first step, so the same mistake fails before anything is published.)
+    #
+    # `inherit` is broader than this job needs: it forwards every repository
+    # secret, including HOMEBREW_TAP_TOKEN and SCOOP_BUCKET_TOKEN, which are
+    # cross-repo write credentials that docs-publish.yml never reads. Narrowing
+    # it to an explicit `RELEASE_TOKEN` map is tracked in #514 — deliberately
+    # not done inline, because the callee is also `workflow_dispatch`-able and
+    # that path has to be canaried first (governance.md step 5). Keep the
+    # forwarding until then; do not read this line as an endorsement of
+    # `inherit` over a narrow map.
+    secrets: inherit
     with:
       image_tag: v${{ needs.prepare.outputs.version }}
       chart_version: ${{ needs.prepare.outputs.version }}
       push_latest: true
-    secrets: inherit

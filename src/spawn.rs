@@ -43,12 +43,27 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 
+use chrono::{DateTime, Utc};
+
 use crate::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership, command_needs_shell_wrap,
+    AgentPtyError, AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, DeliveryNotice, GuardedSend,
+    GuardedSendDetail, SpawnOptions, TabMembership, command_needs_shell_wrap,
 };
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
-use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
+use crate::project_config::{
+    ProjectConfig, default_orchestration, load_project_config, resolve_orchestration_name,
+};
+use crate::prompt_delivery::{
+    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, log_prompt_abandoned, log_prompt_confirmed,
+    log_prompt_stopped, log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written,
+    mint_delivery_id, unconfirmed_retry_delay,
+};
 use crate::scheduler::{Notifier, NotifyEvent};
+
+/// The `path` field every delivery log line from this module carries, so a
+/// daemon log with all three delivery paths writing into it can be read per
+/// path. See [`crate::prompt_delivery`].
+const DELIVERY_LOG_PATH: &str = "spawn";
 
 /// Fallback buffer delay between spawning the PTY and writing the prompt, used
 /// ONLY when [`deliver`] has no hook-event broadcast to gate on (a direct
@@ -81,6 +96,40 @@ pub struct SpawnRequest {
     pub command: Option<String>,
     /// Prompt delivered into the spawned agent / orchestrator pane.
     pub prompt: String,
+    /// PRD #220: a target the CALLER already resolved, used verbatim instead of
+    /// deriving one from `working_dir`'s config.
+    ///
+    /// `dispatch` sets this because it must decide from the CALLER's repo config —
+    /// the config the user saw in `--list-targets` — not from the worktree's. The
+    /// two differ in two ways that both produced wrong outcomes: the worktree is a
+    /// HEAD checkout, so uncommitted config is invisible to it; and
+    /// `load_project_config` normalises an unnamed orchestration to its DIRECTORY
+    /// BASENAME, so the same entry is `myrepo` from the repo and
+    /// `myrepo-dispatch-unit` from the worktree — a name the listing offers and the
+    /// spawn can never match.
+    ///
+    /// Resolving caller-side also means a bad `--orchestration <name>` fails BEFORE
+    /// `git worktree add`, instead of burning a create/remove/branch-delete cycle
+    /// and surfacing as "failed to spawn agent".
+    ///
+    /// `None` (the scheduler and issue-dispatch producers) keeps the
+    /// config-derived behaviour untouched.
+    pub resolved_target: Option<SpawnTarget>,
+    /// Compose the ORCHESTRATOR CONTEXT (roles + delegation protocol + this
+    /// request's prompt as a task) instead of delivering `prompt` verbatim.
+    ///
+    /// `true` only for PRD #220 `dispatch`. Without it a dispatched orchestration's
+    /// orchestrator is never told that it IS one, so it works alone while every
+    /// worker waits for a delegation that cannot arrive.
+    ///
+    /// Deliberately NOT enabled for the scheduler (#127) or issue-dispatch (#120),
+    /// even though both have the identical defect and the composition is now shared.
+    /// Turning it on there changes what lands in a SHIPPED feature's pane: the
+    /// orchestrator receives a one-line pointer instead of the prompt text, and
+    /// three #120/#127 e2e tests assert that text arriving verbatim (a `cat`-based
+    /// stub never reads the file). That is #222's job to do deliberately, with those
+    /// tests updated as part of it — not a side effect of the dispatcher PR.
+    pub compose_orchestrator_context: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -154,6 +203,16 @@ pub struct RoleSpawn {
     pub role_name: String,
     pub command: String,
     pub is_start_role: bool,
+    /// Issue #308: what agent this role runs — its `agent = "…"` declaration
+    /// when the config made one, else the type derived from `command`.
+    ///
+    /// Resolved here, at the point the config is flattened, rather than at the
+    /// spawn seam, because the spawn seam sees only a command. Carrying it
+    /// keeps a DISPATCHED orchestration (`dot-agent-deck dispatch`, the
+    /// scheduler) launching each role exactly as the TUI's `Ctrl+N` path does
+    /// — the parity `orchestration/dispatch/003` pins for `clear = true`
+    /// respawns, which read the spawn-time identity this value becomes.
+    pub agent_type: Option<AgentType>,
 }
 
 /// The branch decision: orchestration tab vs single-agent card. Pure data so it
@@ -164,35 +223,160 @@ pub enum SpawnTarget {
     /// `$SHELL` (resolved by the spawn path, mirroring the new-deck dialog).
     SingleAgent { command: Option<String> },
     /// An orchestration tab rooted at the target dir.
-    Orchestration { name: String, roles: Vec<RoleSpawn> },
+    ///
+    /// `config` is the CHOSEN orchestration's own config, carried through so the
+    /// spawn can compose the orchestrator's context (roles + delegation protocol)
+    /// without re-finding it by name — re-resolution is what let the listing and
+    /// the spawn disagree in the first place. See
+    /// [`crate::orchestrator_context::prepare_orchestrator_prompt`].
+    Orchestration {
+        name: String,
+        roles: Vec<RoleSpawn>,
+        config: Box<crate::project_config::OrchestrationConfig>,
+    },
+}
+
+/// PRD #220: a caller's explicit choice of spawn shape, overriding what the
+/// target dir's config would imply.
+///
+/// Exists because the config-derived default is not knowable by the caller's
+/// intent: "work on this feature" wants a team, "verify this PR" wants one
+/// agent, and both arrive as the same `dispatch` call into the same repo. Only
+/// the user knows which, so `dispatch` asks and passes the answer down. Absent
+/// (`None`), [`decide_target`]'s config-derived behaviour is unchanged, which is
+/// what keeps the scheduler and issue-dispatch paths exactly as they were.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnShapeOverride {
+    /// Force a single agent even when the dir defines `[[orchestrations]]`.
+    SingleAgent,
+    /// Force an orchestration: `None` = the dir's first (same as the config
+    /// default), `Some(name)` = the one with that `name`, or an error if no
+    /// orchestration carries it.
+    Orchestration(Option<String>),
+}
+
+/// [`decide_target`], with an optional caller override (PRD #220).
+///
+/// `Err` only for an override naming an orchestration the dir does not define —
+/// a silent fallback there would spawn something other than what the user chose,
+/// which is exactly the class of surprise this selector exists to remove. The
+/// message lists what IS available so the caller can correct itself.
+pub fn decide_target_with_override(
+    config: Option<&ProjectConfig>,
+    dir: &Path,
+    schedule_command: Option<&str>,
+    over: Option<&SpawnShapeOverride>,
+) -> Result<SpawnTarget, String> {
+    match over {
+        None => Ok(decide_target(config, dir, schedule_command)),
+        Some(SpawnShapeOverride::SingleAgent) => Ok(SpawnTarget::SingleAgent {
+            command: schedule_command.map(|c| c.to_string()),
+        }),
+        Some(SpawnShapeOverride::Orchestration(None)) => {
+            // THE default, resolved through the one shared rule
+            // ([`crate::project_config::default_orchestration`]) that
+            // `decide_target` below also uses. Issue #704: this arm and that one
+            // used to disagree — this one took the first ROLE-BEARING block, that
+            // one took the first ENTRY and degraded to a single-agent card when
+            // slot 0 was roleless. Same question, same repo, two answers.
+            let chosen = config
+                .and_then(|cfg| default_orchestration(cfg, dir))
+                .ok_or_else(|| {
+                    format!(
+                        "no orchestration with roles is defined in {}: add an \
+                         `[[orchestrations]]` section with at least one role, or dispatch a \
+                         single agent instead",
+                        dir.display()
+                    )
+                })?;
+            Ok(SpawnTarget::Orchestration {
+                name: chosen.name.clone(),
+                roles: roles_of(chosen.config),
+                config: Box::new(chosen.config.clone()),
+            })
+        }
+        Some(SpawnShapeOverride::Orchestration(Some(want))) => {
+            let cfg = config.ok_or_else(|| {
+                format!(
+                    "no `.dot-agent-deck.toml` in {}, so no orchestration named '{want}' exists",
+                    dir.display()
+                )
+            })?;
+            let orch = cfg
+                .orchestrations
+                .iter()
+                // Skip roleless entries: two entries can resolve to the SAME name
+                // (e.g. an unnamed `roles = []` plus a real one), and without this
+                // filter `find` could return the empty one and refuse a target the
+                // listing legitimately offered.
+                .filter(|o| !o.roles.is_empty())
+                .find(|o| resolve_orchestration_name(&o.name, dir) == *want)
+                .ok_or_else(|| {
+                    let available: Vec<String> = cfg
+                        .orchestrations
+                        .iter()
+                        .filter(|o| !o.roles.is_empty())
+                        .map(|o| resolve_orchestration_name(&o.name, dir))
+                        .collect();
+                    if available.is_empty() {
+                        format!("no orchestration named '{want}', and none are defined")
+                    } else {
+                        format!(
+                            "no orchestration named '{want}'; available: {}",
+                            available.join(", ")
+                        )
+                    }
+                })?;
+            if orch.roles.is_empty() {
+                return Err(format!("orchestration '{want}' defines no roles"));
+            }
+            Ok(SpawnTarget::Orchestration {
+                name: resolve_orchestration_name(&orch.name, dir),
+                roles: roles_of(orch),
+                config: Box::new(orch.clone()),
+            })
+        }
+    }
+}
+
+/// Flatten one orchestration's configured roles into [`RoleSpawn`]s.
+fn roles_of(orch: &crate::project_config::OrchestrationConfig) -> Vec<RoleSpawn> {
+    orch.roles
+        .iter()
+        .enumerate()
+        .map(|(i, r)| RoleSpawn {
+            role_index: i,
+            role_name: r.name.clone(),
+            command: r.command.clone(),
+            is_start_role: r.start,
+            agent_type: r.resolved_agent_type(),
+        })
+        .collect()
 }
 
 /// Decide what to open from the target dir's config and the schedule's command.
-/// `[[orchestrations]]` with at least one role → orchestration; otherwise a
-/// single-agent card. `dir` is used only to resolve an unnamed orchestration's
-/// name to its cwd-basename (matching the TUI/daemon contract).
+/// A spawnable `[[orchestrations]]` → orchestration; otherwise a single-agent
+/// card. `dir` is used only to resolve an unnamed orchestration's name to its
+/// cwd-basename (matching the TUI/daemon contract).
+///
+/// WHICH orchestration is [`default_orchestration`]'s answer, shared with
+/// [`decide_target_with_override`]'s bare form. Issue #704: this function used to
+/// inspect `orchestrations.first()` alone, so a roleless placeholder in slot 0
+/// sent a scheduled fire to a SINGLE-AGENT CARD in a repo whose second block was
+/// perfectly spawnable — and whose `--list-targets` listing was offering it. The
+/// bare dispatch form had already been fixed; the scheduler had not, and nothing
+/// held the two together. Now one function answers for both.
 pub fn decide_target(
     config: Option<&ProjectConfig>,
     dir: &Path,
     schedule_command: Option<&str>,
 ) -> SpawnTarget {
-    if let Some(cfg) = config
-        && let Some(orch) = cfg.orchestrations.first()
-        && !orch.roles.is_empty()
-    {
-        let name = resolve_orchestration_name(&orch.name, dir);
-        let roles = orch
-            .roles
-            .iter()
-            .enumerate()
-            .map(|(i, r)| RoleSpawn {
-                role_index: i,
-                role_name: r.name.clone(),
-                command: r.command.clone(),
-                is_start_role: r.start,
-            })
-            .collect();
-        return SpawnTarget::Orchestration { name, roles };
+    if let Some(chosen) = config.and_then(|cfg| default_orchestration(cfg, dir)) {
+        return SpawnTarget::Orchestration {
+            name: chosen.name.clone(),
+            roles: roles_of(chosen.config),
+            config: Box::new(chosen.config.clone()),
+        };
     }
     SpawnTarget::SingleAgent {
         command: schedule_command.map(|c| c.to_string()),
@@ -225,12 +409,34 @@ pub fn orchestrator_role_index(roles: &[RoleSpawn]) -> usize {
 /// scheduler's run-active window — is freed the instant the dispatch WORK is
 /// done; a rapid re-fire after a tab close is then not blocked behind the prior
 /// run's lingering delivery wait. The prompt is still delivered either way.
+///
+/// `state` is the daemon's [`AppState`](crate::state::AppState). It is what makes
+/// a daemon-spawned ORCHESTRATION able to delegate: the role → pane maps
+/// `handle_delegate` routes on are populated from here, exactly as the
+/// `AttachRequest::StartAgent` handler populates them for a `Ctrl+N` one. `None`
+/// (tests, and any caller with no daemon state) spawns as before and simply
+/// registers nothing.
+///
+/// It is NOT what makes a spawned pane's live status visible — issue #454 round
+/// 1 briefly made it so, by registering every spawned pane in
+/// `managed_pane_ids`, and that is the model this doc used to describe. It was
+/// replaced (round 2, reviewer nit F is this paragraph): registration is
+/// permanent and pane-scoped, so it survived the child's death, admitted
+/// forged reports for a pane with no process behind it, and grew by one entry
+/// per short-lived pane. Admission now asks
+/// [`AgentPtyRegistry`](crate::agent_pty::AgentPtyRegistry) which GENERATION
+/// owns the pane, from before the child is forked until its record is reaped
+/// (`crate::state::AgentOwnership`), so a single-agent pane is registered
+/// NOWHERE here and needs to be. Only ORCHESTRATION roles still register — that
+/// registration exists for role → pane routing, not for admission, and
+/// `unregister_pane` on close is what takes it back.
 pub async fn spawn(
     req: SpawnRequest,
     registry: &Arc<AgentPtyRegistry>,
     notifier: &dyn Notifier,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
     detach_delivery: bool,
+    state: Option<&crate::state::SharedState>,
 ) -> Result<SpawnHandle, SpawnError> {
     // 1. mkdir -p the working_dir; fail loud via the notifier.
     let dir = Path::new(&req.working_dir);
@@ -246,9 +452,34 @@ pub async fn spawn(
         });
     }
 
-    // 2. Branch on the target dir's config.
-    let config = load_config_for_dir(dir);
-    let target = decide_target(config.as_ref(), dir, req.command.as_deref());
+    // 2. Branch on the target dir's config, unless the caller chose explicitly
+    //    (PRD #220 `dispatch --single` / `--orchestration`). A named
+    //    orchestration that the dir does not define is an error, never a silent
+    //    fallback to something the user did not pick.
+    let target = match req.resolved_target.clone() {
+        Some(t) => t,
+        None => {
+            let cfg = load_config_for_dir(dir);
+            // Issue #704: when the config left the choice to file order, say so.
+            // This path has no user in front of it — a cron tick or an
+            // issue-dispatch fire — so the daemon log is the only place the
+            // record can land. `dispatch` (which does have a caller) puts the
+            // same sentence in its reply, and `--list-targets` / `validate` show
+            // it to the config's author before either ever fires.
+            if let Some(note) = cfg
+                .as_ref()
+                .and_then(|c| default_orchestration(c, dir))
+                .and_then(|chosen| chosen.diagnostic())
+            {
+                tracing::warn!(
+                    task = %req.task_name,
+                    dir = %dir.display(),
+                    "{note}"
+                );
+            }
+            decide_target(cfg.as_ref(), dir, req.command.as_deref())
+        }
+    };
 
     // 3. Spawn + deliver.
     match target {
@@ -273,9 +504,34 @@ pub async fn spawn(
                 &pane_id,
                 None,
                 &req.task_name,
+                // A single-agent spawn has no role, so its card keeps the task
+                // name it always had.
+                None,
+                // …and no role config either, so nothing declares its agent:
+                // derive it from the command exactly as before (issue #308).
+                None,
                 pin_sh,
                 notifier,
             )?;
+            // Issue #454: a single-agent spawn registers NOTHING in the
+            // daemon's `AppState`, and does not need to. Its pane's lifecycle
+            // reports are admitted because the daemon's admission check asks
+            // `AgentPtyRegistry` who it owns (`crate::state::AgentOwnership`),
+            // and `spawn_one` has just put this pane there — from before the
+            // child existed, via the spawn reservation, until the pane changes
+            // hands or the generation's record is reaped. (Issue #454 round 3:
+            // a generation whose child has died keeps answering for its OWN
+            // pane until one of those two happens, so a `SessionEnd` written in
+            // the same breath as the exit is still admitted; see
+            // `crate::state::AgentOwnership`.) Before that, `apply_event`
+            // dropped every non-`SessionStart` report from a scheduled /
+            // dispatched pane and its `daemon status` row showed
+            // `STATUS=- TOOL=-` exactly like the dashboard-pane bug.
+            //
+            // The `surface_spawned_pane` broadcast below is unrelated: it
+            // publishes a synthetic `SessionStart` straight onto `event_tx` for
+            // attached TUIs and never passes through `daemon::ingest_event`, so
+            // the daemon's own `AppState` never sees it.
             // PRD #127 finding #2: surface this single-agent card LIVE to any
             // already-attached TUI (the daemon otherwise only hydrates its
             // agents at TUI startup). Reuses the existing hook-event broadcast
@@ -290,6 +546,9 @@ pub async fn spawn(
                     &pane_id,
                     &req.working_dir,
                     command.as_deref(),
+                    // No role config on a single-agent spawn, so nothing to
+                    // declare (issue #308).
+                    None,
                     &req.task_name,
                 );
             }
@@ -314,7 +573,11 @@ pub async fn spawn(
                 on_tab_closed: None,
             })
         }
-        SpawnTarget::Orchestration { name, roles } => {
+        SpawnTarget::Orchestration {
+            name,
+            roles,
+            config: orch_config,
+        } => {
             let orch_idx = orchestrator_role_index(&roles);
             let mut agents = Vec::with_capacity(roles.len());
             // PRD #127 readiness gate: SUBSCRIBE before any pane is spawned so
@@ -328,7 +591,17 @@ pub async fn spawn(
             // orchestration in the same working dir are then two distinct
             // routing groups instead of one ambiguous `(name, cwd)` identity.
             let orchestration_id = crate::agent_pty::mint_orchestration_id();
-            for role in &roles {
+            // The same `Instance` identity `StartAgent` derives from the
+            // membership these panes are spawned with, so a dispatched
+            // orchestration and a `Ctrl+N` one are scoped by exactly the same
+            // rule and `delegate_targets`' identity equality behaves identically
+            // for both (PRD #140 M2.0). Minted once, before the loop, because
+            // every role of one orchestration shares it.
+            let identity = crate::state::OrchestrationIdentity::Instance {
+                id: orchestration_id.clone(),
+                name: name.clone(),
+            };
+            for (idx, role) in roles.iter().enumerate() {
                 let pane_id = next_pane_id(&req.task_name, Some(role.role_index));
                 let membership = TabMembership::Orchestration {
                     name: name.clone(),
@@ -346,9 +619,143 @@ pub async fn spawn(
                     &pane_id,
                     Some(membership),
                     &req.task_name,
+                    // The card label is the ROLE NAME, not the task name. Every
+                    // role of one dispatch shares `task_name`, so labelling them
+                    // with it makes N identical cards and the user cannot tell
+                    // which is the orchestrator. Matches what the interactive
+                    // `Ctrl+n` path puts on each role pane (`tab.rs`).
+                    Some(role.role_name.as_str()),
+                    // Issue #308: the role's resolved type, so a dispatched
+                    // orchestration wraps and badges a declared launcher role
+                    // identically to the TUI path.
+                    role.agent_type.clone(),
                     false,
                     notifier,
-                )?;
+                );
+                // Issue #600: an orchestration spawn is ALL-OR-NOTHING. This used
+                // to be a bare `?`, which returned the error while every role
+                // already launched stayed live in the registry — with no
+                // `SpawnHandle` returned, the caller had nothing to close them
+                // with and no tab was ever surfaced, so those children were
+                // unreachable by any close path the user has. Tear them down here
+                // instead, so `Err` from this function means "nothing is running".
+                //
+                // Chosen over returning a PARTIAL handle because a half-spawned
+                // orchestration is not a usable product: the orchestrator has been
+                // handed a context file naming roles that do not exist, its
+                // delegations to them cannot route, and the caller
+                // (`handle_dispatch`, `issue_dispatch_run`) has no way to surface
+                // a tab for it — the `OrchestrationSurface` broadcast below is
+                // never reached. See the issue and the PR for the full argument.
+                let id = match id {
+                    Ok(id) => id,
+                    Err(e) => {
+                        roll_back_partial_orchestration(
+                            registry,
+                            state,
+                            &agents,
+                            &name,
+                            &role.role_name,
+                        )
+                        .await;
+                        return Err(e);
+                    }
+                };
+                // Tell the DAEMON's AppState who this pane is, so the
+                // orchestrator we are about to hand a delegation protocol to can
+                // actually use it.
+                //
+                // Without this a dispatched / scheduled orchestration came up
+                // complete and inert: `handle_delegate` looks the sender up in
+                // `pane_role_map`, which only the `StartAgent` handler was
+                // filling, so every `dot-agent-deck delegate` from one of these
+                // orchestrators was dropped with `delegate from unknown pane`
+                // and no worker ever received a task
+                // (`orchestration/dispatch/001`).
+                //
+                // Done HERE — synchronously, inside the loop, as each role's
+                // spawn lands — rather than after the loop or off the
+                // `OrchestrationSurface` broadcast. Off the broadcast there is a
+                // window in which a fast orchestrator's first delegate beats its
+                // own registration. After the loop there is a second problem
+                // (PR review, issue #454 item 4): the loop `?`s out on the first
+                // role that fails to spawn, so a failure at role N left roles
+                // 0..N already launched and registered NOWHERE, with the daemon
+                // holding live children it had no routing entry for. Registering
+                // per role keeps state consistent with whatever subset actually
+                // started.
+                //
+                // (Issue #600 has since decided the other half: the loop no
+                // longer just `?`s out — it rolls the already-spawned roles back,
+                // so `Err` from this function means nothing is left running. This
+                // registration is what the rollback UNDOES, and it still has to
+                // happen here rather than after the loop: the rollback tears down
+                // a role only after that role's `close_agent` has removed its
+                // child, so between the two a live child must never be missing its
+                // routing entry.)
+                //
+                // Issue #454 review, item 5: gated on the SAME validation the
+                // `AttachRequest::StartAgent` seam applies. There it is implicit
+                // — an id `is_valid_pane_id_env` rejects leaves `pane_id_env`
+                // as `None` and the role registration below it never runs — and
+                // this seam had no equivalent, so it could register an id the
+                // registry itself had refused to retain. `next_pane_id` now
+                // honours the cap that makes that unreachable; the check stays
+                // as the seam-level agreement rather than as a second place
+                // where the rule is stated differently. Registering an
+                // unretainable id would be strictly worse than skipping: the
+                // registry stores `pane_id_env = None` for it, so
+                // `write_to_pane_and_submit` could never route to the pane the
+                // role map claimed to have.
+                if let Some(state) = state.filter(|_| {
+                    crate::agent_pty::is_valid_pane_id_env(&pane_id) || {
+                        tracing::warn!(
+                            pane_id_len = pane_id.len(),
+                            role = %role.role_name,
+                            "spawn: refusing to register an orchestration role under a \
+                             pane id the registry cannot retain — delegation to this \
+                             role will not route"
+                        );
+                        false
+                    }
+                }) {
+                    state.write().await.register_orchestration_role(
+                        &pane_id,
+                        &role.role_name,
+                        // `orch_idx`, NOT `role.is_start_role`. `orch_idx` is
+                        // already this path's authority on which role is the
+                        // orchestrator — it is the pane that receives the
+                        // orchestrator context and the caller's task below — and
+                        // it falls back (role named `orchestrator` → any
+                        // `start = true` → role 0) where `is_start_role` alone
+                        // would be false for EVERY role of an orchestration whose
+                        // toml sets no `start`. Registering on the raw flag would
+                        // leave such an orchestration with a context-bearing
+                        // orchestrator that is still not in
+                        // `orchestrator_pane_ids`, i.e. this same bug for a
+                        // narrower input.
+                        //
+                        // KNOWN, and deliberately not fixed here (PR #466
+                        // review, issue #523): the registrar is shared, but this
+                        // RULE is not. The `AttachRequest::StartAgent` path still
+                        // registers on the raw flag — `tab.rs` sends
+                        // `is_start_role: role.start` in the membership — so for
+                        // a toml whose role is named `orchestrator` but sets no
+                        // `start = true`, a `Ctrl+N` tab still registers no
+                        // orchestrator at all and its delegate is rejected. That
+                        // path is not what this change set out to fix, and
+                        // unifying the rule is not local: `tab.rs` computes a
+                        // THIRD answer of its own (`start_role_index`, the bare
+                        // `position(|r| r.start).unwrap_or(0)`, with no
+                        // name-based fallback) and drives default focus and
+                        // orchestrator-prompt delivery off it, so aligning the
+                        // three is a user-visible TUI change owing its own tests
+                        // — see the issue.
+                        idx == orch_idx,
+                        identity.clone(),
+                        Some(req.working_dir.as_str()),
+                    );
+                }
                 agents.push(SpawnedAgent {
                     id,
                     pane_id,
@@ -365,7 +772,63 @@ pub async fn spawn(
             // errs only when no TUI is attached (the standalone-daemon case).
             if let Some(tx) = event_tx {
                 surface_spawned_orchestration(tx, &name, &req.working_dir, &roles, &agents);
+                // …and give every role card its ROLE NAME, the same way the
+                // single-agent branch names its card: a synthetic `SessionStart`
+                // carrying the friendly name as metadata.
+                //
+                // The typed `OrchestrationSurface` above carries `role_name`, but
+                // only as tab STRUCTURE — the card title reads the session's
+                // `display_name`, which nothing was setting on this path. So a
+                // dispatched orchestration rendered `ClaudeCode · 6134822e-f2`
+                // (claude's session UUID) on every card while the daemon knew all
+                // three role names, and the user could not tell the orchestrator
+                // from a worker (`orchestration/dispatch/002`).
+                //
+                // Sent AFTER the surface so the tab exists before the cards it
+                // names, and it cannot disturb the readiness gate below: these
+                // events carry `agent_id: None`, while `wait_for_session_start`
+                // matches only `Some(<registry id>)`. When the role's real
+                // `SessionStart` arrives it supersedes this placeholder and
+                // INHERITS the name (PRD #127 finding #2), so the label survives
+                // the handover instead of reverting to a UUID.
+                for (role, agent) in roles.iter().zip(agents.iter()) {
+                    surface_spawned_pane(
+                        tx,
+                        &agent.pane_id,
+                        &req.working_dir,
+                        Some(&role.command),
+                        role.agent_type.clone(),
+                        &role.role_name,
+                    );
+                }
             }
+            // PRD #222 parity: compose the ORCHESTRATOR CONTEXT, exactly as the
+            // interactive `Ctrl+n` path does, instead of delivering the caller's
+            // task on its own.
+            //
+            // Without this the orchestrator was never told that it IS an
+            // orchestrator, which roles exist, or how to `delegate` — so it acted
+            // on the task alone and every worker sat idle waiting for a delegation
+            // that could not arrive. In a six-role repo that is one working agent
+            // and five idle ones, and it looks like it worked.
+            //
+            // The caller's task is folded INTO the context file rather than
+            // concatenated onto the pointer line, because a multi-line prompt does
+            // not submit reliably through a PTY and task text is arbitrary. If the
+            // file cannot be written we fall back to the bare task rather than
+            // delivering nothing — a degraded orchestrator still beats a silent one.
+            let prompt = if req.compose_orchestrator_context {
+                crate::orchestrator_context::prepare_orchestrator_prompt(
+                    &orch_config,
+                    &req.working_dir,
+                    Some(req.prompt.as_str()),
+                )
+                .unwrap_or_else(|| req.prompt.clone())
+            } else {
+                // #120 / #127: unchanged — the prompt is delivered verbatim. See
+                // `compose_orchestrator_context` for why this is not flipped here.
+                req.prompt.clone()
+            };
             // Deliver the prompt to the orchestrator role pane, gated on that
             // pane's readiness (its registry agent_id is the gate's match key).
             let delivery_pane_id = agents[orch_idx].pane_id.clone();
@@ -375,7 +838,7 @@ pub async fn spawn(
                 delivery_pane_id.clone(),
                 delivery_agent_id,
                 event_rx,
-                req.prompt.clone(),
+                prompt,
                 detach_delivery,
             )
             .await;
@@ -390,24 +853,134 @@ pub async fn spawn(
     }
 }
 
+/// Issue #600: tear down the roles an orchestration spawn had already started
+/// when a LATER role failed, so [`spawn`]'s `Err` means "nothing is running".
+///
+/// Before this, the role loop `?`d straight out: roles `0..N` stayed live in
+/// `AgentPtyRegistry` as PTY children, no `SpawnHandle` came back so the caller
+/// had nothing to close them with, and the `OrchestrationSurface` broadcast that
+/// would have given the user a tab is never reached on the failure path — so the
+/// children were unreachable by every close path that exists. It also left
+/// `handle_dispatch`'s rollback force-removing the worktree those children were
+/// rooted in (issue #575); with the teardown in place that rollback runs against
+/// a tree nothing occupies, which is the state its comment always claimed.
+///
+/// Best-effort by construction, and it never reports failure upwards: the caller
+/// is already returning the ORIGINAL spawn error, which is what the user needs to
+/// see. A role that somehow survives is caught downstream instead — the dispatch
+/// rollback re-asks `worktree_still_in_use` before it removes anything.
+///
+/// Uses the same close protocol as the `AttachRequest::StopAgent` handler
+/// (`begin_pane_close` → `close_agent` → `unregister_pane` → `finish_pane_close`)
+/// rather than a bare `close_agent`, because the roles that DID start are already
+/// registered in `pane_role_map` and a fast orchestrator could in principle have
+/// armed a delegation against one of them before the failing role was reached.
+async fn roll_back_partial_orchestration(
+    registry: &Arc<AgentPtyRegistry>,
+    state: Option<&crate::state::SharedState>,
+    started: &[SpawnedAgent],
+    orchestration: &str,
+    failed_role: &str,
+) {
+    if started.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        orchestration = %orchestration,
+        failed_role = %failed_role,
+        rolling_back = started.len(),
+        "spawn: a later orchestration role failed; tearing down the roles that already started"
+    );
+
+    // Refuse new delegations to every one of these panes BEFORE the first child
+    // is terminated, so the teardown cannot race one in against a pane whose
+    // agent is mid-SIGTERM.
+    for agent in started {
+        registry.begin_pane_close(&agent.pane_id);
+    }
+
+    // `close_agent` runs the synchronous SIGTERM-with-grace loop
+    // (`terminate_child_with_grace_and_wait`, up to `AGENT_TERMINATE_GRACE` per
+    // child), so it must not run on a Tokio worker thread — same reasoning as the
+    // `StopAgent` handler's `spawn_blocking` hop.
+    let registry_for_close = registry.clone();
+    let ids: Vec<String> = started.iter().map(|a| a.id.clone()).collect();
+    let closed = tokio::task::spawn_blocking(move || {
+        ids.into_iter()
+            .map(|id| {
+                let outcome = registry_for_close.close_agent(&id);
+                (id, outcome)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+    match closed {
+        Ok(outcomes) => {
+            for (id, outcome) in outcomes {
+                if let Err(e) = outcome {
+                    // `NotFound` is ordinary here — the child may have exited on
+                    // its own between spawning and the failure of a later role.
+                    tracing::warn!(
+                        agent_id = %id,
+                        error = %e,
+                        "spawn rollback: could not close an already-started role"
+                    );
+                }
+            }
+        }
+        Err(join_err) => {
+            tracing::warn!(
+                error = %join_err,
+                orchestration = %orchestration,
+                "spawn rollback: the close task panicked or was cancelled; \
+                 already-started roles may still be running"
+            );
+        }
+    }
+
+    // Drop the routing identity these panes were given as each spawn landed
+    // (`register_orchestration_role`, above). Done AFTER the children are gone so
+    // a live child is never missing its `pane_role_map` entry — the inverse
+    // ordering is exactly the inconsistency issue #454 closed.
+    if let Some(state) = state {
+        let mut guard = state.write().await;
+        for agent in started {
+            guard.unregister_pane(&agent.pane_id);
+        }
+    }
+    for agent in started {
+        registry.finish_pane_close(&agent.pane_id, true);
+    }
+}
+
 /// Spawn one pane via the existing registry path, tagging it with `pane_id` (so
 /// the prompt-delivery write can route to it) and optional orchestration
 /// `membership`. Surfaces a spawn failure via the notifier.
 #[allow(clippy::too_many_arguments)]
 fn spawn_one(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     command: Option<&str>,
     cwd: &str,
     pane_id: &str,
     membership: Option<TabMembership>,
     task_name: &str,
+    // The friendly label for this pane's CARD, when it differs from the task
+    // name — the role name for an orchestration role. `None` keeps the task
+    // name. `task_name` stays the notifier's subject either way: a spawn
+    // failure is reported against the dispatch, not against one role.
+    display_name: Option<&str>,
+    // Issue #308: what agent this pane runs, when the caller knows something the
+    // command cannot say — an orchestration role's `agent = "…"` declaration.
+    // `None` means "derive it from the command", which is what a single-agent
+    // schedule (no role config, so nothing to declare) always passes.
+    agent_type: Option<AgentType>,
     pin_sh: bool,
     notifier: &dyn Notifier,
 ) -> Result<String, SpawnError> {
     let opts = SpawnOptions {
         command,
         cwd: Some(cwd),
-        display_name: Some(task_name),
+        display_name: Some(display_name.unwrap_or(task_name)),
         rows: 24,
         cols: 80,
         env: pane_env(pane_id, pin_sh),
@@ -420,7 +993,11 @@ fn spawn_one(
         // but reverted to "No agent" after a reconnect rebuilt it from
         // `list_agents`. `from_command` returns `None` for bare commands, the
         // same legacy placeholder behavior.
-        agent_type: AgentType::from_command(command),
+        //
+        // Issue #308: a caller-supplied type wins, so a role whose command is a
+        // launcher (`devbox run -- codex`) is badged and WRAPPED from its first
+        // dispatched spawn rather than reading "No agent" until its first task.
+        agent_type: agent_type.or_else(|| AgentType::from_command(command)),
     };
     registry.spawn_agent(opts).map_err(|e| {
         notifier.notify(NotifyEvent::SpawnFailed {
@@ -558,18 +1135,75 @@ async fn run_delivery(
 }
 
 async fn deliver(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     agent_id: &str,
     event_rx: Option<broadcast::Receiver<BroadcastMsg>>,
     prompt: &str,
 ) {
-    match event_rx {
+    // Issue #424, reviewer finding B9: ONE absolute deadline for the whole
+    // delivery, captured BEFORE the readiness wait. `started` used to be minted
+    // inside `confirm_prompt_delivery` — i.e. after a readiness wait that is 30 s
+    // in production — so an automatic prompt could stay active for ~90 s while
+    // the two TUI paths enforce the shared 60 s `AUTOMATIC_PROMPT_DEADLINE` from
+    // enqueue. Every wait and every write below is bounded by this one instant.
+    let deadline = Instant::now() + AUTOMATIC_PROMPT_DEADLINE;
+    // Issue #424, reviewer finding B4: `readiness` is carried past the write. It
+    // is not "may we deliver" (the fallback still delivers, exactly as before)
+    // but "can this producer report a submitted prompt at all" — which decides
+    // whether an unconfirmed write may be RE-submitted. See
+    // [`confirm_prompt_delivery`].
+    // Issue #243: the scheduler shares the delegate path's readiness gate, so it
+    // shares this defect too — the issue measures a 30 s OpenCode cold spawn HERE,
+    // and leaving it would mean OpenCode still paid the full wait every time a
+    // scheduled card fired. The agent type is read from the deck's own frozen
+    // launch-shape record rather than from the observed badge, so no producer can
+    // talk the gate out of waiting (see `spawn_agent_type`).
+    let spawned_agent_type = registry.spawn_agent_type(agent_id);
+    let has_readiness_signal =
+        crate::state::agent_has_pre_prompt_readiness_signal(spawned_agent_type.as_ref());
+    let (mut event_rx, observed) = match event_rx {
+        // The declared-no-signal short path. Deliberately NOT a bare write: the
+        // 30 s wait it replaces was, accidentally, also the only thing standing
+        // between the prompt and a still-booting agent, so what it becomes is a
+        // bounded buffer — the ceiling #243 names for an agent with nothing to
+        // wait for. `rx` is kept so delivery confirmation still observes the pane
+        // exactly as it does on the waiting path.
+        Some(rx) if !has_readiness_signal => {
+            // Issue #243, round 4: sized against a real declared-`NoSignal` agent
+            // rather than borrowing the ordinary buffer, which was PRD #249's
+            // "warm-case 500 ms, doubled" and was never measured against one —
+            // see `crate::state::NO_SIGNAL_READINESS_BUFFER`.
+            let buffer = crate::state::no_signal_readiness_buffer().min(remaining_before(deadline));
+            tracing::debug!(
+                pane_id,
+                agent_type = ?spawned_agent_type,
+                buffer_ms = buffer.as_millis(),
+                "scheduled spawn: this agent has DECLARED it emits no pre-prompt \
+                 readiness signal; holding the prompt for the no-signal readiness \
+                 buffer instead of waiting out a SessionStart that cannot arrive"
+            );
+            if !buffer.is_zero() {
+                tokio::time::sleep(buffer).await;
+            }
+            (Some(rx), crate::state::SessionStartWait::default())
+        }
         Some(mut rx) => {
-            let timeout = session_start_wait_timeout();
-            let observed =
-                crate::state::wait_for_session_start(&mut rx, pane_id, agent_id, timeout).await;
-            if !observed {
+            let timeout = session_start_wait_timeout().min(remaining_before(deadline));
+            // Issue #243: the scheduler shares the gate, so it shares the
+            // upgrade window — and it needs it at least as much, since this path
+            // applies no post-readiness buffer after a readiness fact at all.
+            // The agent type is the frozen launch record above, not the observed
+            // badge (see `interface_upgrade_window`).
+            let observed = crate::state::wait_for_session_start(
+                &mut rx,
+                pane_id,
+                agent_id,
+                timeout,
+                crate::state::interface_upgrade_window(spawned_agent_type.as_ref()),
+            )
+            .await;
+            if !observed.ready {
                 tracing::debug!(
                     pane_id,
                     timeout_ms = timeout.as_millis(),
@@ -577,11 +1211,1062 @@ async fn deliver(
                      delivering prompt via fallback path"
                 );
             }
+            // Issue #243, round 3: a gate released by a WRAPPER INTERFACE fact
+            // owes a buffer HERE too, and until this branch existed there was no
+            // fact on this path that could arrive early enough to need one.
+            //
+            // That is the whole reason this is not scope creep. Before this
+            // issue a Codex pane had no pre-prompt readiness signal at all, so
+            // the scheduler waited out `SESSION_START_WAIT_TIMEOUT` and the
+            // agent was long up by the time anything was written — the 30 s
+            // defect was also, accidentally, the thing standing between the
+            // prompt and a booting TUI, exactly as it was on the
+            // declared-no-signal path above. This issue's own commits give the
+            // scheduler an interface fact that fires ~100 ms after fork, so
+            // removing the wait without adding the buffer would move the
+            // scheduler onto the same silent prompt loss the delegate path is
+            // being fixed for, on the same measurement.
+            //
+            // Priced exactly as `crate::state::dispatch_one_owned` prices it,
+            // and scoped the same way — by the frozen launch record, never by
+            // the arriving badge. For a Wrapper-strategy agent every readiness
+            // fact that can arrive pre-prompt IS one of the wrapper's two (the
+            // native start comes with the first turn, which is what this issue
+            // measured), so the agent type is a sufficient discriminator without
+            // widening `SessionStartWait`. The strong fact buys the interface
+            // buffer, anything else the ordinary one, and the timeout keeps
+            // today's behaviour of no buffer at all — a fallback here has
+            // already waited out the full timeout.
+            let buffer = if observed.ready
+                && crate::state::agent_is_wrapper_interface_ready(spawned_agent_type.as_ref())
+            {
+                if observed.observed_interface && registry.agent_spawned_as_wrapper_host(agent_id) {
+                    crate::state::wrapper_interface_readiness_buffer()
+                } else {
+                    crate::state::delegate_readiness_buffer()
+                }
+                .min(remaining_before(deadline))
+            } else {
+                Duration::ZERO
+            };
+            if !buffer.is_zero() {
+                tracing::debug!(
+                    pane_id,
+                    agent_type = ?spawned_agent_type,
+                    observed_interface = observed.observed_interface,
+                    buffer_ms = buffer.as_millis(),
+                    "scheduled spawn: the readiness fact came from the wrapper watching this \
+                     agent's interface, which is not on its own input-readiness; holding the \
+                     prompt for the post-readiness buffer"
+                );
+                tokio::time::sleep(buffer).await;
+            }
+            (Some(rx), observed)
         }
-        None => tokio::time::sleep(DELIVER_BUFFER_DELAY).await,
+        None => {
+            tokio::time::sleep(DELIVER_BUFFER_DELAY.min(remaining_before(deadline))).await;
+            (None, crate::state::SessionStartWait::default())
+        }
+    };
+    let delivery_id = mint_delivery_id(pane_id);
+    // Issue #424, reviewer finding B1: the pre-write drain IS the watermark.
+    // Everything already queued on the broadcast was already visible before our
+    // bytes exist, so a submission the agent made on its own beforehand cannot
+    // be mistaken for evidence about this delivery. (Ordering, not causality —
+    // an event PRODUCED before the write that arrives after it is the residual
+    // tracked in #526.) The generation
+    // latch it fills means the very first retry already knows which hook session
+    // it is bound to. Also the last chance to notice the pane rebound while we
+    // waited out a 30 s readiness timeout.
+    //
+    // Auditor HIGH / C1: the latch STARTS from the readiness event's own
+    // generation. Initializing it to `None` here threw that away, so the first
+    // `SessionStart` the confirmation loop happened to see became the binding —
+    // and after an unobserved rollover that is the SUCCESSOR conversation. A
+    // launcher/wrapper-fork readiness event contributes no generation by
+    // design; see `crate::state::SessionStartWait::generation`.
+    let mut generation: Option<(String, DateTime<Utc>)> = observed.generation.clone();
+    let mut drained_capability = false;
+    // Issue #666: discarded on purpose. A start observed BEFORE the write says
+    // nothing about bytes that do not exist yet, so the pre-write drain feeds the
+    // rearm nothing. See [`crate::prompt_delivery::AgentStartRearm`], fact W.
+    let mut pre_write_agent_start = None;
+    if let Some(rx) = event_rx.as_mut()
+        && let Some(reason) = drain_pre_write_events(
+            rx,
+            pane_id,
+            agent_id,
+            &mut generation,
+            &mut drained_capability,
+            &mut pre_write_agent_start,
+        )
+    {
+        log_prompt_stopped(DELIVERY_LOG_PATH, pane_id, &delivery_id, reason);
+        return;
     }
-    if let Err(e) = registry.write_to_pane_and_submit(pane_id, prompt).await {
-        tracing::warn!(pane_id, error = %e, "scheduled prompt delivery failed");
+    // Reviewer finding B1: the FIRST write is identity-guarded too. The plain
+    // `write_to_pane_and_submit` resolves whichever agent currently owns the
+    // pane string, and a pane id is just a string an exited agent frees for the
+    // next spawn — so after a multi-second readiness wait it could type this
+    // dispatch prompt into a replacement.
+    match guarded_submit(registry, pane_id, agent_id, prompt, deadline).await {
+        GuardedOutcome::Written => {}
+        // Issue #424 H3/H5: the FIRST write of this delivery was refused because
+        // the pane's input box already holds bytes of ours that the user has
+        // typed since. No confirmation task exists yet, so this used to be a
+        // `warn!` into a subscriber that `init_logging_from_env` installs only
+        // when `DOT_AGENT_DECK_LOG` is set — a prompt lost with nothing on the
+        // card to say so, which is the shape of the issue itself. Report it.
+        GuardedOutcome::RefusedUserInput => {
+            report_user_input_stop(
+                registry,
+                pane_id,
+                agent_id,
+                &delivery_id,
+                generation.as_ref(),
+            );
+            return;
+        }
+        GuardedOutcome::Refused(reason) => {
+            tracing::warn!(
+                pane_id,
+                delivery_id,
+                reason,
+                "scheduled prompt delivery refused"
+            );
+            return;
+        }
+        GuardedOutcome::Failed(e) => {
+            tracing::warn!(pane_id, error = %e, "scheduled prompt delivery failed");
+            return;
+        }
+    }
+    log_prompt_written(DELIVERY_LOG_PATH, pane_id, &delivery_id, 1);
+    // Issue #424: read from `observed_producer`, not from readiness. A launcher
+    // that declares its boot provenance is skipped by the readiness gate but has
+    // still named the producer, and that is the only question this answers —
+    // whether an unconfirmed write could EVER be confirmed. Keying it off
+    // readiness meant an honest bootstrap disarmed its own recovery
+    // (`scheduler/dispatch/015`).
+    //
+    // Issue #424 F4 (auditor HIGH): both inputs to this answer are taken BEFORE
+    // the write, and that is the point — `observed_producer` is a producer that
+    // was already running when we wrote, and `drained_capability` comes from
+    // frames queued before we wrote. The confirmation loop no longer ADDS to it
+    // from a later event's declared type: provenance and `AgentType` are
+    // producer assertions wherever they appear, so an unmarked start arriving
+    // afterwards would otherwise arm the full replacement payload, and the blind
+    // submit CRs after it, against a pane that may be a shell.
+    let can_report_prompts = observed
+        .observed_producer
+        .as_ref()
+        .is_some_and(crate::prompt_delivery::agent_reports_submitted_prompt)
+        || drained_capability;
+    // Issue #424 F4: the launcher handoff is STANDING, not capability, so it is
+    // recorded rather than folded into the answer above. Arming here instead
+    // would put the one replacement payload on the retry schedule's clock —
+    // ~500 ms after the write — which for `scheduler/dispatch/015` means typing
+    // it into a launcher that has not exec'd the real agent yet, and every
+    // attempt after that is a submit-only probe with nothing to submit. What the
+    // handoff licenses is accepting the successor WHEN IT ANNOUNCES ITSELF, so
+    // the payload goes in exactly when the agent is there to receive it. See
+    // [`crate::state::SessionStartWait::launcher_handoff`].
+    //
+    // Issue #666: the DECLARED TYPE goes with it. It is the pane's believed type
+    // for the `devbox`-shaped population whose command resolves to no agent type
+    // at all, so without it that population has no belief for a post-write
+    // declaration to agree with — see
+    // [`crate::agent_pty::AgentPtyRegistry::pre_write_believed_agent_type`].
+    if let Some(declared) = observed.launcher_handoff.clone() {
+        registry.note_launcher_handoff(agent_id, declared);
+    }
+    match event_rx {
+        Some(rx) => {
+            // Detached on purpose: the caller (a `dispatch` CLI round trip, a
+            // scheduler fire) is freed the instant the bytes are written, exactly
+            // as before this change. Only the CONFIRMATION — which legitimately
+            // runs for tens of seconds against a Claude Code pane starting five
+            // MCP servers — moves to the background.
+            let registry = Arc::clone(registry);
+            let pane_id = pane_id.to_string();
+            let agent_id = agent_id.to_string();
+            let prompt = prompt.to_string();
+            let task = ConfirmationTask {
+                pane_id,
+                agent_id,
+                prompt,
+                delivery_id,
+                generation,
+                can_report_prompts,
+                deadline,
+            };
+            spawn_confirmation_task(registry, rx, task);
+        }
+        // No event bus at all (a direct caller without one). Nothing can ever
+        // report back, so the write is final.
+        None => {
+            log_prompt_unconfirmable(
+                DELIVERY_LOG_PATH,
+                pane_id,
+                &delivery_id,
+                "no hook-event bus for this delivery",
+            );
+            // Issue #424 H3: final means final — no retry will consult this
+            // delivery's payload record, so release it here rather than leaving
+            // it to refuse a later delivery of the same text until the TTL.
+            registry.note_payload_settled(pane_id, prompt);
+        }
+    }
+}
+
+/// How long is left before `deadline`, saturating at zero.
+fn remaining_before(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// The outcome of one identity-guarded submission attempt, flattening
+/// [`GuardedSend`] into the answers this path acts on.
+enum GuardedOutcome {
+    /// Bytes reached the exact expected agent.
+    Written,
+    /// The target refused the write and NOTHING was written — or the write was
+    /// partial and must not be repeated. Terminal either way.
+    Refused(&'static str),
+    /// Issue #424 H5 (reviewer MEDIUM): refused by the WRITER-HELD backstop
+    /// because the user typed after this loop's own pre-check.
+    ///
+    /// Terminal like any other refusal, but not interchangeable with one: it is
+    /// the only stop this path promises to REPORT on the pane's card, and the
+    /// promise used to be broken exactly in the race the backstop exists for.
+    /// The caller checks the user-input clock before every attempt precisely so
+    /// it can report; a keystroke landing between that check and the guarded
+    /// acquisition came back as a bare `Stale`, was logged as "target went
+    /// stale", and published nothing. See [`GuardedSendDetail`].
+    RefusedUserInput,
+    /// Transport error before/around the write.
+    Failed(AgentPtyError),
+}
+
+/// Issue #424, reviewer finding B1 / auditor HIGH #1: submit `prompt` into
+/// `pane_id` bound to the EXACT `agent_id` and hook `generation` it was written
+/// for, re-validated after the writer lock is taken.
+///
+/// Two guards, and both matter for a different race:
+///
+/// * `expected_agent_id` catches a pane that exited and was respawned/rebound
+///   between attempts — [`AgentPtyRegistry`] explicitly supports same-pane
+///   respawn, and the pane id is reusable, so the unguarded write would have
+///   found the successor's writer and typed a stranger's task into it.
+/// * `revalidate` catches a pane whose close has BEGUN while we waited for the
+///   writer — the same recheck the delegate idle-watch performs at the same
+///   point, and the only liveness fact this path can consult without the daemon's
+///   `AppState`.
+///
+/// A SAME-agent `/clear` or thread restart is invisible to both: it rolls the
+/// hook session over while the registry identity stays put. Only the event
+/// stream sees that, so it is caught by the latched generation in
+/// [`drain_pre_write_events`] and [`crate::state::wait_for_prompt_submission`],
+/// which terminate the delivery before the next write is reached. The residual
+/// window is a rollover landing between the end of a watch window and the write
+/// that immediately follows it in the same task — sub-millisecond, and closable
+/// only by threading the daemon's `AppState` into the spawn primitive.
+///
+/// The whole call is bounded by the shared `deadline` (B9). A wedged PTY can
+/// still block inside the synchronous `write_all` under the writer mutex — that
+/// is pre-existing behaviour of every write on this path and is tracked as a
+/// follow-up, not fixed here — but the timeout does bound the far more common
+/// case of waiting behind another writer.
+async fn guarded_submit(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    agent_id: &str,
+    prompt: &str,
+    deadline: Instant,
+) -> GuardedOutcome {
+    let closing = Arc::clone(registry);
+    // Issue #424 H5: the DETAILED form, because this is the path that owes the
+    // user a terminal report and cannot produce one from a flattened `Stale`.
+    let send = registry.write_and_submit_guarded_detailed(
+        pane_id,
+        prompt,
+        Some(agent_id),
+        || async move { !closing.is_pane_closing(pane_id) },
+    );
+    match tokio::time::timeout(remaining_before(deadline), send).await {
+        Err(_) => GuardedOutcome::Refused("deadline elapsed while writing"),
+        Ok(Err(e)) => GuardedOutcome::Failed(e),
+        Ok(Ok(GuardedSendDetail::RefusedUserInput)) => GuardedOutcome::RefusedUserInput,
+        Ok(Ok(GuardedSendDetail::Outcome(outcome))) => match outcome {
+            GuardedSend::Applied => GuardedOutcome::Written,
+            GuardedSend::WrongSession => GuardedOutcome::Refused("agent-replaced"),
+            GuardedSend::Stale => GuardedOutcome::Refused("target went stale"),
+            GuardedSend::NoLiveTarget => GuardedOutcome::Refused("no live target"),
+            GuardedSend::Ambiguous => GuardedOutcome::Refused("ambiguous partial write"),
+        },
+    }
+}
+
+/// Consume everything already queued on `rx` — every frame of it produced
+/// before the write this precedes — latching the pane's hook generation and
+/// noting whether the producer can report a submitted prompt. Returns a stop
+/// reason when the drained frames show the target is already gone.
+///
+/// Auditor HIGH: the generation decision is [`crate::state::latch_generation`],
+/// the SAME function the post-write watch uses, rather than the open-coded copy
+/// that used to live here. That copy never inspected `event_type`, so it happily
+/// bound (or advanced to) a `SessionEnd` instead of stopping on it — a drained
+/// end of the conversation we were about to write into looked like an ordinary
+/// generation. One policy, one place: a future change to what is terminal cannot
+/// apply to only one of the two.
+///
+/// Called TWICE per attempt on purpose (see [`confirm_prompt_delivery`]): once
+/// before the first write, and again in the gap between a watch window expiring
+/// and the retry that follows it. That gap used to be unguarded, so an end/start
+/// pair arriving inside it was observed only AFTER the stale retry had landed.
+fn drain_pre_write_events(
+    rx: &mut broadcast::Receiver<BroadcastMsg>,
+    pane_id: &str,
+    agent_id: &str,
+    generation: &mut Option<(String, DateTime<Utc>)>,
+    can_report_prompts: &mut bool,
+    agent_start: &mut Option<(Instant, AgentType)>,
+) -> Option<&'static str> {
+    loop {
+        match rx.try_recv() {
+            Ok(BroadcastMsg::Event(event)) => {
+                if event.pane_id.as_deref() != Some(pane_id) {
+                    continue;
+                }
+                match event.agent_id.as_deref() {
+                    Some(reported) if reported != agent_id => return Some("agent-replaced"),
+                    None => continue,
+                    Some(_) => {}
+                }
+                if crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type) {
+                    *can_report_prompts = true;
+                }
+                // Issue #666, facts G ∧ I ∧ W for the GAP call. Identity is
+                // enforced above; G is the wrapper-fork discriminator; W holds
+                // only because the gap drain runs after a write. The PRE-write
+                // call passes a sink it discards — a pre-write drain is pre-write
+                // by construction, so nothing it sees can be evidence about bytes
+                // that do not exist yet.
+                // Issue #243: G is the wrapper discriminator, not the wrapper-FORK
+                // one — an interface-ready start is the deck's own observation of
+                // a child painting, never an agent announcing a conversation it
+                // could report a submission for.
+                if agent_start.is_none()
+                    && event.event_type == EventType::SessionStart
+                    && !event.is_wrapper_session_start()
+                {
+                    *agent_start = Some((Instant::now(), event.agent_type.clone()));
+                }
+                if let Some(crate::state::PromptWatch::TargetChanged { reason }) =
+                    crate::state::latch_generation(generation, &event)
+                {
+                    return Some(reason);
+                }
+            }
+            Ok(BroadcastMsg::OrchestrationSurface(_)) => continue,
+            // Issue #424 D2 (both reviewers): TERMINAL, where this used to carry
+            // on. The old comment claimed the dropped frames cost only the
+            // generation latch "which the watcher re-establishes" — it does not.
+            // `latch_generation` binds and re-binds on `SessionStart` alone, by
+            // design, so if the only end/start transition for this pane fell out
+            // of the broadcast ring the surviving ordinary frames announce
+            // nothing and the delivery silently KEEPS a binding whose
+            // conversation is gone. That is target-revocation evidence being
+            // erased, which a same-user flood can arrange on purpose and ordinary
+            // daemon load can arrange by accident.
+            //
+            // Post-write lag was already terminal in
+            // `crate::state::wait_for_prompt_submission`; this is the same rule
+            // at the two remaining drains. Before the first write it costs the
+            // delivery entirely — the prompt is not written at all, logged under
+            // this reason — which is a real availability cost, taken because a
+            // 1024-frame ring overflowing inside the drain window is rare while
+            // writing a spawn prompt into a conversation that may already have
+            // been revoked is not recoverable.
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                return Some("lagged-event-stream");
+            }
+            Err(broadcast::error::TryRecvError::Empty) => return None,
+            Err(broadcast::error::TryRecvError::Closed) => return Some("event-stream-closed"),
+        }
+    }
+}
+
+/// Issue #424: hold a spawn-time prompt PROVISIONAL until the agent reports
+/// submitting it, re-submitting under a bounded backoff while it does not.
+///
+/// This is the daemon-side third delivery path — `dispatch`, the scheduler and
+/// issue-dispatch all reach the PTY through [`deliver`], not through either of
+/// the TUI-owned paths in `crate::ui` — and it is the one the reported failure
+/// actually goes through: three `dispatch … --single` calls inside a minute, one
+/// pane prompted and the other two healthy, in the right worktrees, and idle
+/// forever with no prompt at all.
+///
+/// Every re-submission goes back through [`guarded_submit`], so it is a real
+/// second write to the PTY *of the exact agent the first one reached* — never
+/// of whoever happens to own the pane string by then.
+///
+/// Bounded by [`AUTOMATIC_PROMPT_DEADLINE`], after which the prompt is abandoned
+/// with a warn, a durable report on the pane's card, and no further write. Every
+/// retry types the prompt into the pane again, so the escalating
+/// [`unconfirmed_retry_delay`] keeps that to single digits across the whole
+/// window (see its docs).
+///
+/// `can_report_prompts` is the initial answer to "can this pane's delivery ever
+/// be confirmed" — `true` when a pre-write event came from a producer that
+/// reports submitted prompt text. It is not a fixed verdict: a pane that has
+/// proved NOTHING yet is watched for one window first, and a later event from
+/// such a producer arms retries from then on. That distinction keeps the two
+/// populations apart without guessing from the command line:
+///
+/// * a bare shell / `cat` / a recorder stand-in — and, per reviewer finding B4,
+///   a Pi pane, which emits well-formed status frames but structurally never a
+///   submitted prompt — is never armed and receives exactly ONE write. Retrying
+///   could not be recovery there, only the same prompt typed in again until the
+///   deadline;
+/// * a SLOW agent — the `devbox run claude …` launcher class from the issue,
+///   whose readiness depends on a hook escaping a nested shell — signals late,
+///   arms on that signal, and still gets its retries. Gating this on the
+///   pre-write `SessionStart` alone would have denied a retry to exactly the
+///   agents issue #424 §3 identifies as having the most fragile delivery.
+async fn confirm_prompt_delivery(
+    registry: Arc<AgentPtyRegistry>,
+    mut rx: broadcast::Receiver<BroadcastMsg>,
+    task: ConfirmationTask,
+) {
+    use crate::state::PromptWatch;
+
+    let ConfirmationTask {
+        pane_id,
+        agent_id,
+        prompt,
+        delivery_id,
+        mut generation,
+        can_report_prompts,
+        deadline,
+    } = task;
+    // Issue #424 S1/S2 (both reviewers): THIS delivery's own clock — the
+    // delivery-scoped half of the user-draft rule, and the only half that needs
+    // no shared bookkeeping at all: *a delivery stops retrying once user input
+    // reaches its pane after its own write.* Nothing is keyed by pane, nothing
+    // is keyed by bytes, nothing has to be released, and no other delivery can
+    // disarm it. Sampled here rather than carried in [`ConfirmationTask`]
+    // because this task is spawned immediately after the first write, so this
+    // instant IS that write plus a scheduling hop; input landing inside that hop
+    // is caught by the byte-keyed record below, whose timestamp is the write
+    // itself. See `would_send_user_draft`.
+    let watch_started_at = Instant::now();
+    // Issue #424 H3 (both reviewers): this delivery OWNS the payload record its
+    // first write left on the pane, and owns releasing it. However this task
+    // ends — confirmed, accumulated, abandoned, target changed, lagged, closed,
+    // refused, deadline — the record goes with it, so a later scheduled fire or
+    // delegate hand-off carrying the SAME fixed text is a first write rather
+    // than a repeat of a finished delivery's. That wrong refusal is #424 itself:
+    // it lands before any byte is written, on a path whose only reaction is a
+    // `warn!`. Released by `Drop` rather than at each of the eight exits,
+    // because the one that gets forgotten is the one that reintroduces it.
+    //
+    // Issue #424 S2: ONE HOLDER PER PAYLOAD WRITE. A record is now per write
+    // rather than per distinct payload, so that a delivery sharing its bytes
+    // with a concurrent one cannot release the other's guard — which means this
+    // delivery must hold (and drop) as many as it wrote. The replacement
+    // payload's holder is pushed below, at the write that creates it.
+    let mut payload_records = vec![PayloadRecordRelease {
+        registry: &registry,
+        pane_id: &pane_id,
+        prompt: &prompt,
+    }];
+    let mut attempt: u32 = 1;
+    let mut armed = can_report_prompts;
+    // Issue #424 F4: whether a producer identifying itself AFTER the write may
+    // arm this delivery at all. True only when something said BEFORE we wrote
+    // what this pane is, so that a producer appearing later is genuinely this
+    // delivery's target rather than an unauthenticated claim about a pane our
+    // bytes have already gone into. Two things can say it:
+    //
+    // * the pane declared a LAUNCHER HANDOFF — the launcher consumed our bytes
+    //   and the agent behind it is the authorized successor, the same single
+    //   handoff `crate::state::latch_generation` permits for the generation;
+    // * issue #570: THE DECK SPAWNED IT, as an agent type the deck itself
+    //   selected. `dispatch --single` execs `default_command`, so on that path
+    //   "is there an agent that reports submitted prompts in this pane" has a
+    //   pre-write answer the deck WROTE rather than observed — and the gate was
+    //   consulting neither of the two facts it had.
+    //
+    // Without the second, a daemon-spawned dispatch loses this delivery outright
+    // whenever the agent's `SessionStart` misses the readiness gate: the field
+    // report in #570 missed it by 37 ms, the write went out unarmed on the
+    // fallback path, the producer announced itself 500 ms later, and the retry
+    // that would have submitted the prompt was refused. That retry is not a
+    // safety net on this path — the paired control in the same log shows attempt
+    // 1 not submitting on the delivery that WORKED, which worked because it
+    // retried — so refusing it is the difference between a dispatch and an agent
+    // sitting in a fresh tab having been asked nothing.
+    let accepts_late_producer = registry.agent_declared_launcher_handoff(&agent_id)
+        || registry.agent_spawned_as_reporting_agent(&agent_id);
+    // Issue #666: the ONE extra payload-carrying attempt this delivery may earn.
+    //
+    // Standing here is the same PRE-WRITE fact `accepts_late_producer` above is
+    // built from — but as a TYPE, not a bool, and that difference is the whole
+    // of #424 F4. `accepts_late_producer` only has to answer "may a post-write
+    // producer arm the retry SCHEDULE", and a schedule of submit-only probes
+    // cannot duplicate anything. The rearm authorizes a PAYLOAD WRITE, so it must
+    // also answer "is the thing announcing itself the thing we believed was
+    // there" — otherwise a pane the deck exec'd as Codex is armed by an event
+    // that merely claims to be Claude Code, and the declared type has GRANTED
+    // privilege rather than withheld it. `scheduler/dispatch/016` cases G and H
+    // are exactly that, and they are the reciprocals of case C.
+    //
+    // `generation` is still the PRE-WRITE latch here: `deliver` captures it, runs
+    // the drain, writes attempt 1 and hands it over untouched, and nothing below
+    // has run yet. So `generation.is_none()` IS fact U for the first payload
+    // write, with no separate `ConfirmationTask` field to keep in step with it.
+    let mut rearm = AgentStartRearm::new(registry.pre_write_believed_agent_type(&agent_id));
+    rearm.note_payload_write(generation.is_none());
+    let mut refused_claim_logged = false;
+    loop {
+        let remaining = remaining_before(deadline);
+        if remaining.is_zero() {
+            // Reviewer finding B3, daemon side: a delivery that never found a
+            // producer capable of reporting a submitted prompt was not FAILED —
+            // nothing could ever have confirmed it — so it is logged as
+            // unconfirmable and reported nowhere. Reporting an error on a `cat`
+            // pane's card would be a false alarm on every hookless delivery.
+            if armed {
+                abandon_spawn_prompt(
+                    &registry,
+                    &pane_id,
+                    &agent_id,
+                    &delivery_id,
+                    attempt,
+                    generation.as_ref(),
+                );
+            } else {
+                log_prompt_unconfirmable(
+                    DELIVERY_LOG_PATH,
+                    &pane_id,
+                    &delivery_id,
+                    "this agent cannot report a submitted prompt, so nothing could confirm delivery",
+                );
+            }
+            return;
+        }
+        let window = unconfirmed_retry_delay(attempt).min(remaining);
+        match crate::state::wait_for_prompt_submission(
+            &mut rx,
+            &pane_id,
+            &agent_id,
+            &prompt,
+            &mut generation,
+            window,
+        )
+        .await
+        {
+            PromptWatch::Confirmed => {
+                log_prompt_confirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
+                return;
+            }
+            // Issue #424 D5: our prompt came back doubled with no separator, so
+            // a payload had been sitting in the input box and a later write
+            // appended to it. The agent has submitted it; a third copy is not
+            // recovery. Terminal, and logged apart from a clean confirmation.
+            PromptWatch::Accumulated => {
+                crate::prompt_delivery::log_prompt_accumulated(
+                    DELIVERY_LOG_PATH,
+                    &pane_id,
+                    &delivery_id,
+                    attempt,
+                );
+                return;
+            }
+            // Issue #424 F4: a producer that identifies itself only after our
+            // bytes were written has told us what it CLAIMS to be; it has not
+            // told us that our bytes went to it. It arms this delivery only on
+            // a pre-write statement about the pane — the pane's own launcher
+            // declaration, or (issue #570) the deck's own record of having
+            // spawned a known agent there. See `accepts_late_producer` above.
+            // Refusals are logged once, so a delivery that then holds to its
+            // deadline is diagnosable rather than mysterious.
+            PromptWatch::Elapsed {
+                can_report_prompts,
+                agent_start,
+            } => {
+                armed |= can_report_prompts && accepts_late_producer;
+                // Issue #666: the watch window saw a genuine, identity-matching,
+                // post-write `SessionStart`. That is facts G ∧ I ∧ W; the rearm
+                // adds S (standing, above), U (unbound at the last payload write)
+                // and T (this producer's start precedes its first prompt), and
+                // refuses unless all six hold.
+                if let Some((observed_at, declared)) = agent_start {
+                    rearm.observe_agent_start(observed_at, &declared);
+                }
+                if can_report_prompts && !armed && !refused_claim_logged {
+                    refused_claim_logged = true;
+                    log_prompt_unconfirmable(
+                        DELIVERY_LOG_PATH,
+                        &pane_id,
+                        &delivery_id,
+                        "a producer claimed a reporting agent only after the prompt was written, \
+                         and before it this pane neither declared a launcher handoff nor was \
+                         spawned by this daemon as a known agent; holding the write instead of \
+                         retyping into a target that may never report",
+                    );
+                }
+            }
+            // Reviewer findings B7/B8/B1: every one of these means the evidence
+            // or the target is gone. Stop — do not read missing evidence as
+            // permission to type the prompt again.
+            PromptWatch::Indeterminate => {
+                log_prompt_stopped(
+                    DELIVERY_LOG_PATH,
+                    &pane_id,
+                    &delivery_id,
+                    "lagged-event-stream",
+                );
+                return;
+            }
+            PromptWatch::Closed => {
+                log_prompt_stopped(
+                    DELIVERY_LOG_PATH,
+                    &pane_id,
+                    &delivery_id,
+                    "event-stream-closed",
+                );
+                return;
+            }
+            PromptWatch::TargetChanged { reason } => {
+                log_prompt_stopped(DELIVERY_LOG_PATH, &pane_id, &delivery_id, reason);
+                return;
+            }
+        }
+        // Reviewer finding B3, daemon side: capability is a property of the
+        // PRODUCER, not a verdict a 500 ms timeout may return. Nothing has
+        // identified itself yet, so the write stays PROVISIONAL — held, never
+        // retyped — and the next window asks again. Returning here (what this
+        // did) abandoned the watch half a second after the write while up to 59
+        // seconds of the deadline remained, so an agent booting behind a
+        // launcher had nobody left watching by the time it signalled: the exact
+        // silent loss issue #424 reports, re-created by its own capability gate.
+        // The cost is the mirror of the TUI's `ConfirmationCapability::Unknown`
+        // — a genuinely hookless pane holds a (timer-only) watch until the
+        // deadline instead of exiting after one window.
+        if !armed {
+            continue;
+        }
+        if remaining_before(deadline).is_zero() {
+            abandon_spawn_prompt(
+                &registry,
+                &pane_id,
+                &agent_id,
+                &delivery_id,
+                attempt,
+                generation.as_ref(),
+            );
+            return;
+        }
+        // Auditor HIGH (the unguarded event gap): the watch window above stopped
+        // reading the moment it expired, and everything between that instant and
+        // the write below used to be observed only on the NEXT window — i.e.
+        // after the stale retry had already landed. A `/clear` (or any
+        // end/start pair) that lands in this gap is caught here instead, under
+        // the same policy the window itself applies.
+        // Issue #424 F4: the gap drain's capability observation is post-write
+        // too, so it needs the same standing the window's does.
+        let mut gap_capability = false;
+        let mut gap_agent_start = None;
+        if let Some(reason) = drain_pre_write_events(
+            &mut rx,
+            &pane_id,
+            &agent_id,
+            &mut generation,
+            &mut gap_capability,
+            &mut gap_agent_start,
+        ) {
+            log_prompt_stopped(DELIVERY_LOG_PATH, &pane_id, &delivery_id, reason);
+            return;
+        }
+        armed |= gap_capability && accepts_late_producer;
+        // Issue #666: the gap between a window expiring and the write below is
+        // post-write too, so a start landing in it is the same evidence the
+        // window's is. Observed under the same rule rather than waiting a whole
+        // backoff step for the next window to see it.
+        if let Some((observed_at, declared)) = gap_agent_start {
+            rearm.observe_agent_start(observed_at, &declared);
+        }
+        log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
+        attempt = attempt.saturating_add(1);
+        // Issue #424 D5: after the one bounded replacement payload, later
+        // attempts PROBE SUBMISSION instead of typing the prompt in again — same
+        // guarded path, same writer serialization, same deadline, same
+        // partial-write classification, only an empty payload so the target
+        // receives just the delayed submit CR. See
+        // [`crate::prompt_delivery::attempt_writes_payload`].
+        //
+        // Issue #666: unless this delivery has ARMED — six facts, all of them
+        // pre-write standing or post-write producer evidence, one payload write
+        // per logical delivery, ever. See
+        // [`crate::prompt_delivery::AgentStartRearm`].
+        let now = Instant::now();
+        let writes_payload = crate::prompt_delivery::attempt_writes_payload(attempt, &rearm, now);
+        let spends_rearm = crate::prompt_delivery::attempt_spends_rearm(attempt, &rearm, now);
+        // Issue #424 F1 (auditor HIGH): a probe submits whatever the target is
+        // holding, so it is only meaningful while that is still OUR payload. The
+        // registry refuses it outright once the user has typed since the last
+        // automatic write — that check is the backstop for all three delivery
+        // paths — but this loop asks first so the delivery stops for the reason
+        // it actually stopped for, and REPORTS it on the pane's card. Without
+        // the report this would be exactly the failure #424 is about: a written,
+        // unconfirmed prompt that quietly stops being watched. There is nothing
+        // else to try — retyping the payload into a pane someone is typing in is
+        // strictly worse than stopping — so it is terminal, and the notice tells
+        // the user their pane holds an automatic prompt they never submitted.
+        //
+        // Issue #424 F1, replacement-payload half: the SAME stop applies to the
+        // one bounded replacement payload (attempt 2). Left unguarded it was the
+        // worse half of the finding — the probe merely submits the user's draft,
+        // whereas the replacement APPENDS our prompt to that draft and submits
+        // the pair as a single turn. The registry asks the byte-keyed question
+        // ("would this repeat what we already put in that box?"); this loop asks
+        // the same one, for the same reason it asks the probe's, so the stop is
+        // reported rather than surfacing as a bare `target went stale`.
+        //
+        // Issue #424 S1/S2 (both reviewers): the FIRST of the two questions
+        // below is this delivery's OWN — has user input reached this pane since
+        // MY first write — and it is the one that actually decides. It carries
+        // no pane-keyed state, no digest, nothing to release and nothing another
+        // delivery can disarm, so none of the shared-bookkeeping failures the
+        // reviewers found (a paste falsely draining the records, a concurrent
+        // same-byte delivery releasing this one's guard) can reach it. The
+        // registry's byte-keyed question is kept as the SECOND line: it is the
+        // only form of the rule the writer-held backstop can enforce for the two
+        // TUI paths, whose deliveries live in a different process with no way to
+        // hand their own clock across the wire. What this gives up is a retry
+        // after the user submits their own turn — the byte-keyed record can tell
+        // that the box was emptied, a timestamp cannot — and giving it up is the
+        // safe direction: the delivery stops and REPORTS, with the prompt
+        // visible in the box.
+        let user_typed_since_our_own_write = registry
+            .last_user_input_at(&pane_id)
+            .is_some_and(|typed| typed > watch_started_at);
+        let would_send_user_draft = user_typed_since_our_own_write
+            || if writes_payload {
+                registry.user_typed_since_writing_payload(&pane_id, &prompt)
+            } else {
+                registry.user_typed_since_automatic_write(&pane_id)
+            };
+        if would_send_user_draft {
+            report_user_input_stop(
+                &registry,
+                &pane_id,
+                &agent_id,
+                &delivery_id,
+                generation.as_ref(),
+            );
+            return;
+        }
+        let payload = if writes_payload { prompt.as_str() } else { "" };
+        // Issue #666, fact U for THIS write: read immediately before the write,
+        // so a generation the watch window latched since the last one is already
+        // reflected. A delivery whose agent had announced a conversation by the
+        // time we wrote had its bytes land in a live input box, and a later start
+        // must not authorize appending to them.
+        let unbound_at_write = generation.is_none();
+        match guarded_submit(&registry, &pane_id, &agent_id, payload, deadline).await {
+            GuardedOutcome::Written if writes_payload => {
+                // Issue #424 S2: the replacement left a SECOND record of these
+                // bytes on the pane. Take a holder for it here, at the write
+                // that created it, so this delivery releases exactly what it
+                // wrote and leaves nothing behind to refuse a later one.
+                //
+                // Issue #666: the ARMED write takes one too, in this same arm and
+                // for the same reason — it is a payload write like any other, and
+                // omitting it is #547 recreated on a new path (the record would
+                // outlive the task and refuse a later delivery of the same text
+                // until its TTL).
+                payload_records.push(PayloadRecordRelease {
+                    registry: &registry,
+                    pane_id: &pane_id,
+                    prompt: &prompt,
+                });
+                // Issue #666: recorded on the WRITE, not on the decision. This
+                // also clears any observation that armed it — evidence must
+                // postdate the bytes it is evidence about.
+                rearm.note_payload_write(unbound_at_write);
+                if spends_rearm {
+                    rearm.spend();
+                }
+                log_prompt_written(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt)
+            }
+            GuardedOutcome::Written => crate::prompt_delivery::log_prompt_probe_submitted(
+                DELIVERY_LOG_PATH,
+                &pane_id,
+                &delivery_id,
+                attempt,
+            ),
+            // Issue #424 H5: the user typed between the pre-check above and the
+            // writer-held backstop. Same terminal outcome, same report — the
+            // race the pre-check cannot cover is exactly the one the backstop
+            // covers, and it must not be the one that reports nothing.
+            GuardedOutcome::RefusedUserInput => {
+                report_user_input_stop(
+                    &registry,
+                    &pane_id,
+                    &agent_id,
+                    &delivery_id,
+                    generation.as_ref(),
+                );
+                return;
+            }
+            // The pane is gone (closed, exited, rebound) or the write must not
+            // be repeated — stop rather than burn the deadline retrying.
+            GuardedOutcome::Refused(reason) => {
+                log_prompt_stopped(DELIVERY_LOG_PATH, &pane_id, &delivery_id, reason);
+                return;
+            }
+            GuardedOutcome::Failed(e) => {
+                tracing::warn!(
+                    pane_id,
+                    delivery_id,
+                    error = %e,
+                    "prompt re-submission failed; giving up on confirmation"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Issue #424 H3: releases ONE payload write's record when its confirmation task
+/// ends, whichever of the many ways it ends. See the holders' construction in
+/// [`confirm_prompt_delivery`].
+///
+/// Issue #424 S2: one holder per write, not per delivery. Records are per write,
+/// so a delivery that wrote its payload twice holds two of these; and a delivery
+/// sharing its bytes with a concurrent one releases only its own unit of guard
+/// rather than disarming the other, which is what let a survivor's replacement
+/// land on top of an unsent draft and submit both.
+struct PayloadRecordRelease<'a> {
+    registry: &'a Arc<AgentPtyRegistry>,
+    pane_id: &'a str,
+    prompt: &'a str,
+}
+
+impl Drop for PayloadRecordRelease<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .note_payload_settled(self.pane_id, self.prompt);
+    }
+}
+
+/// Issue #424 F1/H5: stop this delivery because the pane's input box is no
+/// longer ours to submit, and REPORT it on the pane's card.
+///
+/// Reached from three places that are the same stop seen at different instants:
+/// the confirmation loop's own pre-check, the writer-held backstop's refusal a
+/// few microseconds later, and the first detached write. One function so they
+/// cannot drift into reporting differently — the backstop's silence was the
+/// whole of the finding.
+fn report_user_input_stop(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    agent_id: &str,
+    delivery_id: &str,
+    generation: Option<&(String, DateTime<Utc>)>,
+) {
+    log_prompt_stopped(
+        DELIVERY_LOG_PATH,
+        pane_id,
+        delivery_id,
+        "user-input-since-write",
+    );
+    registry.publish_delivery_notice(DeliveryNotice {
+        pane_id: pane_id.to_string(),
+        agent_id: agent_id.to_string(),
+        delivery_id: delivery_id.to_string(),
+        session_id: generation.map(|(id, _)| id.clone()),
+        detail: "a spawn-time prompt was written into this pane and never confirmed, but \
+                 you have typed into the pane since, so it was neither written again nor \
+                 submitted for you; the prompt may still be sitting unsent in the agent's \
+                 input box, above whatever you typed",
+    });
+}
+
+/// Issue #424 §4 / reviewer finding on diagnosability: abandon an unconfirmed
+/// spawn-time prompt LOUDLY.
+///
+/// The two TUI paths surface abandonment in the status bar, but this one is
+/// detached and has no caller left by the time the deadline arrives, so a
+/// `dispatch --single` whose prompt vanished was invisible in the default
+/// environment — `init_logging_from_env` installs a subscriber only when
+/// `DOT_AGENT_DECK_LOG` is set, which is exactly the diagnosability gap the
+/// issue is about.
+///
+/// Reviewer blocker 3 / auditor MEDIUM: the report is DAEMON-SIDE STATE on the
+/// pane's card, not bytes written into the agent's input buffer. The previous
+/// round wrote a one-line notice through `write_notice_guarded`; that
+/// primitive's own production contract says LF may be interpreted as Enter and
+/// that a later ordinary submit sends `notice + newline + user prompt` as a
+/// single turn (pinned by the passing
+/// `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`), so
+/// into a pane that may already hold swallowed seed bytes the diagnostic could
+/// itself become a task. PRD #249 is precedent for ACCEPTING that limitation in
+/// the orchestrator's pane, not evidence it is safe here. See
+/// [`DeliveryNotice`].
+///
+/// Now synchronous, which is the second half of reviewer finding B9: this used
+/// to `await` a writer lock with no timeout AFTER the absolute deadline had
+/// passed, so the registered task — and the cap slot it occupies — could outlive
+/// the one deadline that was supposed to bound the whole delivery.
+fn abandon_spawn_prompt(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    agent_id: &str,
+    delivery_id: &str,
+    attempts: u32,
+    generation: Option<&(String, DateTime<Utc>)>,
+) {
+    log_prompt_abandoned(DELIVERY_LOG_PATH, pane_id, delivery_id, attempts);
+    registry.publish_delivery_notice(DeliveryNotice {
+        pane_id: pane_id.to_string(),
+        agent_id: agent_id.to_string(),
+        delivery_id: delivery_id.to_string(),
+        session_id: generation.map(|(id, _)| id.clone()),
+        detail: "a spawn-time prompt was written into this pane but the agent never reported \
+                 submitting it within the delivery deadline; it may never have arrived — check \
+                 whether this pane was given any task at all (the daemon log names the delivery \
+                 id and the attempt count)",
+    });
+}
+
+/// Everything one detached confirmation loop needs, bundled so the loop's
+/// parameter list stays readable and the identity it is bound to travels as one
+/// value.
+struct ConfirmationTask {
+    pane_id: String,
+    agent_id: String,
+    prompt: String,
+    delivery_id: String,
+    /// The pane's hook session as last observed, with the timestamp that
+    /// established it. Latched pre-write and carried across every attempt so a
+    /// `/clear` between them is caught (reviewer findings B1/B2).
+    generation: Option<(String, DateTime<Utc>)>,
+    can_report_prompts: bool,
+    deadline: Instant,
+}
+
+/// Issue #424, reviewer finding B9 / auditor MEDIUM: the confirmation tasks
+/// currently holding a spawn-time prompt provisional, keyed by pane id.
+///
+/// Before this there was no cancellation handle at all: a closed pane, a
+/// rebound agent or a daemon shutdown was noticed only when a later write
+/// happened to fail, and repeated dispatch into one pane could accumulate
+/// tasks. This map gives all of that one home.
+static CONFIRMATION_TASKS: std::sync::LazyLock<Mutex<HashMap<String, tokio::task::AbortHandle>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Ceiling on concurrently-live confirmation tasks across the daemon.
+///
+/// The map is keyed by pane and single-flight per pane, and each task is bounded
+/// by [`AUTOMATIC_PROMPT_DEADLINE`], so this is not a work queue that can back
+/// up: it is exceeded only when more than this many DISTINCT panes are inside
+/// their delivery window at the same instant. That is a runaway backstop, and it
+/// is kept.
+///
+/// What is NOT kept is what exhaustion used to mean (reviewer HIGH / auditor
+/// LOW). The 257th prompt was written once and then simply not watched, with the
+/// only trace an info-level log line — silent under the default no-subscriber
+/// configuration — so the delivery that most needed #424's recovery was opted
+/// out of it invisibly. It is reachable by CONFIGURATION rather than by
+/// corruption: `issue_dispatch.max_per_run` has no upper bound and schedules can
+/// overlap. Exhaustion is now reported on the pane's own card through the same
+/// [`DeliveryNotice`] surface as an abandoned delivery, so "written but
+/// unwatched" is visible exactly where "written and abandoned" is.
+///
+/// The number itself is deliberately unchanged. Raising it does not remove the
+/// cliff, only move it; removing the cap trades a visible, bounded degradation
+/// for an unbounded task pile. With exhaustion now visible, 256 concurrent
+/// in-window panes is a threshold an operator can see and act on rather than a
+/// silent policy.
+const MAX_CONFIRMATION_TASKS: usize = 256;
+
+/// Start the detached confirmation loop for one pane, under a PER-PANE
+/// single-flight rule: a newer spawn-time prompt for the same pane cancels the
+/// older watch rather than racing it. Two loops on one pane would type two
+/// different prompts into it under two independent backoffs.
+fn spawn_confirmation_task(
+    registry: Arc<AgentPtyRegistry>,
+    rx: broadcast::Receiver<BroadcastMsg>,
+    task: ConfirmationTask,
+) {
+    let pane_id = task.pane_id.clone();
+    let delivery_id = task.delivery_id.clone();
+    let mut tasks = CONFIRMATION_TASKS.lock().unwrap();
+    // Reap finished watches here rather than having each task deregister
+    // itself: self-deregistration races its own registration (a fast task can
+    // finish before the handle is filed) and would leak the entry it could not
+    // find. `is_finished` needs no such coordination.
+    tasks.retain(|_, handle| !handle.is_finished());
+    if tasks.len() >= MAX_CONFIRMATION_TASKS && !tasks.contains_key(&pane_id) {
+        drop(tasks);
+        log_prompt_unconfirmable(
+            DELIVERY_LOG_PATH,
+            &pane_id,
+            &delivery_id,
+            "too many in-flight prompt confirmations; not watching this one",
+        );
+        // Reviewer HIGH: exhausting the cap silently opts the delivery out of
+        // the recovery this whole issue is about. Report it where an abandoned
+        // delivery is reported — see [`MAX_CONFIRMATION_TASKS`].
+        registry.publish_delivery_notice(DeliveryNotice {
+            pane_id: pane_id.clone(),
+            agent_id: task.agent_id.clone(),
+            delivery_id,
+            session_id: task.generation.as_ref().map(|(id, _)| id.clone()),
+            detail: "a spawn-time prompt was written into this pane but the daemon is already \
+                     watching its maximum number of unconfirmed deliveries, so this one is NOT \
+                     being confirmed or retried; check whether the pane acted on its task",
+        });
+        // Issue #424 H3 (reviewer's additional lifecycle gap): this delivery
+        // ends HERE, before `confirm_prompt_delivery` — and therefore before its
+        // RAII holder — ever exists, so the record its first write left has no
+        // owner and would survive to the TTL, refusing an unrelated later
+        // delivery of the same bytes. It will never be retried either, so
+        // release it on the same terminal path that reports it.
+        registry.note_payload_settled(&task.pane_id, &task.prompt);
+        return;
+    }
+    // Held across `tokio::spawn`, which is synchronous — no await, so a `std`
+    // mutex is safe here.
+    let handle = tokio::spawn(confirm_prompt_delivery(registry, rx, task));
+    if let Some(previous) = tasks.insert(pane_id, handle.abort_handle()) {
+        previous.abort();
+    }
+}
+
+/// Cancel the confirmation loop watching `pane_id`, if any. Called when the
+/// pane closes: the prompt's target no longer exists, so neither the retries
+/// nor the abandonment notice have anywhere to go.
+pub fn cancel_prompt_confirmation(pane_id: &str) {
+    if let Some(handle) = CONFIRMATION_TASKS.lock().unwrap().remove(pane_id) {
+        handle.abort();
+    }
+}
+
+/// Cancel every confirmation loop. Called on daemon shutdown, so a prompt watch
+/// cannot outlive the daemon that owns the PTY it is writing into.
+pub fn cancel_all_prompt_confirmations() {
+    let handles: Vec<_> = CONFIRMATION_TASKS
+        .lock()
+        .unwrap()
+        .drain()
+        .map(|(_, handle)| handle)
+        .collect();
+    for handle in handles {
+        handle.abort();
     }
 }
 
@@ -614,13 +2299,22 @@ fn surface_spawned_pane(
     pane_id: &str,
     cwd: &str,
     command: Option<&str>,
+    // Issue #308: the caller's resolved agent type for this pane, when it knows
+    // one the command cannot reveal (a role's `agent = "…"`). `None` derives
+    // from the command, as before. Without it a declared launcher role's
+    // freshly-surfaced card read "No agent" while the daemon registry already
+    // knew it was Codex, and the label only corrected itself on the pane's
+    // first real hook — the exact pre-first-task blankness this issue is about.
+    agent_type: Option<AgentType>,
     task_name: &str,
 ) {
     let mut metadata = HashMap::new();
     metadata.insert(DISPLAY_NAME_METADATA_KEY.to_string(), task_name.to_string());
     let event = AgentEvent {
         session_id: pane_id.to_string(),
-        agent_type: AgentType::from_command(command).unwrap_or(AgentType::None),
+        agent_type: agent_type
+            .or_else(|| AgentType::from_command(command))
+            .unwrap_or(AgentType::None),
         event_type: EventType::SessionStart,
         tool_name: None,
         tool_detail: None,
@@ -695,6 +2389,23 @@ fn surface_spawned_orchestration(
 /// A fresh, valid `DOT_AGENT_DECK_PANE_ID` for a spawned pane. Sanitizes the
 /// task name to the allowed charset and appends a monotonic counter (+ role
 /// index for orchestration panes) so concurrent fires never collide.
+///
+/// "Valid" means [`crate::agent_pty::is_valid_pane_id_env`] accepts it, and that
+/// includes the [`PANE_ID_ENV_MAX_LEN`] byte cap — which this function used to
+/// claim and not honour (issue #454). Schedule and dispatch task names have no
+/// length bound of their own, so a long one produced an over-long id that
+/// `AgentPtyRegistry::spawn_agent` refused to retain: the registry stored
+/// `pane_id_env = None` while the child was launched with the full value, and
+/// `ListAgents` could then never join the pane's live session onto its record.
+/// That is issue #454's exact symptom (`daemon status` showing `STATUS=- TOOL=-`
+/// and reconnect restoring `Idle`) surviving #454's fix, for every task whose
+/// name is long enough. `StopAgent` could not recover the id either, so each
+/// fire also leaked its per-pane daemon state.
+///
+/// The counter and role suffix carry the uniqueness, so it is the SANITIZED NAME
+/// that gets truncated — never the suffix. Two long task names sharing a prefix
+/// therefore produce ids that differ only in the counter, which is exactly what
+/// the counter is for.
 fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
     let n = PANE_COUNTER.fetch_add(1, Ordering::SeqCst);
     let sanitized: String = task_name
@@ -707,10 +2418,28 @@ fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
             }
         })
         .collect();
-    match role_index {
-        Some(idx) => format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}-{n}-r{idx}"),
-        None => format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}-{n}"),
-    }
+    let suffix = match role_index {
+        Some(idx) => format!("-{n}-r{idx}"),
+        None => format!("-{n}"),
+    };
+    // Every byte here is ASCII (the prefix is a literal, the counter and role
+    // index are decimal, and the sanitizer maps every non-`[A-Za-z0-9_-]` char
+    // to `-`), so a byte budget is also a char budget and truncating on it
+    // cannot split a code point.
+    let budget = crate::agent_pty::PANE_ID_ENV_MAX_LEN
+        .saturating_sub(SCHEDULE_PANE_ID_PREFIX.len() + suffix.len());
+    let sanitized = &sanitized[..sanitized.len().min(budget)];
+    let pane_id = format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}{suffix}");
+    // The budget can only underflow to zero if the fixed parts alone overflow
+    // the cap, which needs a ~50-digit counter — unreachable for a `u64` this
+    // process increments once per spawned pane. Asserted rather than truncated
+    // because truncating the SUFFIX is the one repair that would be worse than
+    // the problem: it is what makes two concurrent fires distinct.
+    debug_assert!(
+        crate::agent_pty::is_valid_pane_id_env(&pane_id),
+        "next_pane_id must produce a valid DOT_AGENT_DECK_PANE_ID: {pane_id:?}"
+    );
+    pane_id
 }
 
 // ---------------------------------------------------------------------------
@@ -846,6 +2575,12 @@ pub fn decide_delivery_capped(
 /// (instead of `spawn` directly) once `new_tab_per_fire` and the reuse registry
 /// are in play. The `spawn` primitive's signature is unchanged — reuse is
 /// daemon-side state layered on top.
+// One more than the lint's threshold, matching `spawn_one` above: these are the
+// daemon-wide handles a fire needs (registry, reuse map, notifier, broadcast,
+// AppState), each independently owned by the daemon. Bundling them into a struct
+// purely to satisfy the count would add an indirection every call site has to
+// build and no reader benefits from.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_or_reuse(
     req: SpawnRequest,
     new_tab_per_fire: bool,
@@ -854,6 +2589,7 @@ pub async fn spawn_or_reuse(
     notifier: &dyn Notifier,
     debounce: Duration,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
+    state: Option<&crate::state::SharedState>,
 ) -> Result<(), SpawnError> {
     // Snapshot the reuse decision under the lock (don't hold it across awaits).
     let decision = {
@@ -880,7 +2616,7 @@ pub async fn spawn_or_reuse(
             // #127 single-spawn keeps awaiting delivery (detach_delivery = false):
             // its callback has no rapid-refire-after-close concern and existing
             // tests expect the prior behavior.
-            let handle = spawn(req, registry, notifier, event_tx, false).await?;
+            let handle = spawn(req, registry, notifier, event_tx, false, state).await?;
             // Record the tab for reuse only when the task opts into reuse.
             if !new_tab_per_fire {
                 let entry = ReuseEntry {
@@ -936,6 +2672,1898 @@ async fn deliver_on_idle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use spec::spec;
+
+    fn prompt_watch_event(
+        pane_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        event_type: EventType,
+    ) -> AgentEvent {
+        typed_prompt_watch_event(
+            pane_id,
+            agent_id,
+            session_id,
+            event_type,
+            AgentType::ClaudeCode,
+            false,
+        )
+    }
+
+    fn typed_prompt_watch_event(
+        pane_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        event_type: EventType,
+        agent_type: AgentType,
+        wrapper_fork: bool,
+    ) -> AgentEvent {
+        let mut metadata = std::collections::HashMap::new();
+        if wrapper_fork {
+            metadata.insert(
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+            );
+        }
+        AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    fn spawn_shell_target(registry: &Arc<AgentPtyRegistry>, pane_id: &str) -> String {
+        let command = crate::platform::shell::fixed_command_shell("/bin/sh");
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&command),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell observation target")
+    }
+
+    fn spawn_byte_target(registry: &Arc<AgentPtyRegistry>, pane_id: &str) -> String {
+        spawn_typed_byte_target(registry, pane_id, None)
+    }
+
+    /// A hook endpoint with no listener, for the byte targets' children.
+    ///
+    /// Clearing the inherited endpoints (`crate::test_isolation`) stops a child
+    /// INHERITING a route to a real deck; it does not stop one RESOLVING it.
+    /// With the variable absent, [`crate::platform::paths::socket_path`] falls
+    /// back to `$XDG_RUNTIME_DIR/dot-agent-deck.sock` — the developer's live
+    /// daemon — so an emitting child reaches it either way, and `spawn`'s own
+    /// `env_remove` of the same variable cannot help. Pinning a path nothing
+    /// listens on makes the emit fail closed instead. These targets are bare
+    /// byte sinks that emit nothing at all, so this is belt to that braces: it
+    /// is what keeps the guarantee true for a fixture added later.
+    fn unreachable_hook_endpoint() -> String {
+        std::env::temp_dir()
+            .join(format!("dad-unit-no-listener-{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The same byte-observation target, carrying the
+    /// [`SpawnOptions::agent_type`] the deck itself decides at the spawn site
+    /// (issue #570). `None` is the hookless pane the deck can vouch for
+    /// nothing about; `Some(ClaudeCode)` is the `default_command = claude`
+    /// dispatch the deck exec'd on purpose. The PTY is a byte sink either way,
+    /// so the two differ in exactly the input under test.
+    ///
+    /// **The child is always a plain `/bin/cat`, whatever the type**, and a
+    /// Wrapper-strategy type is stamped onto the registry record afterwards
+    /// rather than declared at the spawn (issue #666 follow-up). Declared at the
+    /// spawn it would make `spawn` launch `dot-agent-deck wrap --agent codex --
+    /// /bin/cat` — a second real deck process between the PTY and the byte sink.
+    /// These fixtures measure raw bytes, and that process brings three things
+    /// none of them want: output of its own on the same PTY, an unbounded window
+    /// over which it forwards the sink's, and hook events it emits itself. The
+    /// belief under test is the pane's frozen
+    /// [`AgentPtyRegistry::pre_write_believed_agent_type`], which
+    /// [`AgentPtyRegistry::note_spawn_agent_type_for_test`] writes bit-for-bit
+    /// as the spawn would have; the spawn-site plumbing that computes it stays
+    /// covered by the types that are NOT wrapped and so still go through
+    /// `SpawnOptions::agent_type` for real.
+    fn spawn_typed_byte_target(
+        registry: &Arc<AgentPtyRegistry>,
+        pane_id: &str,
+        agent_type: Option<AgentType>,
+    ) -> String {
+        #[cfg(unix)]
+        let command = "/bin/cat";
+        #[cfg(windows)]
+        let command = "more.com";
+
+        let wrapped = agent_type.as_ref().is_some_and(|declared| {
+            crate::agent_registry::spec(declared).strategy
+                == Some(crate::agent_registry::IntegrationStrategy::Wrapper)
+        });
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(command),
+                env: vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string()),
+                    (
+                        crate::agent_pty::DOT_AGENT_DECK_SOCKET.to_string(),
+                        unreachable_hook_endpoint(),
+                    ),
+                ],
+                agent_type: if wrapped { None } else { agent_type.clone() },
+                ..SpawnOptions::default()
+            })
+            .expect("spawn byte-observation target");
+        if let Some(declared) = agent_type.filter(|_| wrapped) {
+            registry.note_spawn_agent_type_for_test(&agent_id, declared.clone());
+            assert_eq!(
+                registry.pre_write_believed_agent_type(&agent_id),
+                Some(declared),
+                "the stamped spawn record is the whole input under test here — a \
+                 target that did not take it is a different case wearing this \
+                 case's name"
+            );
+        }
+        agent_id
+    }
+
+    #[derive(Clone, Copy)]
+    enum Dispatch016Standing {
+        SpawnedClaude,
+        SpawnedCodex,
+        SpawnedOpenCode,
+        None,
+        LauncherHandoff,
+    }
+
+    struct Dispatch016RearmObservation {
+        attempt_three: Vec<u8>,
+        attempt_four: Option<Vec<u8>>,
+        after_replay: Option<Vec<u8>>,
+        replay_was_terminal: bool,
+    }
+
+    /// Complete lines the pane's byte target has produced so far — this
+    /// fixture's attempt clock, and it is made of CONTENT rather than of time.
+    ///
+    /// Every delivery attempt puts exactly TWO line terminators into the buffer,
+    /// whatever it decided to write. The line discipline echoes the payload and
+    /// the delayed submit CR back as one `<payload>\r\n`, and `/bin/cat` copies
+    /// the same line straight back as a second `<payload>\r\n`; a submit-only
+    /// probe writes no payload, so its two lines are simply `\r\n\r\n`. Nothing
+    /// else can reach this PTY — the target is a bare `/bin/cat` with no wrapper
+    /// in front of it, which is what `spawn_typed_byte_target` guarantees for
+    /// every type — so `2N` terminators means exactly "attempts 1..=N have
+    /// landed IN FULL", and the last byte any attempt produces is the `\n` that
+    /// makes its second one.
+    fn completed_lines(bytes: &[u8]) -> usize {
+        bytes.windows(2).filter(|window| *window == b"\r\n").count()
+    }
+
+    /// The bytes of delivery attempt `attempt`, sliced out of the accumulated
+    /// buffer by position: everything after that attempt's predecessor's last
+    /// line terminator, up to and including its own second one.
+    ///
+    /// Attempt 1 is the spawn-time write these fixtures deliberately do not make
+    /// — [`confirm_prompt_delivery`] is handed a delivery whose first write has
+    /// already happened elsewhere — so the first attempt to reach the target is
+    /// 2, and it owns lines 1 and 2.
+    ///
+    /// Callers must have established that the buffer holds at least the two
+    /// lines this attempt owns; [`wait_for_detached_delivery_attempt`] is what
+    /// establishes it.
+    fn attempt_slice(bytes: &[u8], attempt: usize) -> Vec<u8> {
+        let index = attempt.saturating_sub(1);
+        let line_ends: Vec<usize> = (0..bytes.len().saturating_sub(1))
+            .filter(|&at| &bytes[at..at + 2] == b"\r\n")
+            .map(|at| at + 2)
+            .collect();
+        assert!(
+            line_ends.len() >= 2 * index,
+            "attempt {attempt} is not complete in this buffer: {:?}",
+            String::from_utf8_lossy(bytes)
+        );
+        let start = if index >= 2 {
+            line_ends[2 * index - 3]
+        } else {
+            0
+        };
+        bytes[start..line_ends[2 * index - 1]].to_vec()
+    }
+
+    /// Block until delivery attempt `attempt` has landed IN FULL, and return the
+    /// whole buffer as it stood at that moment.
+    ///
+    /// The boundary between one attempt and the next is positional, and that is
+    /// the entire point: attempt N's bytes are whatever sits between the
+    /// `2N-2`-th and the `2N`-th line terminator (see [`completed_lines`]), and a
+    /// byte that arrives later can only ever append AFTER that slice. So the
+    /// answer does not depend on when this task is scheduled, on how loaded the
+    /// machine is, or on how long the target took to produce the bytes.
+    ///
+    /// That is what the quiet-period heuristic this replaces could not promise.
+    /// It returned once the output had been still for 250 ms with a trailing
+    /// CRLF, and under a loaded machine the rest of one attempt's output
+    /// routinely arrived after that and was charged to the NEXT attempt — which
+    /// reads a case that correctly PROBED as one that wrote a payload. That is
+    /// issue #666's `scheduler/dispatch/016` case G: a measurement artifact, not
+    /// a production write, and no threshold fixes it because there is no length
+    /// of quiet that a busy scheduler cannot exceed.
+    async fn wait_for_detached_delivery_attempt(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+        attempt: usize,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
+            if completed_lines(&snapshot) >= 2 * attempt.saturating_sub(1) {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for attempt {attempt} to land in full; snapshot={:?}",
+                String::from_utf8_lossy(&snapshot)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Block until `payload`'s own echo is visible on the target, i.e. until the
+    /// delivery's bytes are demonstrably out of the deck and into the PTY.
+    ///
+    /// Content-keyed for the same reason as the helpers above: the caller needs
+    /// an instant that is provably AFTER a specific write, and "the buffer grew"
+    /// only proves that if nothing else can put a byte there.
+    async fn wait_for_detached_payload_echo(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+        payload: &str,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
+            if snapshot
+                .windows(payload.len())
+                .any(|window| window == payload.as_bytes())
+            {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {payload} to reach the target; snapshot={:?}",
+                String::from_utf8_lossy(&snapshot)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn snapshot_delta(before: &[u8], after: &[u8]) -> Vec<u8> {
+        after.strip_prefix(before).unwrap_or(after).to_vec()
+    }
+
+    async fn observe_dispatch_016_rearm_case(
+        case: &str,
+        standing: Dispatch016Standing,
+        declared: AgentType,
+        observe_fourth: bool,
+        replay: bool,
+    ) -> Dispatch016RearmObservation {
+        const PROMPT: &str = "ISSUE-666-ARMED-THIRD-PAYLOAD";
+        let pane_id = format!("dispatch-016-rearm-{case}");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn_type = match standing {
+            Dispatch016Standing::SpawnedClaude => Some(AgentType::ClaudeCode),
+            Dispatch016Standing::SpawnedCodex => Some(AgentType::Codex),
+            Dispatch016Standing::SpawnedOpenCode => Some(AgentType::OpenCode),
+            Dispatch016Standing::None | Dispatch016Standing::LauncherHandoff => None,
+        };
+        let agent_id = spawn_typed_byte_target(&registry, &pane_id, spawn_type);
+
+        if matches!(standing, Dispatch016Standing::LauncherHandoff) {
+            #[cfg(unix)]
+            let unresolvable_command = "/bin/cat";
+            #[cfg(windows)]
+            let unresolvable_command = "more.com";
+            assert_eq!(
+                AgentType::from_command(Some(unresolvable_command)),
+                None,
+                "the launcher-standing case must use a command whose spawn type cannot vouch for it"
+            );
+            assert!(
+                !registry.agent_spawned_as_reporting_agent(&agent_id),
+                "launcher standing must not pass through the deck-spawn record"
+            );
+            let (standing_tx, mut standing_rx) = broadcast::channel(4);
+            standing_tx
+                .send(BroadcastMsg::Event(typed_prompt_watch_event(
+                    &pane_id,
+                    &agent_id,
+                    "pre-write-launcher",
+                    EventType::SessionStart,
+                    AgentType::ClaudeCode,
+                    true,
+                )))
+                .expect("send pre-write launcher handoff");
+            let observed = crate::state::wait_for_session_start(
+                &mut standing_rx,
+                &pane_id,
+                &agent_id,
+                Duration::from_millis(20),
+                // No upgrade window: this fixture posts a `wrapper_fork` start,
+                // which the gate SKIPS. Nothing here is a settled interface fact.
+                Duration::ZERO,
+            )
+            .await;
+            assert_eq!(
+                (observed.ready, observed.launcher_handoff.as_ref()),
+                (false, Some(&AgentType::ClaudeCode)),
+                "the wrapper_fork start must establish standing — carrying the type it \
+                 DECLARED, issue #666 — without satisfying readiness: {observed:?}"
+            );
+            registry.note_launcher_handoff(
+                &agent_id,
+                observed
+                    .launcher_handoff
+                    .clone()
+                    .expect("the pre-write declaration names a type"),
+            );
+        }
+
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let confirmation = tokio::spawn(confirm_prompt_delivery(
+            registry.clone(),
+            event_rx,
+            ConfirmationTask {
+                pane_id: pane_id.clone(),
+                agent_id: agent_id.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: format!("dispatch-016-rearm-{case}"),
+                generation: None,
+                // Retry capability is deliberately already known. Standing is
+                // varied independently and only decides whether the post-write
+                // start may authorize a payload rather than the ordinary probe.
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(12),
+            },
+        ));
+
+        // Attempt 2's payload write has reached the target. Announce the genuine
+        // post-write `SessionStart` HERE, on the payload's own echo rather than
+        // once the attempt has fully landed: the bytes are demonstrably out, so
+        // the event is post-write by construction, and sending it now keeps
+        // `REARM_READINESS_BUFFER`'s 500 ms margin against attempt 3 independent
+        // of how long the rest of this attempt's output takes to arrive.
+        wait_for_detached_payload_echo(&registry, &agent_id, PROMPT).await;
+        event_tx
+            .send(BroadcastMsg::Event(typed_prompt_watch_event(
+                &pane_id,
+                &agent_id,
+                "native-session",
+                EventType::SessionStart,
+                declared,
+                false,
+            )))
+            .expect("send genuine post-write SessionStart");
+        let after_attempt_three = wait_for_detached_delivery_attempt(&registry, &agent_id, 3).await;
+        let attempt_three = attempt_slice(&after_attempt_three, 3);
+
+        let mut attempt_four = None;
+        let mut after_replay = None;
+        let mut replay_was_terminal = false;
+        if observe_fourth {
+            let after_attempt_four =
+                wait_for_detached_delivery_attempt(&registry, &agent_id, 4).await;
+            attempt_four = Some(attempt_slice(&after_attempt_four, 4));
+        } else if replay {
+            event_tx
+                .send(BroadcastMsg::Event(typed_prompt_watch_event(
+                    &pane_id,
+                    &agent_id,
+                    "replayed-successor-session",
+                    EventType::SessionStart,
+                    AgentType::ClaudeCode,
+                    false,
+                )))
+                .expect("send replayed successor SessionStart");
+            replay_was_terminal = tokio::time::timeout(Duration::from_secs(1), confirmation)
+                .await
+                .expect("a second genuine generation must terminate the delivery")
+                .is_ok();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let after = registry
+                .snapshot(&agent_id)
+                .expect("post-replay byte target snapshot");
+            after_replay = Some(snapshot_delta(&after_attempt_three, &after));
+            drop(event_tx);
+            registry.shutdown_all();
+            return Dispatch016RearmObservation {
+                attempt_three,
+                attempt_four,
+                after_replay,
+                replay_was_terminal,
+            };
+        }
+
+        confirmation.abort();
+        let _ = confirmation.await;
+        drop(event_tx);
+        registry.shutdown_all();
+        Dispatch016RearmObservation {
+            attempt_three,
+            attempt_four,
+            after_replay,
+            replay_was_terminal,
+        }
+    }
+
+    async fn type_user_bytes(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+        pane_id: &str,
+        bytes: &[u8],
+    ) {
+        use std::io::Write as _;
+
+        let handle = registry
+            .subscribe(agent_id)
+            .expect("attach detached byte-observation target");
+        let mut writer = handle.writer.lock().await;
+        writer
+            .write_all(bytes)
+            .expect("write detached user input bytes");
+        writer.flush().expect("flush detached user input bytes");
+        drop(writer);
+        registry.note_user_input(pane_id);
+        tokio::time::sleep(Duration::from_millis(75)).await;
+    }
+
+    async fn type_user_draft(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+        pane_id: &str,
+        draft: &str,
+    ) {
+        type_user_bytes(registry, agent_id, pane_id, draft.as_bytes()).await;
+    }
+
+    struct UserFrameRetry {
+        outcome: GuardedSend,
+        before: Vec<u8>,
+        after: Vec<u8>,
+    }
+
+    async fn retry_after_user_frame(
+        pane_id: &str,
+        prompt: &str,
+        draft: &str,
+        frame: &[u8],
+    ) -> UserFrameRetry {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, pane_id);
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(pane_id, prompt, Some(&agent_id), || async { true })
+                .await
+                .expect("delivery before user newline control"),
+            GuardedSend::Applied
+        );
+        type_user_draft(&registry, &agent_id, pane_id, draft).await;
+        type_user_bytes(&registry, &agent_id, pane_id, frame).await;
+        let before = registry
+            .snapshot(&agent_id)
+            .expect("before newline-control retry snapshot");
+        assert!(
+            before
+                .windows(draft.len())
+                .any(|window| window == draft.as_bytes()),
+            "precondition: the unsent draft must physically reach the PTY before the retry; output={:?}",
+            String::from_utf8_lossy(&before)
+        );
+        let outcome = registry
+            .write_and_submit_guarded(pane_id, prompt, Some(&agent_id), || async { true })
+            .await
+            .expect("replacement after user newline control");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after = registry
+            .snapshot(&agent_id)
+            .expect("after newline-control retry snapshot");
+        registry.shutdown_all();
+        UserFrameRetry {
+            outcome,
+            before,
+            after,
+        }
+    }
+
+    /// Issue #424 D2 (both reviewers): a lagged PRE-WRITE / gap drain is
+    /// terminal.
+    ///
+    /// It used to `continue`, on the argument that the dropped frames cost only
+    /// the generation latch "which the watcher re-establishes". It does not:
+    /// `latch_generation` binds on a `SessionStart` alone, so if the only
+    /// end/start transition for this pane fell out of the ring, the surviving
+    /// ordinary frames announce nothing and the delivery keeps a binding whose
+    /// conversation is gone. That is target-revocation evidence being erased —
+    /// arrangeable on purpose by a same-user flood and by accident under load.
+    #[test]
+    fn a_lagged_pre_write_drain_is_terminal_rather_than_silently_continuing() {
+        const PANE_ID: &str = "lagged-drain-pane";
+        const AGENT_ID: &str = "lagged-drain-agent";
+
+        let (tx, mut rx) = broadcast::channel(2);
+        // Overflow the ring for this receiver, then leave one ordinary frame
+        // behind it — the shape where the transition is gone and only
+        // non-announcing frames remain.
+        for i in 0..4 {
+            let _ = tx.send(BroadcastMsg::Event(prompt_watch_event(
+                PANE_ID,
+                AGENT_ID,
+                &format!("successor-{i}"),
+                EventType::Thinking,
+            )));
+        }
+        let mut generation = Some(("original-generation".to_string(), Utc::now()));
+        let mut capability = false;
+        assert_eq!(
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut capability,
+                &mut None,
+            ),
+            Some("lagged-event-stream"),
+            "dropped frames may have carried the end/start this delivery needed to see"
+        );
+
+        // A drain that loses nothing still returns `None`, so the ordinary path
+        // is untouched.
+        let (tx, mut rx) = broadcast::channel(8);
+        let _ = tx.send(BroadcastMsg::Event(prompt_watch_event(
+            PANE_ID,
+            AGENT_ID,
+            "original-generation",
+            EventType::Thinking,
+        )));
+        let mut generation = Some(("original-generation".to_string(), Utc::now()));
+        let mut capability = false;
+        assert_eq!(
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut capability,
+                &mut None,
+            ),
+            None
+        );
+        assert!(capability, "an identified Claude frame proves the channel");
+    }
+
+    /// Issue #666, fact G: a `wrapper_fork`-origin `SessionStart` is NOT arming
+    /// evidence.
+    ///
+    /// The rearm is handed an instant and a declared type, never an event —
+    /// each delivery path observes producer evidence through a different
+    /// substrate — so G is filtered at the observation site. This pins the
+    /// daemon's gap-drain half of that filter; the watch-window half is pinned
+    /// end to end by `scheduler/dispatch/016` case D, whose pane declares a
+    /// launcher handoff and still needs a genuine start before it may arm.
+    ///
+    /// It matters because a launcher's boot-provenance start is emitted BEFORE
+    /// the agent exists by construction. Reading it as "the agent came up after
+    /// our bytes" would arm a rewrite on the very event that says the opposite.
+    #[test]
+    fn a_wrapper_fork_start_is_not_arming_evidence_for_the_rearm() {
+        const PANE_ID: &str = "rearm-fact-g-pane";
+        const AGENT_ID: &str = "rearm-fact-g-agent";
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let _ = tx.send(BroadcastMsg::Event(typed_prompt_watch_event(
+            PANE_ID,
+            AGENT_ID,
+            "launcher-boot",
+            EventType::SessionStart,
+            AgentType::ClaudeCode,
+            true,
+        )));
+        let mut generation = None;
+        let mut capability = false;
+        let mut agent_start = None;
+        assert_eq!(
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut capability,
+                &mut agent_start,
+            ),
+            None
+        );
+        assert!(
+            agent_start.is_none(),
+            "boot provenance says the real agent has NOT started; arming on it would \
+             authorize a rewrite on the one event that proves nothing about readiness"
+        );
+        assert!(
+            generation.is_none(),
+            "and it must not bind a generation either — that is the single handoff \
+             `latch_generation` permits"
+        );
+
+        // The genuine start that follows it IS the evidence, and it is the one
+        // the launcher-handoff population (`scheduler/dispatch/016` case D) waits
+        // for.
+        let _ = tx.send(BroadcastMsg::Event(typed_prompt_watch_event(
+            PANE_ID,
+            AGENT_ID,
+            "native-session",
+            EventType::SessionStart,
+            AgentType::ClaudeCode,
+            false,
+        )));
+        assert_eq!(
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut capability,
+                &mut agent_start,
+            ),
+            None
+        );
+        let (_, declared) = agent_start.expect("a genuine start is arming evidence");
+        assert_eq!(declared, AgentType::ClaudeCode);
+    }
+
+    /// Scenario: Hold detached spawn prompts in confirmation backoff while their target or evidence disappears, and verify every terminal, cancelled, or unauthenticated-capability watch finishes without stale retry bytes. Then vary deck-spawn standing and its trusted producer type, launcher-handoff standing, the event-declared producer type, attempt count, and generation replay around a genuine post-write start: only cases whose trusted and declared types both establish a pre-prompt Claude start may carry one additional payload, while controls receive bare submit probes or stop terminally.
+    #[spec("scheduler/dispatch/016")]
+    #[serial_test::serial(prompt_confirmation_tasks)]
+    #[tokio::test]
+    async fn dispatch_016_detached_retry_stops_before_replacement_or_clear() {
+        // Issue #666 follow-up: this test spawns panes and posts synthetic hook
+        // events, and it is a UNIT test — it never passes through
+        // `common::init_test_env()`, so nothing had cleared the deck endpoints
+        // this process inherited from the pane the suite was launched in. See
+        // `crate::test_isolation` for what that does and does not cover; the
+        // byte targets pin an unreachable endpoint of their own for the rest.
+        crate::test_isolation::detach_from_any_live_deck();
+        cancel_all_prompt_confirmations();
+        const PROMPT: &str = "DETACHED-STALE-PROMPT-MARKER";
+        const PANE_ID: &str = "detached-retry-rebind";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let original_id = spawn_shell_target(&registry, PANE_ID);
+        let (event_tx, event_rx) = broadcast::channel(8);
+        let confirmation = tokio::spawn(confirm_prompt_delivery(
+            registry.clone(),
+            event_rx,
+            ConfirmationTask {
+                pane_id: PANE_ID.to_string(),
+                agent_id: original_id.clone(),
+                prompt: PROMPT.to_string(),
+                delivery_id: "replacement-guard-test".into(),
+                generation: Some(("original-generation".into(), Utc::now())),
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+
+        // The first confirmation window is the deterministic blocked retry.
+        // Rebind while it is waiting, before the 500ms retry is resolved.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        registry
+            .close_agent(&original_id)
+            .expect("close original target");
+        let replacement_id = spawn_shell_target(&registry, PANE_ID);
+        tokio::time::timeout(Duration::from_secs(2), confirmation)
+            .await
+            .expect("replacement must terminate confirmation task")
+            .expect("confirmation task must not panic");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let replacement_output = registry
+            .snapshot(&replacement_id)
+            .expect("replacement snapshot");
+        assert!(
+            !replacement_output
+                .windows(PROMPT.len())
+                .any(|window| window == PROMPT.as_bytes()),
+            "a detached retry must send zero stale prompt bytes to a replacement agent; output={:?}",
+            String::from_utf8_lossy(&replacement_output)
+        );
+        drop(event_tx);
+        registry.shutdown_all();
+
+        const CLEAR_PANE_ID: &str = "detached-retry-clear";
+        let clear_registry = Arc::new(AgentPtyRegistry::new());
+        let clear_agent_id = spawn_shell_target(&clear_registry, CLEAR_PANE_ID);
+        let (clear_tx, clear_rx) = broadcast::channel(8);
+        let clear_confirmation = tokio::spawn(confirm_prompt_delivery(
+            clear_registry.clone(),
+            clear_rx,
+            ConfirmationTask {
+                pane_id: CLEAR_PANE_ID.to_string(),
+                agent_id: clear_agent_id.clone(),
+                prompt: PROMPT.to_string(),
+                delivery_id: "clear-generation-test".into(),
+                generation: Some(("bound-before-clear".into(), Utc::now())),
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+        clear_tx
+            .send(BroadcastMsg::Event(prompt_watch_event(
+                CLEAR_PANE_ID,
+                &clear_agent_id,
+                "bound-before-clear",
+                EventType::SessionEnd,
+            )))
+            .expect("send bound SessionEnd");
+        tokio::time::timeout(Duration::from_secs(1), clear_confirmation)
+            .await
+            .expect("SessionEnd must terminate confirmation task")
+            .expect("clear confirmation task must not panic");
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        let clear_output = clear_registry
+            .snapshot(&clear_agent_id)
+            .expect("same-agent snapshot");
+        assert!(
+            !clear_output
+                .windows(PROMPT.len())
+                .any(|window| window == PROMPT.as_bytes()),
+            "SessionEnd for the bound generation must stop before retry bytes reach the cleared conversation"
+        );
+        clear_registry.shutdown_all();
+
+        // A lagged stream may have dropped the real confirmation; a closed
+        // stream can never report one. Both are terminal and neither permits a
+        // retry after the ordinary 500 ms first window.
+        let stream_registry = Arc::new(AgentPtyRegistry::new());
+        let lagged_pane = "detached-retry-lagged";
+        let lagged_agent = spawn_byte_target(&stream_registry, lagged_pane);
+        let (lagged_tx, lagged_rx) = broadcast::channel(1);
+        lagged_tx
+            .send(BroadcastMsg::Event(prompt_watch_event(
+                "other-pane-a",
+                "other-agent",
+                "other-session-a",
+                EventType::Thinking,
+            )))
+            .expect("queue first event before lag");
+        lagged_tx
+            .send(BroadcastMsg::Event(prompt_watch_event(
+                "other-pane-b",
+                "other-agent",
+                "other-session-b",
+                EventType::Thinking,
+            )))
+            .expect("overflow confirmation receiver");
+        let lagged_confirmation = tokio::spawn(confirm_prompt_delivery(
+            stream_registry.clone(),
+            lagged_rx,
+            ConfirmationTask {
+                pane_id: lagged_pane.into(),
+                agent_id: lagged_agent.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: "lagged-stream-test".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), lagged_confirmation)
+            .await
+            .expect("lagged stream must terminate the confirmation watch")
+            .expect("lagged confirmation task must not panic");
+
+        let closed_pane = "detached-retry-closed";
+        let closed_agent = spawn_byte_target(&stream_registry, closed_pane);
+        let (closed_tx, closed_rx) = broadcast::channel(1);
+        drop(closed_tx);
+        let closed_confirmation = tokio::spawn(confirm_prompt_delivery(
+            stream_registry.clone(),
+            closed_rx,
+            ConfirmationTask {
+                pane_id: closed_pane.into(),
+                agent_id: closed_agent.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: "closed-stream-test".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), closed_confirmation)
+            .await
+            .expect("closed stream must terminate instead of spinning")
+            .expect("closed confirmation task must not panic");
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        for (agent_id, terminal) in [
+            (&lagged_agent, "Lagged must become terminal Indeterminate"),
+            (&closed_agent, "Closed must remain terminal"),
+        ] {
+            let output = stream_registry.snapshot(agent_id).expect("stream snapshot");
+            assert!(
+                !output
+                    .windows(PROMPT.len())
+                    .any(|window| window == PROMPT.as_bytes()),
+                "{terminal}; no retry bytes may follow: {:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        drop(lagged_tx);
+        stream_registry.shutdown_all();
+
+        // The registry-owned lifecycle: pane close aborts its watch, shutdown
+        // aborts all watches, and a newer prompt for one pane aborts the older
+        // flight before its first retry can land.
+        let managed_registry = Arc::new(AgentPtyRegistry::new());
+        let (managed_tx, _) = broadcast::channel(8);
+        let close_pane = "detached-close-cancel";
+        let close_agent = spawn_byte_target(&managed_registry, close_pane);
+        spawn_confirmation_task(
+            managed_registry.clone(),
+            managed_tx.subscribe(),
+            ConfirmationTask {
+                pane_id: close_pane.into(),
+                agent_id: close_agent.clone(),
+                prompt: "CLOSE-CANCELLED-OLD-PROMPT".into(),
+                delivery_id: "close-cancel-test".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        );
+        cancel_prompt_confirmation(close_pane);
+
+        let single_pane = "detached-single-flight";
+        let single_agent = spawn_byte_target(&managed_registry, single_pane);
+        spawn_confirmation_task(
+            managed_registry.clone(),
+            managed_tx.subscribe(),
+            ConfirmationTask {
+                pane_id: single_pane.into(),
+                agent_id: single_agent.clone(),
+                prompt: "SUPERSEDED-OLD-PROMPT".into(),
+                delivery_id: "single-flight-old".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        );
+        spawn_confirmation_task(
+            managed_registry.clone(),
+            managed_tx.subscribe(),
+            ConfirmationTask {
+                pane_id: single_pane.into(),
+                agent_id: single_agent.clone(),
+                prompt: "NEWER-PROMPT-HELD-WITHOUT-RETRY".into(),
+                delivery_id: "single-flight-new".into(),
+                generation: None,
+                can_report_prompts: false,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        );
+
+        let shutdown_panes = ["detached-shutdown-a", "detached-shutdown-b"];
+        let shutdown_agents = shutdown_panes.map(|pane_id| {
+            let agent_id = spawn_byte_target(&managed_registry, pane_id);
+            spawn_confirmation_task(
+                managed_registry.clone(),
+                managed_tx.subscribe(),
+                ConfirmationTask {
+                    pane_id: pane_id.into(),
+                    agent_id: agent_id.clone(),
+                    prompt: format!("SHUTDOWN-CANCELLED-{pane_id}"),
+                    delivery_id: format!("shutdown-cancel-{pane_id}"),
+                    generation: None,
+                    can_report_prompts: true,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                },
+            );
+            agent_id
+        });
+        cancel_all_prompt_confirmations();
+        tokio::time::sleep(Duration::from_millis(550)).await;
+
+        let close_output = managed_registry
+            .snapshot(&close_agent)
+            .expect("pane-close cancellation snapshot");
+        assert!(
+            !String::from_utf8_lossy(&close_output).contains("CLOSE-CANCELLED-OLD-PROMPT"),
+            "pane close must abort its confirmation task before retry bytes"
+        );
+        let single_output = managed_registry
+            .snapshot(&single_agent)
+            .expect("single-flight snapshot");
+        assert!(
+            !String::from_utf8_lossy(&single_output).contains("SUPERSEDED-OLD-PROMPT"),
+            "the newer same-pane watch must abort the older prompt before it retries"
+        );
+        for (pane_id, agent_id) in shutdown_panes.iter().zip(shutdown_agents.iter()) {
+            let output = managed_registry
+                .snapshot(agent_id)
+                .expect("daemon-shutdown cancellation snapshot");
+            assert!(
+                !String::from_utf8_lossy(&output).contains("SHUTDOWN-CANCELLED"),
+                "daemon shutdown must abort the watch for {pane_id} before retry bytes"
+            );
+        }
+        assert!(
+            CONFIRMATION_TASKS.lock().unwrap().is_empty(),
+            "daemon shutdown must drain the confirmation task registry"
+        );
+        drop(managed_tx);
+        managed_registry.shutdown_all();
+
+        // Auditor E4: the target is a hookless byte sink. A producer-controlled
+        // event that merely declares a reporting AgentType, with no
+        // `wrapper_fork` marker to trip the narrow exclusion, must not arm the
+        // detached retry loop.
+        const FORGED_PANE: &str = "unmarked-forged-detached-pane";
+        const FORGED_PROMPT: &str = "UNMARKED-FORGED-RETRY-MUST-NOT-LAND";
+        let forged_registry = Arc::new(AgentPtyRegistry::new());
+        let forged_agent = spawn_byte_target(&forged_registry, FORGED_PANE);
+        let (forged_tx, forged_rx) = broadcast::channel(8);
+        let forged_confirmation = tokio::spawn(confirm_prompt_delivery(
+            forged_registry.clone(),
+            forged_rx,
+            ConfirmationTask {
+                pane_id: FORGED_PANE.into(),
+                agent_id: forged_agent.clone(),
+                prompt: FORGED_PROMPT.into(),
+                delivery_id: "unmarked-forged-capability".into(),
+                generation: None,
+                can_report_prompts: false,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+        forged_tx
+            .send(BroadcastMsg::Event(prompt_watch_event(
+                FORGED_PANE,
+                &forged_agent,
+                "forged-unmarked-session",
+                EventType::SessionStart,
+            )))
+            .expect("send unmarked forged capability claim");
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let forged_output = forged_registry
+            .snapshot(&forged_agent)
+            .expect("forged capability target snapshot");
+        forged_confirmation.abort();
+        let _ = forged_confirmation.await;
+        drop(forged_tx);
+        forged_registry.shutdown_all();
+        assert!(
+            !forged_output
+                .windows(FORGED_PROMPT.len())
+                .any(|window| window == FORGED_PROMPT.as_bytes()),
+            "an unmarked producer assertion must not arm a full replacement payload on a hookless target; output={:?}",
+            String::from_utf8_lossy(&forged_output)
+        );
+
+        // Issue #570: the SAME late unmarked claim, on a pane the DECK ITSELF
+        // spawned with an agent type IT chose — `default_command = claude`, so
+        // `SpawnOptions::agent_type` said ClaudeCode before a byte was written.
+        // That is a pre-write declaration by the deck, not a producer
+        // assertion, and it is the standing the forged case above lacks. The
+        // two panes differ in exactly that one input: same `/bin/cat` byte
+        // sink, same `can_report_prompts: false`, same unmarked post-write
+        // `SessionStart`. Without it a daemon-spawned dispatch whose
+        // `SessionStart` lands after the readiness gate expired is written and
+        // never submitted — no retry ever fires, so nothing types the payload
+        // the agent would have to submit.
+        const SPAWNED_PANE: &str = "deck-spawned-late-claim-pane";
+        const SPAWNED_PROMPT: &str = "DECK-SPAWNED-LATE-CLAIM-MUST-STILL-RETRY";
+        let spawned_registry = Arc::new(AgentPtyRegistry::new());
+        let spawned_agent =
+            spawn_typed_byte_target(&spawned_registry, SPAWNED_PANE, Some(AgentType::ClaudeCode));
+        let (spawned_tx, spawned_rx) = broadcast::channel(8);
+        let spawned_confirmation = tokio::spawn(confirm_prompt_delivery(
+            spawned_registry.clone(),
+            spawned_rx,
+            ConfirmationTask {
+                pane_id: SPAWNED_PANE.into(),
+                agent_id: spawned_agent.clone(),
+                prompt: SPAWNED_PROMPT.into(),
+                delivery_id: "deck-spawned-late-capability".into(),
+                generation: None,
+                can_report_prompts: false,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+        spawned_tx
+            .send(BroadcastMsg::Event(prompt_watch_event(
+                SPAWNED_PANE,
+                &spawned_agent,
+                "late-native-session",
+                EventType::SessionStart,
+            )))
+            .expect("send late native capability claim");
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let spawned_output = spawned_registry
+            .snapshot(&spawned_agent)
+            .expect("deck-spawned target snapshot");
+        spawned_confirmation.abort();
+        let _ = spawned_confirmation.await;
+        drop(spawned_tx);
+        spawned_registry.shutdown_all();
+        assert!(
+            spawned_output
+                .windows(SPAWNED_PROMPT.len())
+                .any(|window| window == SPAWNED_PROMPT.as_bytes()),
+            "a producer identifying itself after the write must still arm the retry on a pane the deck spawned as a reporting agent, or the dispatch prompt is written and never submitted (#570); output={:?}",
+            String::from_utf8_lossy(&spawned_output)
+        );
+
+        // Issue #666, cases A-H. These run concurrently so the real PTY and
+        // production retry clocks cost one attempt-4 timeline rather than eight.
+        let (case_a, case_b, case_c, case_d, case_e, case_f, case_g, case_h) = tokio::join!(
+            observe_dispatch_016_rearm_case(
+                "a-spawned-Claude",
+                Dispatch016Standing::SpawnedClaude,
+                AgentType::ClaudeCode,
+                false,
+                false,
+            ),
+            observe_dispatch_016_rearm_case(
+                "b-no-standing",
+                Dispatch016Standing::None,
+                AgentType::ClaudeCode,
+                false,
+                false,
+            ),
+            observe_dispatch_016_rearm_case(
+                "c-Codex",
+                Dispatch016Standing::SpawnedClaude,
+                AgentType::Codex,
+                false,
+                false,
+            ),
+            observe_dispatch_016_rearm_case(
+                "d-launcher-handoff",
+                Dispatch016Standing::LauncherHandoff,
+                AgentType::ClaudeCode,
+                false,
+                false,
+            ),
+            observe_dispatch_016_rearm_case(
+                "e-one-shot",
+                Dispatch016Standing::SpawnedClaude,
+                AgentType::ClaudeCode,
+                true,
+                false,
+            ),
+            observe_dispatch_016_rearm_case(
+                "f-replay-terminal",
+                Dispatch016Standing::SpawnedClaude,
+                AgentType::ClaudeCode,
+                false,
+                true,
+            ),
+            observe_dispatch_016_rearm_case(
+                "g-spawned-Codex-declared-Claude",
+                Dispatch016Standing::SpawnedCodex,
+                AgentType::ClaudeCode,
+                false,
+                false,
+            ),
+            observe_dispatch_016_rearm_case(
+                "h-spawned-OpenCode-declared-Claude",
+                Dispatch016Standing::SpawnedOpenCode,
+                AgentType::ClaudeCode,
+                false,
+                false,
+            ),
+        );
+
+        let contains_prompt = |bytes: &[u8]| {
+            bytes
+                .windows("ISSUE-666-ARMED-THIRD-PAYLOAD".len())
+                .any(|window| window == b"ISSUE-666-ARMED-THIRD-PAYLOAD")
+        };
+        let bare_submit = |bytes: &[u8]| !bytes.is_empty() && !contains_prompt(bytes);
+        let show =
+            |bytes: &[u8]| format!("bytes={bytes:?}, text={:?}", String::from_utf8_lossy(bytes));
+        let mut rearm_failures = Vec::new();
+        if !contains_prompt(&case_a.attempt_three) {
+            rearm_failures.push(format!(
+                "A/spawned-Claude: attempt 3 must contain the prompt; {}",
+                show(&case_a.attempt_three)
+            ));
+        }
+        if !bare_submit(&case_b.attempt_three) {
+            rearm_failures.push(format!(
+                "B/no-standing: attempt 3 must be a bare submit only; {}",
+                show(&case_b.attempt_three)
+            ));
+        }
+        if !bare_submit(&case_c.attempt_three) {
+            rearm_failures.push(format!(
+                "C/Codex: attempt 3 must be a bare submit only; {}",
+                show(&case_c.attempt_three)
+            ));
+        }
+        if !contains_prompt(&case_d.attempt_three) {
+            rearm_failures.push(format!(
+                "D/launcher-handoff: attempt 3 must contain the prompt; {}",
+                show(&case_d.attempt_three)
+            ));
+        }
+        if !case_e.attempt_four.as_deref().is_some_and(&bare_submit) {
+            rearm_failures.push(format!(
+                "E/one-shot: attempt 4 must return to a bare submit only; {}",
+                case_e
+                    .attempt_four
+                    .as_deref()
+                    .map(&show)
+                    .unwrap_or_else(|| "no attempt 4 bytes".to_string())
+            ));
+        }
+        if !case_f.replay_was_terminal
+            || case_f
+                .after_replay
+                .as_deref()
+                .is_none_or(|bytes| !bytes.is_empty())
+        {
+            rearm_failures.push(format!(
+                "F/replay-terminal: a second genuine generation must finish the task with no later bytes; terminal={}, after_replay={}",
+                case_f.replay_was_terminal,
+                case_f
+                    .after_replay
+                    .as_deref()
+                    .map(&show)
+                    .unwrap_or_else(|| "not observed".to_string())
+            ));
+        }
+        if !bare_submit(&case_g.attempt_three) {
+            rearm_failures.push(format!(
+                "G/spawned-Codex-declared-Claude: attempt 3 must be a bare submit only; {}",
+                show(&case_g.attempt_three)
+            ));
+        }
+        if !bare_submit(&case_h.attempt_three) {
+            rearm_failures.push(format!(
+                "H/spawned-OpenCode-declared-Claude: attempt 3 must be a bare submit only; {}",
+                show(&case_h.attempt_three)
+            ));
+        }
+        assert!(
+            rearm_failures.is_empty(),
+            "scheduler/dispatch/016 issue #666 mismatches:\n{}",
+            rearm_failures.join("\n")
+        );
+    }
+
+    /// Scenario: Deliver a detached spawn prompt, type an unsent user draft before the replacement payload is due, and independently type another draft after the replacement but before the submit-only probe. In both timelines the next automatic attempt must send no bytes, so it neither appends its payload nor submits the user's draft.
+    #[spec("scheduler/dispatch/018")]
+    #[tokio::test]
+    async fn dispatch_018_user_input_disarms_detached_submit_probe() {
+        const PANE_ID: &str = "detached-user-draft-pane";
+        const PROMPT: &str = "AUTOMATIC-PROMPT-BEFORE-USER-DRAFT";
+        const USER_DRAFT: &str = "detached draft deliberately left unsent";
+
+        const REPLACEMENT_PANE_ID: &str = "detached-draft-before-replacement-pane";
+        const REPLACEMENT_PROMPT: &str = "AUTOMATIC-PROMPT-BEFORE-REPLACEMENT-GUARD";
+        const REPLACEMENT_DRAFT: &str = "detached draft before replacement payload";
+
+        let replacement_registry = Arc::new(AgentPtyRegistry::new());
+        let replacement_agent = spawn_byte_target(&replacement_registry, REPLACEMENT_PANE_ID);
+        let initial = replacement_registry
+            .write_and_submit_guarded(
+                REPLACEMENT_PANE_ID,
+                REPLACEMENT_PROMPT,
+                Some(&replacement_agent),
+                || async { true },
+            )
+            .await
+            .expect("attempt 1 guarded delivery");
+        assert_eq!(
+            initial,
+            GuardedSend::Applied,
+            "attempt 1 must never be refused before an automatic write timestamp exists"
+        );
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_initial_delivery = replacement_registry
+            .snapshot(&replacement_agent)
+            .expect("initial detached delivery snapshot");
+        assert!(
+            after_initial_delivery
+                .windows(REPLACEMENT_PROMPT.len())
+                .any(|window| window == REPLACEMENT_PROMPT.as_bytes()),
+            "precondition: attempt 1 must physically reach the detached pane; output={:?}",
+            String::from_utf8_lossy(&after_initial_delivery)
+        );
+
+        type_user_draft(
+            &replacement_registry,
+            &replacement_agent,
+            REPLACEMENT_PANE_ID,
+            REPLACEMENT_DRAFT,
+        )
+        .await;
+        let before_replacement = replacement_registry
+            .snapshot(&replacement_agent)
+            .expect("pre-replacement detached snapshot");
+        assert!(
+            before_replacement
+                .windows(REPLACEMENT_DRAFT.len())
+                .any(|window| window == REPLACEMENT_DRAFT.as_bytes()),
+            "precondition: the unsent user draft must physically reach the detached PTY; output={:?}",
+            String::from_utf8_lossy(&before_replacement)
+        );
+
+        let (replacement_tx, replacement_rx) = broadcast::channel(8);
+        let replacement_confirmation = tokio::spawn(confirm_prompt_delivery(
+            replacement_registry.clone(),
+            replacement_rx,
+            ConfirmationTask {
+                pane_id: REPLACEMENT_PANE_ID.into(),
+                agent_id: replacement_agent.clone(),
+                prompt: REPLACEMENT_PROMPT.into(),
+                delivery_id: "detached-replacement-user-draft-safety".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let after_replacement = replacement_registry
+            .snapshot(&replacement_agent)
+            .expect("post-replacement detached snapshot");
+
+        replacement_confirmation.abort();
+        let _ = replacement_confirmation.await;
+        drop(replacement_tx);
+        replacement_registry.shutdown_all();
+        assert_eq!(
+            after_replacement,
+            before_replacement,
+            "detached attempt 2 must append no replacement payload and send no submit CR after user input; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_replacement),
+            String::from_utf8_lossy(&after_replacement)
+        );
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
+        let (event_tx, event_rx) = broadcast::channel(8);
+        let confirmation = tokio::spawn(confirm_prompt_delivery(
+            registry.clone(),
+            event_rx,
+            ConfirmationTask {
+                pane_id: PANE_ID.into(),
+                agent_id: agent_id.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: "detached-user-draft-safety".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(4),
+            },
+        ));
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let before_user_input = registry
+            .snapshot(&agent_id)
+            .expect("replacement payload snapshot");
+        assert!(
+            before_user_input
+                .windows(PROMPT.len())
+                .any(|window| window == PROMPT.as_bytes()),
+            "precondition: attempt 2 must have reached the byte target before the user types"
+        );
+
+        type_user_draft(&registry, &agent_id, PANE_ID, USER_DRAFT).await;
+        let before_probe = registry
+            .snapshot(&agent_id)
+            .expect("pre-probe pane snapshot");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let after_probe = registry
+            .snapshot(&agent_id)
+            .expect("post-probe pane snapshot");
+
+        confirmation.abort();
+        let _ = confirmation.await;
+        drop(event_tx);
+        registry.shutdown_all();
+        assert_eq!(
+            after_probe,
+            before_probe,
+            "a detached retry must send no submit CR after user input was recorded; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_probe),
+            String::from_utf8_lossy(&after_probe)
+        );
+    }
+
+    /// Scenario: Queue an automatic replacement behind the same writer that is forwarding an attached user's unsent draft, then release the writer without stamping the user-input clock. The queued retry must not append or submit anything before that clock stamp can run.
+    #[spec("scheduler/dispatch/019")]
+    #[tokio::test]
+    async fn dispatch_019_writer_release_does_not_expose_unstamped_user_input() {
+        use std::io::Write as _;
+
+        const PANE_ID: &str = "writer-release-clock-race-pane";
+        const PROMPT: &str = "automatic payload already delivered once";
+        const USER_DRAFT: &str = "attached user draft left unsent";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .await
+                .expect("initial guarded delivery"),
+            GuardedSend::Applied
+        );
+
+        let handle = registry
+            .subscribe(&agent_id)
+            .expect("attach byte-observation target");
+        let mut user_writer = handle.writer.lock().await;
+        let retry_registry = registry.clone();
+        let retry_agent = agent_id.clone();
+        let retry = tokio::spawn(async move {
+            retry_registry
+                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&retry_agent), || async { true })
+                .await
+                .expect("queued guarded replacement")
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !retry.is_finished(),
+            "precondition: the replacement must be queued behind the attached user's writer"
+        );
+
+        user_writer
+            .write_all(USER_DRAFT.as_bytes())
+            .expect("forward unsent attached user draft");
+        user_writer
+            .flush()
+            .expect("flush unsent attached user draft");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let before_writer_release = registry.snapshot(&agent_id).expect("pre-release snapshot");
+        assert!(
+            before_writer_release
+                .windows(USER_DRAFT.len())
+                .any(|window| window == USER_DRAFT.as_bytes()),
+            "precondition: the user's unsent bytes must already be physically visible before the clock stamp; output={:?}",
+            String::from_utf8_lossy(&before_writer_release)
+        );
+
+        // Exact production ordering under test: STREAM_IN drops the pane writer,
+        // then stamps `user_input_at`. Awaiting the already-queued replacement
+        // before stamping forces it to own that handoff window; there is no
+        // scheduler timing by which this fixture can stamp the clock first.
+        drop(user_writer);
+        let retry_outcome = retry.await.expect("queued replacement task");
+        registry.note_user_input(PANE_ID);
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_clock_stamp = registry.snapshot(&agent_id).expect("post-race snapshot");
+
+        registry.shutdown_all();
+        assert_eq!(
+            retry_outcome,
+            GuardedSend::Stale,
+            "a replacement that acquires the writer after user bytes but before their clock stamp must be refused"
+        );
+        assert_eq!(
+            after_clock_stamp,
+            before_writer_release,
+            "the writer-to-clock handoff must not let a retry append its payload or submit the user's draft; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_writer_release),
+            String::from_utf8_lossy(&after_clock_stamp)
+        );
+    }
+
+    /// Scenario: Exercise later, overlapping, and retried automatic deliveries against real byte-observation PTYs, including bracketed paste, production-encoded Ctrl+J and Alt+Enter newlines, plain Enter, and two active same-text owners. Completed work and a submitted turn may admit a later write, but non-submitting editor controls must leave an automatic retry unable to append to or submit the user's draft.
+    #[spec("scheduler/dispatch/020")]
+    #[tokio::test]
+    async fn dispatch_020_payload_guards_are_scoped_to_one_delivery() {
+        const SAME_PANE: &str = "later-same-payload-pane";
+        const SAME_PROMPT: &str = "fixed worker task pointer";
+
+        let same_registry = Arc::new(AgentPtyRegistry::new());
+        let same_agent = spawn_byte_target(&same_registry, SAME_PANE);
+        assert_eq!(
+            same_registry
+                .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, Some(&same_agent), || async {
+                    true
+                })
+                .await
+                .expect("delivery A"),
+            GuardedSend::Applied
+        );
+        type_user_draft(
+            &same_registry,
+            &same_agent,
+            SAME_PANE,
+            "user completed an unrelated turn\r",
+        )
+        .await;
+        let before_delivery_b = same_registry
+            .snapshot(&same_agent)
+            .expect("before delivery B snapshot");
+        let delivery_b = same_registry
+            .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, Some(&same_agent), || async { true })
+            .await
+            .expect("delivery B first attempt");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_delivery_b = same_registry
+            .snapshot(&same_agent)
+            .expect("after delivery B snapshot");
+
+        const REPLACED_PANE: &str = "different-submit-replaces-digest-pane";
+        const DELIVERY_A: &str = "older delivery payload A";
+        const DELIVERY_B: &str = "independent delivery payload B";
+        let replaced_registry = Arc::new(AgentPtyRegistry::new());
+        let replaced_agent = spawn_byte_target(&replaced_registry, REPLACED_PANE);
+        assert_eq!(
+            replaced_registry
+                .write_and_submit_guarded(
+                    REPLACED_PANE,
+                    DELIVERY_A,
+                    Some(&replaced_agent),
+                    || async { true },
+                )
+                .await
+                .expect("delivery A first attempt"),
+            GuardedSend::Applied
+        );
+        type_user_draft(
+            &replaced_registry,
+            &replaced_agent,
+            REPLACED_PANE,
+            "draft that invalidates delivery A",
+        )
+        .await;
+        assert_eq!(
+            replaced_registry
+                .write_and_submit_guarded(
+                    REPLACED_PANE,
+                    DELIVERY_B,
+                    Some(&replaced_agent),
+                    || async { true },
+                )
+                .await
+                .expect("independent delivery B"),
+            GuardedSend::Applied,
+            "precondition: the different guarded submit must replace the pane-global payload slot"
+        );
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let before_delivery_a_retry = replaced_registry
+            .snapshot(&replaced_agent)
+            .expect("before delivery A retry snapshot");
+        let delivery_a_retry = replaced_registry
+            .write_and_submit_guarded(REPLACED_PANE, DELIVERY_A, Some(&replaced_agent), || async {
+                true
+            })
+            .await
+            .expect("delivery A replacement");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_delivery_a_retry = replaced_registry
+            .snapshot(&replaced_agent)
+            .expect("after delivery A retry snapshot");
+
+        const PASTE_PANE: &str = "bracketed-multiline-draft-pane";
+        const PASTE_PROMPT: &str = "automatic payload before bracketed paste";
+        const BRACKETED_DRAFT: &str =
+            "\x1b[200~first line of an unsent draft\nsecond line of an unsent draft\x1b[201~";
+        let paste_registry = Arc::new(AgentPtyRegistry::new());
+        let paste_agent = spawn_byte_target(&paste_registry, PASTE_PANE);
+        assert_eq!(
+            paste_registry
+                .write_and_submit_guarded(PASTE_PANE, PASTE_PROMPT, Some(&paste_agent), || async {
+                    true
+                },)
+                .await
+                .expect("delivery before bracketed paste"),
+            GuardedSend::Applied
+        );
+        type_user_draft(&paste_registry, &paste_agent, PASTE_PANE, BRACKETED_DRAFT).await;
+        let before_paste_retry = paste_registry
+            .snapshot(&paste_agent)
+            .expect("before bracketed-paste retry snapshot");
+        assert!(
+            before_paste_retry
+                .windows(b"first line of an unsent draft".len())
+                .any(|window| window == b"first line of an unsent draft")
+                && before_paste_retry
+                    .windows(b"second line".len())
+                    .any(|window| window == b"second line"),
+            "precondition: the production-shaped bracketed multiline paste must physically reach the PTY; output={:?}",
+            String::from_utf8_lossy(&before_paste_retry)
+        );
+        let paste_retry = paste_registry
+            .write_and_submit_guarded(PASTE_PANE, PASTE_PROMPT, Some(&paste_agent), || async {
+                true
+            })
+            .await
+            .expect("replacement after bracketed paste");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_paste_retry = paste_registry
+            .snapshot(&paste_agent)
+            .expect("after bracketed-paste retry snapshot");
+
+        let ctrl_j_frame = crate::ui::keyevent_to_bytes_for_test(&KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL,
+        ))
+        .expect("production Ctrl+J encoding");
+        let ctrl_j_retry = retry_after_user_frame(
+            "ctrl-j-unsent-draft-pane",
+            "automatic payload before Ctrl+J",
+            "draft extended with a Ctrl+J newline",
+            &ctrl_j_frame,
+        )
+        .await;
+
+        let alt_enter_frame = crate::ui::keyevent_to_bytes_for_test(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::ALT,
+        ))
+        .expect("production Alt+Enter encoding");
+        let alt_enter_retry = retry_after_user_frame(
+            "alt-enter-unsent-draft-pane",
+            "automatic payload before Alt+Enter",
+            "Claude draft extended with an Alt+Enter newline",
+            &alt_enter_frame,
+        )
+        .await;
+
+        let plain_enter_frame = crate::ui::keyevent_to_bytes_for_test(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))
+        .expect("production plain Enter encoding");
+        let plain_enter_retry = retry_after_user_frame(
+            "plain-enter-submitted-pane",
+            "automatic payload before plain Enter",
+            "user turn completed with plain Enter",
+            &plain_enter_frame,
+        )
+        .await;
+        assert!(
+            plain_enter_retry.outcome == GuardedSend::Applied
+                && plain_enter_retry.after.len() > plain_enter_retry.before.len(),
+            "positive control: a genuine plain Enter must drain the completed turn and admit the later automatic payload; outcome={:?}, before={:?}, after={:?}",
+            plain_enter_retry.outcome,
+            String::from_utf8_lossy(&plain_enter_retry.before),
+            String::from_utf8_lossy(&plain_enter_retry.after)
+        );
+
+        const OVERLAP_PANE: &str = "overlapping-same-payload-pane";
+        const OVERLAP_PROMPT: &str = "same payload owned by two active deliveries";
+        const OVERLAP_DRAFT: &str = "user draft after delivery A was superseded";
+        let overlap_registry = Arc::new(AgentPtyRegistry::new());
+        let overlap_agent = spawn_byte_target(&overlap_registry, OVERLAP_PANE);
+        assert_eq!(
+            overlap_registry
+                .write_and_submit_guarded(
+                    OVERLAP_PANE,
+                    OVERLAP_PROMPT,
+                    Some(&overlap_agent),
+                    || async { true },
+                )
+                .await
+                .expect("overlapping delivery A first write"),
+            GuardedSend::Applied
+        );
+        let delivery_a_release = PayloadRecordRelease {
+            registry: &overlap_registry,
+            pane_id: OVERLAP_PANE,
+            prompt: OVERLAP_PROMPT,
+        };
+        assert_eq!(
+            overlap_registry
+                .write_and_submit_guarded(
+                    OVERLAP_PANE,
+                    OVERLAP_PROMPT,
+                    Some(&overlap_agent),
+                    || async { true },
+                )
+                .await
+                .expect("overlapping delivery B first write"),
+            GuardedSend::Applied
+        );
+        let delivery_b_release = PayloadRecordRelease {
+            registry: &overlap_registry,
+            pane_id: OVERLAP_PANE,
+            prompt: OVERLAP_PROMPT,
+        };
+        // The production single-flight replacement aborts A after B has
+        // refreshed its same-byte write. Dropping A's real release owner here
+        // forces that ordering without leaving it to task-scheduler timing.
+        drop(delivery_a_release);
+        type_user_draft(
+            &overlap_registry,
+            &overlap_agent,
+            OVERLAP_PANE,
+            OVERLAP_DRAFT,
+        )
+        .await;
+        let before_overlap_retry = overlap_registry
+            .snapshot(&overlap_agent)
+            .expect("before surviving delivery retry snapshot");
+        let overlap_retry = overlap_registry
+            .write_and_submit_guarded(
+                OVERLAP_PANE,
+                OVERLAP_PROMPT,
+                Some(&overlap_agent),
+                || async { true },
+            )
+            .await
+            .expect("surviving delivery B replacement");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_overlap_retry = overlap_registry
+            .snapshot(&overlap_agent)
+            .expect("after surviving delivery retry snapshot");
+        drop(delivery_b_release);
+
+        same_registry.shutdown_all();
+        replaced_registry.shutdown_all();
+        paste_registry.shutdown_all();
+        overlap_registry.shutdown_all();
+        assert!(
+            delivery_b == GuardedSend::Applied
+                && after_delivery_b.len() > before_delivery_b.len()
+                && delivery_a_retry == GuardedSend::Stale
+                && after_delivery_a_retry == before_delivery_a_retry
+                && after_paste_retry == before_paste_retry
+                && ctrl_j_retry.after == ctrl_j_retry.before
+                && alt_enter_retry.after == alt_enter_retry.before
+                && after_overlap_retry == before_overlap_retry,
+            "payload safety must be scoped by logical delivery and preserve unsent drafts: later_same_payload={{outcome: {delivery_b:?}, before_len: {}, after_len: {}}}; older_retry_after_different_submit={{outcome: {delivery_a_retry:?}, before_len: {}, after_len: {}}}; bracketed_multiline_paste={{outcome: {paste_retry:?}, before: {:?}, after: {:?}}}; ctrl_j_newline={{outcome: {:?}, before: {:?}, after: {:?}}}; alt_enter_newline={{outcome: {:?}, before: {:?}, after: {:?}}}; overlapping_same_payload={{outcome: {overlap_retry:?}, before: {:?}, after: {:?}}}",
+            before_delivery_b.len(),
+            after_delivery_b.len(),
+            before_delivery_a_retry.len(),
+            after_delivery_a_retry.len(),
+            String::from_utf8_lossy(&before_paste_retry),
+            String::from_utf8_lossy(&after_paste_retry),
+            ctrl_j_retry.outcome,
+            String::from_utf8_lossy(&ctrl_j_retry.before),
+            String::from_utf8_lossy(&ctrl_j_retry.after),
+            alt_enter_retry.outcome,
+            String::from_utf8_lossy(&alt_enter_retry.before),
+            String::from_utf8_lossy(&alt_enter_retry.after),
+            String::from_utf8_lossy(&before_overlap_retry),
+            String::from_utf8_lossy(&after_overlap_retry)
+        );
+    }
+
+    /// Scenario: Hold the pane writer while the detached confirmation loop finishes its user-input precheck, then record user input before releasing the writer to its guarded backstop. The resulting refusal must publish a delivery notice instead of ending as a log-only stop.
+    #[spec("scheduler/dispatch/021")]
+    #[tokio::test]
+    async fn dispatch_021_backstop_user_input_refusal_is_reported() {
+        use std::io::Write as _;
+
+        const PANE_ID: &str = "detached-backstop-report-pane";
+        const PROMPT: &str = "detached prompt awaiting confirmation";
+        const USER_DRAFT: &str = "draft arriving after caller precheck";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .await
+                .expect("initial detached delivery"),
+            GuardedSend::Applied
+        );
+        let notices = Arc::new(Mutex::new(Vec::<DeliveryNotice>::new()));
+        let recorded = notices.clone();
+        registry.set_delivery_notice_sink(Arc::new(move |notice| {
+            recorded.lock().unwrap().push(notice);
+        }));
+
+        let handle = registry
+            .subscribe(&agent_id)
+            .expect("attach byte-observation target");
+        let mut user_writer = handle.writer.lock().await;
+        tokio::time::pause();
+        let (event_tx, event_rx) = broadcast::channel(8);
+        let confirmation = tokio::spawn(confirm_prompt_delivery(
+            registry.clone(),
+            event_rx,
+            ConfirmationTask {
+                pane_id: PANE_ID.into(),
+                agent_id: agent_id.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: "detached-backstop-report".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        ));
+
+        // Let the confirmation task install its first 500 ms watch timer before
+        // moving virtual time. After `advance`, the only await it can reach is
+        // the writer we still own, so the caller-side clock precheck has
+        // necessarily completed before this test records the user's input.
+        tokio::task::yield_now().await;
+        tokio::time::advance(unconfirmed_retry_delay(1) + Duration::from_millis(1)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !confirmation.is_finished(),
+            "precondition: after the deterministic backoff the confirmation task must be blocked on the held writer"
+        );
+        user_writer
+            .write_all(USER_DRAFT.as_bytes())
+            .expect("write draft after caller precheck");
+        user_writer
+            .flush()
+            .expect("flush draft after caller precheck");
+        registry.note_user_input(PANE_ID);
+        drop(user_writer);
+        tokio::time::resume();
+        confirmation
+            .await
+            .expect("writer-held backstop must terminate confirmation");
+
+        let notices = notices.lock().unwrap();
+        let notice_details = notices
+            .iter()
+            .map(|notice| notice.detail)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices.len(),
+            1,
+            "a writer-held refusal caused by user input must be durable pane state, not only `target went stale` in a log; notices={notice_details:?}"
+        );
+        drop(notices);
+        drop(event_tx);
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Abandon a spawn prompt against its exact pane owner, then replace that owner and exhaust the 256-watch cap for a new delivery. Abandonment must report state without pane bytes, a stale report must not mark the replacement, and the 257th delivery must visibly report that it is unwatched.
+    #[serial_test::serial(prompt_confirmation_tasks)]
+    #[tokio::test]
+    async fn abandonment_reports_state_and_never_writes_into_the_pane() {
+        cancel_all_prompt_confirmations();
+        const PANE_ID: &str = "abandon-notice-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_shell_target(&registry, PANE_ID);
+        let notices = Arc::new(Mutex::new(Vec::<DeliveryNotice>::new()));
+        let recorded = notices.clone();
+        registry.set_delivery_notice_sink(Arc::new(move |notice| {
+            recorded.lock().unwrap().push(notice);
+        }));
+
+        abandon_spawn_prompt(&registry, PANE_ID, &agent_id, "delivery-abandoned", 3, None);
+        {
+            let notices = notices.lock().unwrap();
+            assert_eq!(notices.len(), 1, "abandonment must report exactly once");
+            assert_eq!(notices[0].pane_id, PANE_ID);
+            assert_eq!(notices[0].agent_id, agent_id);
+            assert_eq!(notices[0].delivery_id, "delivery-abandoned");
+        }
+        // Reviewer blocker 3: the pane's own byte stream stays untouched. The
+        // previous round wrote the diagnostic into the agent's input buffer,
+        // where LF may be read as Enter and a later submit can carry it along as
+        // part of the user's turn.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let output = registry.snapshot(&agent_id).expect("pane snapshot");
+        assert!(
+            !String::from_utf8_lossy(&output).contains("prompt"),
+            "no diagnostic bytes may reach the agent's input: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+
+        // The pane changes hands: the old delivery's report belongs to nobody.
+        registry
+            .close_agent(&agent_id)
+            .expect("close notice target");
+        let replacement = spawn_shell_target(&registry, PANE_ID);
+        assert_ne!(replacement, agent_id);
+        abandon_spawn_prompt(&registry, PANE_ID, &agent_id, "delivery-abandoned", 3, None);
+        assert_eq!(
+            notices.lock().unwrap().len(),
+            1,
+            "a report against a replaced agent must be suppressed, not re-addressed"
+        );
+
+        // Fill exactly the configured watch budget with live pending tasks.
+        // The next distinct pane is the 257th delivery and must publish the
+        // visible state report that the old silent-cap behavior omitted.
+        {
+            let mut tasks = CONFIRMATION_TASKS.lock().unwrap();
+            for index in 0..MAX_CONFIRMATION_TASKS {
+                let pending = tokio::spawn(std::future::pending::<()>());
+                tasks.insert(format!("cap-fill-{index}"), pending.abort_handle());
+            }
+        }
+        let (cap_tx, cap_rx) = broadcast::channel(1);
+        spawn_confirmation_task(
+            registry.clone(),
+            cap_rx,
+            ConfirmationTask {
+                pane_id: PANE_ID.into(),
+                agent_id: replacement.clone(),
+                prompt: "CAP-EXHAUSTED-PROMPT".into(),
+                delivery_id: "cap-exhausted-257".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        );
+        {
+            let notices = notices.lock().unwrap();
+            assert_eq!(
+                notices.len(),
+                2,
+                "the 257th delivery must be visibly reported, not silently unwatched"
+            );
+            assert_eq!(notices[1].delivery_id, "cap-exhausted-257");
+            assert!(
+                notices[1].detail.contains("maximum") && notices[1].detail.contains("NOT"),
+                "the report must explain that confirmation and retry are unavailable: {:?}",
+                notices[1]
+            );
+        }
+        drop(cap_tx);
+        cancel_all_prompt_confirmations();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Consume most of an absolute delivery deadline in a simulated readiness wait, then leave the reporting confirmation unanswered. The watch must publish abandonment within only the remaining budget, rather than granting itself a fresh confirmation deadline.
+    #[tokio::test]
+    async fn readiness_wait_is_inside_the_absolute_confirmation_deadline() {
+        const PANE_ID: &str = "absolute-deadline-pane";
+        const PROMPT: &str = "ABSOLUTE-DEADLINE-PROMPT";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
+        let notices = Arc::new(Mutex::new(Vec::<DeliveryNotice>::new()));
+        let recorded = notices.clone();
+        registry.set_delivery_notice_sink(Arc::new(move |notice| {
+            recorded.lock().unwrap().push(notice);
+        }));
+        let (_event_tx, event_rx) = broadcast::channel(8);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let confirmation = tokio::spawn(confirm_prompt_delivery(
+            registry.clone(),
+            event_rx,
+            ConfirmationTask {
+                pane_id: PANE_ID.into(),
+                agent_id: agent_id.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: "absolute-deadline-test".into(),
+                generation: None,
+                can_report_prompts: true,
+                deadline,
+            },
+        ));
+        tokio::time::timeout(Duration::from_millis(250), confirmation)
+            .await
+            .expect("confirmation must use only the deadline budget left after readiness")
+            .expect("absolute-deadline confirmation task must not panic");
+        assert_eq!(
+            notices.lock().unwrap().len(),
+            1,
+            "abandonment must be visible by one total deadline, including readiness; elapsed={:?}",
+            started.elapsed()
+        );
+
+        registry.shutdown_all();
+    }
 
     fn parse_config(toml: &str) -> ProjectConfig {
         toml::from_str(toml).expect("parse project config")
@@ -985,7 +4613,7 @@ mod tests {
         // The schedule command is ignored for the orchestration branch.
         let t = decide_target(Some(&cfg), dir, Some("ignored"));
         match t {
-            SpawnTarget::Orchestration { name, roles } => {
+            SpawnTarget::Orchestration { name, roles, .. } => {
                 assert_eq!(name, "digest");
                 assert_eq!(roles.len(), 2);
                 assert_eq!(roles[0].role_name, "orchestrator");
@@ -996,6 +4624,263 @@ mod tests {
             }
             other => panic!("expected orchestration, got {other:?}"),
         }
+    }
+
+    // --- Issue #704: ONE default rule, shared by both paths ---
+
+    /// A roleless placeholder in slot 0 with a spawnable block behind it. This is
+    /// the config that made the two paths disagree.
+    fn roleless_slot_zero_config() -> ProjectConfig {
+        parse_config(
+            "[[orchestrations]]\nname = \"placeholder\"\nroles = []\n\n\
+             [[orchestrations]]\nname = \"real\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"sh\"\n",
+        )
+    }
+
+    /// The SCHEDULER path's half of the bug: `decide_target` looked only at
+    /// `orchestrations.first()`, so a roleless slot 0 sent a scheduled fire to a
+    /// single-agent card while `--list-targets` was offering `real` and a bare
+    /// dispatch was spawning it.
+    #[test]
+    fn decide_target_skips_a_roleless_slot_zero_instead_of_degrading_to_one_agent() {
+        let cfg = roleless_slot_zero_config();
+        let dir = Path::new("/tmp/x");
+        match decide_target(Some(&cfg), dir, Some("claude")) {
+            SpawnTarget::Orchestration { name, roles, .. } => {
+                assert_eq!(name, "real");
+                assert_eq!(roles.len(), 2);
+            }
+            SpawnTarget::SingleAgent { .. } => panic!(
+                "a scheduled fire must open the repo's spawnable orchestration, not fall through \
+                 to a single agent because slot 0 happens to be empty"
+            ),
+        }
+    }
+
+    /// The two paths must not just each be right — they must be right for the
+    /// SAME reason, which is what a shared resolver buys. Asserted over the
+    /// configs that used to separate them.
+    #[test]
+    fn scheduler_and_bare_dispatch_agree_on_the_default_orchestration() {
+        let dir = Path::new("/tmp/x");
+        let declared_last = parse_config(
+            "[[orchestrations]]\nname = \"first\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"chosen\"\ndefault = true\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"sh\"\nstart = true\n",
+        );
+        for cfg in [
+            roleless_slot_zero_config(),
+            two_orchestration_config(),
+            declared_last,
+        ] {
+            let scheduled = decide_target(Some(&cfg), dir, Some("claude"));
+            let bare = decide_target_with_override(
+                Some(&cfg),
+                dir,
+                Some("claude"),
+                Some(&SpawnShapeOverride::Orchestration(None)),
+            )
+            .expect("the bare form must resolve every one of these");
+            assert_eq!(
+                scheduled, bare,
+                "a scheduled fire and a bare `--orchestration=` dispatch into the same repo must \
+                 open the same thing — two rules for one question is the bug, whatever either \
+                 rule says"
+            );
+        }
+    }
+
+    /// The declaration beats position on BOTH paths, which is what makes it a
+    /// declaration rather than a hint.
+    #[test]
+    fn declared_default_wins_over_file_order_on_both_paths() {
+        let cfg = parse_config(
+            "[[orchestrations]]\nname = \"first\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"declared\"\ndefault = true\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"sh\"\nstart = true\n",
+        );
+        let dir = Path::new("/tmp/x");
+        for target in [
+            decide_target(Some(&cfg), dir, Some("claude")),
+            decide_target_with_override(
+                Some(&cfg),
+                dir,
+                Some("claude"),
+                Some(&SpawnShapeOverride::Orchestration(None)),
+            )
+            .expect("bare form resolves"),
+        ] {
+            match target {
+                SpawnTarget::Orchestration { name, .. } => assert_eq!(name, "declared"),
+                other => panic!("expected the declared orchestration, got {other:?}"),
+            }
+        }
+    }
+
+    // --- PRD #220: the caller's explicit shape override ---
+
+    fn two_orchestration_config() -> ProjectConfig {
+        parse_config(
+            "[[orchestrations]]\nname = \"digest\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"sh\"\n\n\
+             [[orchestrations]]\nname = \"review\"\n\n\
+             [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"cat\"\nstart = true\n",
+        )
+    }
+
+    /// `None` must leave the config-derived behaviour byte-for-byte unchanged —
+    /// that is what keeps the scheduler and issue-dispatch producers untouched.
+    #[test]
+    fn shape_override_absent_matches_plain_decide_target() {
+        let cfg = two_orchestration_config();
+        let dir = Path::new("/tmp/x");
+        for cmd in [Some("claude"), None] {
+            assert_eq!(
+                decide_target_with_override(Some(&cfg), dir, cmd, None),
+                Ok(decide_target(Some(&cfg), dir, cmd))
+            );
+            assert_eq!(
+                decide_target_with_override(None, dir, cmd, None),
+                Ok(decide_target(None, dir, cmd))
+            );
+        }
+    }
+
+    /// The "verify these PRs" case: one agent, even though the repo defines
+    /// orchestrations. Without the override this dir always yields a team.
+    #[test]
+    fn shape_override_single_agent_wins_over_config_orchestrations() {
+        let cfg = two_orchestration_config();
+        let dir = Path::new("/tmp/x");
+        assert!(matches!(
+            decide_target(Some(&cfg), dir, Some("claude")),
+            SpawnTarget::Orchestration { .. }
+        ));
+        assert_eq!(
+            decide_target_with_override(
+                Some(&cfg),
+                dir,
+                Some("claude"),
+                Some(&SpawnShapeOverride::SingleAgent)
+            ),
+            Ok(SpawnTarget::SingleAgent {
+                command: Some("claude".to_string())
+            })
+        );
+    }
+
+    /// A bare `--orchestration` takes the dir's first (matching the config
+    /// default); a named one picks that orchestration even when it is NOT first.
+    #[test]
+    fn shape_override_orchestration_by_name_selects_beyond_the_first() {
+        let cfg = two_orchestration_config();
+        let dir = Path::new("/tmp/x");
+
+        let first = decide_target_with_override(
+            Some(&cfg),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(None)),
+        );
+        assert!(matches!(
+            first,
+            Ok(SpawnTarget::Orchestration { ref name, .. }) if name == "digest"
+        ));
+
+        let second = decide_target_with_override(
+            Some(&cfg),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(Some("review".into()))),
+        );
+        match second {
+            Ok(SpawnTarget::Orchestration { name, roles, .. }) => {
+                assert_eq!(name, "review");
+                assert_eq!(
+                    roles.len(),
+                    1,
+                    "the SECOND orchestration's roles, not the first's"
+                );
+                assert_eq!(roles[0].role_name, "lead");
+            }
+            other => panic!("expected the named orchestration, got {other:?}"),
+        }
+    }
+
+    /// A name the dir does not define must ERROR, never silently fall back —
+    /// spawning something other than what the user chose is the exact surprise
+    /// this selector exists to remove. The message names what IS available.
+    #[test]
+    fn shape_override_unknown_orchestration_errors_and_lists_available() {
+        let cfg = two_orchestration_config();
+        let dir = Path::new("/tmp/x");
+        let err = decide_target_with_override(
+            Some(&cfg),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(Some("nope".into()))),
+        )
+        .expect_err("an unknown orchestration name must not silently fall back");
+        assert!(err.contains("nope"), "error must name the request: {err}");
+        assert!(
+            err.contains("digest") && err.contains("review"),
+            "error must list the available orchestrations: {err}"
+        );
+    }
+
+    /// Asking for an orchestration where none is defined errors too, rather than
+    /// quietly starting a single agent the user did not ask for.
+    #[test]
+    fn shape_override_orchestration_without_any_defined_errors() {
+        let dir = Path::new("/tmp/x");
+        let bare = decide_target_with_override(
+            None,
+            dir,
+            Some("claude"),
+            Some(&SpawnShapeOverride::Orchestration(None)),
+        );
+        assert!(bare.is_err(), "no config → no orchestration to start");
+
+        let modes_only = parse_config("[[modes]]\nname = \"dev\"\n");
+        assert!(
+            decide_target_with_override(
+                Some(&modes_only),
+                dir,
+                None,
+                Some(&SpawnShapeOverride::Orchestration(None))
+            )
+            .is_err(),
+            "a config with modes but no orchestrations → error"
+        );
+    }
+
+    /// A roleless `[[orchestrations]]` is skipped by `decide_target`, so naming it
+    /// must error rather than spawn an empty team.
+    #[test]
+    fn shape_override_roleless_orchestration_errors() {
+        // `roles` carries no serde default, so the empty list must be explicit.
+        let cfg = parse_config("[[orchestrations]]\nname = \"empty\"\nroles = []\n");
+        let dir = Path::new("/tmp/x");
+        assert!(
+            decide_target_with_override(
+                Some(&cfg),
+                dir,
+                None,
+                Some(&SpawnShapeOverride::Orchestration(Some("empty".into())))
+            )
+            .is_err(),
+            "an orchestration with no roles is not a spawnable target"
+        );
+        // And it is invisible to `--list-targets`, so it is never offered.
+        assert!(
+            crate::dispatch::available_orchestrations(Some(&cfg), dir).is_empty(),
+            "a roleless orchestration must not be listed as a target"
+        );
     }
 
     #[test]
@@ -1015,12 +4900,14 @@ mod tests {
     fn orchestrator_role_index_prefers_named_orchestrator() {
         let roles = vec![
             RoleSpawn {
+                agent_type: None,
                 role_index: 0,
                 role_name: "worker".into(),
                 command: "sh".into(),
                 is_start_role: false,
             },
             RoleSpawn {
+                agent_type: None,
                 role_index: 1,
                 role_name: "orchestrator".into(),
                 command: "cat".into(),
@@ -1034,12 +4921,14 @@ mod tests {
     fn orchestrator_role_index_falls_back_to_start_role_then_first() {
         let start_role = vec![
             RoleSpawn {
+                agent_type: None,
                 role_index: 0,
                 role_name: "lead".into(),
                 command: "sh".into(),
                 is_start_role: false,
             },
             RoleSpawn {
+                agent_type: None,
                 role_index: 1,
                 role_name: "boss".into(),
                 command: "cat".into(),
@@ -1049,6 +4938,7 @@ mod tests {
         assert_eq!(orchestrator_role_index(&start_role), 1);
 
         let neither = vec![RoleSpawn {
+            agent_type: None,
             role_index: 0,
             role_name: "solo".into(),
             command: "sh".into(),
@@ -1068,6 +4958,161 @@ mod tests {
         assert!(is_valid_pane_id_env(&r));
         assert_ne!(a, b, "pane ids must be unique across calls");
         assert!(r.ends_with("-r2"));
+    }
+
+    /// Issue #600: an orchestration spawn is ALL-OR-NOTHING — an `Err` from
+    /// `spawn` means nothing it started is still running, and nothing it
+    /// registered is still registered.
+    ///
+    /// Role 1 is a command that cannot be exec'd, so the failure is the loop's
+    /// real early return rather than a simulated one.
+    ///
+    /// **This test's assertion is the INVERSE of the one it carried for issue
+    /// #454, and deliberately so.** #454 moved role registration from after the
+    /// loop to inside it, and pinned that by asserting the surviving role of a
+    /// partial failure was still in `pane_role_map`. It said in as many words
+    /// what it did not assert: "role 0's child is still running afterwards and
+    /// the caller gets no handle with which to close it … tracked separately."
+    /// #600 is that separate track, and it decided the orphan is the defect: the
+    /// loop now tears down what it started, which unregisters those same panes.
+    /// So the end state flips from "one role registered" to "none", and the
+    /// property under test flips from *ordering* to *atomicity*.
+    ///
+    /// #454's ordering is still load-bearing and is still stated where it lives
+    /// (the comment on the `register_orchestration_role` call): the rollback
+    /// unregisters a role only after that role's child is closed, so a live child
+    /// is never missing its routing entry. What is no longer OBSERVABLE from
+    /// here is the distinction between registering inside the loop and after it —
+    /// under atomicity both end with an empty map. The success-path consequence
+    /// of that ordering keeps its own coverage in `orchestration/dispatch/001`
+    /// (a dispatched orchestrator's `delegate` actually routes).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_partial_orchestration_spawn_leaves_nothing_running_or_registered() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        struct SilentNotifier;
+        impl Notifier for SilentNotifier {
+            fn notify(&self, _event: NotifyEvent) {}
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir for the orchestration cwd");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let role = |idx: usize, name: &str, command: &str| RoleSpawn {
+            agent_type: None,
+            role_index: idx,
+            role_name: name.to_string(),
+            command: command.to_string(),
+            is_start_role: idx == 0,
+        };
+        let req = SpawnRequest {
+            task_name: "partial-454".to_string(),
+            working_dir: dir.path().to_string_lossy().into_owned(),
+            command: None,
+            prompt: "unused — the spawn fails before delivery".to_string(),
+            resolved_target: Some(SpawnTarget::Orchestration {
+                name: "partial-454".to_string(),
+                roles: vec![
+                    role(0, "orchestrator", "/bin/sh"),
+                    role(1, "worker", "/nonexistent/dot-agent-deck-454"),
+                ],
+                config: Box::new(OrchestrationConfig {
+                    default: false,
+                    name: "partial-454".to_string(),
+                    roles: vec![OrchestrationRoleConfig {
+                        agent: None,
+                        name: "orchestrator".to_string(),
+                        command: "/bin/sh".to_string(),
+                        start: true,
+                        description: None,
+                        prompt_template: None,
+                        clear: true,
+                    }],
+                }),
+            }),
+            compose_orchestrator_context: false,
+        };
+
+        let result = spawn(req, &registry, &SilentNotifier, None, false, Some(&state)).await;
+        assert!(
+            result.is_err(),
+            "precondition: role 1 must fail to spawn, aborting the orchestration"
+        );
+
+        // No `SpawnHandle` came back and no orchestration tab was ever surfaced
+        // (the broadcast sits past the early return), so anything still live here
+        // is unreachable by every close path the user has.
+        let live = registry.agent_records();
+        assert!(
+            live.is_empty(),
+            "role 0 spawned before role 1 failed; it must be torn down, not orphaned. \
+             Still live: {:?}",
+            live.iter()
+                .map(|r| r.display_name.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let guard = state.read().await;
+        assert!(
+            guard.pane_role_map.is_empty(),
+            "the rolled-back role must leave no role-map entry: {:?}",
+            guard.pane_role_map
+        );
+        assert!(
+            guard.orchestrator_pane_ids.is_empty(),
+            "…nor an orchestrator marker: {:?}",
+            guard.orchestrator_pane_ids
+        );
+        assert!(
+            guard.pane_orchestration_map.is_empty(),
+            "…nor a routing identity: {:?}",
+            guard.pane_orchestration_map
+        );
+        drop(guard);
+
+        registry.shutdown_all();
+    }
+
+    /// Issue #454 review, item 5: the "valid" in this function's contract
+    /// includes the byte cap, and a schedule / dispatch task name has no length
+    /// bound of its own.
+    ///
+    /// An over-long id is not cosmetic. `AgentPtyRegistry::spawn_agent` refuses
+    /// to RETAIN one — it stores `pane_id_env = None` while launching the child
+    /// with the full value — so the pane exists but the registry cannot name it:
+    /// `ListAgents` has nothing to join the live session onto and `StopAgent`
+    /// can never recover the id to clean up with. That is issue #454's own
+    /// symptom (`STATUS=- TOOL=-`, reconnect restoring `Idle`) surviving #454's
+    /// fix, for every task whose name is long enough, plus a leak per fire.
+    #[test]
+    fn next_pane_id_stays_valid_for_an_unbounded_task_name() {
+        use crate::agent_pty::{PANE_ID_ENV_MAX_LEN, is_valid_pane_id_env};
+        let long = "a-very-long-scheduled-task-name".repeat(20);
+        let single = next_pane_id(&long, None);
+        let role = next_pane_id(&long, Some(7));
+        for id in [&single, &role] {
+            assert!(
+                is_valid_pane_id_env(id),
+                "an unbounded task name must still yield a retainable pane id \
+                 (len={}, cap={PANE_ID_ENV_MAX_LEN}): {id}",
+                id.len()
+            );
+            assert!(id.starts_with(SCHEDULE_PANE_ID_PREFIX));
+        }
+        // The uniqueness-bearing tail is what must never be truncated: two
+        // fires of the same long name differ only by the counter.
+        assert!(
+            role.ends_with("-r7"),
+            "the role suffix must survive: {role}"
+        );
+        assert_ne!(
+            next_pane_id(&long, None),
+            single,
+            "truncation must not collapse two fires of one long name onto one id"
+        );
     }
 
     #[test]
@@ -1239,6 +5284,7 @@ mod tests {
             "sched-morning-digest-0",
             "/tmp/scratch/runbox",
             Some("cat"),
+            None,
             "morning-digest",
         );
         let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued") else {
@@ -1265,7 +5311,7 @@ mod tests {
         // The standalone-daemon case (no attached TUI): `send` errs, swallowed.
         let (tx, rx) = broadcast::channel::<BroadcastMsg>(8);
         drop(rx);
-        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, "x");
+        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, None, "x");
     }
 
     /// PRD #225 hardening: the readiness-wait override may shorten the wait but

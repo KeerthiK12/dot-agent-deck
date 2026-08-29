@@ -20,6 +20,7 @@ mod common;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::TabMembership;
+use dot_agent_deck::state::SessionStatus;
 use spec::spec;
 
 const PROMPT_MARKER: &str = "SCHEDPROMPTMARKER";
@@ -61,7 +62,7 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 #[spec("scheduler/spawn/001")]
 #[test]
 fn spawn_001_mkdir_and_uncreatable_path() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let base = scratch.path();
 
     let missing_dir = base.join("created-on-fire");
@@ -139,7 +140,7 @@ fn spawn_001_mkdir_and_uncreatable_path() {
 #[spec("scheduler/spawn/002")]
 #[test]
 fn spawn_002_orchestration_vs_single_agent() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let base = scratch.path();
 
     // Orchestration target dir.
@@ -205,6 +206,73 @@ fn spawn_002_orchestration_vs_single_agent() {
     );
 }
 
+/// Scenario: Register one task whose `working_dir` holds a config with THREE
+/// `[[orchestrations]]` — a roleless placeholder first, then `first-real`, then
+/// `chosen` carrying `default = true`, each spawnable role running `cat`. Fire it
+/// via run-now and assert the fire opens the `chosen` orchestration's tab and
+/// delivers the prompt to its orchestrator role: not a single-agent card (which
+/// the roleless slot-0 used to produce), and not `first-real` (which file order
+/// would produce).
+#[spec("scheduler/spawn/008")]
+#[test]
+fn spawn_008_declared_default_orchestration_beats_slot_zero_and_file_order() {
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
+    let target = scratch.path().join("multi");
+    std::fs::create_dir_all(&target).expect("create target dir");
+
+    // Both halves of issue #704 in one file. The roleless block in slot 0 is what
+    // used to send this fire to a single-agent card; `chosen` sitting LAST is
+    // what makes the declaration observable rather than coincidental.
+    std::fs::write(
+        target.join(".dot-agent-deck.toml"),
+        "[[orchestrations]]\nname = \"placeholder\"\nroles = []\n\n\
+         [[orchestrations]]\nname = \"first-real\"\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+         [[orchestrations]]\nname = \"chosen\"\ndefault = true\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n",
+    )
+    .expect("write multi-orchestration config");
+
+    let toml = task_block("multi", &target.to_string_lossy(), Some("cat"));
+    let daemon = common::spawn_daemon_serve(Some(&toml), "0");
+
+    daemon.run_now("multi").expect("run-now multi");
+    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
+
+    let orchestration_name = records.iter().find_map(|r| match &r.tab_membership {
+        Some(TabMembership::Orchestration { name, .. }) => Some(name.clone()),
+        _ => None,
+    });
+    let orchestration_name = orchestration_name.unwrap_or_else(|| {
+        panic!(
+            "the fire opened no orchestration tab at all — a roleless block in slot 0 must not \
+             degrade a scheduled fire to a single-agent card while `--list-targets` is still \
+             offering the repo's spawnable orchestrations. Records: {records:?}"
+        )
+    });
+    assert_eq!(
+        orchestration_name, "chosen",
+        "the orchestration declaring `default = true` must win over the one that merely comes \
+         first in the file — otherwise the declaration is decoration and reordering the file \
+         still changes which provider every scheduled run uses"
+    );
+
+    let orchestrator = records
+        .iter()
+        .find(|r| {
+            matches!(
+                &r.tab_membership,
+                Some(TabMembership::Orchestration { role_name, .. }) if role_name == "orchestrator"
+            )
+        })
+        .expect("the chosen orchestration must bring up its start role");
+    assert!(
+        daemon.attach_and_wait_for_output(&orchestrator.id, PROMPT_MARKER, Duration::from_secs(10)),
+        "and the scheduled prompt must actually reach it — selecting the right orchestration and \
+         then delivering nowhere is the same outage with a better-looking registry"
+    );
+}
+
 /// Scenario: Register one task whose explicit `command` touches a unique marker
 /// file on startup. Fire it via run-now and assert the marker appears — proving
 /// the scheduler spawns the configured `command` itself. (The former
@@ -213,7 +281,7 @@ fn spawn_002_orchestration_vs_single_agent() {
 #[spec("scheduler/spawn/003")]
 #[test]
 fn spawn_003_command_is_honored() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let base = scratch.path();
 
     let cmd_dir = base.join("cmd");
@@ -247,7 +315,7 @@ fn spawn_003_command_is_honored() {
 #[spec("scheduler/spawn/004")]
 #[test]
 fn spawn_004_fires_spawn_exactly_once_and_delivers() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let work = scratch.path().join("work");
     std::fs::create_dir_all(&work).expect("create work dir");
 
@@ -284,7 +352,7 @@ fn spawn_004_fires_spawn_exactly_once_and_delivers() {
 #[spec("scheduler/spawn/005")]
 #[test]
 fn spawn_005_delivery_gated_on_session_start() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let work = scratch.path().join("gated");
     std::fs::create_dir_all(&work).expect("create work dir");
 
@@ -350,7 +418,7 @@ fn spawn_005_delivery_gated_on_session_start() {
 #[test]
 #[cfg(unix)]
 fn spawn_006_single_and_role_codex_commands_are_wrapped() {
-    let scratch = tempfile::tempdir().expect("scheduler wrapper scratch");
+    let scratch = common::harness_tempdir().expect("scheduler wrapper scratch");
     let bin_dir = scratch.path().join("bin");
     let single_dir = scratch.path().join("single");
     let orch_dir = scratch.path().join("orchestration");
@@ -430,5 +498,55 @@ fn spawn_006_single_and_role_codex_commands_are_wrapped() {
         ],
         "scheduled single-agent and role spawns must both cross the Wrapper strategy exactly once; observed:\n{}",
         launches.join("\n")
+    );
+}
+
+/// Scenario: Fire a plain scheduled task through the real daemon `RunNow` callback so it reaches `spawn_or_reuse`, then report `running` from the spawned pane through the real non-`SessionStart` `agent-event` CLI. Assert `ListAgents` joins the resulting `Thinking` lifecycle snapshot to that scheduler-created registry record instead of leaving its live status empty.
+#[spec("scheduler/spawn/007")]
+#[test]
+fn spawn_007_scheduler_agent_event_joins_registry_record() {
+    let scratch = common::harness_tempdir().expect("scheduler status-join scratch");
+    let work = scratch.path().join("status-join");
+    std::fs::create_dir_all(&work).expect("create scheduled status-join working dir");
+    let schedules = task_block("status-join", &work.to_string_lossy(), Some("cat"));
+    let daemon = common::spawn_daemon_serve(Some(&schedules), "0");
+
+    daemon
+        .run_now("status-join")
+        .expect("fire scheduled status-join task through RunNow");
+    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
+    let record = records
+        .first()
+        .unwrap_or_else(|| panic!("scheduled spawn never registered an agent: {records:?}"));
+    let agent_id = record.id.clone();
+    let pane_id = record
+        .pane_id_env
+        .clone()
+        .expect("scheduler-created pane must carry its generated pane id");
+
+    let output = daemon.run_agent_event(&pane_id, Some(&agent_id), "running");
+    assert!(
+        output.status.success(),
+        "the real non-SessionStart `agent-event --type running` CLI failed for the scheduled pane: status={:?} stdout={:?} stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let joined = daemon.wait_for_agent_where(
+        |candidate| {
+            candidate.id == agent_id
+                && candidate.pane_id_env.as_deref() == Some(pane_id.as_str())
+                && candidate
+                    .live
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.status == SessionStatus::Thinking)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        joined.is_some(),
+        "the scheduler's spawn_or_reuse pane must be admitted into daemon state so its real lifecycle report joins the registry record; expected agent={agent_id:?} pane={pane_id:?}, got {:?}",
+        daemon.agent_records()
     );
 }

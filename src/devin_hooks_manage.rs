@@ -58,7 +58,7 @@
 //! [`AgentType::Devin`]: crate::event::AgentType::Devin
 //! [`AgentType::ClaudeCode`]: crate::event::AgentType::ClaudeCode
 
-use std::io::{self, ErrorKind, Write as _};
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -120,8 +120,8 @@ const DEVIN_HOOK_EVENTS: &[&str] = &[
 /// the path we would have to guess belongs to a *third-party* tool, and Devin —
 /// not this project — decides where its config lives on Windows. Writing hooks
 /// into a location Devin does not read would look like success while delivering
-/// nothing, and the POSIX quoting [`shell_quote_if_needed`] applies to the hook
-/// command is not what Windows command parsing expects either. Native Windows
+/// nothing, and the POSIX quoting [`crate::platform::paths::shell_quote_if_needed`]
+/// applies to the hook command is not what Windows command parsing expects either. Native Windows
 /// support for the deck is itself still open (#42); today Windows users run
 /// under WSL, where the Unix branch below is the correct one.
 ///
@@ -215,33 +215,6 @@ fn rule_is_dot_agent_deck(rule: &Value) -> bool {
                     .is_some_and(command_is_deck_owned)
             })
         })
-}
-
-/// Build the deck's hook command for `binary_path`, quoting the executable path
-/// when it contains anything outside a conservative safe set so a path with
-/// whitespace or shell metacharacters still parses to the intended argv.
-fn build_command(binary_path: &str) -> String {
-    format!(
-        "{} {HOOK_COMMAND_SUFFIX}",
-        shell_quote_if_needed(binary_path)
-    )
-}
-
-/// Single-quote `path` for a POSIX shell only when it contains a character
-/// outside a conservative safe set; otherwise return it unchanged.
-fn shell_quote_if_needed(path: &str) -> String {
-    fn is_safe(b: u8) -> bool {
-        b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b':' | b'@' | b'%' | b','
-            )
-    }
-    if !path.is_empty() && path.bytes().all(is_safe) {
-        path.to_string()
-    } else {
-        format!("'{}'", path.replace('\'', r"'\''"))
-    }
 }
 
 /// Merge the deck's command hooks for `command` into an existing config value
@@ -352,45 +325,6 @@ fn validate_structure(root: &Value) -> io::Result<()> {
     Ok(())
 }
 
-/// Atomically publish `bytes` to `dest` by writing a temp file in the SAME
-/// directory (so `rename(2)` stays on one filesystem) and renaming over `dest`.
-/// A crash mid-write leaves either the old file or the temp file intact — never a
-/// truncated user config.
-fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<()> {
-    let name = dest
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("config.json");
-    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        // Publish with the destination's OWN mode, or owner-only when the file
-        // is new. `File::create` would otherwise apply `0666 & !umask` — 0644
-        // under a typical 022 umask — and the rename below would silently widen
-        // a config the user (or Devin itself) had kept private. Devin ships this
-        // file at 0600 and it holds `devin.org_id`, MCP server entries, and
-        // whatever else the user puts there, so widening it leaks to every local
-        // account.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(dest)
-                .map(|meta| meta.permissions().mode() & 0o777)
-                .unwrap_or(0o600);
-            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    match std::fs::rename(&tmp, dest) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
-
 /// Read the existing config at `path`, applying the safety contract: only a
 /// MISSING file is an empty config. Malformed content (including the JSONC
 /// comments Devin allows but `serde_json` cannot parse) is backed up to
@@ -431,10 +365,10 @@ pub fn install_to(config_dir: &Path, binary_path: &str) -> io::Result<()> {
     let mut root = read_config(&path)?;
     validate_structure(&root)?;
 
-    let command = build_command(binary_path);
+    let command = crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX);
     install_impl(&mut root, &command);
     let contents = serde_json::to_string_pretty(&root)?;
-    write_atomic(config_dir, &path, contents.as_bytes())
+    crate::agent_hook_config::write_atomic(config_dir, &path, contents.as_bytes())
 }
 
 /// Testable core: remove the deck's hooks from `<config_dir>/config.json`.
@@ -457,7 +391,7 @@ pub fn uninstall_from(config_dir: &Path) -> io::Result<Vec<String>> {
         return Ok(removed);
     }
     let contents = serde_json::to_string_pretty(&root)?;
-    write_atomic(config_dir, &path, contents.as_bytes())?;
+    crate::agent_hook_config::write_atomic(config_dir, &path, contents.as_bytes())?;
     Ok(removed)
 }
 
@@ -465,7 +399,7 @@ pub fn uninstall_from(config_dir: &Path) -> io::Result<Vec<String>> {
 fn current_binary_path() -> String {
     std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "dot-agent-deck".into())
+        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into())
 }
 
 /// Startup entry: install the deck's Devin hooks into the user's Devin config,

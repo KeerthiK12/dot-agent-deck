@@ -363,8 +363,25 @@ pub fn force_kill_child_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     group: &AgentProcessGroup,
 ) {
-    reap_tree_or_fallback(child, group, "force-kill");
+    force_kill_child_group(child, group);
     let _ = child.wait();
+}
+
+/// The TERMINATE half of [`force_kill_child_and_wait`]: run the Job-Object
+/// backstop over the agent's whole tree and return **without reaping** the
+/// direct child.
+///
+/// Issue #581 — see the Unix twin for why a caller holding several agents must
+/// be able to terminate them all before waiting on any one of them. The Windows
+/// hazard is the same shape: `Child::wait` blocks until the direct child's
+/// handle signals, and a caller that interleaves terminate-then-wait per agent
+/// leaves every later agent's job un-terminated for as long as one child takes
+/// to go away.
+pub fn force_kill_child_group(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    group: &AgentProcessGroup,
+) {
+    reap_tree_or_fallback(child, group, "force-kill");
 }
 
 /// Best-effort-graceful-then-force teardown used by the single-pane Ctrl+W path:
@@ -570,6 +587,48 @@ pub fn force_kill_pid(pid: u32) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Foreground process-group query (PRD #370 M1).
+// ---------------------------------------------------------------------------
+
+/// Always `None` on Windows: `portable_pty::MasterPty::process_group_leader`
+/// is `#[cfg(unix)]`-only on the trait itself (there is no Windows console
+/// analogue of a pty foreground process group — Windows pipes/conpty have no
+/// equivalent of `tcgetpgrp`), so the method does not exist to call here at
+/// all. See `unix.rs` for the real implementation. Callers must treat `None`
+/// as "no signal available" and fall back to whatever status they already
+/// have, never as "not busy".
+pub fn foreground_pgid(_master: &dyn portable_pty::MasterPty) -> Option<i32> {
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Process-table sample (PRD #386 M1).
+// ---------------------------------------------------------------------------
+
+/// Always `None` on Windows: PRD #386 scopes native Windows process walking
+/// out, exactly as [`foreground_pgid`] does today. There is also nothing for
+/// the discriminator to compare — the whole signal rests on POSIX sessions
+/// (`getsid(2)`), which Windows has no analogue of, so a `Toolhelp32Snapshot`
+/// walk would enumerate a tree it could not classify.
+///
+/// Callers must treat `None` as "no signal available" and leave whatever status
+/// they already have alone, never read it as "not busy". The cross-platform
+/// half — [`super::ProcessInfo`], [`super::descendants`] and
+/// [`super::descendant_shell_activity`] — still compiles and is still tested
+/// here, so a future Windows backend only has to supply this one function.
+pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
+    None
+}
+
+/// The async twin of [`process_table`], so the daemon's poll loop needs no
+/// `cfg` branch of its own (issue #429). Unconditionally `None` for the same
+/// reason, and it never awaits anything: there is no subprocess to bound, so the
+/// caller's timeout simply never fires here.
+pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
+    None
 }
 
 // ---------------------------------------------------------------------------

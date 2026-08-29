@@ -54,7 +54,7 @@ Two independent changes:
 - The PATH fix adds **no** per-spawn branching to `agent_pty` / `spawn.rs`; it is a single daemon-startup block. On capture failure the daemon falls back to its inherited PATH with no behavior change.
 - `grep -rn "SCHEDULE_AUTHORING_AGENT" src/` finds no hardcoded agent name; the authoring command resolves from config (`default_command`) and is user-overridable.
 - The agent command is selectable at schedule authoring (Edit/Add) and the dashboard new-pane flow.
-- `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test-fast` pass; `cargo test-e2e` passes before the PR (CLAUDE.md rule 5).
+- `cargo fmt --check`, `cargo clippy --all-targets --features e2e -- -D warnings`, and `cargo test-fast` pass; `cargo test-e2e` passes before the PR (CLAUDE.md rule 5).
 - User docs describe login-shell PATH resolution (incl. the daemon-restart caveat) and the agent-command picker.
 
 ## Milestones

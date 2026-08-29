@@ -40,7 +40,7 @@ const MANAGER_KEY: &[u8] = b"S";
 /// Create an isolated scratch dir and write a global `schedules.toml` into it;
 /// returns (scratch_dir, schedules_path).
 fn scratch_with_schedules(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().expect("scratch tempdir");
+    let dir = common::harness_tempdir().expect("scratch tempdir");
     let path = dir.path().join("schedules.toml");
     std::fs::write(&path, body).expect("write fixture schedules.toml");
     (dir, path)
@@ -981,7 +981,7 @@ fn form_003_edit_prefills_seed_and_spawns_in_row_working_dir() {
     // A distinctively-named existing directory for the row's working_dir, so the
     // spawn-cwd marker (`EDITWORKDIR`) is a known literal regardless of the
     // tempdir prefix. Held alive for the whole test.
-    let row_work_parent = tempfile::tempdir().expect("row working_dir parent");
+    let row_work_parent = common::harness_tempdir().expect("row working_dir parent");
     let row_work = row_work_parent.path().join("EDITWORKDIR");
     std::fs::create_dir(&row_work).expect("create row working_dir");
 
@@ -1284,7 +1284,7 @@ fn form_006_edit_repick_different_dir_wins_in_seed() {
     // carry `PICKDIRBRAVO` only, while `ROWDIRALPHA` can appear ONLY via the stale
     // existing-values `working_dir:` line. B holds a marker child (`INNERMARK`) so
     // the descent into B is observable. Held alive for the whole test.
-    let parent = tempfile::tempdir().expect("repick parent");
+    let parent = common::harness_tempdir().expect("repick parent");
     let row_work = parent.path().join("ROWDIRALPHA");
     let pick_work = parent.path().join("PICKDIRBRAVO");
     std::fs::create_dir(&row_work).expect("create row working_dir (A)");
@@ -1465,7 +1465,8 @@ fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // Space → confirm current dir → new-pane form
     deck.wait_for_string("No mode"); // Mode field is up (cycler at "No mode")
-    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8 → saturate
+    deck.send_keys(b"\x1b[D"); // Left ×1 → schedule: issues (before dispatcher)
     // The dialog title becomes "… — schedule: issues mode" only when the
     // issue-dispatch option is the SELECTED one, so it is a selection-dependent
     // signal (the bare `[schedule: issues]` chip renders at every cycler index).

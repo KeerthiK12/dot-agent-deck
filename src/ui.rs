@@ -11,13 +11,12 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 
 use crate::agent_pty::TabMembership;
-use crate::ascii_art::{AsciiArtResult, generate_ascii_art};
 use crate::config;
-use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
+use crate::config::{BellConfig, DashboardConfig};
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
 use crate::event::{AgentType, EventType, OrchestrationSurface, SendResult};
 use crate::features::Features;
@@ -29,6 +28,14 @@ use crate::keybindings::{Action as KbAction, KeybindingConfig};
 use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
+use crate::prompt_delivery::{
+    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, attempt_delivery_id,
+    attempt_writes_payload, log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed,
+    log_prompt_probe_submitted, log_prompt_stopped, log_prompt_unconfirmable,
+    log_prompt_unconfirmed, log_prompt_written, mint_delivery_id, pane_confirmation_capability,
+    prompt_submission_accumulated, prompt_submission_matches, submission_is_after_watermark,
+    unconfirmed_retry_delay,
+};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
 use crate::tab_layout::fit_tab_labels;
@@ -126,19 +133,153 @@ impl CardDensity {
     }
 }
 
-fn choose_density(total_cards: usize, cols: usize, available_height: u16) -> CardDensity {
-    let total_card_rows = total_cards.div_ceil(cols);
-    for density in [
+/// The richest density that renders `total_cards` cards in `cols` columns
+/// within `available_height` rows, or `None` when not even [`CardDensity::Compact`]
+/// fits them all.
+///
+/// The `None` is the whole point (issue #588). The predecessor of this function
+/// — `choose_density` — returned `Compact` both when Compact fit and when
+/// nothing fit, so its one caller could not tell a layout that works from one
+/// that is about to hide cards, and silently sliced in the second case.
+/// [`choose_grid_layout`] needs that distinction to decide whether to spend a
+/// column on completeness.
+fn fitting_density(total_cards: usize, cols: usize, available_height: u16) -> Option<CardDensity> {
+    let total_card_rows = total_cards.div_ceil(cols) as u64;
+    [
         CardDensity::Spacious,
         CardDensity::Normal,
         CardDensity::Compact,
-    ] {
-        let needed = total_card_rows as u16 * density.card_height();
-        if needed <= available_height {
-            return density;
+    ]
+    .into_iter()
+    .find(|density| {
+        total_card_rows * u64::from(density.card_height()) <= u64::from(available_height)
+    })
+}
+
+/// How many card columns `width` comfortably carries — the deck's historical
+/// step function, and still the column count any deck that already fits gets.
+///
+/// The thresholds encode ~50 columns per card at two columns and ~60 at three:
+/// a *comfortable* card, not the narrowest useful one. [`MIN_CARD_W`] names the
+/// other end of that range, and [`choose_grid_layout`] is what may reach for it.
+fn grid_columns(width: u16) -> usize {
+    if width >= 180 {
+        3
+    } else if width >= 100 {
+        2
+    } else {
+        1
+    }
+}
+
+/// The narrowest card the grid will ever lay out, in terminal columns.
+///
+/// Issue #588 is what naming this explicitly buys. [`grid_columns`] encoded a
+/// minimum card width *implicitly* and generously (50 columns per card at two
+/// columns, 60 at three), so a sub-100-column deck was pinned to one column no
+/// matter how many cards it had to show — a 7-role orchestration could not fit
+/// seven cards at any density and silently painted five.
+///
+/// 40 is measured against the rendered card, not guessed. A role card's title is
+/// `` ` <n> <AgentType> · <role> ` `` sharing the top border with the
+/// ` ● Thinking ` status badge, inside two border columns. At 40 that leaves ten
+/// columns of role name (`ClaudeCode · documente…`), the full-width `Dir:` row
+/// and the widest `` ` Last: 0s  Tools: 14 ` `` bottom-border rung; by 30 the
+/// role name has vanished entirely (`ClaudeCode ·…`), which would defeat the
+/// point of painting the card at all.
+///
+/// It is a floor that only ever buys completeness: [`choose_grid_layout`] goes
+/// below `grid_columns`'s comfortable widths **only** when the narrower card is
+/// what makes every card fit. A deck that already fits keeps exactly the columns
+/// it has always had.
+const MIN_CARD_W: u16 = 40;
+
+/// The most columns `width` can hold at [`MIN_CARD_W`] each.
+///
+/// This is the CEILING on [`choose_grid_layout`]'s search, never the value it
+/// returns. Floored at 1 so a terminal narrower than a single card still draws
+/// one (clipped) column rather than dividing by zero.
+fn max_columns_for_width(width: u16) -> usize {
+    ((width / MIN_CARD_W) as usize).max(1)
+}
+
+/// Both axes of the card grid, decided together by [`choose_grid_layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GridLayout {
+    cols: usize,
+    density: CardDensity,
+}
+
+/// Choose columns and density TOGETHER: the first pair that renders **all**
+/// `total_cards` cards in `available_height` rows.
+///
+/// Issue #588: these two axes used to be decided independently — columns from
+/// width alone, density from height alone — so neither could compensate for the
+/// other. Seven roles on a 90-column, 27-row deck got `cols = 1` (width < 100);
+/// no density fit seven single-column cards in the 25 rows left after the title
+/// and stats bar (`7 * 5 = 35` at the densest tier), the density chooser
+/// returned `Compact` anyway, and the render path sliced to the five rows that
+/// fit. Two roles were never painted, and on screen a hidden role is
+/// indistinguishable from one that failed to start. The information needed to
+/// fit all seven — a second column needs only `7.div_ceil(2) * 5 = 20` of those
+/// 25 rows — was available at render time; the algorithm never looked.
+///
+/// The search starts at [`grid_columns`] and widens only as far as
+/// [`max_columns_for_width`] allows, so:
+///
+/// * a deck that already fits is **untouched** — the first `cols` tried is the
+///   one the deck has always used, and Compact fits there in every case that
+///   isn't already overflowing;
+/// * a deck that does not fit spends columns, cheapest resource first, to become
+///   complete. Within each column count the richest density wins, which answers
+///   the issue's open question ("more columns at a richer density" over "fewer
+///   columns with smaller cards") the way it suggests: prompt and tool lines are
+///   the card's actual content, horizontal space is the cheaper sacrifice.
+///
+/// When nothing fits, the layout the deck has always used is returned rather
+/// than the widest one, and the caller is left to signal the overflow. Narrowing
+/// every card is a real cost, paid here only for completeness; if completeness
+/// is out of reach the trade buys nothing, and the overflow indicator — not a
+/// squeezed grid — is what resolves the ambiguity that made this a bug.
+fn choose_grid_layout(total_cards: usize, width: u16, available_height: u16) -> GridLayout {
+    let preferred_cols = grid_columns(width);
+    // `max` guards the invariant asserted by `max_columns_for_width_never_below_grid_columns`:
+    // the ceiling can never sit below the historical count, so no deck loses a
+    // column it has today.
+    let max_cols = max_columns_for_width(width).max(preferred_cols);
+
+    for cols in preferred_cols..=max_cols {
+        if let Some(density) = fitting_density(total_cards, cols, available_height) {
+            return GridLayout { cols, density };
         }
     }
-    CardDensity::Compact
+
+    GridLayout {
+        cols: preferred_cols,
+        density: CardDensity::Compact,
+    }
+}
+
+/// The `  (↑12 ↓34)` indicator a scrollable list appends to its header when
+/// rows are hidden above and/or below the viewport, or an empty string when
+/// everything is on screen.
+///
+/// Shared by the scheduled-tasks modal and the deck's card grid. Issue #588
+/// found the two disagreeing in the way that matters: the modal signalled its
+/// hidden rows while the card grid rendered its title plain, so a role card cut
+/// off the bottom of a short deck read as a role that never started. One
+/// formatter means neither surface can drift from the other's shape.
+///
+/// The two leading spaces are part of the indicator — every caller appends it
+/// directly to a header string, and separating it there would be one more thing
+/// to keep in sync.
+fn scroll_indicator(hidden_above: usize, hidden_below: usize) -> String {
+    match (hidden_above, hidden_below) {
+        (0, 0) => String::new(),
+        (a, 0) => format!("  (\u{2191}{a})"),
+        (0, b) => format!("  (\u{2193}{b})"),
+        (a, b) => format!("  (\u{2191}{a} \u{2193}{b})"),
+    }
 }
 
 /// Clamp a (possibly stale) vertical scroll offset to the largest value that
@@ -226,7 +367,17 @@ enum ActiveTabView {
         focused_pane_id: Option<String>,
     },
     /// Orchestration tab: same card layout as dashboard, scoped to role panes.
-    Orchestration { role_pane_ids: Vec<String> },
+    Orchestration {
+        role_pane_ids: Vec<String>,
+        /// PRD #336: mirrors `Tab::Orchestration::split_narrow`, so
+        /// `compute_frame_layout` resolves the sidebar/pane-column split
+        /// without reaching into shared state mid-layout. The split is global
+        /// (`TabManager::orchestration_split_narrow`), so every orchestration
+        /// tab carries the same value here — but it still travels *as data* on
+        /// the render snapshot, which is what keeps the layout pass a pure
+        /// function of its inputs.
+        split_narrow: bool,
+    },
 }
 
 /// Lightweight snapshot of tab state for rendering, decoupled from TabManager.
@@ -234,6 +385,10 @@ struct TabBarInfo {
     show: bool,
     labels: Vec<String>,
     active_index: usize,
+    /// PRD #333: per-tab pane statuses, aligned with `labels` — `Some` for an
+    /// Orchestration tab (used to color its label), `None` for every other
+    /// tab.
+    orchestration_statuses: Vec<Option<Vec<SessionStatus>>>,
 }
 
 struct DirPickerState {
@@ -496,6 +651,79 @@ Rules:
 - CONFIRM the full entry (every field, especially repo and max_per_run) with the user before you call `schedule add`.
 - AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, each dispatched issue surfaces live as its own tab on the deck.";
 
+/// PRD #220: display name of the built-in "dispatcher" option in the new-pane
+/// Mode cycler — appended after `schedule: issues`. Selecting it opens a
+/// dispatcher tab: an ordinary agent that additionally knows the
+/// `dot-agent-deck dispatch <name>` verb.
+const DISPATCHER_MODE_NAME: &str = "dispatcher";
+
+/// PRD #220 M3.0: the seed prompt for the dispatcher mode.
+///
+/// Scope is deliberately MECHANICS ONLY — what the `dispatch` verb is, what it
+/// does, and the constraints that follow from process isolation. It carries no
+/// opinion on how the user should organise work, matching both schedule-authoring
+/// seeds (which cover only which CLI to use, which flags do not apply, and where
+/// results surface). An earlier version cast the pane as a planner ("decompose
+/// into independent units", "keep the number of units reasonable (2-6)", "NEVER
+/// do the work yourself") — that was cut: the deck does not own the user's
+/// workflow, and the last line actively forbade the pane from doing anything else
+/// the user asked. See the Design record in `prds/220-…md`.
+const DISPATCHER_SEED_PROMPT: &str = "\
+You are an ordinary assistant with one extra effector available: the `dot-agent-deck dispatch` verb, which starts an isolated line of work in its own git worktree. Help the user with whatever they ask, exactly as you normally would. When they say to START something as a separate line of work, reach for `dispatch` rather than doing that work here.
+
+## The verb
+  dot-agent-deck dispatch <name> [--task <text>] [--task-file <path>] (--single | --orchestration [<name>])
+  dot-agent-deck dispatch --list-targets
+
+- <name> is a short slug naming this line of work (e.g. `fix-auth-bug`, `prd-220`). It names the worktree and its branch.
+- --task carries the prompt the isolated agent receives. --task-file reads that text from a file (or `-` for stdin) instead; the two are mutually exclusive.
+
+## Choosing the shape — ASK, do not guess
+A unit can start as ONE agent or as a multi-role ORCHESTRATION (a team that divides the work). Which one the user wants is not inferable from the request: \"work on these three features\" usually wants a team per feature, while \"verify these three PRs\" usually wants one agent each — and both arrive here as the same words. Guessing wrong is expensive and visible.
+
+So, before the FIRST dispatch of a session:
+1. Run `dot-agent-deck dispatch --list-targets`. It prints the shapes this repo actually offers (always `single`, plus each orchestration by name).
+2. If more than one is offered, show the user the list and ask which they want. If only `single` is offered, say so and use it — there is nothing to ask.
+3. Pass their answer on every dispatch: `--single`, or `--orchestration <name>`.
+
+Reuse the answer for later dispatches in the same conversation rather than asking again, unless the user changes it or the new unit is clearly different in kind.
+
+## What it does
+- Creates a git worktree as a SIBLING of this repo, at ../<repo>-dispatch-<name>, on branch agent/dispatch-<name>. Isolation is automatic — never create or pick a worktree yourself.
+- Starts the shape you selected inside it, delivering the --task text as its opening prompt.
+- Returns immediately and reports what was started and where.
+
+## Rules
+- The --task text must be SELF-CONTAINED — independent of THIS CONVERSATION, not of the repo. The dispatched agent is a fresh process and cannot see anything said here, so state the goal and the expected outcome in the task itself.
+- The unit works in a copy of THIS REPO, so it already has the code, the docs, the PRDs and the skills. REFERENCE them by path instead of pasting their contents: `--task \"Execute the /prd-full skill for PRD 220\"` is complete as it stands. Never paste a skill's or a file's contents into --task.
+- Use paths RELATIVE to the repo root. An absolute path into this checkout points the unit back at the directory you are in, which defeats the isolation it was just given.
+- Pass --single or --orchestration explicitly. With neither, the shape falls back to whatever the repo's config implies, which is the guess this asking exists to avoid.
+- `dispatch` is fire-and-forget: there is NO return edge yet, so a dispatched unit's completion does NOT come back to this pane. Never tell the user results will report back here — give them the worktree path instead, and point at the unit's own tab on the deck.
+- A <name> is single-use. Removing a worktree keeps its branch, so re-dispatching the same name is refused while agent/dispatch-<name> still exists — pick a different name, or delete that branch once you are done with it.
+- Relay the path that `dispatch` reports for each line of work, so the user can follow it.";
+
+/// PRD #220: build the dispatcher `ModeConfig` — a seeded single-agent mode that
+/// teaches the agent the `dispatch` verb (see [`DISPATCHER_SEED_PROMPT`]).
+///
+/// Appends the pane's own `working_dir`, since the seed's `../<repo>-dispatch-…`
+/// layout is relative to it and the agent otherwise has to infer it.
+fn build_dispatcher_mode(working_dir: &std::path::Path) -> ModeConfig {
+    let seed = format!(
+        "{seed}\n\nworking_dir: {dir}\n\nThe repo at that path is the main worktree — the one dispatched worktrees are created as siblings of.",
+        seed = DISPATCHER_SEED_PROMPT,
+        dir = working_dir.display(),
+    );
+    ModeConfig {
+        agent: None,
+        name: DISPATCHER_MODE_NAME.to_string(),
+        init_command: None,
+        seed_prompt: Some(seed),
+        panes: Vec::new(),
+        rules: Vec::new(),
+        reactive_panes: 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // "Scheduled Tasks" management dialog (PRD #127 M3.3)
 // ---------------------------------------------------------------------------
@@ -590,6 +818,7 @@ fn build_schedule_authoring_mode(
         }
     };
     ModeConfig {
+        agent: None,
         name: SCHEDULE_MODE_NAME.to_string(),
         init_command: None,
         seed_prompt: Some(seed),
@@ -622,8 +851,8 @@ fn build_issue_dispatch_authoring_seed(working_dir: &std::path::Path) -> String 
 const DAEMON_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// PRD #140 review: the deadline for a query whose answer is only an
-/// INFORMATIONAL HINT — currently just [`live_orchestration_cwds`], which runs
-/// on the `Ctrl+n` form-open key path. A local unix-socket round-trip against a
+/// INFORMATIONAL HINT — currently just [`live_orchestration_cwds_and_titles`],
+/// which runs on the `Ctrl+n` form-open key path. A local unix-socket round-trip against a
 /// healthy daemon completes in well under a millisecond, so 250 ms is orders of
 /// magnitude of headroom while capping the worst case (wedged daemon, socket
 /// file present but nothing draining it) at a quarter second instead of
@@ -649,11 +878,17 @@ fn send_daemon_request_blocking_with_timeout(
     req: &crate::daemon_protocol::AttachRequest,
     timeout: std::time::Duration,
 ) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
-    use crate::daemon_protocol::{KIND_REQ, KIND_RESP};
-    use std::io::{Read, Write};
+    use crate::daemon_protocol::KIND_REQ;
+    use std::io::Write;
 
     let path = config::attach_socket_path();
-    let mut stream = crate::platform::ipc::IpcClient::connect(&path)?;
+    // Issue #435: `timeout` is a per-operation deadline, and connect is one of
+    // the operations. Connecting through the bare `IpcClient::connect` left it
+    // outside the budget entirely — on Unix that call blocks uninterruptibly
+    // when the daemon's accept queue is full, so a wedged daemon could hang
+    // this synchronous TUI key path forever despite the deadline two lines
+    // below.
+    let mut stream = crate::platform::ipc::IpcClient::connect_timeout(&path, timeout)?;
     stream.set_timeouts(timeout)?;
 
     let payload = serde_json::to_vec(req).map_err(std::io::Error::other)?;
@@ -664,8 +899,35 @@ fn send_daemon_request_blocking_with_timeout(
     stream.write_all(&payload)?;
     stream.flush()?;
 
+    read_resp_frame_blocking(&mut stream)
+}
+
+/// Read one `KIND_RESP` frame off a synchronous reader and decode its body.
+///
+/// Split out of [`send_daemon_request_blocking_with_timeout`] so the framing
+/// can be exercised against a plain in-memory reader (issue #478) — the send
+/// path itself needs a live socket at [`config::attach_socket_path`].
+///
+/// The length prefix is checked against
+/// [`crate::daemon_protocol::MAX_FRAME_LEN`] BEFORE the body is allocated,
+/// mirroring [`crate::daemon_protocol::read_frame`] — same bound, same
+/// [`std::io::ErrorKind::InvalidData`], same message shape. Without it a
+/// 5-byte header claiming `u32::MAX` made this allocate ~4 GiB without the
+/// peer sending a single body byte, and this runs SYNCHRONOUSLY on the
+/// `Ctrl+n` new-pane key path (via [`live_orchestration_cwds`]), so the
+/// failure mode was the TUI ballooning or being OOM-killed on a keystroke.
+/// The socket is `0o600`, so the reachable case is a buggy or compromised
+/// same-uid daemon — exactly the "buggy peer" `MAX_FRAME_LEN` was written for.
+/// Every caller already treats `Err` as a failed request (best-effort hint,
+/// or a `Run-now failed: …` status line), so an over-long frame degrades
+/// instead of panicking.
+fn read_resp_frame_blocking<R: std::io::Read>(
+    r: &mut R,
+) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
+    use crate::daemon_protocol::{KIND_RESP, MAX_FRAME_LEN};
+
     let mut resp_header = [0u8; 5];
-    stream.read_exact(&mut resp_header)?;
+    r.read_exact(&mut resp_header)?;
     if resp_header[0] != KIND_RESP {
         return Err(std::io::Error::other(format!(
             "expected RESP frame, got kind 0x{:02x}",
@@ -678,8 +940,14 @@ fn send_daemon_request_blocking_with_timeout(
         resp_header[3],
         resp_header[4],
     ]) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame length {len} exceeds {MAX_FRAME_LEN}"),
+        ));
+    }
     let mut body = vec![0u8; len];
-    stream.read_exact(&mut body)?;
+    r.read_exact(&mut body)?;
     serde_json::from_slice(&body).map_err(std::io::Error::other)
 }
 
@@ -727,6 +995,14 @@ const SAME_CWD_ORCHESTRATION_WARNING: [&str; 3] = [
     "    and one working tree; /worktree-prd isolates.",
 ];
 
+/// The BLOCKING refusal shown on the same guard seam as
+/// [`SAME_CWD_ORCHESTRATION_WARNING`] when the typed Name matches a name a
+/// live orchestration already holds. Unlike that warning, submitting is
+/// refused — see [`NewPaneFormState::name_collision`] — so the render side
+/// also drops `[Submit]` from the action row entirely.
+const NAME_COLLISION_WARNING: [&str; 1] =
+    ["  ! This name is already in use by a live orchestration."];
+
 /// PRD #140 M4.0: the shared warning DECISION — does `form_cwd` collide with
 /// any directory the daemon reports as hosting a live orchestration? The single
 /// code path behind both the L1 seam
@@ -763,42 +1039,63 @@ fn live_orchestration_in_same_cwd(form_cwd: &Path, live_orchestration_cwds: &[St
         .any(|c| std::fs::canonicalize(c).is_ok_and(|live| live == form_canonical))
 }
 
-/// PRD #140 M4.0: directories that currently host a live orchestration, derived
-/// from the daemon's `ListAgents` — the same one-shot socket query
-/// [`live_schedule_names`] uses at dialog-open time, and the same records the
-/// hydration path buckets. A down daemon degrades to "no live orchestrations"
-/// (no warning), which is the right failure direction for an informational hint.
+/// PRD #140 M4.0: directories that currently host a live orchestration, AND
+/// the live orchestration TITLES (for the name-uniqueness
+/// suggestion/refusal) — both derived from ONE daemon
+/// `ListAgents` snapshot, the same one-shot socket query [`live_schedule_names`]
+/// uses at dialog-open time, and the same records the hydration path buckets.
+/// A down daemon degrades to "nothing live" (no warning, suggest `-orchestrator-1`,
+/// never block submit), which is the right failure direction for a best-effort
+/// hint. Kept as ONE query (not two) so extending the same-cwd warning's call to
+/// also carry names costs no extra daemon round-trip on the `Ctrl+n` path.
 ///
-/// Only `TabMembership::Orchestration` panes contribute, and only via the
+/// Only `TabMembership::Orchestration` panes contribute. Cwds come from the
 /// tab-wide `orchestration_cwd` (never the per-pane cwd, which round-9 #2 let
-/// diverge into sub-directories). Duplicates are dropped so N role panes of one
-/// orchestration don't inflate the list.
+/// diverge into sub-directories); titles mirror the exact fallback
+/// `TabManager::open_orchestration_tab_with_existing_role_panes` (`src/tab.rs`)
+/// uses to compute the tab TITLE — `display_title` when non-empty, else the
+/// canonical `name` — so a name is only ever suggested/refused against what a
+/// user would actually SEE as another orchestration's tab label. Duplicates are
+/// dropped in both lists so N role panes of one orchestration don't inflate them.
 ///
 /// PRD #140 review: time-boxed at [`DAEMON_HINT_TIMEOUT`] rather than the
 /// default five seconds. This runs SYNCHRONOUSLY on the `Ctrl+n` key path, so a
 /// wedged daemon (socket file present, nothing draining it) used to freeze
-/// form-open for the whole default deadline. The warning is a best-effort hint,
-/// never a correctness gate — routing does not consult it — so a slow or down
-/// daemon fails open to "no live orchestrations" and the form opens instantly.
-fn live_orchestration_cwds() -> Vec<String> {
+/// form-open for the whole default deadline. The warning/suggestion/refusal are
+/// all best-effort hints, never a correctness gate — routing does not consult
+/// them — so a slow or down daemon fails open and the form opens instantly.
+fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
     let Ok(resp) = send_daemon_request_blocking_with_timeout(
         &crate::daemon_protocol::AttachRequest::ListAgents,
         DAEMON_HINT_TIMEOUT,
     ) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    let mut seen: HashSet<String> = HashSet::new();
-    resp.agent_records
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|r| match r.tab_membership {
-            Some(TabMembership::Orchestration {
-                orchestration_cwd, ..
-            }) => orchestration_cwd,
-            _ => None,
-        })
-        .filter(|cwd| seen.insert(cwd.clone()))
-        .collect()
+    let mut seen_cwds: HashSet<String> = HashSet::new();
+    let mut seen_titles: HashSet<String> = HashSet::new();
+    let mut cwds = Vec::new();
+    let mut titles = Vec::new();
+    for r in resp.agent_records.unwrap_or_default() {
+        let Some(TabMembership::Orchestration {
+            name,
+            display_title,
+            orchestration_cwd,
+            ..
+        }) = r.tab_membership
+        else {
+            continue;
+        };
+        if let Some(cwd) = orchestration_cwd
+            && seen_cwds.insert(cwd.clone())
+        {
+            cwds.push(cwd);
+        }
+        let title = display_title.filter(|t| !t.is_empty()).unwrap_or(name);
+        if seen_titles.insert(title.clone()) {
+            titles.push(title);
+        }
+    }
+    (cwds, titles)
 }
 
 /// PRD #80 M8: which new-pane-form field is focused. Public because it rides
@@ -855,6 +1152,15 @@ struct NewPaneFormState {
     /// offers the `schedule: issues` option after `schedule`; when false it is
     /// hidden and the cycler shape is byte-for-byte the pre-feature baseline.
     show_issue_dispatch: bool,
+    /// PRD #220: the built-in "dispatcher" authoring mode, appended after
+    /// `schedule: issues` in the cycler. Carries the authoring seed prompt
+    /// that teaches the agent to decompose work and call `dispatch` per unit.
+    dispatcher_authoring: ModeConfig,
+    /// PRD #220: when true the cycler offers the `dispatcher` option after
+    /// `schedule: issues`. True for the ordinary `Ctrl+n` form (the feature has
+    /// graduated out of the experimental flag); false only for the mode-locked
+    /// form, which renders no cycler at all.
+    show_dispatcher: bool,
     selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations, then "schedule" [, "schedule: issues"]
     /// PRD #20 finding #8: the selected agent's index into
     /// [`crate::agent_registry::ALL`], or `None` when the user hasn't picked one
@@ -876,9 +1182,10 @@ struct NewPaneFormState {
     /// Only ever `Some` when `schedule_locked` is `true`.
     schedule_existing: Option<config::ScheduledTask>,
     /// PRD #140 M4.0: whether this form's directory already hosts one of the
-    /// live orchestrations the daemon reported (see [`live_orchestration_cwds`]),
-    /// decided ONCE by [`live_orchestration_in_same_cwd`] when the form opens.
-    /// Drives the non-blocking same-cwd warning via
+    /// live orchestrations the daemon reported (see
+    /// [`live_orchestration_cwds_and_titles`]), decided ONCE by
+    /// [`live_orchestration_in_same_cwd`] when the form opens. Drives the
+    /// non-blocking same-cwd warning via
     /// [`NewPaneFormState::same_cwd_orchestration_warning`].
     ///
     /// Stored as the decided verdict rather than the raw cwd list because the
@@ -889,29 +1196,40 @@ struct NewPaneFormState {
     /// warning, so every other form construction site renders byte-for-byte as
     /// before.
     live_orchestration_in_same_cwd: bool,
-}
-
-// ---------------------------------------------------------------------------
-// Idle ASCII art state machine (per session)
-// ---------------------------------------------------------------------------
-
-enum IdleArtPhase {
-    /// Session is idle but hasn't hit the timeout yet.
-    Waiting,
-    /// LLM generation spawned; poll receiver for result.
-    Generating(std::sync::mpsc::Receiver<Option<AsciiArtResult>>),
-    /// Generation succeeded; frames are cached.
-    HasArt(AsciiArtResult),
-    /// Generation failed; retry after cooldown.
-    Failed(std::time::Instant),
-}
-
-struct IdleArtEntry {
-    phase: IdleArtPhase,
-    /// `last_activity` when this idle stretch began.
-    idle_since: DateTime<Utc>,
-    /// True if the user navigated to this card after art appeared (dismisses art).
-    dismissed: bool,
+    /// The live orchestration TITLES the daemon reported (see
+    /// [`live_orchestration_cwds_and_titles`]) — the uniqueness universe both
+    /// [`NewPaneFormState::suggest_orchestration_name`] and
+    /// [`NewPaneFormState::name_collision`] check against. Unlike
+    /// `live_orchestration_in_same_cwd`, kept as the raw list rather than a
+    /// pre-decided verdict: the typed Name changes every keystroke, so there is
+    /// no single "decided" answer to cache — the collision check re-reads this
+    /// list every frame, which costs nothing (plain string compares, no
+    /// filesystem). Empty (the `new` default) means "nothing known live" — the
+    /// suggestion starts at `-orchestrator-1` and nothing is ever refused.
+    live_orchestration_names: Vec<String>,
+    /// Whether the user has edited the Name field by hand since the form
+    /// opened — set by the two text-edit key arms in
+    /// `handle_new_pane_form_key` (`FormField::Name` only), never by the
+    /// basename pre-fill `transition_after_dir_pick` applies. While `false`,
+    /// [`Self::resuggest_name_for_selection`] is free to overwrite
+    /// `name` with the generated suggestion; once `true`, that fn leaves the
+    /// field alone — a generated default may replace a generated default,
+    /// never a human edit. Guards re-clicking the selected chip, arrowing
+    /// between orchestrations, and arrowing off and back onto one, all of
+    /// which land on the same call.
+    name_touched: bool,
+    /// The Name the form opened with — the directory basename
+    /// `transition_after_dir_pick` pre-fills. Kept so that cycling AWAY from an
+    /// orchestration can put it back: the `-orchestrator-N` suggestion belongs
+    /// to the orchestration selection, and a plain pane, a workload mode or the
+    /// built-in `schedule`/`dispatcher` options must not inherit it. Without
+    /// this, the suggestion was a one-way overwrite — and since the cycler
+    /// orders orchestrations BEFORE `schedule`/`dispatcher`, merely passing
+    /// over one on the way to them left every such pane named
+    /// `<folder>-orchestrator-N`. Only ever consulted while
+    /// [`Self::name_touched`] is `false`, so it can never overwrite a human
+    /// edit.
+    name_prefill: String,
 }
 
 impl NewPaneFormState {
@@ -931,6 +1249,7 @@ impl NewPaneFormState {
         // time by `build_schedule_authoring_mode` (threaded with the picked dir),
         // so `seed_prompt` here is dead data; leave it `None`.
         let schedule_authoring = ModeConfig {
+            agent: None,
             name: SCHEDULE_MODE_NAME.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -941,6 +1260,7 @@ impl NewPaneFormState {
         // PRD #120: synthetic issue-dispatch authoring option (name only; seed
         // derived at submit time). Whether it is offered is the flag snapshot.
         let issue_dispatch_authoring = ModeConfig {
+            agent: None,
             name: ISSUE_DISPATCH_MODE_NAME.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -948,6 +1268,10 @@ impl NewPaneFormState {
             rules: Vec::new(),
             reactive_panes: 0,
         };
+        let dispatcher_authoring = build_dispatcher_mode(&dir);
+        // Remembered so leaving an orchestration can restore it — see
+        // `name_prefill`.
+        let name_prefill = name.clone();
         Self {
             dir,
             name,
@@ -960,6 +1284,13 @@ impl NewPaneFormState {
             // render wrapper once at construction so the count/name/cycler-cap
             // all observe one consistent value.
             show_issue_dispatch: crate::features::show_issue_dispatch_authoring(),
+            dispatcher_authoring,
+            // PRD #220: GRADUATED — the `dispatcher` option is offered to everyone.
+            // It shipped behind `features::show_dispatcher()`; that wrapper is gone
+            // and this branch is inlined (CLAUDE.md #9). The field itself stays,
+            // because the mode-locked form below still sets it `false` — for an
+            // unrelated reason (that form hides the cycler entirely).
+            show_dispatcher: true,
             selection_index: 0,
             agent_selection: None,
             has_mode_field,
@@ -971,6 +1302,15 @@ impl NewPaneFormState {
             // cwds via `with_live_orchestration_cwds`; unattached means no
             // warning.
             live_orchestration_in_same_cwd: false,
+            // The caller attaches the daemon's live-orchestration titles via
+            // `with_live_orchestration_names`; unattached means nothing is
+            // known live, so the suggestion starts at `-orchestrator-1` and
+            // nothing is ever refused.
+            live_orchestration_names: Vec::new(),
+            // A freshly opened form has no human edit yet — the basename
+            // pre-fill below is not one.
+            name_touched: false,
+            name_prefill,
         }
     }
 
@@ -986,6 +1326,110 @@ impl NewPaneFormState {
     fn with_live_orchestration_cwds(mut self, cwds: Vec<String>) -> Self {
         self.live_orchestration_in_same_cwd = live_orchestration_in_same_cwd(&self.dir, &cwds);
         self
+    }
+
+    /// Attach the daemon's live-orchestration TITLES to the form — the
+    /// uniqueness universe [`Self::suggest_orchestration_name`] and
+    /// [`Self::name_collision`] check against. Mirrors
+    /// [`Self::with_live_orchestration_cwds`]'s shape; unlike that one, the raw
+    /// list is kept (not a pre-decided verdict) since the typed Name changes
+    /// every keystroke — see the field doc.
+    fn with_live_orchestration_names(mut self, names: Vec<String>) -> Self {
+        self.live_orchestration_names = names;
+        self
+    }
+
+    /// The next free `<foldername>-orchestrator-N` for this form's directory,
+    /// skipping any `N` a live orchestration's title already holds (see
+    /// [`Self::live_orchestration_names`]). `N` is counted globally over ALL
+    /// live orchestrations, not per-directory — uniqueness is the whole point
+    /// of the name, and a per-cwd counter would offer `-orchestrator-1` in two
+    /// different directories at once (PRD decision, not reopened here).
+    fn suggest_orchestration_name(&self) -> String {
+        let base = self
+            .dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut n: usize = 1;
+        loop {
+            let candidate = format!("{base}-orchestrator-{n}");
+            if !self
+                .live_orchestration_names
+                .iter()
+                .any(|l| l == &candidate)
+            {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// Re-derive the Name field for the CURRENT selection — called from every
+    /// path that can change `selection_index` (arrow keys, click).
+    ///
+    /// Landing on an orchestration suggests the next free
+    /// `<folder>-orchestrator-N`; landing on anything else (No mode, a
+    /// workload mode, the built-in `schedule` / `schedule: issues` /
+    /// `dispatcher` options) restores [`Self::name_prefill`], the directory
+    /// basename the form opened with.
+    ///
+    /// **Both directions matter.** This used to apply the suggestion and
+    /// return early otherwise, which made it a one-way overwrite: the name
+    /// survived the selection that generated it. Because the cycler orders the
+    /// orchestrations BEFORE the built-in `schedule`/`dispatcher` options,
+    /// reaching those from "No mode" means passing over an orchestration — so
+    /// a plain pane, a `dev`-mode pane and a scheduled task could all end up
+    /// named `<folder>-orchestrator-N` without the user ever selecting an
+    /// orchestration.
+    ///
+    /// Still a no-op once [`Self::name_touched`] is set — a generated default
+    /// may replace a generated default, never a human edit. Without that
+    /// guard, re-clicking the already-selected chip, arrowing between two
+    /// orchestrations, or arrowing off one and back all silently clobber
+    /// whatever the user typed.
+    fn resuggest_name_for_selection(&mut self) {
+        if self.name_touched {
+            return;
+        }
+        self.name = if self.selected_orchestration().is_some() {
+            self.suggest_orchestration_name()
+        } else {
+            self.name_prefill.clone()
+        };
+    }
+
+    /// The title this submission will ACTUALLY take: the typed Name when it
+    /// is non-empty, otherwise the canonical fallback
+    /// `open_orchestration_tab` applies
+    /// ([`crate::project_config::resolve_orchestration_name`],
+    /// `src/tab.rs:846-849`). `None` when no orchestration is selected — a
+    /// plain mode/card/authoring option carries no identity uniqueness
+    /// constraint. [`Self::name_collision`] must compare THIS and not the raw
+    /// field — an empty field is not "no title", it is the canonical title,
+    /// and comparing `""` against the live titles can never match because
+    /// `live_orchestration_cwds_and_titles` filters empties out
+    /// (`src/ui.rs:944`). Uses `is_empty()`, mirroring `src/tab.rs:846`'s
+    /// predicate byte for byte — trimming here would let a whitespace-only
+    /// name resolve differently in the guard than in the tab.
+    fn resolved_title(&self) -> Option<String> {
+        let orch = self.selected_orchestration()?;
+        Some(if self.name.is_empty() {
+            crate::project_config::resolve_orchestration_name(&orch.name, &self.dir)
+        } else {
+            self.name.clone()
+        })
+    }
+
+    /// Whether the title this submission will actually take (see
+    /// [`Self::resolved_title`]) matches a name a live orchestration already
+    /// holds. Only meaningful when an orchestration is selected — a plain
+    /// mode/card/authoring option carries no identity uniqueness constraint.
+    /// Drives the blocking refusal at submit and the `[Submit]`-button-gone
+    /// render on the guard seam.
+    fn name_collision(&self) -> bool {
+        self.resolved_title()
+            .is_some_and(|t| self.live_orchestration_names.iter().any(|l| l == &t))
     }
 
     /// PRD #140 M4.0: whether the form should render
@@ -1016,6 +1460,7 @@ impl NewPaneFormState {
         // PRD #170 round 2 (reviewer finding 7): seed is derived at submit time by
         // `build_schedule_authoring_mode`; the synthetic mode only carries `name`.
         let schedule_authoring = ModeConfig {
+            agent: None,
             name: SCHEDULE_MODE_NAME.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -1024,6 +1469,7 @@ impl NewPaneFormState {
             reactive_panes: 0,
         };
         let issue_dispatch_authoring = ModeConfig {
+            agent: None,
             name: ISSUE_DISPATCH_MODE_NAME.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -1031,6 +1477,7 @@ impl NewPaneFormState {
             rules: Vec::new(),
             reactive_panes: 0,
         };
+        let dispatcher_authoring = build_dispatcher_mode(&dir);
         let mut form = Self {
             dir,
             name: SCHEDULE_MODE_NAME.to_string(),
@@ -1043,6 +1490,8 @@ impl NewPaneFormState {
             // only — the issue-dispatch option lives on the `Ctrl+n` cycler, and
             // the locked form hides the cycler entirely, so it never appears here.
             show_issue_dispatch: false,
+            dispatcher_authoring,
+            show_dispatcher: false,
             selection_index: 0,
             agent_selection: None,
             has_mode_field: true,
@@ -1052,6 +1501,15 @@ impl NewPaneFormState {
             // PRD #140 M4.0: the locked schedule form can't select an
             // orchestration, so the same-cwd warning never applies to it.
             live_orchestration_in_same_cwd: false,
+            // The locked schedule form can't select an orchestration either,
+            // so there is never a name to suggest or collide.
+            live_orchestration_names: Vec::new(),
+            // The Name field is hidden and fixed to `SCHEDULE_MODE_NAME` on
+            // this form, so there is nothing to touch.
+            name_touched: false,
+            // No cycler and no orchestration on this form, so nothing ever
+            // reverts to it.
+            name_prefill: SCHEDULE_MODE_NAME.to_string(),
         };
         // Lock the selection onto the built-in schedule option (index 1 with no
         // modes/orchestrations) so the existing schedule spawn branch fires.
@@ -1073,6 +1531,12 @@ impl NewPaneFormState {
         self.schedule_index() + 1
     }
 
+    /// PRD #220: cycler index of the dispatcher option — appended after
+    /// `schedule: issues`. Only meaningful when `show_dispatcher` is true.
+    fn dispatcher_index(&self) -> usize {
+        self.issue_dispatch_index() + if self.show_issue_dispatch { 1 } else { 0 }
+    }
+
     /// Whether the built-in "schedule" authoring option is currently selected.
     fn is_schedule_selected(&self) -> bool {
         self.selection_index == self.schedule_index()
@@ -1083,33 +1547,59 @@ impl NewPaneFormState {
         self.show_issue_dispatch && self.selection_index == self.issue_dispatch_index()
     }
 
+    /// PRD #220: whether the dispatcher option is selected.
+    fn is_dispatcher_selected(&self) -> bool {
+        self.show_dispatcher && self.selection_index == self.dispatcher_index()
+    }
+
     /// PRD #120: whether the current selection is a throwaway authoring option
     /// (plain `schedule` OR `schedule: issues`). Drives the shared
     /// "↳ authoring (one-off)" hint + its reserved render row.
+    ///
+    /// PRD #220: `dispatcher` is deliberately NOT a member. The schedule options
+    /// really are one-off — their own seeds tell the user the pane existed only to
+    /// write the schedule and can be closed. A dispatcher pane has continued
+    /// purpose: the user keeps talking to it and may dispatch again, and it is a
+    /// real mode tab rather than a throwaway authoring card (see
+    /// `build_new_pane_request`). Labelling it "authoring (one-off)" told the user
+    /// the opposite.
     fn is_authoring_selected(&self) -> bool {
         self.is_schedule_selected() || self.is_issue_dispatch_selected()
     }
 
     fn mode_option_count(&self) -> usize {
         // +1 for the built-in "schedule" authoring option appended at the end,
-        // +1 more for the flag-gated "schedule: issues" option when shown.
+        // +1 more for the flag-gated "schedule: issues" option when shown,
+        // +1 more for the dispatcher option (PRD #220).
         1 + self.modes.len()
             + self.orchestrations.len()
             + 1
             + if self.show_issue_dispatch { 1 } else { 0 }
+            + if self.show_dispatcher { 1 } else { 0 }
     }
 
     fn select_next_mode(&mut self) {
         if self.selection_index + 1 < self.mode_option_count() {
             self.selection_index += 1;
+            // Selecting an orchestration suggests the next free name in
+            // place of whatever was in the field.
+            self.resuggest_name_for_selection();
         }
     }
 
     fn select_previous_mode(&mut self) {
         self.selection_index = self.selection_index.saturating_sub(1);
+        // Symmetric to `select_next_mode` — cycling backward onto an
+        // orchestration suggests the next free name too.
+        self.resuggest_name_for_selection();
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
+        // PRD #220: the dispatcher mode — checked first since it is appended
+        // after the schedule options in the cycler.
+        if self.is_dispatcher_selected() {
+            return Some(&self.dispatcher_authoring);
+        }
         // PRD #120: the flag-gated issue-dispatch authoring option — its synthetic
         // mode supplies the cycler's title/chip ("schedule: issues mode"); the
         // spawned request swaps in the issue-dispatch seed (see
@@ -1158,6 +1648,9 @@ impl NewPaneFormState {
         } else if self.show_issue_dispatch && idx == self.issue_dispatch_index() {
             // PRD #120: the flag-gated issue-dispatch authoring option.
             ISSUE_DISPATCH_MODE_NAME.to_string()
+        } else if self.show_dispatcher && idx == self.dispatcher_index() {
+            // PRD #220: the dispatcher mode.
+            DISPATCHER_MODE_NAME.to_string()
         } else {
             // PRD #127 M3.2: built-in "schedule" authoring option.
             SCHEDULE_MODE_NAME.to_string()
@@ -1301,6 +1794,32 @@ const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(1
 /// because it is the same kind of knob: one named place to tune a decay.
 pub const COMMAND_BANNER_TTL: std::time::Duration = std::time::Duration::from_millis(2500);
 
+/// How much output an empty pane must have consumed before a failed scroll can
+/// be treated as evidence that the agent keeps no terminal scrollback. Measured
+/// in live pane screenfuls (`rows * cols`), never against the parser's configured
+/// scrollback capacity.
+pub const SCROLL_NOTICE_MIN_SCREENFULS: u64 = 8;
+
+/// The single-line explanation rendered after a mature pane cannot scroll.
+/// Kept named so the L1 observation seam can identify the production message
+/// without duplicating its wording.
+///
+/// **It claims only what was observed** (PRD #611, audit finding 2). An earlier
+/// wording asserted that *"this agent redraws in place and keeps no
+/// scrollback"*, which is a claim about the agent's rendering model — and the
+/// evidence behind the trigger cannot establish one. The trigger counts bytes
+/// handed to the parser before anything parses them, so a pane fed
+/// `8 * rows * cols` NUL bytes, or cursor-control noise, or a chunk the parser
+/// panicked on, arrives at the same "lots of output, no retained lines" state
+/// with no rendering model implied. Worse, the bytes need not be the agent's
+/// own: an agent that `cat`s an untrusted file or prints a web response is
+/// relaying content it did not author, so a third party could make the deck
+/// state a falsehood in the deck's own voice. What the deck genuinely knows is
+/// that THIS pane has nothing to scroll, so that is all it says; the per-agent
+/// explanation lives in `docs/keyboard-shortcuts.md`, which M1 rewrote for it.
+pub const SCROLL_NOTICE_TEXT: &str =
+    "Nothing to scroll — this pane has no scrollback to move through";
+
 /// PRD #76 M2.20 — minimum gap between the last forwarded keystroke and an
 /// Enter keystroke that follows it on the human-typing path. Agent TUIs like
 /// claude treat a CR fused to preceding bytes as newline-in-input, not submit;
@@ -1424,8 +1943,132 @@ struct SendRetryState {
 #[derive(Clone)]
 struct PromptDelivery {
     expected_agent_id: Option<String>,
+    /// Issue #424 (reviewer finding B2): the daemon-authoritative hook session
+    /// GENERATION this delivery is bound to, captured at the FIRST successful
+    /// write and retained across every attempt.
+    ///
+    /// It used to be `None` always on the orchestrator path and captured only in
+    /// a branch the seed path never reached, so every rotated retry told the
+    /// daemon "any generation will do" — enough to refuse a different registry
+    /// agent, useless against a same-agent `/clear` or thread restart, which is
+    /// precisely the case where the old prompt lands in a NEW conversation.
+    /// `None` here means no generation has been named yet. It is latched ONCE
+    /// and never re-latched, because a generation change after the latch is a
+    /// lost target, not a new address to write to. Two places may perform that
+    /// one latch, for two different reasons:
+    ///
+    /// * [`bind_delivery_generation`], BEFORE the first write — the ordinary
+    ///   case, naming the conversation the bytes are about to enter;
+    /// * [`bind_generation_before_retry`], before a RETRY made by a delivery
+    ///   whose first write went into a pane that had no generation at all (the
+    ///   launcher/10 s-fallback case). Issue #424 D1: leaving that delivery
+    ///   permanently unbound meant every retry told the daemon "any generation
+    ///   will do" for exactly the population this issue exists to repair.
     expected_session_id: Option<String>,
+    /// Issue #424 F2 (auditor HIGH): the pane generation this delivery has SEEN
+    /// while it was written but still unbound — a witness, not a binding.
+    ///
+    /// D1 named the conversation a retry is about to enter, which closed the
+    /// case where the late generation is still current when the retry runs. It
+    /// did not close the counter-sequence: attempt 1 writes while the pane has
+    /// no generation, a genuine `SessionStart(R)` arrives WHILE THE RETRY IS
+    /// BACKED OFF (so the every-frame bind refuses — a write already exists),
+    /// `R` then ends before the retry is due, and by then
+    /// [`delivery_target_changed`] is comparing against `None` and answers
+    /// "unchanged" because nothing was ever bound. The retry either adopts `R`'s
+    /// successor and sends the old task into it, or goes out with no generation
+    /// guard at all.
+    ///
+    /// The daemon-side latch observes `R` and its end sequentially and
+    /// terminates on the second ([`crate::state::latch_generation`]); the TUI
+    /// samples a snapshot per frame and would otherwise forget the transition
+    /// happened. This field is what makes it remember: once a generation has
+    /// been seen after our bytes, its disappearance or replacement is a lost
+    /// target exactly as a bound one's would be.
+    ///
+    /// Deliberately NOT a binding: it is not sent on the wire, does not rotate
+    /// the epoch, and does not claim a conversation the bytes never entered —
+    /// see [`bind_delivery_generation`] for why binding every frame is the thing
+    /// that laundered a `/clear` into an authorization, and `prompt/pane-input/026`
+    /// for the drifting-session-id pane it would abandon.
+    observed_generation: Option<String>,
+    /// Issue #424 H4 (auditor HIGH): the pane's generation-CLOSURE count at the
+    /// instant of the FIRST write. `None` until then — nothing is written, so
+    /// nothing can have been revoked.
+    ///
+    /// Issue #424 S4 (reviewer HIGH): stamped immediately BEFORE the RPC that
+    /// may write, on both TUI paths, and never afterwards. A transport error is
+    /// not proof that the daemon did not apply the write, so a baseline stored
+    /// only in the `Applied`/`Queued` arm was missing from exactly the delivery
+    /// that needed it: `attempts` stayed 0, an entire generation burst passed
+    /// unnoticed, and the eventual success then stored the ALREADY-INCREMENTED
+    /// count as its baseline — laundering the missed closure permanently. It
+    /// therefore doubles as the "a write may have occurred" witness
+    /// [`delivery_target_changed`] gates on, which the attempt counter cannot be
+    /// because a lost response leaves it at zero.
+    ///
+    /// [`Self::observed_generation`] is a witness the TUI has to SEE to record,
+    /// and production offers no guarantee of a render pass while a short-lived
+    /// generation exists. `SessionStart(R)`, `SessionEnd(R)` and
+    /// `SessionStart(R2)` can all land between two passes; `AppState::apply_event`
+    /// removes R's session and its journal on the end, so by the next pass there
+    /// is no witness to acquire and no trace that R was ever there. The delivery
+    /// then adopts R2 and types the revoked task into it.
+    ///
+    /// A count read from the snapshot needs no pass to have been taken at the
+    /// right moment: `AppState` maintains it as it consumes the events, in order,
+    /// exactly as the daemon's own latch does — see
+    /// [`crate::state::AppState::pane_generation_closures`]. The witness is kept
+    /// alongside it because the two answer different questions: the witness is
+    /// the identity of a generation this delivery saw, the count is the number of
+    /// conversations it MISSED.
+    closures_at_write: Option<u64>,
     delivery_id: String,
+    /// Issue #424 (reviewer blocker 2): which WIRE-IDENTITY epoch this delivery
+    /// is on.
+    ///
+    /// The daemon's ledger binds a `delivery_id` to a FINGERPRINT of the target
+    /// identity (agent + session + pane + text) at first admission and refuses a
+    /// later request that reuses the id with a different one. That is right, and
+    /// it collided with two other correct behaviours: after a LOST RESPONSE the
+    /// retry deliberately reuses the same attempt id (so a physically-applied
+    /// write replays instead of double-submitting), while binding the hook
+    /// generation for the first time changes `expected_session_id` — and B11 now
+    /// hashes that. Same id, different fingerprint: a permanent `Conflict` that
+    /// the error branch retried, unchanged, until the deadline.
+    ///
+    /// So an identity change that lands while a wire request may still be
+    /// recorded rotates the EPOCH, which gives the delivery a fresh wire
+    /// identity while leaving the logical id (what logs and local state key on)
+    /// and the attempt number alone. Same-request replay is preserved within an
+    /// epoch; a new epoch is admitted as new work.
+    epoch: u32,
+    /// Issue #424: whether a wire request has been issued in this epoch whose
+    /// outcome may be sitting in the daemon's ledger. Set before every send and
+    /// cleared when the epoch rotates. A CLEAN response is not enough to clear
+    /// it — a delivered outcome is exactly what the ledger caches — so this is
+    /// only about "could the current wire id already be bound to a fingerprint".
+    wire_issued: bool,
+    /// Issue #424: how many PTY submissions this LOGICAL delivery has made. `0`
+    /// means nothing has been written yet, so nothing the pane reports can be
+    /// evidence about it. Each attempt goes on the wire under its own
+    /// [`attempt_delivery_id`] so the daemon's ledger cannot replay a cached
+    /// `Applied` in place of the second physical submission a retry exists for.
+    attempts: u32,
+    /// Issue #424 (reviewer finding B2/#3): the ORDERING watermark — the newest
+    /// timestamp in this pane's own event journal at the instant of the first
+    /// write. A submission at or before it was already history when we wrote and
+    /// is not evidence about this delivery. It does not establish causality —
+    /// see #526 and
+    /// [`submission_is_after_watermark`] for why this replaced a wall-clock
+    /// comparison against our own write time.
+    watermark: Option<DateTime<Utc>>,
+    /// Issue #424 (reviewer findings B3/B4): whether this pane has ever been
+    /// observed to have a producer that can report a submitted prompt. Sticky
+    /// once true — a `SessionEnd` must not disarm a delivery mid-flight — and it
+    /// is what gates RE-SUBMISSION, so a slow launcher arms late and a Pi pane
+    /// never arms at all.
+    can_report_prompts: bool,
 }
 
 /// PRD #20 R20-005: bounded exponential backoff for a retried automatic prompt.
@@ -1441,40 +2084,6 @@ pub fn send_retry_delay(attempts: u32) -> std::time::Duration {
     const CAP: std::time::Duration = std::time::Duration::from_secs(2);
     let shift = attempts.saturating_sub(1).min(6);
     std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift)).min(CAP)
-}
-
-/// PRD #20 R20-004 (finding #3): hard cap on how long an automatic prompt (a
-/// mode seed or an orchestrator role prompt) is retried before it is abandoned.
-/// The deadline is checked BEFORE the readiness/backoff/delivery branches so it
-/// is actually reachable — the previous code checked it only after the delivery
-/// branch, which always returned first, so a permanent non-delivery
-/// (`wrong-session`, a never-live role) retried one RPC every ~2s forever.
-pub const AUTOMATIC_PROMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// PRD #20 R20-004 (finding #3): mint a GLOBALLY-UNIQUE delivery id for an
-/// automatic prompt. The old `seed-<pane>-<seq>` restarted its counter at 1 in
-/// EVERY TUI process while the daemon's dedup ledger persists — so a reconnecting
-/// (restarted) TUI could reuse an id the daemon still had cached and have a
-/// genuinely-new prompt silently suppressed (or replayed against conflicting
-/// content). This combines a per-PROCESS nonce (two processes never collide)
-/// with a global monotonic counter (two ids within one process never collide),
-/// keyed by pane for log readability.
-fn mint_delivery_id(pane_id: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nonce = *NONCE.get_or_init(|| {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        std::process::id().hash(&mut h);
-        // Nanos since the epoch disambiguate a pid reused across restarts.
-        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            dur.as_nanos().hash(&mut h);
-        }
-        h.finish()
-    });
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("send-{nonce:016x}-{pane_id}-{seq}")
 }
 
 struct UiState {
@@ -1548,6 +2157,46 @@ struct UiState {
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
+    /// Issue #308: maps pane_id → the agent type its config DECLARED
+    /// (`agent = "…"` on the role or mode), for panes that made a declaration.
+    ///
+    /// Kept beside `SessionState.agent_type` rather than written into it,
+    /// because the two answer different questions and only one of them may
+    /// drive timing. `SessionState.agent_type` is the OBSERVED identity: it
+    /// stays `AgentType::None` until something running in the pane reports, and
+    /// three separate readiness gates read exactly that — `agent_ready` in the
+    /// orchestrator-prompt, mode-seed and dispatch paths all spell "the agent
+    /// has started" as `agent_type != AgentType::None`. Seeding a declaration
+    /// into that field would make all three fire at spawn and type a prompt
+    /// into a launcher that has not started its agent yet — which is precisely
+    /// the population (`devbox run -- codex`) this key exists for, so the
+    /// feature would break delivery for exactly the users it is meant to help.
+    ///
+    /// A declaration is nonetheless real knowledge, and the whole point of
+    /// issue #308 is that the card should show it immediately. So it lands
+    /// here, is read only by [`render_session_card`], and changes nothing but
+    /// what is drawn. The same split PRD #225 made between
+    /// `RunningAgent::agent_type` (observed, badge) and `spawn_agent_type`
+    /// (launch), one layer up.
+    ///
+    /// **Lifecycle.** Entries are removed on exactly the paths that remove
+    /// [`Self::pane_metadata`]: closing a pane (`Action::ClosePane`), closing a
+    /// tab, and the restore-failure / mode-activation-failure arms that retire
+    /// a pane id they just spawned. A stale entry would nonetheless be inert
+    /// rather than a mislabelled card, because a pane id is never recycled
+    /// within a daemon session — `EmbeddedPaneController::allocate_id`
+    /// (`src/embedded_pane.rs`) hands out a monotonic counter and never reuses
+    /// a retired value, and the reconnect path bumps `next_id` past every
+    /// rehydrated id before allocating again. So a leftover entry can only be
+    /// looked up by the pane that put it there.
+    ///
+    /// Only the two surfaces that can carry a declaration are ever inserted:
+    /// orchestration ROLE panes and MODE agent panes. In particular the mode's
+    /// reactive SIDE panes get no entry — `TabManager::route_reactive_commands`
+    /// (`src/tab.rs`) closes and re-creates those panes under fresh ids as
+    /// rules fire, so an entry keyed on one of them would be orphaned on every
+    /// rule that fires rather than on tab close.
+    pane_declared_agent: HashMap<String, AgentType>,
     /// Maps pane_id → launch metadata for auto-save/restore.
     pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
@@ -1561,6 +2210,24 @@ struct UiState {
     update_available: Option<String>,
     /// Layout mode for embedded terminal panes (stacked or tiled).
     pane_layout: PaneLayout,
+    /// The command-entry lock: while engaged, a keystroke aimed at a focused
+    /// NON-orchestrator role pane of an Orchestration tab is dropped instead of
+    /// reaching that pane's PTY (see [`gate_pane_input_key`]), and the deck
+    /// steers focus itself (see the auto-focus chain in the render loop).
+    /// Toggled by `Ctrl+E` from command mode. **Locked by default** — a lock
+    /// you must remember to engage protects nothing.
+    ///
+    /// Deck-global, deliberately, and stored next to [`Self::pane_layout`] for
+    /// the same reason: it describes how someone is working right now, not
+    /// which tab they happened to open. A per-tab lock means unlocking has to
+    /// be repeated in every Orchestration tab, with nothing on screen saying
+    /// why the state set moments ago does not apply here.
+    ///
+    /// What is deck-global is WHERE the value lives, not how far it reaches:
+    /// the gate still matches only [`Tab::Orchestration`], so Dashboard and
+    /// Mode tabs are never gated whatever this says. Not persisted — every
+    /// deck starts locked.
+    command_entry_locked: bool,
     /// Warnings collected during session save/restore, flushed after terminal restore.
     session_warnings: Vec<String>,
     /// PRD #89 review-fix G1: tracks whether the most recent periodic snapshot
@@ -1640,8 +2307,6 @@ struct UiState {
     form_button_rects: Vec<(Action, Rect)>,
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
-    /// Per-session idle ASCII art cache. Key = session_id.
-    idle_art_cache: HashMap<String, IdleArtEntry>,
     /// Config generation state — tracks directories where user chose "Never".
     config_gen_state: config::ConfigGenState,
     /// Pane ID + cwd for the pending config-gen modal prompt.
@@ -1847,12 +2512,14 @@ impl UiState {
             new_pane_form: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
+            pane_declared_agent: HashMap::new(),
             pane_metadata: HashMap::new(),
             config,
             keybindings,
             last_bell_status: HashMap::new(),
             update_available: None,
             pane_layout: PaneLayout::Stacked,
+            command_entry_locked: true,
             session_warnings: Vec::new(),
             session_snapshot_write_failed: false,
             selection: None,
@@ -1861,7 +2528,6 @@ impl UiState {
             agent_pane_rect: None,
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
-            idle_art_cache: HashMap::new(),
             config_gen_state: config::ConfigGenState::load(),
             config_gen_target: None,
             config_gen_selected: 0,
@@ -1984,6 +2650,33 @@ pub(crate) const DASHBOARD_LEFT_PERCENT: u16 = 33;
 pub(crate) const DASHBOARD_PANES_PERCENT: u16 = 67;
 pub(crate) const ORCHESTRATION_LEFT_PERCENT: u16 = 34;
 pub(crate) const ORCHESTRATION_PANES_PERCENT: u16 = 66;
+/// PRD #336: the narrower-sidebar split an orchestration tab toggles to with
+/// `Ctrl+l`, reclaiming ~9% of the frame width for the working pane column.
+pub(crate) const ORCHESTRATION_LEFT_PERCENT_NARROW: u16 = 25;
+pub(crate) const ORCHESTRATION_PANES_PERCENT_NARROW: u16 = 75;
+
+/// PRD #336: resolve the orchestration sidebar/pane-column split percentages
+/// for a tab's toggle state — `(25, 75)` when narrow, `(34, 66)` (the default)
+/// otherwise. Single source of truth: every site that would otherwise name
+/// `ORCHESTRATION_LEFT_PERCENT` / `ORCHESTRATION_PANES_PERCENT` directly goes
+/// through here, so the layout pass and the spawn-time PTY sizing cannot
+/// disagree about how wide a role pane is.
+///
+/// The flag is threaded in as a parameter rather than read from shared state.
+/// The split itself is global (`TabManager::orchestration_split_narrow`), but
+/// this resolver stays a pure function of the flag: the render path already
+/// carries the value it should use on `ActiveTabView::Orchestration`, so no
+/// call site has to reach for the owner mid-layout.
+pub(crate) fn orchestration_split_percents(narrow: bool) -> (u16, u16) {
+    if narrow {
+        (
+            ORCHESTRATION_LEFT_PERCENT_NARROW,
+            ORCHESTRATION_PANES_PERCENT_NARROW,
+        )
+    } else {
+        (ORCHESTRATION_LEFT_PERCENT, ORCHESTRATION_PANES_PERCENT)
+    }
+}
 
 /// Inner helper: right column dims for a dashboard/orchestration-style tab
 /// where the right column holds a vertical stack of `pane_count` panes.
@@ -2073,20 +2766,32 @@ pub(crate) fn dashboard_pane_dims(
 /// the spawn path, which spawns `Tiled` with no role focused yet — hence
 /// the `focused_role_index` parameter is gone and role 0 is the
 /// Stacked expanded slot.
+///
+/// PRD #336: `narrow` selects the split via `orchestration_split_percents`.
+/// The sole caller is the spawn path, which opens a brand-new (or restored)
+/// tab; because the split is GLOBAL, such a tab adopts whatever split is
+/// currently in effect, so callers pass `tab_manager.orchestration_split_narrow()`
+/// — not a hardcoded default, which would open every role PTY at 66% and let
+/// the first frame reflow it. Keeping it an explicit parameter rather than
+/// reading the owner from inside here is what keeps this helper a pure
+/// function of its inputs and testable without a `TabManager`
+/// (`orchestration/layout/003`).
 pub(crate) fn orchestration_role_pane_dims(
     frame_area: Rect,
     role_count: usize,
     role_index: usize,
     layout: PaneLayout,
     show_tab_bar: bool,
+    narrow: bool,
 ) -> (u16, u16) {
     // Stacked: role 0 is the expanded slot, mirroring the renderer's
     // "expand the first slot if nothing is focused" fallback. Tiled
     // ignores `is_focused` (equal division).
     let is_focused = role_index == 0;
+    let (_, panes_percent) = orchestration_split_percents(narrow);
     right_column_pane_dims(
         frame_area,
-        ORCHESTRATION_PANES_PERCENT,
+        panes_percent,
         role_count as u16,
         is_focused,
         layout,
@@ -2211,173 +2916,12 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
 // ---------------------------------------------------------------------------
 // Orchestrator prompt construction
 // ---------------------------------------------------------------------------
-
-/// Build the orchestrator context file content.
-/// Includes the role's own prompt_template, the available-agents list, and
-/// delegation protocol instructions.
-fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
-    let mut content = String::new();
-
-    // 1. Orchestrator's own prompt_template.
-    if let Some(start_role) = config.roles.iter().find(|r| r.start)
-        && let Some(ref tpl) = start_role.prompt_template
-    {
-        content.push_str(tpl);
-        content.push_str("\n\n");
-    }
-
-    // 2. Available agents list.
-    content.push_str("## Available agents\n\n");
-    for role in &config.roles {
-        if role.start {
-            continue;
-        }
-        let desc = role.description.as_deref().unwrap_or("(no description)");
-        content.push_str(&format!("- **{}**: {}\n", role.name, desc));
-    }
-
-    // 3. Delegation protocol.
-    //
-    // Issue #303: the task text reaches this CLI through YOUR shell, so
-    // `--task "…"` is rewritten before argv is built — backticks and `$(…)` are
-    // executed, `$VAR` substituted, an unescaped `"` ends the argument, a `\`
-    // removes itself — while the delegation still reports success. The file form
-    // is therefore the unconditional default here, with the reason stated inline
-    // (an orchestrator that does not know WHY drifts back to `--task`).
-    //
-    // The audit of the first cut (auditor finding 1) showed that protecting only
-    // the final `--task-file` read is not enough: an `echo "…"` expands the
-    // content BEFORE it reaches disk, and an unquoted path can itself carry
-    // command substitution or `..` traversal. Hence the four creation rules, and
-    // the persistence/secrets note (#329's advice half).
-    //
-    // Round 3 then deleted the shell fallback that round 2 had recommended. A
-    // quoted `<<'EOF'` delimiter disables expansion inside the heredoc, but a
-    // task line that is exactly `EOF` terminates it and Bash parses and executes
-    // every line after it — and task files are exactly where untrusted text
-    // (issue bodies, code, another agent's brief) lands. "Use a fresh
-    // unpredictable delimiter and check the payload for it" is a rule an agent
-    // must get right on every single input, with silent command execution as the
-    // failure mode, so the only recommendation left is a non-shell file writer.
-    //
-    // Round 4 restored the *inline* fallback — not the shell one. Round 3's
-    // premise, "every agent in this system has a file-writing tool", confused
-    // having a tool with being authorized to use it: the e2e gate then caught a
-    // real Haiku worker launched with `--allowedTools Bash Read` calling `Write`
-    // and parking forever on the approval prompt. Guidance that depends on an
-    // unguaranteed permission produces exactly the silent stall #303 is about,
-    // so all three branches (file / short plain inline / say you cannot) are now
-    // stated outright rather than left to inference.
-    content.push_str("\n## Delegation protocol\n\n");
-    content.push_str(
-        "To delegate work to an agent, use `delegate` with one command per agent. \
-         Pass the task as a **file** — `--task-file` is the default, not an escape hatch:\n\n\
-         ```bash\n\
-         dot-agent-deck delegate --to <role-name> --task-file '.dot-agent-deck/<task-slug>.md'\n\
-         ```\n\n\
-         Four rules for producing that file. The last two are about the *path*, not the \
-         contents:\n\n\
-         - Write it with your **file-writing tool**. Do not construct it with shell redirection \
-         or a heredoc: a line of the task text can terminate the heredoc, and everything after \
-         that line is then executed as shell commands.\n\
-         - Invent a **fresh slug** for `<task-slug>` from `[a-z0-9][a-z0-9-]*` only, at most 40 \
-         characters. Never build it out of an issue title, a branch name, or any other text you \
-         did not write yourself.\n\
-         - No `/`, no `\\` and no `..` in the slug — the file goes directly in \
-         `.dot-agent-deck/`.\n\
-         - **Single-quote the whole path** in every command you run.\n\n\
-         Task and summary files persist on disk after the handoff. Keep credentials, customer \
-         data and other secrets out of them, pick a path that does not already exist, and delete \
-         exactly that path once the handoff has succeeded.\n\n\
-         **If you have no file-writing tool, or it is not authorized and invoking it would stop \
-         you at an approval prompt, do not wait there — skip the file and use the inline form \
-         below.** Never substitute shell redirection or a heredoc for the missing tool.\n\n\
-         `--task \"…\"` is the fallback for exactly that case, and is safe only when the whole \
-         task is **a single line of plain text with no backticks, no `$`, no `\"`, no `\\` and no \
-         `!`**:\n\n\
-         ```bash\n\
-         dot-agent-deck delegate --to <role-name> --task \"Short plain task description.\"\n\
-         ```\n\n\
-         Why the allowlist is that narrow: everything after `--task` is processed by **your own \
-         shell** before dot-agent-deck receives it. Backticks and `$(…)` are executed and \
-         replaced by their output — usually empty — `$VAR` becomes its value or nothing, a \
-         balanced inner `\"` is removed and changes how the rest of the argument is quoted, a \
-         `\\` before `$`, a backtick, `\"` or `\\` removes itself, and a `\\` at the end of a \
-         line removes itself *and* the newline. `!` is excluded because a Bash with history \
-         expansion on rewrites it before argv is built. An unmatched `\"` aborts the command \
-         outright; everything else is dropped silently while the delegation still reports \
-         success, so the worker acts on a task with pieces missing and nobody sees an error. \
-         `--task-file` is read from disk verbatim, so none of this applies to it.\n\n\
-         If a task will not fit that one plain line and you cannot write a file, say so plainly \
-         to the user and ask for the file-writing tool to be authorized, rather than improvising \
-         a way around the allowlist.\n\n\
-         To delegate to multiple agents in parallel, make **one call per agent** so each gets its own task:\n\n\
-         ```bash\n\
-         dot-agent-deck delegate --to coder --task-file '.dot-agent-deck/login-endpoint-coder.md'\n\
-         dot-agent-deck delegate --to reviewer --task-file '.dot-agent-deck/login-endpoint-reviewer.md'\n\
-         ```\n\n\
-         If all agents should receive the **exact same task**, you may combine them in one call:\n\n\
-         ```bash\n\
-         dot-agent-deck delegate --to <role1> --to <role2> --task-file '.dot-agent-deck/<task-slug>.md'\n\
-         ```\n\n\
-         When all work is complete and you are satisfied with the results:\n\n\
-         ```bash\n\
-         dot-agent-deck work-done --done --task-file '.dot-agent-deck/final-summary-<summary-slug>.md'\n\
-         ```\n\
-         (or `dot-agent-deck work-done --done --task \"Final summary.\"` when that summary really is \
-         one plain line). The same four rules apply to that file: `<summary-slug>` is a fresh slug \
-         you invent, the path must not already exist before you write it, and you delete exactly \
-         that path once the command has exited successfully.\n\n\
-         **Shell safety and context length are two different problems.** Writing long context to \
-         `.dot-agent-deck/<task-slug>.md` and *referencing that path inside* `--task \"…\"` keeps the \
-         task description short, but the description itself still goes through your shell. Passing \
-         the file with `--task-file` is what keeps the shell out of the text. One file solves both \
-         at once: write the full task to `.dot-agent-deck/<task-slug>.md` and hand it over with \
-         `--task-file`.\n",
-    );
-
-    // 4. Important guidelines.
-    content.push_str(
-        "\n## Important\n\n\
-         Wait for the user to tell you what to work on.\n\n\
-         Once you know the task, delegate immediately via the CLI commands above. \
-         Do NOT ask for confirmation before delegating. \
-         Do NOT offer to design, analyze, or plan — that is the workers' job. \
-         Do NOT ask 'should I proceed?' or 'do you want me to delegate?' — just delegate. \
-         Your only job: understand what needs doing, frame clear task descriptions, and hand off.\n\n\
-         Never send a new task to a worker that is still working on a previous task. \
-         Wait for its work-done signal before delegating again to the same worker. \
-         Delegating to different workers in parallel is fine.\n\n\
-         Delegation is one-way: orchestrator → worker. Workers NEVER delegate to other workers \
-         — a `dot-agent-deck delegate` call from inside a worker does not route back through your \
-         notification stream, so the downstream task is silently dropped and the calling worker \
-         waits forever (or signals work-done in a paused state). When briefing a worker, never \
-         instruct them to \"delegate the fix to coder\" or \"hand off to <other role>\". \
-         Instead, tell them to report the diagnosis back and signal work-done; you (the orchestrator) \
-         will delegate the next hop. The chain you coordinate is: worker A diagnoses → reports → \
-         you delegate to worker B → worker B works → reports → you re-engage worker A.\n\n\
-         When a task related to a PRD is fully completed (all workers done, reviews passed), \
-         run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n",
-    );
-
-    content
-}
-
-// ---------------------------------------------------------------------------
-// M6: Skill file auto-deployment
-// ---------------------------------------------------------------------------
-
-/// Write the orchestrator context to a file and return a one-liner to inject.
-/// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
-pub fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
-    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-    std::fs::create_dir_all(&dir).ok()?;
-    let file_path = dir.join("orchestrator-context.md");
-    let content = build_orchestrator_context(config);
-    std::fs::write(&file_path, &content).ok()?;
-    Some("Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and delegation protocol. Acknowledge your role and wait for instructions.".to_string())
-}
-
+//
+// MOVED to `src/orchestrator_context.rs` (PRD #222 parity): the daemon spawn
+// path needs the same composition, and two copies is what left a
+// daemon-started orchestration without its delegation protocol. Imported below
+// so this module's call site and tests are unchanged.
+use crate::orchestrator_context::prepare_orchestrator_prompt;
 // ---------------------------------------------------------------------------
 // PRD #76 M2.12: hydration partition
 // ---------------------------------------------------------------------------
@@ -2925,6 +3469,66 @@ fn process_pending_seed_prompts(
     let mut backoff = std::mem::take(&mut ui.send_retry_backoff);
     let mut deliveries = std::mem::take(&mut ui.prompt_delivery);
     prompts.retain_mut(|sp| {
+        // Issue #424: CONFIRMATION FIRST. A previous frame's `Applied`/`Queued`
+        // only proved the PTY accepted bytes, so the seed is still here; if the
+        // agent has since reported submitting it, this delivery is done — clear
+        // the seed and all its retry state. Checked ahead of the backoff gate
+        // because the write that gets confirmed is precisely the one whose
+        // backoff window is still open (`prompt/pane-input/024`, `/026`).
+        if let Some(delivery) = deliveries.get_mut(&sp.pane_id) {
+            // Reviewer blocker 1: the target check runs BEFORE the bind, and
+            // compares the bound generation against the current one. Binding
+            // first overwrote the answer with the question — see
+            // [`delivery_target_changed`] and [`bind_delivery_generation`].
+            //
+            // Reviewer findings B1/B2: the conversation we wrote into is GONE.
+            // Neither retyping into its successor nor accepting that successor's
+            // events as confirmation is safe, so the delivery stops here with a
+            // visible reason.
+            if delivery_target_changed(snapshot, &sp.pane_id, delivery) {
+                log_prompt_stopped(
+                    "seed",
+                    &sp.pane_id,
+                    &delivery.delivery_id,
+                    "delivery-target-changed",
+                );
+                feedback = Some(
+                    "Seed prompt not delivered (the agent's conversation changed); abandoned"
+                        .to_string(),
+                );
+                backoff.remove(&sp.pane_id);
+                deliveries.remove(&sp.pane_id);
+                return false;
+            }
+            bind_delivery_generation(delivery, snapshot, &sp.pane_id);
+            match prompt_submission_evidence(snapshot, &sp.pane_id, &sp.prompt, delivery) {
+                Some(SubmissionEvidence::Confirmed) => {
+                    log_prompt_confirmed(
+                        "seed",
+                        &sp.pane_id,
+                        &delivery.delivery_id,
+                        delivery.attempts,
+                    );
+                    backoff.remove(&sp.pane_id);
+                    deliveries.remove(&sp.pane_id);
+                    return false;
+                }
+                // Issue #424 D5: the seed came back doubled with no separator.
+                // Terminal — see [`SubmissionEvidence::Accumulated`].
+                Some(SubmissionEvidence::Accumulated) => {
+                    log_prompt_accumulated(
+                        "seed",
+                        &sp.pane_id,
+                        &delivery.delivery_id,
+                        delivery.attempts,
+                    );
+                    backoff.remove(&sp.pane_id);
+                    deliveries.remove(&sp.pane_id);
+                    return false;
+                }
+                None => {}
+            }
+        }
         // PRD #20 R20-005 (finding #13): the hard timeout is checked FIRST, before
         // the readiness/backoff/delivery branches — so it is actually reachable.
         // The old code checked it only AFTER the delivery branch (which always
@@ -2932,7 +3536,32 @@ fn process_pending_seed_prompts(
         // non-delivery re-attempted one RPC every ~2s forever. An expired seed is
         // abandoned here with NO further delivery attempt.
         if sp.created_at.elapsed() > AUTOMATIC_PROMPT_DEADLINE {
-            tracing::warn!(pane_id = %sp.pane_id, "seed prompt: timed out; abandoning");
+            // Issue #424: the same warn this always emitted, now carrying the
+            // delivery identity and how many submissions were made — the two
+            // facts that tell "never written" apart from "written N times and
+            // never confirmed" when reading back a lost seed after the fact.
+            let (delivery_id, attempts) = deliveries
+                .get(&sp.pane_id)
+                .map(|delivery| (delivery.delivery_id.clone(), delivery.attempts))
+                .unwrap_or_default();
+            // Reviewer finding B3: a pane that never identified a producer was
+            // never RETRIED either, so its single write reaching the deadline is
+            // not a failure to report — it is a pane nothing could ever report
+            // for. Logged as unconfirmable rather than abandoned so the two are
+            // distinguishable when reading back a lost seed.
+            if attempts > 0
+                && delivery_capability(snapshot, &sp.pane_id, deliveries.get(&sp.pane_id))
+                    != ConfirmationCapability::Reports
+            {
+                log_prompt_unconfirmable(
+                    "seed",
+                    &sp.pane_id,
+                    &delivery_id,
+                    "no producer on this pane can report a submitted prompt",
+                );
+            } else {
+                log_prompt_abandoned("seed", &sp.pane_id, &delivery_id, attempts);
+            }
             backoff.remove(&sp.pane_id);
             deliveries.remove(&sp.pane_id);
             return false;
@@ -2942,7 +3571,11 @@ fn process_pending_seed_prompts(
             s.pane_id.as_deref() == Some(sp.pane_id.as_str()) && s.agent_type != AgentType::None
         });
         // Slow path: no SessionStart after 10s (e.g. opencode) — proceed anyway.
-        let timeout_ready = !agent_ready && sp.created_at.elapsed() > SPAWN_TIME_READINESS_TIMEOUT;
+        // Issue #424 (reviewer finding B3): this still decides WHEN to write,
+        // exactly as before, but no longer decides whether the write is
+        // confirmable. That question is answered by the producer, below.
+        let timeout_ready =
+            !agent_ready && sp.created_at.elapsed() > std::time::Duration::from_secs(10);
         if agent_ready {
             sp.ready_since.get_or_insert(now);
         }
@@ -2975,23 +3608,170 @@ fn process_pending_seed_prompts(
                     // conversation.
                     expected_agent_id: pane.pane_agent_id(&sp.pane_id),
                     expected_session_id: snapshot.pane_hook_session_id(&sp.pane_id),
+                    observed_generation: None,
+                    closures_at_write: None,
                     // PRD #20 finding #3: globally-unique id (process nonce +
                     // global counter), not a per-process `seed-<pane>-N`.
                     delivery_id: mint_delivery_id(&sp.pane_id),
+                    attempts: 0,
+                    watermark: None,
+                    can_report_prompts: false,
+                    epoch: 0,
+                    wire_issued: false,
                 }
             });
             let expected_agent_id = delivery.expected_agent_id.clone();
-            let expected_session_id = delivery.expected_session_id.clone();
             let delivery_id = delivery.delivery_id.clone();
+            let already_written = delivery.attempts > 0;
+            // Reviewer finding B3: read the capability as of THIS frame, not as
+            // of the readiness timeout — a producer that identifies itself at
+            // 10.1 s must still get its retries.
+            let capability = delivery_capability(snapshot, &sp.pane_id, Some(delivery));
+            delivery.can_report_prompts |= capability == ConfirmationCapability::Reports;
+            // Reviewer finding B3: a delivery already written into a pane whose
+            // producer is unknown is HELD, not rewritten. Retyping into a pane
+            // that has given no evidence it can report anything is the failure
+            // mode the retry policy exists to avoid.
+            if already_written && capability != ConfirmationCapability::Reports {
+                return true;
+            }
+            // Issue #424 D1: we are past every hold, so this frame WILL write
+            // into whatever conversation the pane currently has. Name it before
+            // doing so — see [`bind_generation_before_retry`]. Must come before
+            // the epoch and session are read below, because binding can rotate
+            // the epoch.
+            bind_generation_before_retry(delivery, snapshot, &sp.pane_id);
+            let expected_session_id = delivery.expected_session_id.clone();
+            let epoch = delivery.epoch;
+            // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT
+            // rides its own wire id, or the daemon's ledger would replay the
+            // first `Applied` and this retry would never reach the PTY at all.
+            let attempt = delivery.attempts.saturating_add(1);
+            // Issue #424 D5: after the one bounded replacement payload, later
+            // attempts probe SUBMISSION rather than typing the seed in again —
+            // same identity guards, same terminal-outcome classification, empty
+            // payload. See [`crate::prompt_delivery::attempt_writes_payload`].
+            //
+            // Issue #666 ships the armed third payload on the DAEMON path only,
+            // so this passes a permanently-disarmed rearm and behaves exactly as
+            // it did before. The blocker is not the arming policy — it is that a
+            // launcher-wrapped pane's delivery does not survive the genuine
+            // agent's `SessionStart` at all on this path: the wrapper's own
+            // `wrapper_fork` start becomes the pane's generation, the delivery
+            // binds it, and the real start then reads as a rollover and abandons
+            // the seed. Arming a write that no longer exists fixes nothing. See
+            // issue #684.
+            let writes_payload = attempt_writes_payload(attempt, &AgentStartRearm::default(), now);
+            let wire_delivery_id = wire_attempt_id(&delivery_id, epoch, attempt, !writes_payload);
+            // Reviewer blocker 2: from here on, a request under this wire id may
+            // be recorded in the daemon's ledger, so a later identity change has
+            // to rotate the epoch rather than reuse it.
+            delivery.wire_issued = true;
+            // Reviewer finding B2/#3: read the watermark IMMEDIATELY before the
+            // write, so everything already in the pane's journal is pre-existing
+            // history by construction.
+            let watermark = pane_event_watermark(snapshot, &sp.pane_id);
+            // Issue #424 H4: and the generation-closure count, for the same
+            // reason and at the same instant — every rollover after this point is
+            // one this delivery's bytes were sitting through. See
+            // [`PromptDelivery::closures_at_write`].
+            let closures = snapshot.pane_generation_closures(&sp.pane_id);
+            // Issue #424 S4 (reviewer HIGH): PERSISTED BEFORE THE RPC, not in
+            // the success arm. A transport error is not proof that the daemon
+            // did not apply the write — the lost-response case the delivery
+            // ledger exists to tolerate — and storing the baseline only on
+            // success left `closures_at_write` at `None` for exactly that write.
+            // A whole `SessionStart`/`SessionEnd`/`SessionStart` burst then
+            // passed unnoticed, the ordinary bind adopted the successor, and the
+            // eventual success stored the already-incremented count, laundering
+            // the missed closure permanently. Being `Some` is also this
+            // delivery's "a write may have occurred" witness — see
+            // [`delivery_target_changed`].
+            if let Some(delivery) = deliveries.get_mut(&sp.pane_id)
+                && delivery.closures_at_write.is_none()
+            {
+                delivery.closures_at_write = Some(closures);
+            }
             match pane.write_and_submit_to_pane_with_identity(
                 &sp.pane_id,
-                &sp.prompt,
+                if writes_payload { &sp.prompt } else { "" },
                 expected_agent_id.as_deref(),
                 expected_session_id.as_deref(),
-                Some(&delivery_id),
+                Some(&wire_delivery_id),
             ) {
-                // Delivered (or accepted for delivery): drop the seed + its state.
+                // Issue #424: the PTY accepted the bytes — that is ALL this
+                // means. Whether the agent's TUI was in submit-CR-aware mode
+                // when the CR landed is not knowable here, so the seed, its
+                // identity and its retry are RETAINED until the agent reports
+                // submitting it (checked at the top of this closure).
                 Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
+                    let delivery = deliveries
+                        .get_mut(&sp.pane_id)
+                        .expect("delivery inserted above");
+                    delivery.attempts = attempt;
+                    if delivery.watermark.is_none() {
+                        delivery.watermark = watermark;
+                    }
+                    if writes_payload {
+                        log_prompt_written("seed", &sp.pane_id, &delivery_id, attempt);
+                    } else {
+                        log_prompt_probe_submitted("seed", &sp.pane_id, &delivery_id, attempt);
+                    }
+                    match capability {
+                        // A recognized producer that structurally cannot report
+                        // a submitted prompt (Pi). Retrying could never be
+                        // confirmed — only retyped — so the write is final.
+                        ConfirmationCapability::CannotReport => {
+                            log_prompt_unconfirmable(
+                                "seed",
+                                &sp.pane_id,
+                                &delivery_id,
+                                "this agent cannot report a submitted prompt",
+                            );
+                            backoff.remove(&sp.pane_id);
+                            deliveries.remove(&sp.pane_id);
+                            return false;
+                        }
+                        // Reviewer finding B3: nothing has identified itself
+                        // yet. Hold the write PROVISIONAL — retained, so a
+                        // producer that signals at 10.1 s still arms retries and
+                        // a confirmation still finalizes — but do NOT retype
+                        // into a pane that has given no reason to think a second
+                        // copy would help. This is where the old code finalized
+                        // and threw the prompt away, which is what excluded the
+                        // slow-launcher class from the whole fix.
+                        ConfirmationCapability::Unknown => {
+                            backoff.remove(&sp.pane_id);
+                            return true;
+                        }
+                        ConfirmationCapability::Reports => {
+                            log_prompt_unconfirmed("seed", &sp.pane_id, &delivery_id, attempt);
+                            schedule_unconfirmed_retry(&mut backoff, &sp.pane_id, now, attempt);
+                            return true;
+                        }
+                    }
+                }
+                // Issue #424 (tester's finding, C2): a TERMINAL outcome is
+                // terminal HERE too. This arm used to funnel every non-success
+                // result into `schedule_send_retry`, so a `WrongSession` on a
+                // provisional delivery — the pane changed hands, the
+                // identity-aware controller refused before writing — left the
+                // stale seed alive and retrying until the deadline instead of
+                // stopping, and an `Ambiguous` could be retried after a PARTIAL
+                // write, which is the one thing that variant exists to forbid.
+                // The orchestrator path already did this
+                // ([`is_terminal_send_result`]); only the seed path did not.
+                Ok(other) if seed_result_is_terminal(other, already_written) => {
+                    log_prompt_stopped(
+                        "seed",
+                        &sp.pane_id,
+                        &delivery_id,
+                        describe_send_result(other),
+                    );
+                    feedback = Some(format!(
+                        "Seed prompt not delivered ({}); abandoned",
+                        describe_send_result(other)
+                    ));
                     backoff.remove(&sp.pane_id);
                     deliveries.remove(&sp.pane_id);
                     return false;
@@ -3051,22 +3831,580 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
     // The daemon-side agent id currently bound to this pane (the registry key,
     // == the client's stream-backend `agent_id`). This is the reliable identity:
     // a respawn/rebind rolls it over, so the daemon's guard catches a stale
-    // delivery to a replacement. We deliberately do NOT capture a session id:
-    // the UI's session view carries placeholder sessions with UI-minted ids that
-    // don't match the daemon's hook-derived session state, so comparing them
-    // daemon-side would spuriously reject EVERY delivery. The agent-id guard
-    // already covers the respawn case; the session axis stays daemon-internal
-    // (exercised by the protocol tests that set up daemon state directly).
+    // delivery to a replacement.
+    //
+    // The hook GENERATION is deliberately left `None` HERE, not abandoned: at
+    // capture time (tab creation) no agent exists yet, so there is nothing to
+    // bind to, and the UI's own placeholder session ids are UI-minted values the
+    // daemon would reject on sight. It is bound instead at the first write, from
+    // `AppState::pane_hook_session_id` — which IS the daemon-derived generation,
+    // fed by the same hook events the daemon applies — by
+    // [`bind_delivery_generation`]. Reviewer finding B2: leaving it `None`
+    // through delivery is what let a same-agent `/clear` between enqueue and
+    // write put the old prompt into the new conversation.
     let expected_agent_id = pane.pane_agent_id(pane_id);
     ui.prompt_delivery.insert(
         pane_id.to_string(),
         PromptDelivery {
             expected_agent_id,
             expected_session_id: None,
+            observed_generation: None,
+            closures_at_write: None,
             // PRD #20 finding #3: globally-unique id (process nonce + global
             // counter) so a TUI restart can't collide with the daemon's still-live
             // dedup ledger.
             delivery_id: mint_delivery_id(pane_id),
+            attempts: 0,
+            watermark: None,
+            can_report_prompts: false,
+            epoch: 0,
+            wire_issued: false,
+        },
+    );
+}
+
+/// Issue #424: whether `snapshot` shows the agent in `pane_id` having actually
+/// SUBMITTED `expected` — the only honest evidence that a written prompt was
+/// delivered rather than swallowed by a still-booting agent TUI.
+///
+/// Reads the pane's sessions' `recent_events` rather than `last_user_prompt`
+/// because the latter is a single overwritable slot: a prompt the human types a
+/// frame after the seed lands would erase the evidence before the delivery loop
+/// next runs, turning a real delivery into a spurious re-submission.
+///
+/// FOUR axes must all match, because any one of them alone produces a false
+/// confirmation that reinstates the bug in a new shape:
+///
+/// * the PANE — the same text submitted in a sibling pane says nothing about
+///   this delivery (`prompt/pane-input/026`);
+/// * the IDENTITY — reviewer finding B2/#2 and auditor B6. The event must carry
+///   a non-optional `agent_id` that matches every identity we hold: the
+///   delivery's `expected_agent_id` when the controller could supply one, and
+///   the owning session's. `PromptDelivery` already stored the expected agent
+///   and this never consulted it, while the daemon-side watcher accepted an
+///   agent-less event on the pane alone. The hook socket is owner-only but any
+///   same-user process can write to it, so an event that cannot say who it came
+///   from is unusable evidence — accepting it cleared every scrap of retry state
+///   and re-created #424's silent loss in a shape no log would explain;
+/// * the TEXT — an unrelated prompt the human typed into the target pane is not
+///   our prompt arriving, and comparison goes through
+///   [`prompt_submission_matches`] so a seed longer than `USER_PROMPT_MAX_LEN`
+///   still matches its truncated report, and a CR-swallowed newline-separated
+///   doubled submission counts as delivered rather than leaving the retry armed;
+/// * the WATERMARK — an event already in the pane's journal when we wrote is
+///   pre-existing history. `attempts == 0` (nothing written yet) can never
+///   confirm.
+///
+/// The GENERATION is enforced separately, by [`delivery_target_changed`], and
+/// not as a field on the event: `AppState::apply_event` REMAPS an incoming
+/// event's `session_id` onto the stable card id for UI continuity, so the id
+/// stored in `recent_events` is not the hook generation and cannot be compared
+/// against one. What the snapshot does hold authoritatively is the pane's
+/// CURRENT generation, so the delivery is stopped outright the moment that
+/// differs from the bound one — which makes "the generation is unchanged" a
+/// precondition of ever reaching this function.
+fn prompt_submission_evidence(
+    snapshot: &AppState,
+    pane_id: &str,
+    expected: &str,
+    delivery: &PromptDelivery,
+) -> Option<SubmissionEvidence> {
+    if delivery.attempts == 0 {
+        return None;
+    }
+    let mut evidence = None;
+    for session in snapshot
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+    {
+        for event in &session.recent_events {
+            let Some(reported_agent) = event.agent_id.as_deref() else {
+                continue;
+            };
+            let identity_matches = delivery
+                .expected_agent_id
+                .as_deref()
+                .is_none_or(|expected_agent| expected_agent == reported_agent)
+                && session
+                    .agent_id
+                    .as_deref()
+                    .is_none_or(|owner| owner == reported_agent);
+            if !identity_matches
+                || !submission_is_after_watermark(event.timestamp, delivery.watermark)
+            {
+                continue;
+            }
+            let Some(reported) = event.user_prompt.as_deref() else {
+                continue;
+            };
+            if prompt_submission_matches(expected, reported) {
+                // A clean confirmation anywhere in the journal wins outright:
+                // accumulation elsewhere does not make a real delivery dirty.
+                return Some(SubmissionEvidence::Confirmed);
+            }
+            if prompt_submission_accumulated(expected, reported) {
+                evidence = Some(SubmissionEvidence::Accumulated);
+            }
+        }
+    }
+    evidence
+}
+
+/// Issue #424 D5: what a pane's journal says about a written prompt, once
+/// identity and watermark have already been satisfied.
+///
+/// Two outcomes, kept apart because they authorize different things and because
+/// a log has to be able to tell them apart afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionEvidence {
+    /// The agent reported submitting our prompt — verbatim, truncated, or as
+    /// newline-separated copies ([`prompt_submission_matches`]). The delivery is
+    /// real.
+    Confirmed,
+    /// The agent reported our prompt submitted as repeated copies run together
+    /// with no separator ([`prompt_submission_accumulated`]). A payload had been
+    /// sitting in the input box and a later write appended to it, so what the
+    /// agent is acting on is a corrupted turn rather than the task as written.
+    ///
+    /// Terminal all the same: it is proof the bytes were submitted, and typing a
+    /// third copy into an agent already working is the direction that runs a
+    /// dispatch task twice. See [`prompt_submission_accumulated`] for why this is
+    /// a safety net rather than the remedy.
+    Accumulated,
+}
+
+/// Issue #424 (reviewer findings B1/B2, reviewer blocker 1): is the
+/// conversation this delivery was written into GONE?
+///
+/// True once something has been written, a generation was bound, and the pane's
+/// CURRENT generation is no longer that one — whether because the pane has none
+/// at all (what `AppState::apply_event` leaves behind for a `SessionEnd`) or
+/// because a different one has taken over. The bytes went into a conversation
+/// that no longer exists: a retry could only land in a successor, and a matching
+/// event from that successor could only falsely confirm a delivery that never
+/// landed.
+///
+/// Two things had to change together here, and neither works alone:
+///
+/// * this used to test only for a TRANSIENT `None`. The render loop samples the
+///   final `AppState` of a frame, while the event subscriber applies frames
+///   independently, so a rapid `/clear` whose `SessionEnd` and successor
+///   `SessionStart` both land between two renders never shows a `None` at all —
+///   the check simply never fired for the case it was written for;
+/// * [`bind_delivery_generation`] used to run FIRST and overwrite the bound
+///   generation with the current one, so by the time this ran, old and current
+///   were equal by construction. Comparing them is meaningless unless the bind
+///   is the one-shot it now is.
+///
+/// The comparison is against the generation THIS delivery bound, so a pane that
+/// never had one (`expected_session_id == None`) is not "changed" — it is
+/// unbound, and its first generation is the initial bind, not a rollover. That
+/// is the same one-handoff shape [`crate::state::latch_generation`] applies on
+/// the daemon side.
+///
+/// **Known residual (issue #532).** A pane hosting a wrapped agent has TWO
+/// producers under one registry agent id — `dot-agent-deck wrap` emits under
+/// `{pane}-session`, the wrapped agent's native hooks under their own id — and
+/// `AppState::pane_hook_session` tracks whichever event is newest, so the pane's
+/// "current generation" alternates between them. This check then reads that
+/// alternation as a lost target and abandons. The daemon's own send guard
+/// already refuses the same shape (it requires an EXACT match against the
+/// current generation), so this makes an existing intermittent refusal
+/// deterministic one frame earlier rather than introducing a new failure; the
+/// fix belongs at `pane_hook_session`, which should not treat a non-announcing
+/// frame from a second producer as a generation.
+fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &PromptDelivery) -> bool {
+    // Issue #424 S4 (reviewer HIGH): "nothing has been written" is
+    // `attempts == 0` AND no baseline, not `attempts == 0` alone. A daemon can
+    // apply a write and lose the response, which leaves `attempts` at 0 with
+    // bytes physically in the pane; gating on the counter alone made this
+    // return `false` for exactly that delivery, so the whole burst below went
+    // unnoticed and the ordinary bind adopted the successor. The baseline is
+    // stamped immediately BEFORE the RPC, so `Some` means "a write may have
+    // occurred" — the witness this check needs — and `None` still means the
+    // untouched delivery it always meant. See
+    // [`PromptDelivery::closures_at_write`].
+    if delivery.attempts == 0 && delivery.closures_at_write.is_none() {
+        return false;
+    }
+    // Issue #424 H4 (auditor HIGH): a conversation has ENDED on this pane since
+    // our bytes went in. Checked before anything that compares identities,
+    // because in the sequence this closes there is no identity left to compare:
+    // a whole `SessionStart(R)` / `SessionEnd(R)` / `SessionStart(R2)` burst can
+    // land between two render passes, and `AppState::apply_event` removes R's
+    // session and journal on its end, so the next pass sees only R2 and would
+    // otherwise witness it, adopt it, and send the revoked task into it. See
+    // [`PromptDelivery::closures_at_write`].
+    if let Some(at_write) = delivery.closures_at_write
+        && snapshot.pane_generation_closures(pane_id) > at_write
+    {
+        return true;
+    }
+    // Issue #424 F2: an unbound delivery is not automatically unchanged. If a
+    // generation was SEEN after our bytes and is now gone or replaced, the
+    // conversation those bytes could have entered is over — the same transition
+    // the daemon's latch consumes sequentially, retained across frames here.
+    // See [`PromptDelivery::observed_generation`].
+    let reference = delivery
+        .expected_session_id
+        .as_deref()
+        .or(delivery.observed_generation.as_deref());
+    let Some(reference) = reference else {
+        return false;
+    };
+    snapshot
+        .pane_hook_session_id(pane_id)
+        .is_none_or(|current| current != reference)
+}
+
+/// Issue #424: bind the parts of a delivery's identity that are only knowable
+/// from the live snapshot — the hook generation, and whether this pane's
+/// producer can report a submitted prompt at all.
+///
+/// Called every frame AFTER the target check, so a pane that identifies itself
+/// late (the `devbox run claude …` launcher class from issue #424 §3, which
+/// signals readiness well after the 10 s fallback) arms its retries on that
+/// signal instead of having had its prompt finalized and thrown away at 10 s.
+///
+/// The generation is bound EXACTLY ONCE, and only BEFORE the first write.
+///
+/// Both halves matter and for different reasons:
+///
+/// * **Once.** Re-binding every frame is what let a `/clear` be laundered into
+///   an authorization: the successor generation was copied into
+///   `expected_session_id` before both the target check and the send, so the
+///   daemon's guard compared the successor against itself, matched, and
+///   delivered the revoked task into the new conversation (reviewer blocker 1).
+///   After the one bind, a differing generation is
+///   [`delivery_target_changed`]'s business.
+/// * **Before the first write.** The generation guard exists to answer "is the
+///   conversation THE BYTES WENT INTO still here". A generation that only
+///   appears after the write is not that conversation — we never addressed it —
+///   so adopting it retroactively claims a target this delivery never had, and
+///   any later generation on that pane then reads as a lost target. That is not
+///   hypothetical: the snapshot's `pane_hook_session` advances on ANY event
+///   carrying a pane id, including one from a producer that never announced a
+///   session, so a pane whose events carry drifting session ids would abandon
+///   deliveries it never endangered (`prompt/pane-input/026`).
+///
+/// A prompt written into a pane that had NO generation — the 10 s-fallback
+/// launcher case — therefore stays UNBOUND for as long as it is merely being
+/// held. It is not left unbound forever, though: see
+/// [`bind_generation_before_retry`], which is the other half of this policy and
+/// the one that keeps a launcher delivery from retrying with no generation guard
+/// at all.
+///
+/// Capability is sticky so a `SessionEnd` cannot disarm a delivery mid-flight,
+/// and is refreshed on EVERY frame — that half is what lets a late-identifying
+/// producer still arm its retries.
+fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, pane_id: &str) {
+    if delivery.expected_session_id.is_none()
+        && delivery.attempts == 0
+        && let Some(current) = snapshot.pane_hook_session_id(pane_id)
+    {
+        adopt_generation(delivery, current);
+    }
+    // Issue #424 F2: a generation that appears after our write cannot be bound —
+    // we never addressed it — but it must not be forgotten either. Witnessed
+    // here, on the same every-frame pass, so its later end/replacement reaches
+    // [`delivery_target_changed`] instead of vanishing between two snapshots.
+    // First witness only: what matters is the transition away from the
+    // conversation that existed while our bytes sat there.
+    //
+    // ANNOUNCED generations only, which is the same discriminator
+    // [`crate::state::latch_generation`] applies and the reason this is not the
+    // every-frame bind in disguise: `AppState::pane_hook_session` advances on
+    // any frame carrying a pane id, so a pane whose ordinary events drift
+    // through session ids (`prompt/pane-input/026`) would otherwise acquire a
+    // witness it never announced and abandon a delivery nothing endangered.
+    if delivery.expected_session_id.is_none()
+        && delivery.attempts > 0
+        && delivery.observed_generation.is_none()
+        && let Some(announced) = pane_announced_generation(snapshot, pane_id)
+    {
+        delivery.observed_generation = Some(announced);
+    }
+    if !delivery.can_report_prompts {
+        delivery.can_report_prompts = pane_confirmation_capability(
+            snapshot
+                .sessions
+                .values()
+                .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+                .map(|session| &session.agent_type),
+        ) == ConfirmationCapability::Reports;
+    }
+}
+
+/// Issue #424 D1 (both reviewers): bind the pane's CURRENT generation
+/// immediately before a retry that is about to be sent INTO that generation.
+///
+/// [`bind_delivery_generation`] refuses to claim a target retroactively, and that
+/// is right as far as it goes — a generation that appeared after our bytes is not
+/// the conversation they went into. What it did not justify is what happened
+/// next. In the launcher case at the centre of #424 the 10 s fallback writes
+/// while no hook generation exists and a normal `Applied` sets `attempts = 1`;
+/// when the genuine `SessionStart` then arrives, `delivery_target_changed`
+/// answers false (still unbound) and the one-shot bind is refused (a write
+/// exists), so `expected_session_id` stayed `None` FOREVER. Capability became
+/// `Reports`, attempt 2 went into the now-genuine generation while still
+/// declaring no generation at all, and if it was swallowed and the user then
+/// cleared or switched conversation, attempt 3 carried no session guard and could
+/// inject the old task into the successor under the same registry agent. Exact
+/// agent identity does not separate two conversations owned by one process.
+///
+/// So the refusal is narrowed to what it can actually defend: we do not claim a
+/// target for a write already made, but we do NAME the conversation we are about
+/// to write into, at the moment we write into it. From then on the delivery is
+/// pinned exactly like any other and [`delivery_target_changed`] guards it. This
+/// is the same late adoption `crate::state::latch_generation` performs on the
+/// daemon side; without it the "one pinned policy across all three paths" claim
+/// is false.
+///
+/// Deliberately called ONLY at the write site, never on the every-frame pass. A
+/// delivery being HELD (capability `Unknown`, no retry in flight) is not writing
+/// into anything, so binding it would re-introduce exactly the retroactive claim
+/// `bind_delivery_generation` refuses — and would make an unrelated later
+/// generation read as a lost target for a delivery that was never endangered.
+///
+/// The `prompt/pane-input/026` counter-example that argued against binding late
+/// does not reach this: it concerned a pane whose ORDINARY frames carry drifting
+/// session ids, and the daemon-side latch now treats only a `SessionStart` as an
+/// announcement. The residual that does remain is #532's wrapped-agent
+/// alternation, which `AppState::pane_hook_session` still tracks across two
+/// producers; that shows up as an abandoned delivery — the safe direction — and
+/// is already documented on [`delivery_target_changed`].
+fn bind_generation_before_retry(delivery: &mut PromptDelivery, snapshot: &AppState, pane_id: &str) {
+    if delivery.attempts == 0 || delivery.expected_session_id.is_some() {
+        return;
+    }
+    if let Some(current) = snapshot.pane_hook_session_id(pane_id) {
+        adopt_generation(delivery, current);
+    }
+}
+
+/// Record `generation` as this delivery's bound target, rotating the WIRE epoch
+/// when a request may already be recorded under the current attempt id.
+///
+/// Reviewer blocker 2: binding changes the delivery FINGERPRINT, and the daemon's
+/// ledger refuses a reused id carrying a different one — a permanent `Conflict`
+/// the error branch would retry unchanged until the deadline. See
+/// [`PromptDelivery::epoch`]. Shared by both bind sites so the rotation cannot be
+/// remembered in one and forgotten in the other.
+fn adopt_generation(delivery: &mut PromptDelivery, generation: String) {
+    delivery.expected_session_id = Some(generation);
+    if delivery.wire_issued {
+        delivery.epoch = delivery.epoch.saturating_add(1);
+        delivery.wire_issued = false;
+    }
+}
+
+/// Issue #424 (reviewer blocker 2): the wire id for `attempt` of a delivery,
+/// including its epoch. Epoch 0 — every delivery whose identity never changed
+/// mid-flight, i.e. the overwhelming majority — produces exactly the id
+/// [`attempt_delivery_id`] always produced.
+///
+/// Issue #424 D5: a SUBMIT-ONLY PROBE gets its own id shape. The ledger binds an
+/// id to a fingerprint of the target identity AND THE TEXT at first admission, so
+/// a probe's empty payload is a different fingerprint by construction; giving it a
+/// visibly different id keeps a probe and a payload attempt from ever being
+/// confused in a log or in the ledger, rather than relying on the attempt counter
+/// alone to keep them apart.
+fn wire_attempt_id(delivery_id: &str, epoch: u32, attempt: u32, probe: bool) -> String {
+    let base = match epoch {
+        0 => delivery_id.to_string(),
+        _ => format!("{delivery_id}#e{epoch}"),
+    };
+    let base = if probe { format!("{base}#probe") } else { base };
+    attempt_delivery_id(&base, attempt)
+}
+
+/// Issue #424 (reviewer finding B3): the pane's confirmation capability as of
+/// this frame, treating a delivery that has ALREADY seen a reporting producer as
+/// permanently capable.
+///
+/// Reviewer finding B6 also lands here. [`prompt_submission_confirmed`] requires
+/// the confirming event to carry a non-optional `agent_id`, so a pane where NO
+/// identity exists anywhere — no controller-reported agent id on the delivery
+/// and none on any of the pane's sessions, the fully-untagged pre-F9 hook world
+/// — can never produce a confirmation this build will accept. Arming retries
+/// there would retype the prompt until the deadline for structural reasons,
+/// which is the same failure B4 describes for Pi. So it is classified
+/// [`ConfirmationCapability::CannotReport`]: written once, never retyped. This
+/// is what "classify events that cannot supply an identity as unconfirmable"
+/// means on the write side.
+fn delivery_capability(
+    snapshot: &AppState,
+    pane_id: &str,
+    delivery: Option<&PromptDelivery>,
+) -> ConfirmationCapability {
+    // Reviewer MEDIUM (C6): the mixed legacy-hook shape. A perfectly ordinary
+    // daemon-backed pane can have a known controller/registry agent id AND a
+    // reporting `AgentType`, while an older pre-F9 hook binary emits events that
+    // carry no `agent_id` at all. Every input to the checks below then says
+    // "Reports", and `prompt_submission_confirmed` rejects every actual event as
+    // unusable evidence — so the delivery retypes the prompt until the deadline
+    // through a channel that is structurally incapable of confirming it. That is
+    // the same failure B4 describes for Pi, arriving by a different route, and
+    // `crate::state` deliberately supports untagged hooks for backward
+    // compatibility, so it is a real shape rather than an impossible one.
+    //
+    // Capability is therefore answered by the EVIDENCE CHANNEL, not by the type
+    // alone — and this comes first, ahead of the sticky flag, because the sticky
+    // flag is set from the type. `Unknown` rather than `CannotReport`: within a
+    // session this is permanent, but the honest answer is "nothing that could
+    // confirm has been seen", and `Unknown` holds the prompt provisional (no
+    // retyping) while staying recoverable the moment one identified event
+    // arrives. Finalizing here would throw the prompt away on the strength of a
+    // hook binary's age.
+    if delivery.is_some_and(|d| evidence_channel_is_unidentified(snapshot, pane_id, d)) {
+        return ConfirmationCapability::Unknown;
+    }
+    if delivery.is_some_and(|d| d.can_report_prompts) {
+        return ConfirmationCapability::Reports;
+    }
+    let pane_sessions = || {
+        snapshot
+            .sessions
+            .values()
+            .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+    };
+    let identity_known = delivery.is_some_and(|d| d.expected_agent_id.is_some())
+        || pane_sessions().any(|session| session.agent_id.is_some());
+    if !identity_known {
+        // A pane with no session at all has not answered the question yet — it
+        // is the boot-time state of every launcher, so it must stay `Unknown`
+        // (held, not finalized) or B3 comes straight back.
+        return if pane_sessions().next().is_some() {
+            ConfirmationCapability::CannotReport
+        } else {
+            ConfirmationCapability::Unknown
+        };
+    }
+    pane_confirmation_capability(pane_sessions().map(|session| &session.agent_type))
+}
+
+/// Issue #424 (reviewer MEDIUM, C6): has this pane produced evidence since our
+/// write that [`prompt_submission_confirmed`] could never accept, and nothing
+/// else?
+///
+/// True only when all three hold: the delivery has actually written; the pane's
+/// journal holds at least one PRODUCER event newer than the delivery's
+/// watermark; and NONE of those events carries an `agent_id`. One identified
+/// post-write producer event settles the question the other way immediately, so a
+/// pane that is merely quiet, or that has some untagged frames among tagged ones,
+/// is never classified here.
+///
+/// The watermark bound matters: a pane's journal routinely opens with an
+/// untagged frame the daemon itself synthesized (`spawn::surface_spawned_pane`
+/// emits `agent_id: None` on purpose so a real hook supersedes it), and reading
+/// that as proof of an untagged channel would opt every scheduler-spawned pane
+/// out of the recovery this issue exists for.
+///
+/// Issue #424 D4 (both reviewers): DAEMON-SYNTHETIC events are excluded from the
+/// channel entirely — not counted as identified evidence, and not counted as
+/// untagged evidence either. The shell-activity monitor's `ShellBusy`/`ShellIdle`
+/// and this issue's own delivery notice are identified because they must land on
+/// the right card, and none of them proves that a NATIVE hook on this pane can
+/// report a submitted prompt. Letting one of them answer the question the other
+/// way is what defeated C6: a mixed legacy-hook pane whose real events are all
+/// untagged fell back to sticky `Reports` on the strength of an event the daemon
+/// wrote itself, and resumed retyping through a channel that can never confirm.
+/// See [`crate::event::AgentEvent::is_daemon_synthetic`].
+fn evidence_channel_is_unidentified(
+    snapshot: &AppState,
+    pane_id: &str,
+    delivery: &PromptDelivery,
+) -> bool {
+    if delivery.attempts == 0 {
+        return false;
+    }
+    let mut saw_post_write_evidence = false;
+    for session in snapshot
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+    {
+        for event in session.recent_events.iter().filter(|event| {
+            submission_is_after_watermark(event.timestamp, delivery.watermark)
+                && !event.is_daemon_synthetic()
+        }) {
+            if event.agent_id.is_some() {
+                return false;
+            }
+            saw_post_write_evidence = true;
+        }
+    }
+    saw_post_write_evidence
+}
+
+/// Issue #424 F2: the pane's current hook generation, but only when this pane
+/// has actually ANNOUNCED it — a genuine (non-launcher-origin) `SessionStart`
+/// naming it sits in the pane's own journal.
+///
+/// The discriminator is [`crate::state::latch_generation`]'s, for its reasons: a
+/// `SessionStart` is self-describing and authoritative, and anything else is
+/// inference. `AppState::pane_hook_session` deliberately advances on ANY frame
+/// carrying a pane id — good for the send guard, useless as evidence that a
+/// conversation began — so reading it raw would make a pane whose ordinary
+/// events drift through session ids look like a rolling series of
+/// conversations. That pane is `prompt/pane-input/026`, and it is also the #532
+/// wrapped-agent alternation.
+///
+/// Matched by TIMESTAMP rather than by session id, because the two are not the
+/// same string by the time they reach here: `AppState::apply_event`'s reuse
+/// guard remaps a same-agent `SessionStart` onto the existing card's id for UI
+/// continuity, while the generation map deliberately records the ORIGINAL,
+/// pre-remap id. Asking whether the pane's newest genuine `SessionStart` is what
+/// ESTABLISHED the current generation compares the two facts that survive that
+/// remap.
+fn pane_announced_generation(snapshot: &AppState, pane_id: &str) -> Option<String> {
+    let (current, established_at) = snapshot.pane_hook_session_entry(pane_id)?;
+    let announced_at = snapshot
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+        .flat_map(|session| session.recent_events.iter())
+        // Issue #243: EITHER wrapper origin is excluded. Both carry the wrapper's
+        // own session id rather than the agent's, so neither is a conversation
+        // announcing itself over this pane.
+        .filter(|event| {
+            event.event_type == EventType::SessionStart && !event.is_wrapper_session_start()
+        })
+        .map(|event| event.timestamp)
+        .max()?;
+    (announced_at >= established_at).then_some(current)
+}
+
+/// Issue #424 (reviewer finding B2/#3): the ordering watermark for `pane_id` —
+/// the newest timestamp in its own event journal right now. Captured immediately
+/// before the first write; see [`submission_is_after_watermark`], which
+/// documents why this is ordering rather than causality (#526).
+fn pane_event_watermark(snapshot: &AppState, pane_id: &str) -> Option<DateTime<Utc>> {
+    snapshot
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+        .flat_map(|session| session.recent_events.iter().map(|event| event.timestamp))
+        .max()
+}
+
+/// Issue #424: record that an automatic prompt for `pane_id` was WRITTEN but is
+/// not yet confirmed — arming the re-submission after
+/// [`unconfirmed_retry_delay`]. Distinct from [`schedule_send_retry`], which
+/// backs off a target that REFUSED delivery; see that helper's docs for why the
+/// two schedules differ.
+fn schedule_unconfirmed_retry(
+    backoff: &mut HashMap<String, SendRetryState>,
+    pane_id: &str,
+    now: std::time::Instant,
+    attempts: u32,
+) {
+    backoff.insert(
+        pane_id.to_string(),
+        SendRetryState {
+            next_attempt_at: now + unconfirmed_retry_delay(attempts),
+            attempts,
         },
     );
 }
@@ -3090,6 +4428,35 @@ pub fn is_terminal_send_result(result: SendResult) -> bool {
     )
 }
 
+/// Issue #424 (tester's finding, C2): [`is_terminal_send_result`] for the SEED
+/// path, where "already written" changes the answer for two of the three
+/// variants.
+///
+/// * `Ambiguous` is terminal unconditionally. It means bytes may have LANDED
+///   from a partial write, and the no-blind-retry rule that variant exists for
+///   does not depend on what came before it.
+/// * `WrongSession` / `Unknown` are terminal once a PROVISIONAL WRITE EXISTS.
+///   The delivery is then bound to a specific agent's conversation, and a
+///   refusal proves that target is gone: the only thing a retry could reach is a
+///   stranger (`prompt/pane-input/028`). Before the first write nothing has been
+///   injected anywhere, so the same refusal is an ordinary non-delivery — the
+///   pane is still settling, the seed is retained under backoff and bounded by
+///   the deadline, which is what `prompt/pane-input/006` pins.
+///
+/// The orchestrator path deliberately does NOT share this nuance: its role
+/// prompt is abandoned on the first terminal outcome
+/// (`deliver_orchestrator_prompt_bounds_deadline_and_terminal_outcomes`), and
+/// abandoning there also finalizes a tab's role state, so the two paths differ
+/// on the pre-write case only. The half that carries the safety property — never
+/// retry a bound delivery into a target that refused it — is identical on both.
+fn seed_result_is_terminal(result: SendResult, already_written: bool) -> bool {
+    match result {
+        SendResult::Ambiguous => true,
+        SendResult::WrongSession | SendResult::Unknown => already_written,
+        _ => false,
+    }
+}
+
 /// PRD #20 R20-005 (finding #13): abandon an orchestrator role prompt — clear
 /// its prompt (so the render-loop gate stops re-entering), drop its retry/
 /// delivery/ready-since state, and surface `msg`. Used on the deadline and on a
@@ -3107,6 +4474,32 @@ fn abandon_orchestrator_prompt(
     ui.prompt_delivery.remove(start_pane_id);
     ui.orchestration_ready_since.remove(&tab_id);
     ui.status_message = Some((msg, now));
+}
+
+/// Issue #424: finalize an orchestrator role prompt whose delivery is now
+/// CONFIRMED — the start role becomes `Working`, the tab is marked prompted (so
+/// the render-loop gate stops re-entering), and every scrap of provisional
+/// delivery state is dropped.
+///
+/// Extracted from the old `Applied`/`Queued` arm, which ran this the moment the
+/// PTY accepted bytes. That is precisely the defect issue #424 reports: it made
+/// "swallowed by a booting TUI" and "delivered and acted upon" indistinguishable,
+/// and threw away the retry state that could have recovered the first case. The
+/// body is unchanged; what changed is what has to be true before it runs.
+fn finalize_orchestrator_prompt(
+    ui: &mut UiState,
+    tab_id: TabId,
+    start_pane_id: &str,
+    start_role_index: usize,
+    role_statuses: &mut [OrchestrationRoleStatus],
+    orchestrator_prompt: &mut Option<String>,
+) {
+    *orchestrator_prompt = None;
+    role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
+    ui.orchestration_prompted.insert(tab_id);
+    ui.send_retry_backoff.remove(start_pane_id);
+    ui.prompt_delivery.remove(start_pane_id);
+    ui.orchestration_ready_since.remove(&tab_id);
 }
 
 /// PRD #20 R20-003/004/005 (findings #5, #13): deliver (or retry, or abandon) an
@@ -3131,6 +4524,69 @@ fn deliver_orchestrator_prompt(
 ) {
     let start_pane_id = role_pane_ids[start_role_index].clone();
 
+    // Issue #424: CONFIRMATION FIRST. A previous frame's `Applied`/`Queued`
+    // proved only that the PTY accepted bytes, so the prompt is still here and
+    // the role is still not `Working`; if the orchestrator has since reported
+    // submitting it, the delivery is real and everything finalizes now. Checked
+    // ahead of the backoff gate because the write being confirmed is exactly the
+    // one whose backoff window is still open (`prompt/pane-input/023`).
+    if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+        let delivery_id = delivery.delivery_id.clone();
+        let attempts = delivery.attempts;
+        // Reviewer blocker 1: target check BEFORE the bind, comparing bound
+        // against current — see the seed path's twin and
+        // [`delivery_target_changed`].
+        //
+        // Reviewer findings B1/B2: the conversation we wrote into is GONE.
+        // Neither retyping into its successor nor accepting that successor's
+        // events as confirmation is safe.
+        if delivery_target_changed(snapshot, &start_pane_id, delivery) {
+            log_prompt_stopped(
+                "orchestrator",
+                &start_pane_id,
+                &delivery_id,
+                "delivery-target-changed",
+            );
+            abandon_orchestrator_prompt(
+                ui,
+                tab_id,
+                &start_pane_id,
+                orchestrator_prompt,
+                now,
+                "Orchestrator prompt not delivered (the agent's conversation changed); abandoned"
+                    .to_string(),
+            );
+            return;
+        }
+        bind_delivery_generation(delivery, snapshot, &start_pane_id);
+        let evidence = orchestrator_prompt.as_deref().and_then(|expected| {
+            prompt_submission_evidence(snapshot, &start_pane_id, expected, delivery)
+        });
+        if let Some(evidence) = evidence {
+            match evidence {
+                SubmissionEvidence::Confirmed => {
+                    log_prompt_confirmed("orchestrator", &start_pane_id, &delivery_id, attempts)
+                }
+                // Issue #424 D5: the role prompt came back doubled with no
+                // separator. The orchestrator HAS submitted it, so the role is
+                // genuinely working and finalizing is honest; what must stop is
+                // the retry that would type a third copy into it.
+                SubmissionEvidence::Accumulated => {
+                    log_prompt_accumulated("orchestrator", &start_pane_id, &delivery_id, attempts)
+                }
+            }
+            finalize_orchestrator_prompt(
+                ui,
+                tab_id,
+                &start_pane_id,
+                start_role_index,
+                role_statuses,
+                orchestrator_prompt,
+            );
+            return;
+        }
+    }
+
     // PRD #20 R20-005 (finding #13): DEADLINE FIRST — before the readiness /
     // backoff / delivery branches — so the hard timeout is actually reachable.
     // The old block had no orchestrator deadline at all, so a permanent
@@ -3140,7 +4596,45 @@ fn deliver_orchestrator_prompt(
         .get(&tab_id)
         .is_some_and(|t| now.duration_since(*t) > AUTOMATIC_PROMPT_DEADLINE)
     {
-        tracing::warn!(pane_id = %start_pane_id, "orchestrator prompt: timed out; abandoning");
+        // Issue #424: the same warn this always emitted, now carrying the
+        // delivery identity and how many submissions were made — the two facts
+        // that tell "never written" apart from "written N times and never
+        // confirmed" when reading back a lost prompt after the fact.
+        let (delivery_id, attempts) = ui
+            .prompt_delivery
+            .get(start_pane_id.as_str())
+            .map(|delivery| (delivery.delivery_id.clone(), delivery.attempts))
+            .unwrap_or_default();
+        // Reviewer finding B3: a pane whose producer never identified itself was
+        // never RETRIED either, so its single write reaching the deadline is not
+        // a delivery failure — it is a pane nothing could ever report for, which
+        // is the case the old `timeout_ready` carve-out finalized at 10 s. The
+        // role still finalizes, just on an explicit capability answer rather
+        // than on how fast a signal happened to arrive.
+        if attempts > 0
+            && delivery_capability(
+                snapshot,
+                &start_pane_id,
+                ui.prompt_delivery.get(start_pane_id.as_str()),
+            ) != ConfirmationCapability::Reports
+        {
+            log_prompt_unconfirmable(
+                "orchestrator",
+                &start_pane_id,
+                &delivery_id,
+                "no producer on this pane can report a submitted prompt",
+            );
+            finalize_orchestrator_prompt(
+                ui,
+                tab_id,
+                &start_pane_id,
+                start_role_index,
+                role_statuses,
+                orchestrator_prompt,
+            );
+            return;
+        }
+        log_prompt_abandoned("orchestrator", &start_pane_id, &delivery_id, attempts);
         abandon_orchestrator_prompt(
             ui,
             tab_id,
@@ -3181,33 +4675,150 @@ fn deliver_orchestrator_prompt(
     if !ui.prompt_delivery.contains_key(start_pane_id.as_str()) {
         capture_prompt_delivery(ui, &start_pane_id, pane);
     }
-    let (expected_agent_id, expected_session_id, delivery_id) =
+    // Reviewer finding B2: bind the hook GENERATION before the write. Captured
+    // at tab creation this would be `None` (no agent exists yet) and stay
+    // `None` forever, which is what left every orchestrator retry telling the
+    // daemon "any generation will do".
+    if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+        bind_delivery_generation(delivery, snapshot, &start_pane_id);
+    }
+    // Reviewer finding B3: the capability answer as of THIS frame.
+    let capability = delivery_capability(
+        snapshot,
+        &start_pane_id,
+        ui.prompt_delivery.get(start_pane_id.as_str()),
+    );
+    let (expected_agent_id, delivery_id, attempt) =
         match ui.prompt_delivery.get(start_pane_id.as_str()) {
             Some(d) => (
                 d.expected_agent_id.clone(),
-                d.expected_session_id.clone(),
                 Some(d.delivery_id.clone()),
+                d.attempts.saturating_add(1),
             ),
-            None => (None, None, None),
+            None => (None, None, 1),
         };
-    let prompt_text = orchestrator_prompt
+    // Reviewer finding B3: a prompt already written into a pane whose producer
+    // is unknown is HELD, never rewritten — see the seed path's twin gate.
+    if attempt > 1 && capability != ConfirmationCapability::Reports {
+        return;
+    }
+    // Issue #424 D1: past every hold, so this frame WILL write into whatever
+    // conversation the pane currently has. Name it first, and read the epoch
+    // AFTER — binding can rotate it. See [`bind_generation_before_retry`].
+    let (expected_session_id, epoch) = match ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+        Some(delivery) => {
+            bind_generation_before_retry(delivery, snapshot, &start_pane_id);
+            (delivery.expected_session_id.clone(), delivery.epoch)
+        }
+        None => (None, 0),
+    };
+    // Issue #424 D5: after the one bounded replacement payload, later attempts
+    // probe SUBMISSION rather than typing the role prompt in again. See
+    // [`crate::prompt_delivery::attempt_writes_payload`].
+    //
+    // Issue #666: disarmed here for the same reason as the seed path's twin — the
+    // armed third payload ships on the daemon path only. See that call site, and
+    // issue #684.
+    let writes_payload = attempt_writes_payload(attempt, &AgentStartRearm::default(), now);
+    // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT rides
+    // its own wire id, or the daemon's ledger replays the first `Applied` and a
+    // retry never reaches the PTY at all. See [`attempt_delivery_id`].
+    let wire_delivery_id = delivery_id
         .as_deref()
-        .unwrap_or_default()
-        .to_string();
+        .map(|id| wire_attempt_id(id, epoch, attempt, !writes_payload));
+    // Reviewer blocker 2: a request under this wire id may now be recorded in
+    // the daemon's ledger — see [`PromptDelivery::epoch`].
+    if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+        delivery.wire_issued = true;
+    }
+    let prompt_text = if writes_payload {
+        orchestrator_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        String::new()
+    };
+    // Reviewer finding B2/#3: the watermark, read immediately before the write so
+    // everything already in the pane's journal is pre-existing history.
+    let watermark = pane_event_watermark(snapshot, &start_pane_id);
+    // Issue #424 H4: and the generation-closure count, at the same instant and
+    // for the same reason. See [`PromptDelivery::closures_at_write`].
+    let closures = snapshot.pane_generation_closures(&start_pane_id);
+    // Issue #424 S4 (reviewer HIGH): persisted BEFORE the RPC on this path too —
+    // a daemon that applied the write and lost the response leaves `attempts` at
+    // 0, and a baseline stored only on success is a baseline the lost write
+    // never got. See the seed path's twin.
+    if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str())
+        && delivery.closures_at_write.is_none()
+    {
+        delivery.closures_at_write = Some(closures);
+    }
     match pane.write_and_submit_to_pane_with_identity(
         &start_pane_id,
         &prompt_text,
         expected_agent_id.as_deref(),
         expected_session_id.as_deref(),
-        delivery_id.as_deref(),
+        wire_delivery_id.as_deref(),
     ) {
+        // Issue #424: the PTY accepted the bytes — that is ALL this means. The
+        // prompt, the role's non-`Working` status, the delivery identity and the
+        // retry are RETAINED until the orchestrator reports submitting it
+        // (checked at the top of this function).
         Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
-            *orchestrator_prompt = None;
-            role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
-            ui.orchestration_prompted.insert(tab_id);
-            ui.send_retry_backoff.remove(start_pane_id.as_str());
-            ui.prompt_delivery.remove(start_pane_id.as_str());
-            ui.orchestration_ready_since.remove(&tab_id);
+            let logged_id = delivery_id.clone().unwrap_or_default();
+            if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+                delivery.attempts = attempt;
+                if delivery.watermark.is_none() {
+                    delivery.watermark = watermark;
+                }
+                delivery.can_report_prompts |= capability == ConfirmationCapability::Reports;
+            }
+            if writes_payload {
+                log_prompt_written("orchestrator", &start_pane_id, &logged_id, attempt);
+            } else {
+                log_prompt_probe_submitted("orchestrator", &start_pane_id, &logged_id, attempt);
+            }
+            match capability {
+                // A recognized producer that structurally cannot report a
+                // submitted prompt (Pi). Retrying could never be confirmed —
+                // only retyped — so the write is final and the role finalizes.
+                ConfirmationCapability::CannotReport => {
+                    log_prompt_unconfirmable(
+                        "orchestrator",
+                        &start_pane_id,
+                        &logged_id,
+                        "this agent cannot report a submitted prompt",
+                    );
+                    finalize_orchestrator_prompt(
+                        ui,
+                        tab_id,
+                        &start_pane_id,
+                        start_role_index,
+                        role_statuses,
+                        orchestrator_prompt,
+                    );
+                }
+                // Reviewer finding B3: nothing has identified itself yet. Hold
+                // the write PROVISIONAL — so a producer signalling at 10.1 s
+                // still arms retries and a confirmation still finalizes — but do
+                // NOT retype into a pane that has given no reason to think a
+                // second copy would help. This is where the old code finalized
+                // the role and threw the prompt away, which is what excluded the
+                // slow-launcher class from the whole fix.
+                ConfirmationCapability::Unknown => {
+                    ui.send_retry_backoff.remove(start_pane_id.as_str());
+                }
+                ConfirmationCapability::Reports => {
+                    log_prompt_unconfirmed("orchestrator", &start_pane_id, &logged_id, attempt);
+                    schedule_unconfirmed_retry(
+                        &mut ui.send_retry_backoff,
+                        &start_pane_id,
+                        now,
+                        attempt,
+                    );
+                }
+            }
         }
         // PRD #20 finding #13: a TERMINAL outcome is abandoned (no forever
         // retry); a RETRYABLE liveness transition is retried under backoff,
@@ -3251,11 +4862,18 @@ fn deliver_orchestrator_prompt(
 /// mode/restore agent shell (the one launch class that doesn't pass its command
 /// through the common `agent_pty::spawn` boundary — it spawns a shell and
 /// injects the command as keystrokes). Resolves the Wrapper-strategy identity
-/// from the command and returns `dot-agent-deck wrap --agent <name> -- <cmd>`
-/// for a Wrapper agent (Codex); returns the command unchanged for native agents.
-/// Idempotent, so a re-typed already-wrapped command is never double-wrapped.
-fn wrap_agent_command(command: &str) -> String {
-    match AgentType::from_command(Some(command)) {
+/// and returns `dot-agent-deck wrap --agent <name> -- <cmd>` for a Wrapper
+/// agent (Codex); returns the command unchanged for native agents. Idempotent,
+/// so a re-typed already-wrapped command is never double-wrapped.
+///
+/// Issue #308: `declared` is the mode's `agent = "…"` key when it has one, and
+/// it wins over parsing the command — a mode agent pane running
+/// `devbox run codex-big` is otherwise typed in BARE, and an unwrapped Codex
+/// emits nothing until its first turn, so the pane reads "No agent" for as long
+/// as the user has not prompted it. `None` (every mode without the key) derives
+/// from the command exactly as before.
+fn wrap_agent_command(command: &str, declared: Option<AgentType>) -> String {
+    match declared.or_else(|| AgentType::from_command(Some(command))) {
         Some(agent_type) => crate::wrap::wrap_launch_command(command, &agent_type),
         None => command.to_string(),
     }
@@ -3602,6 +5220,17 @@ pub enum Action {
     /// PRD #80: toggle the embedded-pane layout between stacked and tiled
     /// (Ctrl+T).
     ToggleLayout,
+    /// Toggle the deck-global command-entry lock (Ctrl+E), which decides
+    /// whether keystrokes reach a focused non-orchestrator role pane's PTY.
+    /// Only ever reaches the handler from an Orchestration tab in command mode
+    /// — [`scope_command_entry_lock`] un-resolves it everywhere else.
+    ToggleOrchestrationLock,
+    /// PRD #336: toggle the orchestration sidebar/pane-column split between
+    /// the default 34/66 ratio and the narrower-sidebar 25/75 (Ctrl+L). The
+    /// split is global — one press applies to every orchestration tab, open or
+    /// opened later — but the chord is only claimed on an orchestration tab:
+    /// on any other tab it reaches the PTY as ordinary input.
+    ToggleOrchestrationSplit,
     /// PRD #80: leave `PaneInput` and return to Normal (command) mode on the
     /// current tab (Ctrl+D).
     DetachToNormal,
@@ -3990,6 +5619,50 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
+/// Issue #424 S1: does this user-input byte SUBMIT the agent's input box, given
+/// the byte that immediately preceded it in the same stream?
+///
+/// This lives beside [`keyevent_to_bytes`] because it is that function read
+/// backwards. The daemon's submit drain
+/// (`PaneInputState::note_user_bytes`) never sees a `KeyEvent` — it sees only
+/// the bytes this encoder produced — so it has to recover which keypress made
+/// them. It used to answer "any CR or LF", which contradicts the encoder
+/// directly above it and the acceptance matrix that shaped it
+/// (`prds/done/227-modifier-aware-pane-key-forwarding.md:36-43`: real agents,
+/// tmux-rendered screens, submit vs. newline distinguished by whether the draft
+/// stayed in one input box):
+///
+/// | frame | what produces it, above | pi | claude |
+/// |---|---|---|---|
+/// | `ESC[13;{m}u` | `Enter` + SHIFT/CONTROL (`:5153`) | newline | newline |
+/// | `LF` | `Ctrl+J`, via [`ctrl_c0_byte`] (`:5109`) | newline | newline |
+/// | `ESC` `CR` | `Enter` + ALT, kept in its historical form on purpose (`:5143`, `:5206`) | submit | **newline** |
+/// | `CR` | plain `Enter` (`:5169`) — and `Ctrl+M`, the same byte by the caret rule | submit | submit |
+///
+/// Exactly one row submits on every supported agent, and it is the only one
+/// this returns `true` for. `ESC` `CR` is the row that matters: it is a genuine
+/// AMBIGUITY rather than an oversight, and it resolves the way every unknown
+/// here has to. A *missed* drain fails CLOSED — a later same-payload delivery is
+/// refused, which is reported and bounded by the record TTL. A *false* drain
+/// fails OPEN — the replacement stops recognizing itself as a repeat and
+/// submits the user's half-typed draft sandwiched between two copies of the
+/// payload. `ESC[13;{m}u` needs no arm at all: it carries neither byte.
+///
+/// `keyevent_submit_classification_matches_prd_227_matrix` (in `agent_pty`)
+/// pins every row against the real encoder and the real stream scanner, so a
+/// change to the forwarding contract cannot silently desynchronize the drain.
+pub(crate) fn user_byte_submits_input_box(preceding: Option<u8>, byte: u8) -> bool {
+    /// The ESC the ALT prefix adds at `:5207`.
+    const ESC: u8 = 0x1b;
+
+    byte == b'\r' && preceding != Some(ESC)
+}
+
+#[cfg(test)]
+pub(crate) fn keyevent_to_bytes_for_test(key: &KeyEvent) -> Option<Vec<u8>> {
+    keyevent_to_bytes(key)
+}
+
 /// Compute the row offset between widget-relative coordinates and vt100 screen
 /// coordinates. Must match the viewport calculation in `terminal_widget.rs`.
 fn screen_row_offset(screen: &vt100::Screen, pane_rect: Rect) -> u16 {
@@ -3999,6 +5672,26 @@ fn screen_row_offset(screen: &vt100::Screen, pane_rect: Rect) -> u16 {
     let anchor = (cursor_row + 1).min(screen_rows);
     let effective_rows = anchor.max(inner_h);
     effective_rows.saturating_sub(inner_h) as u16
+}
+
+/// The status line a Ctrl+click on an OSC-8 hyperlink leaves behind, with the
+/// URL shortened to fit the one-row status area.
+///
+/// Extracted out of the mouse arm so the L1 seam (`mouse/hyperlink/001`)
+/// exercises the same code the live click path runs rather than an agreeing
+/// copy of it.
+pub fn opened_link_status(url: &str) -> String {
+    // Issue #574: the URL is whatever the agent wrote into its own PTY as an
+    // OSC-8 hyperlink, so byte 57 is as arbitrary as the string — `&url[..57]`
+    // panicked the event loop the moment it landed inside a character. The
+    // `> 60` gate is kept so the set of URLs that get shortened at all is
+    // unchanged; only the cut itself moves to a character boundary.
+    let display = if url.len() > 60 {
+        crate::prompt_delivery::truncate_on_char_boundary(url, 57)
+    } else {
+        url.to_string()
+    };
+    format!("Opened: {display}")
 }
 
 /// Extract text from a vt100 screen for the given selection region.
@@ -4183,6 +5876,97 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
     } else {
         Action::Continue
     }
+}
+
+/// Status message shown when a keystroke is dropped because the command-entry
+/// lock is engaged. Follows this codebase's existing no-op-with-feedback
+/// convention (e.g. `RequestConfigGen`'s "No active agent session to send
+/// prompt to.").
+///
+/// It names `Ctrl+D` **first**, and that is load-bearing rather than
+/// stylistic: this message is only ever shown from `UiMode::PaneInput`, which
+/// — since [`scope_command_entry_lock`] claims the chord in `UiMode::Normal`
+/// only — is precisely the mode where `Ctrl+E` alone does nothing. Naming just
+/// the unlock chord would instruct the user to press a chord that provably
+/// cannot work from where they are standing.
+const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d then Ctrl+e to unlock";
+
+/// Gate the PTY-forward fallback [`handle_pane_input_key`] produces against the
+/// command-entry lock. When the active tab is [`Tab::Orchestration`], the lock
+/// is engaged, and the focused pane is neither the orchestrator
+/// (`role_pane_ids[start_role_index]`) nor waiting for input, a would-be
+/// [`Action::ForwardToPane`] is dropped (returned as [`Action::Continue`])
+/// before it ever reaches that pane's PTY.
+///
+/// The orchestrator pane's own input is never gated, and non-orchestration tabs
+/// are unaffected — the `Tab::Orchestration` match below is what bounds the
+/// lock's reach, and it is the only thing that does. This is also the sole gate
+/// site, so global chords resolved earlier by [`global_action_for_mode`] never
+/// pass through it.
+///
+/// **Nothing becomes read-only.** The lock does not remove worker input, it
+/// gates it behind one deliberate `Ctrl+D`, `Ctrl+E`. Every reach-into-a-worker
+/// fail-safe stays reachable at that cost.
+///
+/// **The `WaitingForInput` carve-out.** While the focused non-orchestrator role
+/// pane reports [`SessionStatus::WaitingForInput`], the lock stops gating that
+/// pane and the keystroke passes through untouched. The lock's subject is the
+/// *unsolicited* interruption of a working agent; an agent that has stopped and
+/// asked is already blocked on a human, so answering it is a response to a
+/// request rather than an intrusion into state the orchestrator believes it
+/// owns. The exemption is a pure read of live status with nothing latched
+/// anywhere, so the gate re-engages on the very next keystroke once the status
+/// clears. Chosen over an always-allowed navigation-key allowlist because it
+/// reuses a signal the deck already computes every frame, needs no per-agent key
+/// knowledge, and can answer a free-text prompt — which an allowlist cannot.
+/// **Accepted limitation:** an agent that never reports `WaitingForInput` gets
+/// no carve-out and still needs a deliberate unlock.
+///
+/// `pane_status` is the `pane_id -> SessionStatus` join
+/// [`build_pane_status_for_gate`] returns, handed straight over by the call
+/// site. That producer — not this consumer — is where ambiguity is resolved: it
+/// omits any `pane_id` claimed by more than one session, and the `Some(...)`
+/// match below then denies the exemption for a missing key without needing to
+/// know why it is missing. See its docs for why the guard cannot live here.
+fn gate_pane_input_key(
+    action: Action,
+    ui: &UiState,
+    tab_manager: &TabManager,
+    pane: &dyn PaneController,
+    pane_status: &HashMap<&str, SessionStatus>,
+) -> Action {
+    if !matches!(action, Action::ForwardToPane(_)) {
+        return action;
+    }
+    if !ui.command_entry_locked {
+        return action;
+    }
+    let Tab::Orchestration {
+        role_pane_ids,
+        start_role_index,
+        ..
+    } = tab_manager.active_tab()
+    else {
+        return action;
+    };
+    let orchestrator_pane_id = role_pane_ids.get(*start_role_index).map(String::as_str);
+    let focused_pane_id = pane.focused_pane_id();
+    if focused_pane_id.as_deref() == orchestrator_pane_id {
+        return action;
+    }
+    // The carve-out is checked LAST so it can only ever widen what gets
+    // through — the orchestrator's never-gated rule above and the
+    // tab-kind/lock guards before it keep their existing meaning whatever
+    // status happens to be attached to a pane.
+    if let Some(pane_id) = focused_pane_id.as_deref()
+        && matches!(
+            pane_status.get(pane_id),
+            Some(SessionStatus::WaitingForInput)
+        )
+    {
+        return action;
+    }
+    Action::Continue
 }
 
 /// PRD #241 M3: the close-confirmation dialog's whole state — which option is
@@ -6088,21 +7872,25 @@ fn transition_after_dir_pick(ui: &mut UiState) {
                 Ok(Some(config)) => (config.modes, config.orchestrations),
                 _ => (vec![], vec![]),
             };
-            // PRD #140 M4.0: snapshot the daemon's live-orchestration
-            // directories now — before any orchestration can be opened from this
-            // form — so selecting an orchestration whose cwd already hosts one
-            // renders the non-blocking shared-resource warning above `[Submit]`.
-            // One-shot `ListAgents`, exactly like `live_schedule_names` at
-            // manager-open time; a down daemon just yields no warning. The query
-            // is skipped when the project offers no orchestration to select, so
+            // PRD #140 M4.0: snapshot the daemon's live
+            // orchestrations now — before any orchestration can be opened from
+            // this form — so selecting one whose cwd already hosts a live
+            // orchestration renders the non-blocking shared-resource warning,
+            // AND so the Name field can be suggested/refused against titles
+            // that are actually live. ONE `ListAgents` round-trip serves both
+            // (see `live_orchestration_cwds_and_titles`), exactly like
+            // `live_schedule_names` at manager-open time; a down daemon just
+            // yields no warning and suggests `-orchestrator-1`. The query is
+            // skipped when the project offers no orchestration to select, so
             // the common plain-pane `Ctrl+n` costs no extra round-trip.
-            let live_orch_cwds = if orchestrations.is_empty() {
-                Vec::new()
+            let (live_orch_cwds, live_orch_names) = if orchestrations.is_empty() {
+                (Vec::new(), Vec::new())
             } else {
-                live_orchestration_cwds()
+                live_orchestration_cwds_and_titles()
             };
             NewPaneFormState::new(dir, name, command, modes, orchestrations)
                 .with_live_orchestration_cwds(live_orch_cwds)
+                .with_live_orchestration_names(live_orch_names)
         }
         // PRD #170: the picked dir is pre-seeded as the schedule's working_dir;
         // the Command field pre-fills from the resolved authoring command so a
@@ -6161,6 +7949,36 @@ fn record_candidate(command: &str) -> Option<String> {
 /// Shared by the Enter-submit key arm and the `[Submit]` button
 /// ([`Action::FormSubmit`]) so click and key spawn an identical pane.
 fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> NewPaneRequest {
+    // PRD #220: the dispatcher option — a seeded single agent that knows the
+    // `dot-agent-deck dispatch <name>` verb.
+    //
+    // Spawned as a dashboard CARD (`mode_config: None`) carrying the seed via
+    // `seed_prompt`, exactly like the two schedule options below and for the
+    // same reason PRD #127 gave: a mode tab routes through `render_mode_tab`'s
+    // 50/50 split, so a mode declaring no side panes (which is what the
+    // dispatcher is — `panes: []`, `reactive_panes: 0`) renders the agent at
+    // half width with an empty column beside it. `mode_side_pane_dims` halves
+    // the width unconditionally, so there is no way to opt out of the split
+    // while remaining a mode tab.
+    //
+    // The synthetic `ModeConfig` is still built for the CYCLER (title + chip via
+    // `selected_mode`); only the spawn shape differs. Same split as
+    // `schedule: issues`, whose synthetic mode names the cycler while its seed
+    // rides on the request.
+    if form.is_dispatcher_selected() {
+        return NewPaneRequest {
+            dir: form.dir.clone(),
+            name: form.name.clone(),
+            command: if form.command.trim().is_empty() {
+                resolve_authoring_command(default_command)
+            } else {
+                form.command.clone()
+            },
+            mode_config: None,
+            orchestration_config: None,
+            seed_prompt: build_dispatcher_mode(&form.dir).seed_prompt,
+        };
+    }
     // PRD #120: the flag-gated "schedule: issues" authoring option — like the
     // plain "schedule" option it is a throwaway single-agent authoring CARD, but
     // its seed authors an ISSUE-DISPATCH task (`schedule add --repo …`) instead
@@ -6294,6 +8112,14 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
             // selected), pressing Enter on Name submits — there's no later
             // field to advance to.
             FormField::Name | FormField::Command => {
+                // A name a live orchestration already holds is REFUSED at
+                // submit — no SpawnPane, form stays open. Checked before
+                // building the request so a stale/resubmitted taken name
+                // (e.g. the user typed over the suggestion) never reaches the
+                // daemon as a second orchestration under the same title.
+                if form.name_collision() {
+                    return Action::Continue;
+                }
                 // The blank-command -> `default_command` authoring default now
                 // lives in `build_new_pane_request`, so both this Enter door and
                 // the [Submit] button door apply it identically.
@@ -6310,7 +8136,11 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
         },
         KeyCode::Backspace if matches!(form.focused, FormField::Name | FormField::Command) => {
             let field = match form.focused {
-                FormField::Name => &mut form.name,
+                FormField::Name => {
+                    // A human edit — the suggestion must never overwrite it.
+                    form.name_touched = true;
+                    &mut form.name
+                }
                 FormField::Command => &mut form.command,
                 FormField::Mode | FormField::Agent => unreachable!(),
             };
@@ -6318,7 +8148,11 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
         }
         KeyCode::Char(c) if matches!(form.focused, FormField::Name | FormField::Command) => {
             let field = match form.focused {
-                FormField::Name => &mut form.name,
+                FormField::Name => {
+                    // A human edit — the suggestion must never overwrite it.
+                    form.name_touched = true;
+                    &mut form.name
+                }
                 FormField::Command => &mut form.command,
                 FormField::Mode | FormField::Agent => unreachable!(),
             };
@@ -6372,11 +8206,21 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     if kb.matches(KbAction::ToggleLayout, key) {
         return Some(Action::ToggleLayout);
     }
+    // PRD #336. This stays a pure chord→action mapping with no tab awareness;
+    // the orchestration-tab scoping is applied by `scope_orchestration_split`
+    // at the one dispatch site that has tab context. Resolving here and
+    // narrowing there keeps this function a plain keybinding table.
+    if kb.matches(KbAction::ToggleOrchestrationSplit, key) {
+        return Some(Action::ToggleOrchestrationSplit);
+    }
     if kb.matches(KbAction::NewPane, key) {
         return Some(Action::NewPane);
     }
     if kb.matches(KbAction::ClosePane, key) {
         return Some(Action::CloseSelected);
+    }
+    if kb.matches(KbAction::ToggleOrchestrationLock, key) {
+        return Some(Action::ToggleOrchestrationLock);
     }
     // Ctrl+PageDown / Ctrl+PageUp: non-configurable tab navigation.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -6425,6 +8269,42 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     }
 }
 
+/// Un-resolve `Ctrl+E` (`ToggleOrchestrationLock`) unless the active tab is an
+/// Orchestration tab **and** the deck is in command mode.
+///
+/// Same conflict class, and the same trade, as [`global_action_for_mode`]'s
+/// `CloseSelected` scoping above: `Ctrl+E` is `0x05`, readline's
+/// `end-of-line`. A globally-bound chord that a pane's occupant also wants is
+/// claimed only in command mode, and the user pays one extra `Ctrl+D` rather
+/// than losing the chord entirely. Without this, an Orchestration tab would
+/// swallow the byte unconditionally and a focused role pane's PTY would never
+/// receive it — so the user could not move to the end of a line they were
+/// typing at the agent.
+///
+/// It cannot live inside `global_action_for_mode` the way `CloseSelected`'s
+/// mode term does, because it needs one thing that function has no access to:
+/// which KIND of tab is active. `is_orchestration_tab` is true **only** for
+/// [`Tab::Orchestration`], whose `role_pane_ids[start_role_index]` is what
+/// gives the chord something to mean; on a Dashboard or Mode tab the lock
+/// reaches nothing, so claiming the chord there would cost the byte for no
+/// behaviour. Kept a standalone pure function rather than an inline `if` at the
+/// call site because it is then unit-testable without a PTY — an inline
+/// condition is only reachable through the full event loop.
+fn scope_command_entry_lock(
+    action: Option<Action>,
+    is_orchestration_tab: bool,
+    mode: UiMode,
+) -> Option<Action> {
+    match action {
+        Some(Action::ToggleOrchestrationLock)
+            if !is_orchestration_tab || mode != UiMode::Normal =>
+        {
+            None
+        }
+        other => other,
+    }
+}
+
 /// PRD #241 M1 (L1 `keybindings/safety/003`, `/004`, `keybindings/remap/003`):
 /// resolve a key the way the live loop does for a given mode.
 ///
@@ -6433,8 +8313,17 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
 /// PTY-forwarding fall-through (`handle_pane_input_key`). Returning `None`
 /// means "no global command and nothing to forward", i.e. the key belongs to
 /// that mode's own handler.
+///
+/// The `ToggleOrchestrationLock` pass below applies [`scope_command_entry_lock`]'s
+/// MODE term only, with `is_orchestration_tab: true`. Mode is this helper's
+/// whole subject and is knowable here, so leaving it out would make the helper
+/// over-report `Ctrl+E` as claimed in `PaneInput` — the exact thing the scoping
+/// exists to stop. Tab kind is not knowable here and is applied at the live
+/// call site, so this helper answers for the most permissive tab.
 pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
-    if let Some(action) = global_action_for_mode(kb, mode, key) {
+    if let Some(action) =
+        scope_command_entry_lock(global_action_for_mode(kb, mode, key), true, mode)
+    {
         return Some(action);
     }
     if mode == UiMode::PaneInput {
@@ -6444,6 +8333,47 @@ pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) 
         };
     }
     None
+}
+
+/// PRD #336: narrow a resolved action to the tab type AND mode it applies to.
+///
+/// `Action::ToggleOrchestrationSplit` resolves only on an orchestration tab, in
+/// command mode. The global resolvers are pure chord→action tables with no tab
+/// context, so left alone they claim the chord everywhere — and because
+/// `dispatch_action`'s handler no-ops off an orchestration tab, the keystroke is
+/// swallowed rather than reaching the focused pane's PTY.
+///
+/// Both halves of the narrowing matter, and for the same reason: the default
+/// `Ctrl+l` is readline's `clear-screen`, so anything running in a pane has a
+/// legitimate claim on it.
+///
+/// - **Tab type** — on a Dashboard or Mode tab the action can do nothing, so
+///   claiming the chord there is pure loss.
+/// - **Mode** — this mirrors `close_pane` (PRD #241 M1), which is command-mode
+///   only precisely so `Ctrl+w` still reaches the PTY as word-delete while the
+///   user is typing. Same conflict class here: without the mode check, `Ctrl+l`
+///   typed into a *role pane* — the most likely place to want a screen clear —
+///   would resize the sidebar instead of clearing. Toggling costs one extra
+///   keystroke (`Ctrl+d` first); silently eating clear-screen costs more.
+///
+/// Returning `None` un-resolves it so the key falls through to the normal
+/// `PaneInput` forwarding path. Every other action passes through untouched.
+/// Kept as a standalone pure function so it is unit-testable without a PTY
+/// (`orchestration/layout/005`) — an inline `if` at the call site would only
+/// be reachable through the full event loop.
+fn scope_orchestration_split(
+    action: Option<Action>,
+    is_orchestration_tab: bool,
+    mode: UiMode,
+) -> Option<Action> {
+    match action {
+        Some(Action::ToggleOrchestrationSplit)
+            if !is_orchestration_tab || mode != UiMode::Normal =>
+        {
+            None
+        }
+        other => other,
+    }
 }
 
 /// PRD #80 / #40: map a Normal-mode tab-cycling key to its [`Action`]. The
@@ -6665,6 +8595,37 @@ fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usi
         .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(*idx))
 }
 
+/// Unwind **every** per-pane registration a freshly spawned pane accumulated,
+/// for a spawn that succeeded and is then abandoned.
+///
+/// A pane that is created and then given up on (its mode tab failed to open)
+/// has already been recorded in six places by the time the failure is known.
+/// Removing them inline, arm by arm, is how issue #308's `pane_declared_agent`
+/// came to join a leak that five sibling maps were already in — and five of
+/// those are *card-visible*, including the placeholder session, which keeps
+/// rendering a dashboard card for a pane that no longer exists. Every abandon
+/// path routes through here so a future per-pane map is added once, rather
+/// than silently omitted from one caller.
+///
+/// Call this **only once the pane is genuinely gone**. A `close_pane` that
+/// FAILED leaves the pane live, and a live pane must keep its card and
+/// metadata so the user can still see it and retry (the same rule PRD #92 F4
+/// applies to an explicit close).
+fn rollback_abandoned_pane(pane_id: &str, ui: &mut UiState, state: &SharedState) {
+    {
+        let mut st = state.blocking_write();
+        // The placeholder session inserted right after the spawn — plus any
+        // session the daemon has already bound to this pane — would otherwise
+        // outlive the pane as a ghost card.
+        st.remove_sessions_for_pane(pane_id);
+        st.unregister_pane(pane_id);
+    }
+    ui.pane_metadata.remove(pane_id);
+    ui.pane_display_names.remove(pane_id);
+    ui.pane_names.remove(pane_id);
+    ui.pane_declared_agent.remove(pane_id);
+}
+
 /// PRD #80 M3: close the tab at `idx` and reconcile shared state — unregister
 /// every successfully-closed pane, drop the matching sessions (keeping any that
 /// failed to close so the user can retry), clean their metadata, and resweep the
@@ -6699,6 +8660,7 @@ fn close_tab_by_index(
             drop(st);
             for id in &outcome.closed {
                 ui.pane_metadata.remove(id);
+                ui.pane_declared_agent.remove(id);
             }
             if outcome.is_clean() {
                 ui.status_message = Some(("Closed tab".to_string(), std::time::Instant::now()));
@@ -6922,6 +8884,61 @@ fn dispatch_action(
             // split on the next frame (it reads `pane_layout`).
             ui.status_message = Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
         }
+        // Ctrl+e: toggle the deck-global command-entry lock. The action only
+        // ever reaches here from an Orchestration tab in command mode —
+        // `scope_command_entry_lock` un-resolves it everywhere else — so there
+        // is no per-tab guard left to apply.
+        Action::ToggleOrchestrationLock => {
+            ui.command_entry_locked = !ui.command_entry_locked;
+            // On the locked→unlocked half ONLY, drop the waiting-episode latch
+            // on EVERY Orchestration tab: the lock is deck-global, so
+            // unlocking stops observation everywhere at once and any tab can
+            // be left holding a frozen latch, not just the one active right
+            // now. From this frame on the render loop stops calling
+            // `observe_waiting_panes`, so a latch left standing here would
+            // freeze at its current value and be misread on re-lock as a fresh
+            // all-clear edge for an episode the human already dealt with by
+            // hand. Clearing on the unlocked→locked half instead would be
+            // wrong: that half is followed by frames that observe, so it has
+            // nothing to compensate for, and it would discard an edge the deck
+            // is about to act on legitimately.
+            if !ui.command_entry_locked {
+                tab_manager.clear_waiting_pane_latch();
+            }
+            let lock_name = if ui.command_entry_locked {
+                "locked"
+            } else {
+                "unlocked"
+            };
+            ui.status_message = Some((
+                format!("Pane entry: {lock_name}"),
+                std::time::Instant::now(),
+            ));
+        }
+        // Ctrl+l: toggle the orchestration sidebar/pane-column split (PRD
+        // #336). The split is GLOBAL — one press changes every orchestration
+        // tab, open or opened later — but the chord is still only *actionable*
+        // from an orchestration tab, so the guard below stays: pressing it on
+        // the Dashboard must not silently change orchestration geometry.
+        // Unreachable off an orchestration tab anyway —
+        // `scope_orchestration_split` un-resolves the chord there — but the
+        // `matches!` keeps this a no-op rather than a panic if that changes.
+        Action::ToggleOrchestrationSplit => {
+            if matches!(tab_manager.active_tab(), Tab::Orchestration { .. }) {
+                // `TabManager` owns the split and rewrites every orchestration
+                // tab in the same call, so there is no window in which one tab
+                // disagrees with another.
+                let narrow = tab_manager.toggle_orchestration_split();
+                let split_name = if narrow { "25/75" } else { "34/66" };
+                // Mirroring `ToggleLayout`: flip the flag and let the next
+                // frame pick it up. `compute_frame_layout` reads it off
+                // `ActiveTabView::Orchestration`, and the pre-draw
+                // `resize_panes_to_layout` pass reflows the role panes' PTYs
+                // from the same rects — no resize is pushed from here.
+                ui.status_message =
+                    Some((format!("Split: {split_name}"), std::time::Instant::now()));
+            }
+        }
         // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
         // the current tab.
         //
@@ -6937,11 +8954,6 @@ fn dispatch_action(
             match resume_pane_input_target(ui, pane, tab_manager, snapshot, filtered) {
                 Some(target_pane_id) if pane.focus_pane(&target_pane_id).is_ok() => {
                     ui.mode = UiMode::PaneInput;
-                    // Reset dismissed flags so art reappears when the user
-                    // returns to the dashboard (mirrors `Action::Focus`).
-                    for entry in ui.idle_art_cache.values_mut() {
-                        entry.dismissed = false;
-                    }
                     ui.status_message = Some((
                         format!(
                             "PaneInput mode — type to interact, {} for dashboard",
@@ -7067,9 +9079,15 @@ fn dispatch_action(
                         Ok(()) => {
                             let mut st = state.blocking_write();
                             st.sessions.remove(&session_id);
+                            // …and every OTHER session this pane carries. Removing
+                            // only the card's own left a ghost card behind whenever
+                            // the pane had a placeholder session too — see
+                            // `remove_sessions_for_pane`.
+                            st.remove_sessions_for_pane(&pane_id);
                             st.unregister_pane(&pane_id);
                             drop(st);
                             ui.pane_metadata.remove(&pane_id);
+                            ui.pane_declared_agent.remove(&pane_id);
                             ui.status_message =
                                 Some((format!("Closed pane {pane_id}"), std::time::Instant::now()));
                         }
@@ -7212,12 +9230,6 @@ fn dispatch_action(
         }
         // Normal-mode digit 1-9: jump to card N and focus its pane.
         Action::FocusCard(idx) => {
-            // Dismiss idle art on the target card.
-            if let Some((sid, _)) = filtered.get(idx)
-                && let Some(entry) = ui.idle_art_cache.get_mut(*sid)
-            {
-                entry.dismissed = true;
-            }
             focus_deck(idx, ui, filtered, snapshot, state, pane);
             // PRD #84 M4: focusing a card can change which Stacked pane expands;
             // the pre-draw `resize_panes_to_layout` re-sizes it next frame.
@@ -7383,12 +9395,6 @@ fn dispatch_action(
             // the Orchestration deck didn't). Setting it here is one shared
             // change covering both decks.
             ui.selected_index = dashboard_focus_target(ui, filtered.len());
-            // Dismiss idle art on the focused card
-            if let Some(sid) = selected_id
-                && let Some(entry) = ui.idle_art_cache.get_mut(sid)
-            {
-                entry.dismissed = true;
-            }
             if let Some(sid) = selected_id
                 && let Some(session) = snapshot.sessions.get(sid)
             {
@@ -7438,11 +9444,6 @@ fn dispatch_action(
                     match focus_result {
                         Ok(()) => {
                             ui.mode = UiMode::PaneInput;
-                            // Reset dismissed flags so art reappears when
-                            // the user returns to the dashboard.
-                            for entry in ui.idle_art_cache.values_mut() {
-                                entry.dismissed = false;
-                            }
                             ui.status_message = Some((
                                 format!(
                                     "PaneInput mode — type to interact, {} for dashboard",
@@ -7546,7 +9547,10 @@ fn dispatch_action(
                     // name to the tab TITLE only, via `display_title`; the
                     // identity stays the canonical `orch_config.name`.
                     let display_title = (!req.name.is_empty()).then(|| req.name.clone());
-                    let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
+                    // `None`: the interactive path carries no caller task — the user
+                    // types their instructions after the orchestrator acknowledges.
+                    // Output is byte-for-byte the pre-#222 text.
+                    let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str, None);
                     // PRD #89 M2b.2: keep a copy of the prepared prompt for the
                     // capture snapshot below — `prompt` itself is moved into
                     // `open_orchestration_tab`. Empty when the orchestration
@@ -7576,6 +9580,10 @@ fn dispatch_action(
                         0,
                         PaneLayout::Tiled,
                         true,
+                        // PRD #336: the split is global, so a newly opened tab
+                        // adopts whatever is currently in effect — spawn the
+                        // role PTYs at that width rather than at the default.
+                        tab_manager.orchestration_split_narrow(),
                     );
                     match tab_manager.open_orchestration_tab(
                         &orch_config,
@@ -7633,6 +9641,15 @@ fn dispatch_action(
                                     .insert(role_pane_ids[i].clone(), role.name.clone());
                                 ui.pane_names
                                     .insert(role_pane_ids[i].clone(), role.name.clone());
+                                // Issue #308: a role that DECLARED its agent
+                                // badges from here, not from a hook — which is
+                                // the whole point for a launcher command, and
+                                // the only option at all for an agent that
+                                // announces itself late (Codex) or never (Pi).
+                                if let Some(declared) = role.declared_agent_type() {
+                                    ui.pane_declared_agent
+                                        .insert(role_pane_ids[i].clone(), declared);
+                                }
                             }
                             let start_idx =
                                 orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
@@ -7749,10 +9766,19 @@ fn dispatch_action(
                     // hydration carries it; the local placeholder stays at `None`
                     // until the first `SessionStart` hook fires (pre-M2.13
                     // contract).
-                    let spawn_agent_type = if req.command.is_empty() {
-                        None
-                    } else {
-                        AgentType::from_command(Some(req.command.as_str()))
+                    //
+                    // Issue #308: for a MODE the command is typed in the form
+                    // while the identity may be declared in `[[modes]]`, so the
+                    // declaration answers first — that is the only thing that
+                    // can identify a `devbox run codex-big` agent pane, and it
+                    // drives the wrap below as well as the badge.
+                    let spawn_agent_type = match req.mode_config.as_ref() {
+                        Some(mode) if !req.command.is_empty() => {
+                            mode.resolved_agent_type(req.command.as_str())
+                        }
+                        Some(mode) => mode.declared_agent_type(),
+                        None if req.command.is_empty() => None,
+                        None => AgentType::from_command(Some(req.command.as_str())),
                     };
                     // PRD #20 M8: launch Wrapper-strategy agents (Codex now;
                     // Gemini later) WRAPPED so their stdout is monitored
@@ -7857,6 +9883,17 @@ fn dispatch_action(
                             ui.pane_display_names
                                 .insert(new_id.clone(), resolved_name.clone());
                             ui.pane_names.insert(new_id.clone(), resolved_name);
+                            // Issue #308: a mode may declare what its agent pane
+                            // runs, since that pane's command is typed in this
+                            // form rather than written in the config. A plain
+                            // dashboard card declares nothing and is unchanged.
+                            if let Some(declared) = req
+                                .mode_config
+                                .as_ref()
+                                .and_then(|mode| mode.declared_agent_type())
+                            {
+                                ui.pane_declared_agent.insert(new_id.clone(), declared);
+                            }
                             let mode_name_for_save =
                                 req.mode_config.as_ref().map(|m| m.name.clone());
                             ui.pane_metadata.insert(
@@ -7957,7 +9994,10 @@ fn dispatch_action(
                                                 // launch line here. The persisted
                                                 // `saved.command` stays bare (only
                                                 // the injected line is transformed).
-                                                let launch = wrap_agent_command(&agent_cmd);
+                                                let launch = wrap_agent_command(
+                                                    &agent_cmd,
+                                                    mode_config.declared_agent_type(),
+                                                );
                                                 let _ = pane.write_to_pane(&new_id, &launch);
                                             }
                                         }
@@ -7972,7 +10012,30 @@ fn dispatch_action(
                                         ui.commit_pending_last_command();
                                     }
                                     Err(e) => {
-                                        let _ = pane.close_pane(&new_id);
+                                        // Issue #308 follow-up: the spawn SUCCEEDED
+                                        // and registered this pane id in six places
+                                        // before `open_mode_tab` failed. Unwind all
+                                        // six together via the shared helper — a
+                                        // user who retries a broken mode used to
+                                        // grow every one of those maps by an entry
+                                        // per attempt for the life of the session,
+                                        // and the placeholder session left a card
+                                        // for a pane that no longer existed.
+                                        //
+                                        // Gated on the close actually succeeding: if
+                                        // `close_pane` fails the pane is still live,
+                                        // so its card and metadata must stay visible
+                                        // and recoverable rather than being purged
+                                        // out from under it (PRD #92 F4).
+                                        match pane.close_pane(&new_id) {
+                                            Ok(()) => rollback_abandoned_pane(&new_id, ui, state),
+                                            Err(close_err) => tracing::warn!(
+                                                pane_id = %new_id,
+                                                error = %close_err,
+                                                "mode activation failed and the pane could not be \
+                                                 closed — pane state preserved"
+                                            ),
+                                        }
                                         // PRD #196: the mode-tab spawn FAILED — do
                                         // NOT commit the submit candidate, so a
                                         // failed mode-spawn never pollutes
@@ -8212,11 +10275,26 @@ fn dispatch_action(
             {
                 form.selection_index = idx;
                 form.focused = FormField::Mode;
+                // Clicking a chip lands on the selection the same way the
+                // arrow keys do — suggest a name if it landed on an
+                // orchestration.
+                form.resuggest_name_for_selection();
             }
         }
         // [Submit] → spawn the pane from the form values (== Enter on the final
         // field). Reuses the SpawnPane arm so click and key spawn identically.
         Action::FormSubmit => {
+            // Same refusal as the Enter-submit key door — the render seam
+            // already hides this button in that state
+            // (`render_new_pane_form`), but a routed click event is guarded
+            // here too rather than trusted to have been unreachable.
+            let collision = ui
+                .new_pane_form
+                .as_ref()
+                .is_some_and(|f| f.name_collision());
+            if collision {
+                return Flow::Continue;
+            }
             if let Some(form) = ui.new_pane_form.take() {
                 ui.mode = UiMode::Normal;
                 let req = build_new_pane_request(&form, &ui.config.default_command);
@@ -8716,6 +10794,29 @@ fn handle_key_event(
     frame_area: Rect,
 ) -> Flow {
     observe_command_mode_edge(ui, std::time::Instant::now());
+    // PRD #611 M2 (Decision "the notice must not swallow the keystroke"):
+    // dismissal happens HERE, at the top of the funnel, before the key has been
+    // classified and before any handler can return — so it is structurally
+    // impossible for it to consume anything. There is no `return`, no `Action`,
+    // and no branch on what the key is: every key that reaches this function
+    // goes on to be resolved and dispatched exactly as it would have been with
+    // no notice on screen.
+    //
+    // This is where the notice deliberately diverges from the command banner,
+    // which stays up on an UNBOUND key. That rule earns its keep there because
+    // an unbound key is the moment you most likely thought you were talking to
+    // the agent — which is precisely the state the banner exists to correct.
+    // The reasoning does not transfer: this notice answers a question the user
+    // just asked by scrolling, and once they have moved on to typing, holding
+    // the answer on screen is clutter rather than help.
+    //
+    // Ordered BEFORE `handle_focused_pane_scroll_key` below on purpose: a
+    // second PageUp clears the notice here and then re-arms it there with a
+    // fresh instant, which is the refresh Decision 5 asks for. No frame is
+    // rendered in between, so there is no hide-then-reshow edge to see.
+    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+        embedded.clear_scroll_notices();
+    }
     // How many cards this tab is showing — what the per-mode handlers clamp their
     // selection against. Derived here rather than passed in so it cannot disagree
     // with the `filtered` list the same call resolves against.
@@ -8763,6 +10864,31 @@ fn handle_key_event(
     // while the user is typing in a pane.
     if action.is_none() && !is_ctrl_c {
         action = global_action_for_mode(&kb, ui.mode, &key);
+        // Same reasoning as `close_pane` above, one step further: `Ctrl+E` is
+        // claimed only on an Orchestration tab, and only in command mode.
+        // `global_action_for_mode` has no tab context, so a `Ctrl+E` typed into
+        // a focused pane would otherwise be claimed here and never reach the
+        // PTY — breaking readline's end-of-line for the agent the user is
+        // typing at. Un-resolving it lets the key fall through to the normal
+        // `PaneInput` forwarding path (`0x05`) instead.
+        let is_orchestration_tab = matches!(tab_manager.active_tab(), Tab::Orchestration { .. });
+        // PRD #393 experimental gate (CLAUDE.md #9). Passing `false` for the
+        // tab term when the flag is off makes `scope_command_entry_lock`
+        // un-resolve `Ctrl+E` everywhere, exactly as it already does off an
+        // Orchestration tab — so the key falls through to the PTY and the lock
+        // has no binding at all. Expressed through the existing tab term rather
+        // than a second branch so there is only one place that decides whether
+        // the chord is claimed.
+        action = scope_command_entry_lock(
+            action,
+            is_orchestration_tab && crate::features::show_command_entry_lock(),
+            ui.mode,
+        );
+        // PRD #336: the split toggle resolves only on an orchestration tab, in
+        // command mode. This is the first point in the funnel with tab context,
+        // so narrow it here — otherwise `Ctrl+l` is claimed everywhere and
+        // never reaches a pane's PTY. See `scope_orchestration_split`.
+        action = scope_orchestration_split(action, is_orchestration_tab, ui.mode);
     }
 
     // PRD #341 M5: command-mode focused-pane scrolling (`scroll_pane_up` /
@@ -8770,7 +10896,10 @@ fn handle_key_event(
     // equivalent of the wheel, so command mode is a real read-only inspect
     // mode. The scroll is applied in place; `Action::Continue` stops the
     // key falling through to `dispatch_normal_mode_key`.
-    if action.is_none() && !is_ctrl_c && handle_focused_pane_scroll_key(&kb, ui.mode, &key, pane) {
+    if action.is_none()
+        && !is_ctrl_c
+        && handle_focused_pane_scroll_key(&kb, ui.mode, &key, pane, std::time::Instant::now())
+    {
         action = Some(Action::Continue);
     }
 
@@ -8837,7 +10966,41 @@ fn handle_key_event(
             }
             UiMode::DirPicker => handle_dir_picker_key(key, ui),
             UiMode::NewPaneForm => handle_new_pane_form_key(key, ui),
-            UiMode::PaneInput => handle_pane_input_key(key),
+            UiMode::PaneInput => {
+                let candidate = handle_pane_input_key(key);
+                // The gate needs live per-pane status for the
+                // `WaitingForInput` carve-out, and `UiState` caches none — so
+                // build the join from the `snapshot` already in scope here and
+                // hand it over. Deliberately `build_pane_status_for_gate`, not
+                // the plain `build_pane_status` the pane borders read: it omits
+                // any `pane_id` claimed by more than one session, so an
+                // ambiguous pane can never earn the carve-out.
+                //
+                // PRD #393 experimental gate (CLAUDE.md #9): with the flag off
+                // the keystroke is forwarded untouched, which also skips
+                // building the status join above — the lock is the only reader
+                // of it, so there is nothing to compute when it cannot act.
+                let gated = if crate::features::show_command_entry_lock() {
+                    gate_pane_input_key(
+                        candidate.clone(),
+                        ui,
+                        tab_manager,
+                        pane,
+                        &build_pane_status_for_gate(snapshot),
+                    )
+                } else {
+                    candidate.clone()
+                };
+                if matches!(candidate, Action::ForwardToPane(_))
+                    && matches!(gated, Action::Continue)
+                {
+                    ui.status_message = Some((
+                        ORCHESTRATION_LOCK_STATUS_MESSAGE.to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
+                gated
+            }
             UiMode::StarPrompt => handle_star_prompt_key(key, ui),
             UiMode::ConfigGenPrompt => handle_config_gen_prompt_key(key, ui),
             UiMode::QuitConfirm => {
@@ -9479,6 +11642,11 @@ pub fn run_tui(
                             0,
                             PaneLayout::Tiled,
                             true,
+                            // PRD #336: a restored tab adopts the current
+                            // global split, like any other tab. The global is
+                            // not persisted across launches, so a restore at
+                            // startup lands on the 34/66 default.
+                            tab_manager.orchestration_split_narrow(),
                         );
                         // Empty saved prompt → `None` so the delivery gate
                         // writes nothing (matching the live path's "no prompt"
@@ -9551,6 +11719,15 @@ pub fn run_tui(
                                         .insert(role_pane_ids[i].clone(), role.name.clone());
                                     ui.pane_names
                                         .insert(role_pane_ids[i].clone(), role.name.clone());
+                                    // Issue #308: a restored role keeps its
+                                    // declared badge, so a session restore looks
+                                    // like the tab that was saved rather than
+                                    // reverting every launcher role to
+                                    // "No agent".
+                                    if let Some(declared) = role.declared_agent_type() {
+                                        ui.pane_declared_agent
+                                            .insert(role_pane_ids[i].clone(), declared);
+                                    }
                                 }
                                 // Re-capture the orchestration metadata onto the
                                 // start role pane so a later snapshot keeps the
@@ -9727,10 +11904,14 @@ pub fn run_tui(
             // (the agent command is sent later via `write_to_pane`), so
             // infer agent_type from the saved command rather than from
             // the spawn command (which is `None` here).
+            // Issue #308: the mode's `agent = "…"` declaration answers first, so
+            // a restored declared agent pane badges immediately instead of
+            // waiting for a hook that a launcher-hidden Codex will not send
+            // until its first turn.
             let mode_agent_type = if saved_pane.command.is_empty() {
-                None
+                mode_config.declared_agent_type()
             } else {
-                AgentType::from_command(Some(saved_pane.command.as_str()))
+                mode_config.resolved_agent_type(saved_pane.command.as_str())
             };
             match pane.create_pane_with_options(
                 None,
@@ -9755,6 +11936,25 @@ pub fn run_tui(
                             .insert(new_id.clone(), saved_pane.name.clone());
                     }
                     ui.pane_metadata.insert(new_id.clone(), saved_pane.clone());
+                    // Issue #308: mirror the orchestration-restore insert above
+                    // (`role.declared_agent_type()`), so a restored mode badges
+                    // from the SAME source a freshly-activated one does. The
+                    // spawn above also passes `mode_agent_type` into
+                    // `AgentSpawnOptions`, so `session.agent_type` usually comes
+                    // back hydrated from the daemon and this entry is never
+                    // read — the map is consulted only while that field is
+                    // `AgentType::None`. That makes this insert harmless today
+                    // and load-bearing tomorrow: the fresh path deliberately
+                    // leaves `session.agent_type` at `None` and badges from the
+                    // map, so without this the restored badge would be the one
+                    // display path with no map fallback, and a future rework of
+                    // `create_pane_with_options`'s `agent_type` wiring would
+                    // silently revert restored declared-launcher modes to
+                    // "No agent" — the exact regression this issue exists to
+                    // prevent. The `Err` arm below removes it again.
+                    if let Some(declared) = mode_config.declared_agent_type() {
+                        ui.pane_declared_agent.insert(new_id.clone(), declared);
+                    }
                     // PRD #76 M2.15 fixup pass 2 G1 — compute side-pane
                     // dims so the restored mode's side panes spawn at the
                     // viewport-derived size, not the 24×80 default.
@@ -9787,16 +11987,26 @@ pub fn run_tui(
                                 // (the persisted `saved_pane.command` stays bare).
                                 let _ = pane.write_to_pane(
                                     &new_id,
-                                    &wrap_agent_command(&saved_pane.command),
+                                    &wrap_agent_command(
+                                        &saved_pane.command,
+                                        mode_config.declared_agent_type(),
+                                    ),
                                 );
                             }
                         }
                         Err(e) => {
+                            // Same unwind as the activation arm, through the same
+                            // helper, so the two paths cannot drift apart as
+                            // per-pane maps are added.
+                            //
+                            // Deliberately NOT gated on the close succeeding, unlike
+                            // activation: this arm goes on to substitute a fallback
+                            // dashboard pane for the same saved pane (PRD #69), so
+                            // preserving the abandoned pane's card here would leave
+                            // the user with two cards for one restored pane. That
+                            // trade-off is this path's own, and predates #308.
                             let _ = pane.close_pane(&new_id);
-                            state.blocking_write().unregister_pane(&new_id);
-                            ui.pane_metadata.remove(&new_id);
-                            ui.pane_display_names.remove(&new_id);
-                            ui.pane_names.remove(&new_id);
+                            rollback_abandoned_pane(&new_id, &mut ui, &state);
                             ui.session_warnings.push(format!(
                                 "Warning: failed to restore mode '{}': {e}",
                                 mode_config.name
@@ -9817,8 +12027,13 @@ pub fn run_tui(
                                 terminal.get_frame().area(),
                             );
                             // PRD #76 M2.13: infer agent_type from the
-                            // saved command for the fallback path too.
-                            let fb_agent_type = AgentType::from_command(cmd);
+                            // saved command for the fallback path too — and,
+                            // since issue #308, prefer the mode's declaration:
+                            // the mode failed to restore, but what its agent
+                            // pane runs did not change.
+                            let fb_agent_type = mode_config
+                                .declared_agent_type()
+                                .or_else(|| AgentType::from_command(cmd));
                             match pane.create_pane_with_options(
                                 cmd,
                                 Some(&saved_pane.dir),
@@ -9885,8 +12100,11 @@ pub fn run_tui(
                         terminal.get_frame().area(),
                     );
                     // PRD #76 M2.13: infer agent_type from saved command
-                    // for this outer-error fallback as well.
-                    let fb_agent_type = AgentType::from_command(cmd);
+                    // for this outer-error fallback as well, with the mode's
+                    // issue-#308 declaration taking precedence as above.
+                    let fb_agent_type = mode_config
+                        .declared_agent_type()
+                        .or_else(|| AgentType::from_command(cmd));
                     match pane.create_pane_with_options(
                         cmd,
                         Some(&saved_pane.dir),
@@ -10147,18 +12365,16 @@ pub fn run_tui(
         // cursorless history.
         reconcile_pane_input_scrollback(&mut ui, &*pane);
 
-        let term_width = terminal.get_frame().area().width;
-        let has_embedded_panes = pane
-            .as_any()
-            .downcast_ref::<EmbeddedPaneController>()
-            .map(|e| !e.pane_ids().is_empty())
-            .unwrap_or(false);
-        let dashboard_width = if has_embedded_panes {
-            term_width * 33 / 100
-        } else {
-            term_width
-        };
-        ui.columns = grid_columns(dashboard_width);
+        // Issue #588: `ui.columns` used to be computed HERE too, by a second
+        // `grid_columns` call against a `dashboard_width` re-derived from a
+        // hardcoded 33% (the orchestration split is 34%, or 25% when narrow) —
+        // a different number from the `dashboard_area.width` the cards were
+        // actually laid out in. Two independent answers to one question, and
+        // the navigation half was the one nobody could see was wrong. The value
+        // now has exactly one writer, `render_card_grid`, which assigns the
+        // column count it just drew with. It runs inside this loop's
+        // `terminal.draw` below, i.e. before any key is handled, so navigation
+        // never reads a value from before the first frame.
 
         let has_pane_control = pane.is_available();
         let pane_layout = ui.pane_layout;
@@ -10178,10 +12394,108 @@ pub fn run_tui(
                 side_pane_ids: mode_manager.managed_pane_ids(),
                 focused_pane_id: focused_pane_id.clone(),
             },
-            Tab::Orchestration { role_pane_ids, .. } => ActiveTabView::Orchestration {
+            Tab::Orchestration {
+                role_pane_ids,
+                split_narrow,
+                ..
+            } => ActiveTabView::Orchestration {
                 role_pane_ids: role_pane_ids.clone(),
+                // PRD #336: carry the split into the render snapshot so
+                // `compute_frame_layout` resolves the ratio from data. Every
+                // orchestration tab holds the same (global) value — see
+                // `TabManager::toggle_orchestration_split`.
+                split_narrow: *split_narrow,
             },
         };
+        // Focus follows the lock. While the command-entry lock is engaged the
+        // deck steers the active Orchestration tab's focus itself: onto the
+        // lowest-order `WaitingForInput` role pane while one exists, and back
+        // to the orchestrator on the all-clear edge. While unlocked the WHOLE
+        // chain — observation included — is skipped, so the deck makes no focus
+        // decision at all and nothing fights the human's manual choice. Focus
+        // stays exactly where they put it until the deck is locked again.
+        //
+        // The status join is the same `build_pane_status` the pane borders read,
+        // so no new data flow is introduced. `Some(new_id)` means focus actually
+        // moved, so it is re-focused on the live pane controller.
+        //
+        // The gate lives here, at the call site, rather than inside
+        // `TabManager`: the lock is a `UiState` concern and nothing in
+        // `src/tab.rs` knows it exists — the same seam `gate_pane_input_key`
+        // reads it from. Skipping `observe_waiting_panes` means a latch set
+        // before an unlock could otherwise survive across it; the toggle
+        // handler calls `clear_waiting_pane_latch` on the locked→unlocked half
+        // to compensate (see that method's doc comment for the straddling trace
+        // this protects).
+        //
+        // PRD #393 experimental gate (CLAUDE.md #9). The steering is part of the
+        // gated surface rather than a separate feature: it only ever ran while
+        // locked, so with the flag off it must not run either — otherwise the
+        // deck would move focus on its own for a lock the user cannot see or
+        // reach. Flag off therefore means no automatic focus movement at all,
+        // which is exactly v0.35.8's behaviour.
+        //
+        // Greptile PR #446: the flag is LIVE-RELOADED (`features::spawn_watcher`
+        // re-reads `.dot-agent-deck.toml` every ~2s), so unlike a compile-time
+        // gate it can flip mid-session — which makes it a second way to stop
+        // observing, alongside the `Ctrl+E` unlock. The latch this chain reads
+        // (`had_waiting_pane` / `all_clear_pending`) is EDGE-triggered, so
+        // stopping observation while it is set freezes it: a pane that resolves
+        // while the flag is off would be re-read on the next enable as a fresh
+        // all-clear edge and yank focus to the orchestrator for an episode the
+        // human already dealt with. The `Ctrl+E` handler compensates for its own
+        // half by calling `clear_waiting_pane_latch`; the flag needs the same
+        // compensation, done here rather than edge-tracked because holding no
+        // latch at all is the honest state while the surface does not exist.
+        // Read ONCE per frame into a local. The `else if` below tests
+        // `ui.command_entry_locked` — a `UiState` bool, not the flag — so this
+        // is already a single read and the local changes no behaviour; it is
+        // here to keep that property obvious, so a later edit cannot introduce
+        // a second read that disagrees with this one mid-frame.
+        //
+        // Note also why a torn read could not persist even if one occurred: the
+        // clear below is LEVEL-triggered, running on every frame the flag is
+        // off, not edge-triggered on the transition. So a frame that somehow
+        // observed the wrong value self-corrects on the next one (~16ms) —
+        // orders of magnitude faster than a human can resolve a waiting pane.
+        // That is the reason this compensates unconditionally rather than
+        // tracking the on->off edge.
+        let command_entry_lock_enabled = crate::features::show_command_entry_lock();
+        if !command_entry_lock_enabled {
+            tab_manager.clear_waiting_pane_latch();
+        } else if ui.command_entry_locked {
+            let pane_status_for_focus: HashMap<&str, SessionStatus> = build_pane_status(&snapshot);
+            // The observation runs FIRST and outside the chain, because it must
+            // happen on every locked frame no matter which branch below wins.
+            tab_manager.observe_waiting_panes(&pane_status_for_focus);
+            // The `poll(0ms)` peek is a pending-input guard, computed ONCE per
+            // frame and threaded into the decision as a plain `bool`. A focus
+            // move applied on this frame lands before the event loop below
+            // drains what is already queued, and a key read after focus moved
+            // is forwarded to whatever pane is focused THEN — not the one it
+            // was typed at. So both branches of the decision defer while input
+            // is pending:
+            //
+            // - all-clear: fires exactly when the user has just answered the
+            //   last prompt and is likely still typing, and the resulting key
+            //   would reach the ORCHESTRATOR's PTY, which the command-entry
+            //   lock deliberately does not gate.
+            // - waiting-focus: a lower-role-order pane going `WaitingForInput`
+            //   steals focus from the waiting pane the user is mid-answer to,
+            //   and because the new pane is itself `WaitingForInput` the lock's
+            //   carve-out forwards the queued keystrokes straight to it.
+            //
+            // Deferring costs nothing in either case: the all-clear edge is
+            // latched in `all_clear_pending` and survives until consumed, and
+            // the waiting target is recomputed from the status snapshot every
+            // frame. See `TabManager::auto_focus_locked`.
+            let input_pending = crossterm::event::poll(std::time::Duration::from_millis(0))?;
+            if let Some(new_id) =
+                tab_manager.auto_focus_locked(&pane_status_for_focus, input_pending)
+            {
+                let _ = pane.focus_pane(&new_id);
+            }
+        }
         let tab_bar_labels: Vec<String> = tab_manager
             .tabs()
             .iter()
@@ -10203,10 +12517,30 @@ pub fn run_tui(
                 },
             })
             .collect();
+        // PRD #333: join each Orchestration tab's role panes to their live
+        // status through the SAME `state.sessions[*].status` source the deck
+        // cards and embedded-pane borders read (`build_pane_status`), so the
+        // tab label's aggregate color agrees with what's actually on screen.
+        // Non-orchestration tabs get `None` — this feature doesn't touch them.
+        let pane_status_for_tabs: HashMap<&str, SessionStatus> = build_pane_status(&snapshot);
+        let tab_bar_orchestration_statuses: Vec<Option<Vec<SessionStatus>>> = tab_manager
+            .tabs()
+            .iter()
+            .map(|tab| match tab {
+                Tab::Orchestration { role_pane_ids, .. } => Some(
+                    role_pane_ids
+                        .iter()
+                        .filter_map(|pid| pane_status_for_tabs.get(pid.as_str()).cloned())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
         let tab_bar_info = TabBarInfo {
             show: tab_manager.show_tab_bar(),
             labels: tab_bar_labels,
             active_index: tab_manager.active_index(),
+            orchestration_statuses: tab_bar_orchestration_statuses,
         };
         // PRD #84 M4 (invariants 1, 2 & 4) — ONE layout pass per frame, then
         // compute → resize → render, all against the SAME live frame area.
@@ -10442,6 +12776,33 @@ pub fn run_tui(
             // clobber the feedback nor leak into command mode.
             let is_input_event = matches!(&ev, Event::Paste(_))
                 || matches!(&ev, Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Press);
+
+            // PRD #611 (review finding 4a): dismiss the cannot-scroll notice
+            // HERE, at the event seam, rather than only at the top of
+            // `handle_key_event`.
+            //
+            // `handle_key_event` is the funnel for keys that reach it, but it is
+            // not the only path an input event can take: the non-live intercept
+            // directly below returns before it, changes mode and drains the rest
+            // of the burst, so a key aimed at a pane that has just gone
+            // non-writable used to leave the notice up while the user had
+            // demonstrably moved on. Clearing on the raw event makes "the next
+            // input clears it" hold on EVERY path, including any added later.
+            //
+            // Still non-consuming, for the same structural reason it was at the
+            // top of the funnel: there is no `return` and no branch on what the
+            // event turned out to be, so the event goes on to be handled exactly
+            // as it would have been with no notice on screen. `clear_scroll_notices`
+            // is O(1) unless something is actually armed, so this costs a single
+            // relaxed atomic read per keystroke. The call inside
+            // `handle_key_event` stays: it is idempotent, and it is what the L1
+            // dismissal seam drives.
+            if is_input_event
+                && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+            {
+                embedded.clear_scroll_notices();
+            }
+
             if ui.mode == UiMode::PaneInput
                 && is_input_event
                 && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
@@ -10975,7 +13336,15 @@ pub fn run_tui(
                                 mouse.row,
                                 &ui.focused_pane_rect,
                             );
-                            scroll_focused_agent_pane(embedded, &pane_id, ui.mode, up, col, row);
+                            scroll_focused_agent_pane(
+                                embedded,
+                                &pane_id,
+                                ui.mode,
+                                up,
+                                col,
+                                row,
+                                std::time::Instant::now(),
+                            );
                         }
                         crossterm::event::MouseEventKind::Down(
                             crossterm::event::MouseButton::Left,
@@ -11008,13 +13377,8 @@ pub fn run_tui(
                                                 drop(parser);
                                                 drop(hmap);
                                                 if open::that(&url).is_ok() {
-                                                    let display = if url.len() > 60 {
-                                                        format!("{}...", &url[..57])
-                                                    } else {
-                                                        url
-                                                    };
                                                     ui.status_message = Some((
-                                                        format!("Opened: {display}"),
+                                                        opened_link_status(&url),
                                                         std::time::Instant::now(),
                                                     ));
                                                 }
@@ -11334,11 +13698,83 @@ pub fn run_tui(
     ratatui::restore();
 
     // Flush accumulated session warnings now that the terminal is restored.
-    for warning in &ui.session_warnings {
-        eprintln!("{warning}");
-    }
+    // Sanitised on the way out — see `flush_session_warnings` for why that
+    // happens HERE and not at the fifteen `session_warnings.push` sites.
+    flush_session_warnings(&ui.session_warnings, &mut std::io::stderr().lock());
 
     Ok(())
+}
+
+/// Issue #576: write each accumulated `session_warnings` entry to `out`, one
+/// line each, with every control character escaped first.
+///
+/// This runs AFTER [`ratatui::restore()`], so `out` is a real terminal with no
+/// widget layer in between. That is the whole problem: the in-session sink is
+/// affirmatively safe — `ratatui-core` filters `!symbol.contains(char::is_control)`
+/// in both `Buffer::set_stringn` and `Span::styled_graphemes`, so a control
+/// character in a rendered string cannot reach the tty — while this loop used to
+/// `eprintln!` the string verbatim. Several push sites interpolate values the
+/// deck does not control: a daemon-supplied `display_name` / `agent_id` arriving
+/// via a saved pane's name, and the saved pane's `dir`. A value carrying ANSI
+/// escapes can repaint the shell the user is dropped back into, a `\r` can
+/// overwrite the line just printed, and a `\n` can forge an additional line that
+/// reads as the deck's own output.
+///
+/// **Sanitising here rather than at each producer is the point.** There are
+/// fifteen push sites today and they only grow — the most recent was added by
+/// following the established idiom exactly, which is the right thing for a
+/// contributor to do. Per-producer escaping means every future site must
+/// remember; one sanitisation point at the single consumer fixes them all by
+/// construction and cannot be forgotten by a later addition. Push sites
+/// therefore keep pushing plain, readable strings, and nothing about this is
+/// visible at the call site — which is exactly why it is documented at the seam
+/// that enforces it.
+///
+/// Errors are dropped rather than panicking the way `eprintln!` does: this is
+/// the last statement of a clean shutdown, and a closed stderr is not worth
+/// turning an orderly exit into a panic over.
+fn flush_session_warnings<W: std::io::Write>(warnings: &[String], out: &mut W) {
+    for warning in warnings {
+        let _ = writeln!(out, "{}", escape_control_chars(warning));
+    }
+}
+
+/// Escape every control character in `s`, borrowing unchanged when there are
+/// none (the overwhelmingly common case — a warning naming a well-behaved pane).
+///
+/// The predicate is [`char::is_control`], deliberately the SAME one
+/// `ratatui-core` filters on, so the exit flush is safe on exactly the terms the
+/// in-session path already is: Unicode category `Cc`, i.e. C0 (U+0000..=U+001F),
+/// DEL (U+007F) and C1 (U+0080..=U+009F) — the last of which some terminals do
+/// still act on.
+///
+/// Escaping, not stripping (issue #576 asks the question explicitly): this is a
+/// diagnostic surface, and a name that silently loses characters reads as a
+/// different name, whereas `\r` in the output preserves the evidence that
+/// something odd was in it. The spelling is Rust's own — `\n`/`\r`/`\t` for the
+/// three with conventional names, `\u{XX}` for the rest.
+///
+/// A literal backslash is deliberately NOT escaped. Doing so would make the
+/// encoding injective, which nothing here needs — this output is read by a
+/// human, never parsed back — and would cost real legibility on the push sites
+/// that interpolate a saved pane's `dir`, since every Windows path would come
+/// back doubled (`C:\\Users\\…`). The residual ambiguity is a warning that
+/// contained the six literal characters `\u{1b}` to begin with.
+fn escape_control_chars(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(char::is_control) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:02x}}}", c as u32)),
+            other => out.push(other),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -11360,12 +13796,19 @@ struct TabStripRects {
     closes: Vec<(usize, Rect)>,
 }
 
+/// PRD #333: `orchestration_statuses[i]` carries tab `i`'s pane statuses
+/// (`Some` for an Orchestration tab, `None` for every tab this feature
+/// doesn't touch) so an *inactive* tab's label can render in
+/// `palette::status_color()` of the highest-priority status among them. The
+/// active tab, and any tab whose aggregate resolves to Idle, render in the
+/// ordinary tab style — see the carve-out comment in the loop.
 fn render_tab_strip(
     frame: &mut Frame,
     area: Rect,
     labels: &[String],
     closeable: &[bool],
     active_index: usize,
+    orchestration_statuses: &[Option<&[SessionStatus]>],
 ) -> TabStripRects {
     // PRD #13: the tab-bar row is left unpainted so the terminal's own
     // background shows through (no absolute `tab_bar_bg` fill).
@@ -11396,6 +13839,31 @@ fn render_tab_strip(
             active_style
         } else {
             base_style
+        };
+        // PRD #333: an orchestration tab's label takes the color of the single
+        // highest-priority status among its panes instead of the base label
+        // color, so color means "something here needs attention". Two
+        // carve-outs (maintainer review on PR #356) keep the label readable:
+        //   - the ACTIVE tab is never tinted. Its highlight is `REVERSED`,
+        //     which swaps fg/bg, so an absolute fg would become the label's
+        //     *background* and draw the text in the terminal's background
+        //     color. It renders exactly like an active non-orchestration tab.
+        //   - an aggregate that resolves to Idle (including `Unknown`, which
+        //     `status_color` aliases to it) falls through to the base style
+        //     rather than painting `STATUS_IDLE` (a grey) onto read-critical
+        //     text — the low-contrast-on-light pattern PRD #13 removed from
+        //     `ui.rs`. An idle tab simply looks like an ordinary tab.
+        // Tabs this feature doesn't touch (`None`) are untouched.
+        let style = match orchestration_statuses.get(i).copied().flatten() {
+            Some(statuses) if i != active_index => {
+                let color = palette::status_color(&palette::highest_priority_status(statuses));
+                if color == palette::STATUS_IDLE {
+                    style
+                } else {
+                    style.fg(color)
+                }
+            }
+            _ => style,
         };
 
         // Divider between tabs (not before the first).
@@ -11641,18 +14109,22 @@ fn compute_frame_layout(
                 pane_layout,
             }
         }
-        ActiveTabView::Orchestration { role_pane_ids, .. } => {
+        ActiveTabView::Orchestration {
+            role_pane_ids,
+            split_narrow,
+            ..
+        } => {
             let pane_ids: Vec<String> = all_pane_ids
                 .iter()
                 .filter(|&id| role_pane_ids.contains(id))
                 .cloned()
                 .collect();
-            let (dashboard_area, panes_area) = split_cards_area(
-                main_area,
-                &pane_ids,
-                ORCHESTRATION_LEFT_PERCENT,
-                ORCHESTRATION_PANES_PERCENT,
-            );
+            // PRD #336: resolve this tab's toggled split rather than the fixed
+            // constants, so `Ctrl+l` reflows both the rendered columns and (via
+            // `resize_panes_to_layout`) the role panes' PTYs on the next frame.
+            let (left_percent, panes_percent) = orchestration_split_percents(*split_narrow);
+            let (dashboard_area, panes_area) =
+                split_cards_area(main_area, &pane_ids, left_percent, panes_percent);
             let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
             FrameContent::Cards {
                 dashboard_area,
@@ -11814,12 +14286,286 @@ fn resize_panes_to_layout(layout: &FrameLayout, embedded: &EmbeddedPaneControlle
 /// avoid a per-frame clone of every pane id; the status enum clone is cheap
 /// (fieldless). Extracted from `render_frame` so the join can be unit-tested
 /// without a live daemon.
+///
+/// **On two sessions sharing one `pane_id`** (issue #398). `HashMap` is one key,
+/// one value, so if it happened the surviving status was whichever session
+/// iteration reached last — unspecified, and able to differ between runs. Three
+/// features read this join and each would have silently taken an arbitrary one:
+/// PRD #333 tab-label colouring, PRD #373 `auto_focus_waiting_pane`, and the
+/// pane borders above.
+///
+/// The collision is now fixed at its source rather than arbitrated here.
+/// `AppState::apply_event`'s reuse guard makes an untagged (`agent_id: None`)
+/// event adopt the pane's existing session instead of minting a sibling, which
+/// was the one pathway that produced a duplicate. **So this function
+/// deliberately keeps its plain `collect()`** — there is no tie left to break,
+/// and a tie-break rule here would be dead code that reads as if duplicates
+/// were still expected.
+///
+/// If a new duplicate pathway is ever introduced, fix it at that source too.
+/// Resolving it here cannot work in general: by the time a consumer holds the
+/// returned map the ambiguity is already discarded, and — as
+/// [`build_pane_status_for_gate`] documents at length — the safe resolution is
+/// not even the same for every consumer. That sibling function keeps its own
+/// fail-closed guard precisely because the lock's answer (deny) is the opposite
+/// of what a colouring consumer would want, and because it must stay correct
+/// against a hostile status wire regardless of what this seam guarantees.
 pub(crate) fn build_pane_status(state: &AppState) -> HashMap<&str, SessionStatus> {
     state
         .sessions
         .values()
         .filter_map(|s| s.pane_id.as_deref().map(|pid| (pid, s.status.clone())))
         .collect()
+}
+
+/// The same `pane_id -> SessionStatus` join as [`build_pane_status`], but
+/// **fail-closed on ambiguity**: a `pane_id` claimed by more than one session
+/// is OMITTED from the result entirely, whatever those sessions' statuses say.
+///
+/// Only [`gate_pane_input_key`] — the `WaitingForInput` carve-out — reads this.
+/// **Omission means "deny"**: the gate tests
+/// `matches!(pane_status.get(pane_id), Some(SessionStatus::WaitingForInput))`,
+/// which is false for a missing key, so leaving an ambiguous pane out of the
+/// map is exactly what makes the carve-out refuse to widen the lock. A single,
+/// unambiguous session behaves identically to [`build_pane_status`].
+///
+/// **Why this is a separate function, and why it must be the producer** — do
+/// not merge it back into [`build_pane_status`], and do not try to move the
+/// check into the gate instead:
+///
+/// - [`build_pane_status`] is deliberately left as-is. Its consumers (pane
+///   border colouring) want today's behaviour, and a colour being wrong on a
+///   collision is cosmetic. The lock is the security-shaped one, so only the
+///   lock's feed hardens.
+/// - `HashMap<&str, SessionStatus>` is one key, one value by construction, so a
+///   collision cannot be *represented* in the join's output at all — by the time
+///   the gate reads the map the ambiguity has already been discarded and no
+///   consumer-side check, however clever, can recover it. Only the raw
+///   `state.sessions` collection still knows, which is why the guard has to live
+///   here, on the producing side.
+/// - The rule is "any duplicate", not "any *disagreeing* duplicate". Permitting
+///   agreeing duplicates would hand an attacker on the status wire precisely
+///   what they want: a second session that also claims `WaitingForInput` would
+///   sail through. "Closed only when the duplicates happen to disagree" is not
+///   fail-closed.
+///
+/// **It also omits a pane whose status was last written by an untagged
+/// producer** ([`AppState::untagged_status_panes`]). Until issue #398 an
+/// `agent_id: None` report could not reach a pane's real session at all — it
+/// minted a rival, and the duplicate rule above then denied the pane. Removing
+/// that duplicate would otherwise have handed an unidentified producer a
+/// working route to `WaitingForInput`, and with it the carve-out: on the
+/// unauthenticated hook socket (#401) a pane id is a small integer, so this
+/// would have been strictly easier to reach than the tagged path it replaced.
+/// The denial that used to fall out of a bug is therefore made explicit here.
+/// Both rules are the same principle — act only on a status whose origin is
+/// established — and the duplicate rule stays because it also covers two
+/// TAGGED sessions, which provenance says nothing about.
+pub(crate) fn build_pane_status_for_gate(state: &AppState) -> HashMap<&str, SessionStatus> {
+    // `None` marks a pane_id seen more than once; it is dropped below rather
+    // than resolved, since there is no defensible way to pick a winner.
+    let mut joined: HashMap<&str, Option<SessionStatus>> = HashMap::new();
+    for session in state.sessions.values() {
+        let Some(pane_id) = session.pane_id.as_deref() else {
+            continue;
+        };
+        joined
+            .entry(pane_id)
+            .and_modify(|slot| *slot = None)
+            .or_insert_with(|| Some(session.status.clone()));
+    }
+    joined
+        .into_iter()
+        .filter(|(pane_id, _)| !state.untagged_status_panes.contains(*pane_id))
+        .filter_map(|(pane_id, status)| status.map(|status| (pane_id, status)))
+        .collect()
+}
+
+/// The deck's title row: the product name, the session count, and — when the
+/// grid could not paint every card — the `  (↑a ↓b)` overflow indicator from
+/// [`scroll_indicator`].
+///
+/// Split out of [`render_frame`] because two call sites build it (the card grid
+/// and the everything-filtered-out branch) and only one of them can overflow.
+fn deck_title_line(showing: usize, total_sessions: usize, scroll_hint: &str) -> Line<'static> {
+    let title_text = if showing < total_sessions {
+        format!("— {showing}/{total_sessions} session(s)")
+    } else {
+        format!("— {total_sessions} session(s)")
+    };
+    let mut spans = vec![
+        Span::styled(
+            " dot-agent-deck ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(title_text, text_primary()),
+    ];
+    if !scroll_hint.is_empty() {
+        // Yellow + bold, not the title's own dim primary: this is the one piece
+        // of the row that says "what you are looking at is incomplete", and
+        // issue #588 is a report of that fact being invisible. It must not read
+        // as chrome.
+        spans.push(Span::styled(
+            scroll_hint.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Lay out and draw the deck's card grid into `area` — the title row, every card
+/// row that fits, and the filler above the stats bar — and return the stats-bar
+/// rect for the caller to draw into.
+///
+/// Extracted from [`render_frame`] by issue #588 so the layout decision has one
+/// home and an L1 seam ([`render_card_grid_to_buffer`]) can drive the real thing
+/// rather than a re-implementation of it.
+///
+/// Two invariants live here:
+///
+/// * **`ui.columns` is written here and nowhere else.** It is what left/right
+///   card navigation reads, so a column count computed independently of the one
+///   the cards were laid out with desyncs selection movement from what is on
+///   screen — silently, since both look correct in isolation. It used to be
+///   computed by a second [`grid_columns`] call in the main loop, from a width
+///   that was recomputed rather than the `area` actually handed to the grid.
+///   Now it can only be the value that drew this frame.
+/// * **A sliced grid says so.** `visible_rows` may still be short of
+///   `total_rows` on a genuinely tiny deck; when it is, the title carries the
+///   `(↑a ↓b)` indicator counting the CARDS (not rows) off each end. Silence
+///   there was the bug: an unpainted role is indistinguishable from a role that
+///   failed to start, which sent two separate investigations after a hydration
+///   defect that was not there.
+fn render_card_grid(
+    frame: &mut Frame,
+    area: Rect,
+    ui: &mut UiState,
+    sessions: &[&SessionState],
+    session_ids: &[&String],
+    total_sessions: usize,
+    tick: u64,
+) -> Rect {
+    // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
+    let available_for_cards = area.height.saturating_sub(2);
+    let GridLayout { cols, density } =
+        choose_grid_layout(sessions.len(), area.width, available_for_cards);
+    let card_height = density.card_height();
+    // Single writer — see this function's docs.
+    ui.columns = cols;
+
+    let all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
+    let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
+    let total_rows = all_rows.len();
+
+    // Calculate how many rows fit in the available area
+    let visible_rows = (available_for_cards / card_height).max(1) as usize;
+
+    // Adjust scroll offset to keep selected row visible. PRD #113: only when a
+    // card is actively highlighted — an inactive selection (`None`) leaves the
+    // scroll position alone.
+    if let Some(sel) = ui.selected_index {
+        let selected_row = sel / cols;
+        if selected_row < ui.scroll_offset {
+            ui.scroll_offset = selected_row;
+        } else if selected_row >= ui.scroll_offset + visible_rows {
+            ui.scroll_offset = selected_row + 1 - visible_rows;
+        }
+    }
+
+    // Re-clamp after a resize may have grown `visible_rows`: an offset left over
+    // from a previous overflow state must shrink so the last card row still sits
+    // at the bottom (no scrolled-off top / blank tail). Only reduces an
+    // over-large offset; legitimate scrolling is unchanged.
+    ui.scroll_offset = clamp_scroll_offset(ui.scroll_offset, total_rows, visible_rows);
+
+    let end = (ui.scroll_offset + visible_rows).min(total_rows);
+    let rows = &all_rows[ui.scroll_offset..end];
+    let row_ids = &all_row_ids[ui.scroll_offset..end];
+
+    // Counted in CARDS, off the slice that is actually about to be painted —
+    // ground truth, rather than a second opinion from `choose_grid_layout`.
+    // Every row above the window is full, so `scroll_offset * cols` cards sit
+    // above; the tail row may be partial, hence the `min`.
+    let hidden_above = ui.scroll_offset * cols;
+    let hidden_below = sessions
+        .len()
+        .saturating_sub((end * cols).min(sessions.len()));
+    let title = Paragraph::new(deck_title_line(
+        sessions.len(),
+        total_sessions,
+        &scroll_indicator(hidden_above, hidden_below),
+    ));
+
+    let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
+    for _ in rows {
+        constraints.push(Constraint::Length(card_height));
+    }
+    constraints.push(Constraint::Min(0)); // filler
+    constraints.push(Constraint::Length(1)); // stats bar
+
+    let row_chunks = Layout::vertical(constraints).split(area);
+
+    frame.render_widget(title, row_chunks[0]);
+
+    for (vi, (row, ids)) in rows.iter().zip(row_ids.iter()).enumerate() {
+        let col_constraints: Vec<Constraint> = (0..cols)
+            .map(|_| Constraint::Ratio(1, cols as u32))
+            .collect();
+        let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[vi + 1]);
+
+        for (col_idx, session) in row.iter().enumerate() {
+            let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
+            let is_selected = ui.selected_index == Some(flat_index);
+            // PRD #127 finding #2: `ui.display_names` is populated by hydration
+            // and explicit renames; a live scheduler-spawned card has no entry
+            // there, so fall back to the friendly name the synthetic
+            // `SessionStart` carried onto `SessionState.display_name`. Without
+            // this the live card degraded to the truncated pane id while a
+            // reconnect (which reads the daemon registry's display_name into
+            // `ui.display_names`) titled it correctly.
+            let display_name = ids
+                .get(col_idx)
+                .and_then(|id| ui.display_names.get(*id))
+                .or(session.display_name.as_ref());
+            let card_number = {
+                let n = flat_index + 1;
+                if n <= 9 { Some(n as u8) } else { None }
+            };
+            let card_area = col_chunks[col_idx];
+            // Issue #308: what this pane's config said it runs, for a launcher
+            // command that says nothing itself. Consulted only while the pane's
+            // agent has not identified itself.
+            let declared_agent_type = session
+                .pane_id
+                .as_deref()
+                .and_then(|pane_id| ui.pane_declared_agent.get(pane_id));
+            render_session_card(
+                frame,
+                card_area,
+                session,
+                tick,
+                is_selected,
+                display_name,
+                card_number,
+                density,
+                // PRD #341 M4: the live deck's mode, so the seam that pins the
+                // selection accent and the running app cannot disagree.
+                ui.mode,
+                declared_agent_type,
+            );
+            // PRD #80 M4: record this card's screen rect (paired with its flat
+            // selection index) for the mouse hit-test. Safe to mutate `ui` here
+            // — `display_name` was the only live `ui` borrow and its last use
+            // was the `render_session_card` call above.
+            ui.card_rects.push((flat_index, card_area));
+        }
+    }
+
+    row_chunks[row_chunks.len() - 1]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11902,12 +14648,18 @@ fn render_frame(
         // terminal-relative — the active tab is cued with Modifier::REVERSED,
         // not an absolute background tint.
         let closeable: Vec<bool> = (0..tab_bar.labels.len()).map(|i| i != 0).collect();
+        let orchestration_statuses: Vec<Option<&[SessionStatus]>> = tab_bar
+            .orchestration_statuses
+            .iter()
+            .map(|statuses| statuses.as_deref())
+            .collect();
         let strip = render_tab_strip(
             frame,
             tab_bar_rect,
             &tab_bar.labels,
             &closeable,
             tab_bar.active_index,
+            &orchestration_statuses,
         );
         ui.tab_header_rects = strip.headers;
         ui.tab_close_rects = strip.closes;
@@ -11960,6 +14712,7 @@ fn render_frame(
                 focused_pane_id.as_deref(),
                 &pane_status,
                 banner_visibility,
+                now,
             );
             return;
         }
@@ -12009,6 +14762,7 @@ fn render_frame(
                 ui.mode,
                 banner_visibility,
                 Some(&pane_outer_rects),
+                now,
             );
         }
 
@@ -12019,42 +14773,14 @@ fn render_frame(
     let sessions: Vec<&SessionState> = filtered.iter().map(|(_, s)| *s).collect();
     let session_ids: Vec<&String> = filtered.iter().map(|(id, _)| *id).collect();
 
-    let cols = grid_columns(dashboard_area.width);
-
-    // Choose card density based on available vertical space
-    // 1 row for title + 1 row for stats bar at bottom of dashboard
-    let available_for_density = dashboard_area.height.saturating_sub(2);
-    let density = choose_density(sessions.len(), cols, available_for_density);
-    let card_height = density.card_height();
-
-    // Update idle art state machine
-    update_idle_art(
-        &mut ui.idle_art_cache,
-        &ui.config.idle_art,
-        &state.sessions,
-        density,
-    );
-
     // Title bar
     let total_sessions = state.sessions.len();
     let showing = sessions.len();
-    let title_text = if showing < total_sessions {
-        format!("— {}/{} session(s)", showing, total_sessions)
-    } else {
-        format!("— {} session(s)", total_sessions)
-    };
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " dot-agent-deck ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(title_text, text_primary()),
-    ]));
 
     if sessions.is_empty() {
-        // All filtered out
+        // All filtered out. Nothing is drawn, so nothing can be hidden — no
+        // overflow indicator on this title.
+        let title = Paragraph::new(deck_title_line(showing, total_sessions, ""));
         let vertical = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),
@@ -12097,102 +14823,22 @@ fn render_frame(
                 ui.mode,
                 banner_visibility,
                 Some(&pane_outer_rects),
+                now,
             );
         }
         render_overlays(frame, ui, active_mode_name);
         return;
     }
 
-    let all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
-    let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
-    let total_rows = all_rows.len();
-
-    // Calculate how many rows fit in the available area
-    let visible_rows = (available_for_density / card_height).max(1) as usize;
-
-    // Adjust scroll offset to keep selected row visible. PRD #113: only when a
-    // card is actively highlighted — an inactive selection (`None`) leaves the
-    // scroll position alone.
-    if let Some(sel) = ui.selected_index {
-        let selected_row = sel / cols;
-        if selected_row < ui.scroll_offset {
-            ui.scroll_offset = selected_row;
-        } else if selected_row >= ui.scroll_offset + visible_rows {
-            ui.scroll_offset = selected_row + 1 - visible_rows;
-        }
-    }
-
-    // Re-clamp after a resize may have grown `visible_rows`: an offset left over
-    // from a previous overflow state must shrink so the last card row still sits
-    // at the bottom (no scrolled-off top / blank tail). Only reduces an
-    // over-large offset; legitimate scrolling is unchanged.
-    ui.scroll_offset = clamp_scroll_offset(ui.scroll_offset, total_rows, visible_rows);
-
-    let end = (ui.scroll_offset + visible_rows).min(total_rows);
-    let rows = &all_rows[ui.scroll_offset..end];
-    let row_ids = &all_row_ids[ui.scroll_offset..end];
-
-    let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
-    for _ in rows {
-        constraints.push(Constraint::Length(card_height));
-    }
-    constraints.push(Constraint::Min(0)); // filler
-    constraints.push(Constraint::Length(1)); // stats bar
-
-    let row_chunks = Layout::vertical(constraints).split(dashboard_area);
-
-    frame.render_widget(title, row_chunks[0]);
-
-    for (vi, (row, ids)) in rows.iter().zip(row_ids.iter()).enumerate() {
-        let col_constraints: Vec<Constraint> = (0..cols)
-            .map(|_| Constraint::Ratio(1, cols as u32))
-            .collect();
-        let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[vi + 1]);
-
-        for (col_idx, session) in row.iter().enumerate() {
-            let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
-            let is_selected = ui.selected_index == Some(flat_index);
-            // PRD #127 finding #2: `ui.display_names` is populated by hydration
-            // and explicit renames; a live scheduler-spawned card has no entry
-            // there, so fall back to the friendly name the synthetic
-            // `SessionStart` carried onto `SessionState.display_name`. Without
-            // this the live card degraded to the truncated pane id while a
-            // reconnect (which reads the daemon registry's display_name into
-            // `ui.display_names`) titled it correctly.
-            let display_name = ids
-                .get(col_idx)
-                .and_then(|id| ui.display_names.get(*id))
-                .or(session.display_name.as_ref());
-            let card_number = {
-                let n = flat_index + 1;
-                if n <= 9 { Some(n as u8) } else { None }
-            };
-            let idle_art = ids.get(col_idx).and_then(|id| ui.idle_art_cache.get(*id));
-            let card_area = col_chunks[col_idx];
-            render_session_card(
-                frame,
-                card_area,
-                session,
-                tick,
-                is_selected,
-                display_name,
-                card_number,
-                density,
-                idle_art,
-                // PRD #341 M4: the live deck's mode, so the seam that pins the
-                // selection accent and the running app cannot disagree.
-                ui.mode,
-            );
-            // PRD #80 M4: record this card's screen rect (paired with its flat
-            // selection index) for the mouse hit-test. Safe to mutate `ui` here
-            // — `display_name` / `idle_art` were the only live `ui` borrows and
-            // their last use was the `render_session_card` call above.
-            ui.card_rects.push((flat_index, card_area));
-        }
-    }
-
-    // Stats bar at bottom of dashboard area
-    let stats_area = row_chunks[row_chunks.len() - 1];
+    let stats_area = render_card_grid(
+        frame,
+        dashboard_area,
+        ui,
+        &sessions,
+        &session_ids,
+        total_sessions,
+        tick,
+    );
     render_stats_bar(
         frame,
         &state.aggregate_stats(),
@@ -12219,6 +14865,7 @@ fn render_frame(
             ui.mode,
             banner_visibility,
             Some(&pane_outer_rects),
+            now,
         );
     }
 
@@ -12563,12 +15210,11 @@ const BLOCK_GLYPH_GAP: u16 = 1;
 /// PRD #341 M3b — a hand-rolled 5-row block font covering exactly the distinct
 /// glyphs in "COMMAND MODE" (C, O, M, A, N, D, E) plus a word space.
 ///
-/// No text renderer exists in this repo — `src/ascii_art.rs` is LLM-generated
-/// idle art, not a font — and this is deliberately NOT a general one either: it
-/// is a private lookup table for one string. Each glyph is a fixed-width bitmap
-/// where `#` is an inked cell and `.` is background; the word space is a
-/// narrower all-background glyph so "COMMAND MODE" reads as two words without
-/// costing a full letter's width.
+/// No text renderer exists in this repo, and this is deliberately NOT a general
+/// one either: it is a private lookup table for one string. Each glyph is a
+/// fixed-width bitmap where `#` is an inked cell and `.` is background; the
+/// word space is a narrower all-background glyph so "COMMAND MODE" reads as two
+/// words without costing a full letter's width.
 const BLOCK_FONT: [(char, [&str; BLOCK_ROWS]); 8] = [
     ('C', ["####", "#...", "#...", "#...", "####"]),
     ('O', ["####", "#..#", "#..#", "#..#", "####"]),
@@ -12706,6 +15352,23 @@ const BANNER_LINE: &str = " COMMAND MODE — Ctrl+D to type ";
 /// bottom-bar chip so the two read as one vocabulary.
 const BANNER_WORD_LINE: &str = " COMMAND ";
 
+/// PRD #611 M2 — the cannot-scroll notice's narrow tier, for a pane too slim to
+/// carry [`SCROLL_NOTICE_TEXT`].
+///
+/// The banner above degrades rather than disappearing, and the same reasoning
+/// applies here with more force: the whole point of this notice is that silence
+/// on a pane that will not scroll reads as a bug. A tiled two-column split on an
+/// ordinary terminal is already narrower than the full sentence, which is the
+/// common case rather than the exotic one. Says less and promises nothing extra
+/// — in particular it still does not offer PageUp, which fails on exactly the
+/// same empty buffer the wheel does, and it no longer says *"this agent keeps
+/// none"*, which was the same unearned claim about the agent's rendering model
+/// that [`SCROLL_NOTICE_TEXT`] documents dropping.
+///
+/// `pub` for the same reason as the full form: the L1 tier seam derives its
+/// width boundary from this string's length rather than from a copy of it.
+pub const SCROLL_NOTICE_SHORT: &str = "Nothing to scroll — no scrollback";
+
 /// Draw one reversed line centred in `inner`.
 fn draw_centred_banner_line(buf: &mut Buffer, inner: Rect, text: &str) {
     let width = text.chars().count() as u16;
@@ -12796,6 +15459,52 @@ fn render_command_mode_overlay(
     }
 }
 
+/// PRD #611 M2 — draw the cannot-scroll notice over ONE pane, in the
+/// command banner's idiom: a single reversed line, centred in the pane's inner
+/// area, through the same [`draw_centred_banner_line`] the banner's own
+/// single-line tiers use.
+///
+/// Two tiers and then nothing, mirroring [`command_banner_tier`]: whatever fits
+/// gets drawn, and a pane too narrow even for the short form is left alone
+/// rather than having text spill across its border into its neighbour.
+fn render_cannot_scroll_notice(buf: &mut Buffer, pane_rect: Rect) {
+    let inner = Rect {
+        x: pane_rect.x.saturating_add(1),
+        y: pane_rect.y.saturating_add(1),
+        width: pane_rect.width.saturating_sub(2),
+        height: pane_rect.height.saturating_sub(2),
+    }
+    .intersection(*buf.area());
+    if inner.is_empty() {
+        return;
+    }
+    let fits = |text: &str| text.chars().count() as u16 <= inner.width;
+    let text = if fits(SCROLL_NOTICE_TEXT) {
+        SCROLL_NOTICE_TEXT
+    } else if fits(SCROLL_NOTICE_SHORT) {
+        SCROLL_NOTICE_SHORT
+    } else {
+        return;
+    };
+    draw_centred_banner_line(buf, inner, text);
+}
+
+/// PRD #611 M2 — is this pane's cannot-scroll notice still worth drawing at
+/// `now`?
+///
+/// Shares [`COMMAND_BANNER_TTL`] rather than owning a second timeout. The two
+/// are the same kind of thing — a brief explanation that fades on its own — and
+/// a user who has learned how long one of them lingers has learned both. A
+/// separate knob would be two numbers to keep in agreement for no gain.
+fn scroll_notice_visible(
+    ctrl: &EmbeddedPaneController,
+    pane_id: &str,
+    now: std::time::Instant,
+) -> bool {
+    ctrl.scroll_notice_armed_at(pane_id)
+        .is_some_and(|armed| now.saturating_duration_since(armed) < COMMAND_BANNER_TTL)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_terminal_panes(
     frame: &mut Frame,
@@ -12838,6 +15547,9 @@ fn render_terminal_panes(
     // via `pane_stack_rects` (used by callers without a `FrameLayout` rect list,
     // e.g. the mode-tab agent / side panes).
     precomputed_rects: Option<&[Rect]>,
+    // Injected by L1 notice-lifecycle coverage; live frames pass the same `now`
+    // used for every other transient render state in that frame.
+    now: std::time::Instant,
 ) -> Option<Rect> {
     let ctrl = embedded?;
     if pane_ids.is_empty() {
@@ -12874,6 +15586,13 @@ fn render_terminal_panes(
     // Track the focused pane's rect and screen for hardware cursor positioning.
     let mut focused_pane_rect: Option<Rect> = None;
     let mut focused_screen: Option<std::sync::Arc<std::sync::Mutex<vt100::Parser>>> = None;
+    // PRD #611 M2: outer rects of panes whose cannot-scroll notice is still
+    // live, collected per pane as they are drawn. Keyed by the pane that armed
+    // it rather than by focus — this is the ONE shared path the dashboard, the
+    // orchestrator pane and the mode tabs all render through, so no tab-type or
+    // agent-name branch is needed to scope it (PRD #611: worker panes need no
+    // exclusion because a pane nobody scrolls never arms one).
+    let mut notice_rects: Vec<Rect> = Vec::new();
 
     // PRD #84: the per-pane OUTER rects are the single source of truth shared
     // with `resize_panes_to_layout`. When the caller threads in the exact
@@ -12918,6 +15637,9 @@ fn render_terminal_panes(
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
                     }
+                    if scroll_notice_visible(ctrl, pane_id, now) {
+                        notice_rects.push(chunks[i]);
+                    }
                     frame.render_widget(widget, chunks[i]);
                 }
             }
@@ -12945,6 +15667,9 @@ fn render_terminal_panes(
                     if is_focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
+                    }
+                    if scroll_notice_visible(ctrl, pane_id, now) {
+                        notice_rects.push(chunks[i]);
                     }
                     frame.render_widget(widget, chunks[i]);
                 }
@@ -12990,7 +15715,41 @@ fn render_terminal_panes(
     // BEFORE the selection highlight (so an active text selection stays crisp
     // rather than being dimmed along with everything else).
     if command_mode && let Some(rect) = focused_pane_rect {
+        // PRD #611 (review finding 5): a live cannot-scroll notice on THIS pane
+        // suppresses the banner outright, rather than being drawn on top of it.
+        //
+        // The notice is one line and the banner is not: from 5 inner rows up it
+        // selects a block-letter tier (`BannerTier::BlockCommand` at 40x5,
+        // `BlockCommandModeWithSubtitle` at 60x7), so drawing one line over it
+        // replaces the middle row and leaves block-letter rows above and below —
+        // and, at the richest tier, a stray `Ctrl+D to type` underneath. That is
+        // not "the notice wins", it is two messages interleaved. Only the
+        // single-line tiers were ever fully replaced, which is why the pane
+        // geometry the first precedence test happened to use hid this.
+        //
+        // Dimming is deliberately untouched: it is gated on mode and focus
+        // alone and tells the user typing does not reach the agent, which stays
+        // true while the notice is up.
+        let banner = if focused_id
+            .as_deref()
+            .is_some_and(|id| scroll_notice_visible(ctrl, id, now))
+        {
+            CommandBannerVisibility::Collapsed
+        } else {
+            banner
+        };
         render_command_mode_overlay(frame.buffer_mut(), rect, banner);
+    }
+
+    // PRD #611 M2: the cannot-scroll notice, drawn AFTER the command-mode
+    // overlay for the same reason that overlay is drawn after the panes — it
+    // has to land on top of what it is explaining. The ordering also settles
+    // the one frame where both could appear: a scroll attempted while the
+    // COMMAND MODE banner is still up. The notice wins, because it answers a
+    // question the user asked a moment ago while the banner announces a state
+    // they can already see in the border and the bottom bar.
+    for rect in &notice_rects {
+        render_cannot_scroll_notice(frame.buffer_mut(), *rect);
     }
 
     // Render selection highlight over the focused pane.
@@ -13061,6 +15820,7 @@ fn render_mode_tab(
     // frame, forwarded rather than re-derived so a Mode tab and a Dashboard pane
     // cannot disagree about whether the banner is up.
     banner: CommandBannerVisibility,
+    now: std::time::Instant,
 ) {
     // PRD #83: `focused_pane_id` is keyed by stable pane id. `None` (or an
     // id that isn't one of this tab's side panes) means the agent pane is
@@ -13095,6 +15855,7 @@ fn render_mode_tab(
             // Mode-tab panes recompute their rects (out of the Cards finding's
             // scope); the agent pane is a single Stacked pane filling agent_area.
             None,
+            now,
         );
         if rect.is_some() {
             ui.focused_pane_rect = rect;
@@ -13118,6 +15879,7 @@ fn render_mode_tab(
             // Mode side panes recompute via pane_stack_rects (Tiled) — same
             // split as the `side_pane_rects` above; out of the Cards finding's scope.
             None,
+            now,
         );
         // Use side pane rect when a side pane is visually focused, or as fallback.
         if side_visual_focus.is_some() || ui.focused_pane_rect.is_none() {
@@ -14464,6 +17226,10 @@ fn render_help_overlay(
         // below; leaving it here would document a key that does nothing where
         // the heading promises it works.
         help_key_line(&n(KbAction::ToggleLayout), "Toggle layout (stacked/tiled)"),
+        // PRD #336: `toggle_orchestration_split` is NOT listed here, for the
+        // same reason PRD #241 review F6 moved `close_pane` out — it is
+        // command-mode only, so this heading's "works from any pane" promise
+        // would be false. It is listed under "Dashboard (command mode)" below.
         // Quit is not a remappable action: Ctrl+C (non-overridable) opens the
         // Detach/Stop/Cancel modal, so the help row is a fixed string.
         help_key_line("Ctrl+c", "Quit"),
@@ -14495,6 +17261,14 @@ fn render_help_overlay(
         help_key_line(&n(KbAction::FocusPane), "Focus selected pane"),
         // PRD #241: command-mode only, and it asks before it destroys anything.
         help_key_line(&n(KbAction::ClosePane), "Close selected pane (confirms)"),
+        // PRD #336: command-mode only and orchestration-tab only, so it sits
+        // here rather than under "Global" (see the note there). The description
+        // names the tab scope, and stays within the ~30 columns this field
+        // renders before it truncates mid-word.
+        help_key_line(
+            &n(KbAction::ToggleOrchestrationSplit),
+            "Toggle orch tab split ratio",
+        ),
         help_key_line(&n(KbAction::Filter), "Filter sessions"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
         help_key_line(&n(KbAction::Rename), "Rename session"),
@@ -14786,19 +17560,32 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerCl
 /// single navigable field (Command), so the generic "Tab: switch field" hint is
 /// misleading — `schedule_locked` shows a Command-only `Enter: confirm  Esc:
 /// cancel` instead.
+///
+/// Issue #589: `submit_refused` is [`NewPaneFormState::name_collision`] — the
+/// SAME predicate the Enter guard returns `Action::Continue` on and the same
+/// one that drops `[Submit]` from the action row. When it holds, the hint drops
+/// the `Enter:` clause entirely rather than naming a key the guard will
+/// silently refuse, matching how the button row handles it (removed, not
+/// dimmed). The caller passes the one `form.name_collision()` it already
+/// computed for the button row, so the two cannot drift apart the way the
+/// old `name_submits`-alone wording did — that boolean cannot see a collision.
+/// Only the `has_mode_field` arm consults it: a collision requires a selected
+/// orchestration, and the arms below are reachable only from the mode-locked
+/// schedule form, which offers none.
 fn new_pane_form_footer_hint(
     has_mode_field: bool,
     name_submits: bool,
+    submit_refused: bool,
     schedule_locked: bool,
 ) -> &'static str {
     if schedule_locked {
         return "  Enter: confirm  Esc: cancel";
     }
     if has_mode_field {
-        if name_submits {
-            "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: submit  Esc: cancel"
-        } else {
-            "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: next  Esc: cancel"
+        match (name_submits, submit_refused) {
+            (true, true) => "  Tab: switch  \u{25c0}\u{25b6}: mode  Esc: cancel",
+            (true, false) => "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: submit  Esc: cancel",
+            (false, _) => "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: next  Esc: cancel",
         }
     } else {
         "  Tab: switch field  Enter: next/confirm  Esc: cancel"
@@ -14961,12 +17748,7 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
         // Column header, with a scroll indicator when rows are hidden.
         let hidden_above = win_start;
         let hidden_below = ui.scheduled_tasks.len().saturating_sub(win_end);
-        let scroll_hint = match (hidden_above, hidden_below) {
-            (0, 0) => String::new(),
-            (a, 0) => format!("  (\u{2191}{a})"),
-            (0, b) => format!("  (\u{2193}{b})"),
-            (a, b) => format!("  (\u{2191}{a} \u{2193}{b})"),
-        };
+        let scroll_hint = scroll_indicator(hidden_above, hidden_below);
         lines.push(Line::styled(
             format!(
                 "  {:<name_col$}{:<status_col$}{}{}",
@@ -15194,11 +17976,17 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     } else {
         0
     };
-    // PRD #140 M4.0: the same-cwd orchestration warning block — a blank
-    // separator row plus the copy lines — shown only when the selected
-    // orchestration's directory already hosts a live one. Empty otherwise, so
-    // every other form state keeps its exact prior geometry.
-    let warning_lines: &[&str] = if form.same_cwd_orchestration_warning() {
+    // Decided once and reused below to also drop `[Submit]` from the action
+    // row.
+    let name_collision = form.name_collision();
+    // PRD #140 M4.0: the warning/refusal block — a blank
+    // separator row plus the copy lines. A name collision takes priority over
+    // the non-blocking same-cwd warning (it's the more urgent of the two and
+    // blocks submit); empty when neither applies, so every other form state
+    // keeps its exact prior geometry.
+    let warning_lines: &[&str] = if name_collision {
+        &NAME_COLLISION_WARNING
+    } else if form.same_cwd_orchestration_warning() {
         &SAME_CWD_ORCHESTRATION_WARNING
     } else {
         &[]
@@ -15390,7 +18178,15 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // PRD #170: pass `show_mode` (false when locked) so the locked footer drops
     // the `◀▶: mode` hint; unlocked it equals the old `has_mode_field`. Finding 6:
     // `schedule_locked` selects the Command-only `Enter: confirm  Esc: cancel`.
-    let footer = new_pane_form_footer_hint(show_mode, name_submits, form.schedule_locked);
+    // Issue #589: reuse the SAME `name_collision` that dropped `[Submit]` from
+    // the action row above, so the footer and the button row can never disagree
+    // about whether Enter is available.
+    let footer = new_pane_form_footer_hint(
+        show_mode,
+        name_submits,
+        name_collision,
+        form.schedule_locked,
+    );
     lines.push(Line::styled(footer, text_primary()));
 
     // PRD #170: the locked schedule form retitles the modal by action; otherwise
@@ -15528,11 +18324,18 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         }
     }
 
-    // [Submit] / [Cancel] buttons on the reserved row.
-    let buttons = [
-        Button::new("Submit", "", Action::FormSubmit, true),
-        Button::new("Cancel", "", Action::FormCancel, true),
-    ];
+    // [Submit] / [Cancel] buttons on the reserved row. A name collision drops
+    // [Submit] from the row entirely (not merely disabled —
+    // `render_modal_button_row` still paints a disabled button's label
+    // dimmed, and the refusal must not even show the action as available).
+    let buttons: Vec<Button> = if name_collision {
+        vec![Button::new("Cancel", "", Action::FormCancel, true)]
+    } else {
+        vec![
+            Button::new("Submit", "", Action::FormSubmit, true),
+            Button::new("Cancel", "", Action::FormCancel, true),
+        ]
+    };
     let btn_row = Rect {
         x: row_x,
         y: line_y(submit_line_idx),
@@ -15577,13 +18380,65 @@ const FOCUSED_PANE_SCROLL_LINES: isize = 3;
 /// ([`scroll_focused_agent_pane`]) and the `scroll_pane_up` / `scroll_pane_down`
 /// bindings ([`handle_focused_pane_scroll_key`]). Nothing here can reach the
 /// child — it only sets a vt100 scrollback offset.
-fn scroll_focused_pane_scrollback(embedded: &EmbeddedPaneController, pane_id: &str, up: bool) {
+fn scroll_focused_pane_scrollback(
+    embedded: &EmbeddedPaneController,
+    pane_id: &str,
+    up: bool,
+    now: std::time::Instant,
+) {
     let delta = if up {
         FOCUSED_PANE_SCROLL_LINES
     } else {
         -FOCUSED_PANE_SCROLL_LINES
     };
     embedded.scroll_pane(pane_id, delta);
+    // PRD #611 M2 (Decision "reactive, not proactive"): this is the ONLY place
+    // the notice is armed, and it is inside the scroll operation itself — so it
+    // can only ever fire on an attempt that was actually made. Focusing a pane,
+    // spawning one, or merely rendering one reaches nothing here, and neither
+    // does the wheel when it forwards into the child's own pager.
+    if pane_has_nothing_to_scroll(embedded, pane_id) {
+        embedded.arm_scroll_notice(pane_id, now);
+    }
+}
+
+/// PRD #611 M2 — is this pane one the deck genuinely has nothing to scroll for?
+///
+/// A conjunction, because neither half is evidence on its own. **No retained
+/// lines** describes a claude pane one second after spawn just as well as it
+/// describes a terminal-managed agent that will never retain any. **Substantial
+/// output** describes every busy pane, including the ones that scroll perfectly.
+/// Together they say something the deck can only learn by watching: this agent
+/// has been running long enough to have filled the buffer several times over,
+/// and the buffer is still empty — so it is repainting in place and the deck has
+/// nothing to show, which is what the notice explains.
+///
+/// Deliberately says nothing about WHICH agent (PRD #611: "detect the condition,
+/// not the agent name"). A registry entry naming codex would go stale the moment
+/// either that agent or another one changed its rendering model, and it would
+/// under-report silently rather than fail loudly. Nothing here reads an agent
+/// name, an agent type, or a mode fingerprint.
+///
+/// The threshold is measured against the pane's LIVE geometry, never against
+/// the parser's configured scrollback capacity: every pane is constructed with
+/// the same 10,000-line capacity, so a threshold derived from it would say the
+/// identical thing about every pane regardless of how big that pane is.
+fn pane_has_nothing_to_scroll(embedded: &EmbeddedPaneController, pane_id: &str) -> bool {
+    let Some(facts) = embedded.scroll_facts(pane_id) else {
+        return false;
+    };
+    if facts.scrollback_depth > 0 {
+        return false;
+    }
+    let screenful = u64::from(facts.rows) * u64::from(facts.cols);
+    // A pane with no area has no screenful to compare against, and the
+    // threshold would collapse to zero — which would arm the notice on a pane
+    // that has produced nothing at all. Say nothing instead; a pane that thin
+    // has no room to render the notice either.
+    if screenful == 0 {
+        return false;
+    }
+    facts.bytes_since_spawn >= SCROLL_NOTICE_MIN_SCREENFULS * screenful
 }
 
 /// PRD #341 M5 — the ONE decision a wheel event over the focused agent pane
@@ -15611,11 +18466,12 @@ fn scroll_focused_agent_pane(
     up: bool,
     pane_col: u16,
     pane_row: u16,
+    now: std::time::Instant,
 ) {
     if mode == UiMode::PaneInput && embedded.mouse_mode_enabled(pane_id) {
         let _ = embedded.forward_mouse_scroll(pane_id, up, pane_col, pane_row);
     } else {
-        scroll_focused_pane_scrollback(embedded, pane_id, up);
+        scroll_focused_pane_scrollback(embedded, pane_id, up, now);
     }
 }
 
@@ -15639,6 +18495,7 @@ fn handle_focused_pane_scroll_key(
     mode: UiMode,
     key: &KeyEvent,
     pane: &dyn PaneController,
+    now: std::time::Instant,
 ) -> bool {
     if mode != UiMode::Normal {
         return false;
@@ -15653,7 +18510,7 @@ fn handle_focused_pane_scroll_key(
     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
         && let Some(pane_id) = embedded.focused_pane_id()
     {
-        scroll_focused_pane_scrollback(embedded, &pane_id, up);
+        scroll_focused_pane_scrollback(embedded, &pane_id, up, now);
     }
     true
 }
@@ -15670,38 +18527,60 @@ fn pane_relative_coords(screen_col: u16, screen_row: u16, pane_rect: &Option<Rec
     }
 }
 
-fn grid_columns(width: u16) -> usize {
-    if width >= 180 {
-        3
-    } else if width >= 100 {
-        2
-    } else {
-        1
-    }
-}
-
-/// PRD #341 M4 — the selected card's border accent, de-emphasised when the
-/// keyboard is NOT driving the deck.
+/// Issue #442 — the *glyph and emphasis* half of how a deck card's border
+/// encodes selection. The colour half lives in [`render_session_card`], which
+/// pairs every state below with [`palette::SELECTED`] when selected and the
+/// agent's status colour when not.
 ///
-/// Selection deliberately survives the mode switch (it is where `Ctrl+D` sends
-/// you back to), so before this the deck looked equally live in both modes — on
-/// the Dashboard the pane overlay sits off to the right and the deck is where the
-/// user's eyes already are, which made it the weakest tab for mode signalling.
+/// Together they give selection three simultaneous cues — a high-contrast
+/// colour, a heavier glyph, and the `▸ ` title marker — because two separate
+/// reports showed that any single one of them can fail: a colour can be dimmed
+/// into the background, and a thicker line is no easier to see when its colour
+/// already matches the background. The ladder:
 ///
-/// The colour is [`palette::SELECTED`] in both modes and the `▸ ` title marker
-/// stays in both (Decision 5: the user must still be able to tell WHAT is
-/// selected while typing). Only the accent's weight moves: command mode keeps
-/// today's full-strength BOLD, `PaneInput` drops BOLD **and** adds
-/// `Modifier::DIM`. Two channels rather than one because DIM is not honoured by
-/// every terminal — where it is ignored, the missing BOLD still reads as
-/// de-emphasised.
-fn selected_card_border_style(mode: UiMode) -> Style {
-    let base = Style::default().fg(palette::SELECTED);
-    if mode == UiMode::PaneInput {
-        base.add_modifier(Modifier::DIM)
-    } else {
-        base.add_modifier(Modifier::BOLD)
+/// | state                         | border        | emphasis |
+/// |-------------------------------|---------------|----------|
+/// | unselected                    | `Plain` (`│`) | —        |
+/// | selected, `UiMode::PaneInput` | `Thick` (`┃`) | —        |
+/// | selected, command mode        | `Thick` (`┃`) | BOLD     |
+///
+/// Thickness is the same channel the embedded-pane path already uses for focus
+/// (`TerminalWidget`, `BorderType::Thick`), which deck cards never adopted.
+/// The `▸ ` title marker stays in BOTH selected states (PRD #341 Decision 5:
+/// the user must still be able to tell WHAT is selected while typing), so the
+/// mode distinction is carried by weight alone.
+///
+/// ## Why no `Modifier::DIM` anywhere on this path
+///
+/// The previous recipe (PRD #341 M4) painted selection [`palette::SELECTED`]
+/// (Magenta) and de-emphasised `PaneInput` by adding `Modifier::DIM`. On a dark
+/// theme DIM Magenta lands in the same visual band as [`palette::STATUS_IDLE`]
+/// (DarkGray) — so the SELECTED card read as just another idle one, which is
+/// issue #442. It was worse than an outline problem: ratatui draws the block's
+/// borders first and then PATCHES the title spans over those cells, and
+/// `Style::patch` only overrides fields the title actually sets. A border
+/// modifier therefore leaks into every title span that declares no modifier of
+/// its own — the card's title AND its `Last:` / `Tools:` bottom-border stats
+/// faded along with the outline, making the selected card the faintest thing on
+/// screen.
+///
+/// So the invariant is: selection may only ever ADD emphasis, never subtract it.
+/// A selected card must never render dimmer than the same card unselected —
+/// `theme/palette/006` pins that. Do not reintroduce DIM here to signal a mode;
+/// use the glyph ladder above, which no terminal renders as "less visible".
+fn card_border_glyph(is_selected: bool, mode: UiMode) -> (BorderType, Modifier) {
+    if !is_selected {
+        return (BorderType::Plain, Modifier::empty());
     }
+    // `BorderType` never feeds `Block::inner`, so promoting the selected card to
+    // a heavier glyph costs no rows or columns — the card's inner area, and
+    // everything laid out inside it, is byte-identical to the unselected case.
+    let emphasis = if mode == UiMode::PaneInput {
+        Modifier::empty()
+    } else {
+        Modifier::BOLD
+    };
+    (BorderType::Thick, emphasis)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15714,12 +18593,34 @@ fn render_session_card(
     display_name: Option<&String>,
     card_number: Option<u8>,
     density: CardDensity,
-    idle_art: Option<&IdleArtEntry>,
     // PRD #341 M4: which mode the deck is being rendered in. Only the selected
     // card's accent reads it (see `selected_card_border_style`).
     mode: UiMode,
+    // Issue #308: the agent this pane's config DECLARED, for a pane that made a
+    // declaration and whose agent has not identified itself yet. Used ONLY when
+    // the observed `session.agent_type` is still the neutral placeholder, so an
+    // agent that has reported always wins — a declaration cannot keep
+    // mislabelling a card once the pane says otherwise. `None` for every pane
+    // with no declaration, which is every pane before this key existed and the
+    // default for the L1 render seams.
+    declared_agent_type: Option<&AgentType>,
 ) {
-    let is_placeholder = session.agent_type == crate::event::AgentType::None;
+    // The type the card SHOWS. A launcher command (`devbox run -- codex`)
+    // identifies nothing, so without the declaration this stays
+    // `AgentType::None` and the card reads "No agent" — for Codex, until the
+    // first delegated task, because it posts nothing before its first turn.
+    // Note this is a display decision and nothing more: the readiness gates
+    // that decide WHEN a prompt may be written still read
+    // `session.agent_type`, so a declared pane is drawn immediately and still
+    // waits for its agent to actually start before anything is typed into it.
+    let shown_agent_type = if session.agent_type == crate::event::AgentType::None {
+        declared_agent_type
+            .cloned()
+            .unwrap_or(crate::event::AgentType::None)
+    } else {
+        session.agent_type.clone()
+    };
+    let is_placeholder = shown_agent_type == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
         ("No agent", text_primary())
     } else {
@@ -15727,11 +18628,14 @@ fn render_session_card(
     };
     let status_color = status_style.fg.unwrap_or(Color::Reset);
 
-    let id_display = if session.session_id.len() > 11 {
-        &session.session_id[..11]
-    } else {
-        &session.session_id
-    };
+    // Issue #574: `session_id` is producer-controlled — `apply_event` keys the
+    // session map on whatever the hook socket sent, with no length, charset or
+    // boundary check between the socket and here. `&session_id[..11]` is a BYTE
+    // index, so an id whose 11th byte falls inside a character panicked this
+    // function — and because it runs inside the render loop, EVERY frame died
+    // and the whole deck went down with the one bad card. Same truncator the
+    // hook binary already uses on prompts, for the same reason.
+    let id_display = crate::prompt_delivery::truncate_on_char_boundary(&session.session_id, 11);
 
     let num_prefix = match card_number {
         Some(n) => format!("{n} "),
@@ -15767,7 +18671,7 @@ fn render_session_card(
     // common case. A non-live card additionally shows a trailing
     // `history` / `view-only` marker.
     let badge_style = Style::default()
-        .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
+        .fg(crate::agent_registry::spec(&shown_agent_type).badge_color)
         .add_modifier(Modifier::BOLD);
     // The marker is appended AFTER the `<type> · <id-or-name>` so the
     // `<type> · …` shape callers match on (e.g. `Codex ·`, `Pi · orch-01`)
@@ -15778,7 +18682,7 @@ fn render_session_card(
     let title_segments: Vec<(String, Style)> = {
         let mut segs = vec![
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
-            (format!("{}", session.agent_type), badge_style),
+            (format!("{shown_agent_type}"), badge_style),
             (label_after_badge, title_bold),
         ];
         if !is_live {
@@ -15793,21 +18697,27 @@ fn render_session_card(
     let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
     let title_spans = truncate_styled_segments(title_segments, max_title);
 
-    let border_style = if is_selected {
-        // PRD #155 Option A: selection uses the dedicated `selected` accent role
-        // (Magenta, paired with the `▸ ` title marker above) — distinct from
-        // every status color and from the focused-pane cyan. PRD #341 M4: its
-        // WEIGHT now tracks the mode, so the deck looks live exactly when the
-        // keyboard is driving it.
-        selected_card_border_style(mode)
+    // Issue #442. An UNSELECTED card's border colour is its STATUS, so an idle
+    // agent recedes and a working one reads green. A SELECTED card's border
+    // switches to the terminal's own foreground (`palette::SELECTED`), which is
+    // the one colour guaranteed to contrast with the terminal's own background
+    // on either theme — see that constant for why a status colour cannot carry
+    // selection on its own. Status is not lost: the badge still reports it.
+    let base_border_style = if is_selected {
+        Style::default().fg(palette::SELECTED)
     } else if is_placeholder {
         // Placeholder ("No agent") cards read as secondary: dim the terminal's
         // own foreground (matching the prior DarkGray intent) so the empty slot
-        // doesn't draw a full-strength border like a live agent.
+        // doesn't draw a full-strength border like a live agent. Selecting one
+        // takes the branch above, so an empty slot is never dim while selected.
         text_dim()
     } else {
         Style::default().fg(status_color)
     };
+    // Selection ALSO thickens the glyph and, in command mode, adds BOLD — three
+    // cues rather than one. See `card_border_glyph`.
+    let (border_type, border_emphasis) = card_border_glyph(is_selected, mode);
+    let border_style = base_border_style.add_modifier(border_emphasis);
 
     // PRD #339: `Last` / `Tools` ride the bottom border instead of a content
     // row. Border cells are paid for by `Borders::ALL` either way, so the
@@ -15826,6 +18736,7 @@ fn render_session_card(
 
     let mut block = Block::default()
         .borders(Borders::ALL)
+        .border_type(border_type)
         .border_style(border_style)
         .title(Line::from(title_spans))
         .title_alignment(ratatui::layout::Alignment::Left)
@@ -15842,10 +18753,9 @@ fn render_session_card(
     }
 
     // PRD #13 Option A: selection is cued by the `▸ ` title prefix and the
-    // Magenta+BOLD border above (the `selected` palette accent, PRD #155) — no
-    // whole-card `Modifier::REVERSED`. The full-card inversion was too heavy and
-    // redundant with those two cues, and stays terminal-relative (no absolute
-    // `selected_bg` tint).
+    // thickened border above (issue #442) — no whole-card `Modifier::REVERSED`.
+    // The full-card inversion was too heavy and redundant with those two cues,
+    // and stays terminal-relative (no absolute `selected_bg` tint).
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -15899,24 +18809,6 @@ fn render_session_card(
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
-
-    // Overlay ASCII art on top of the normal content (unless dismissed by user)
-    if let Some(entry) = idle_art
-        && !entry.dismissed
-        && let IdleArtPhase::HasArt(ref art) = entry.phase
-        && !art.frames.is_empty()
-    {
-        // Clear the inner area so the Dir line and other content don't bleed through
-        frame.render_widget(Clear, inner);
-
-        let frame_index = (tick / 120) as usize % art.frames.len();
-        let art_lines: Vec<Line<'_>> = art.frames[frame_index]
-            .lines()
-            .map(|l| Line::from(Span::styled(l.to_string(), text_primary())))
-            .collect();
-        let art_widget = Paragraph::new(art_lines);
-        frame.render_widget(art_widget, inner);
-    }
 }
 
 fn flash_dot(status: &SessionStatus, tick: u64) -> &'static str {
@@ -16029,161 +18921,6 @@ fn format_elapsed(last_activity: DateTime<Utc>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Idle ASCII art – background generation & per-tick state machine
-// ---------------------------------------------------------------------------
-
-/// Build the "input" string sent to the LLM from session prompts.
-fn build_art_input(session: &SessionState) -> String {
-    let mut parts: Vec<&str> = session.first_prompts.iter().map(|s| s.as_str()).collect();
-    if let Some(ref last) = session.last_user_prompt
-        && !session.first_prompts.iter().any(|p| p == last)
-    {
-        parts.push(last);
-    }
-    parts.join(" | ")
-}
-
-/// Build the "output" string sent to the LLM from recent tool activity.
-fn build_art_output(session: &SessionState) -> String {
-    let tool_summaries: Vec<String> = session
-        .recent_events
-        .iter()
-        .rev()
-        .filter_map(|e| {
-            e.tool_name.as_deref().map(|name| {
-                if let Some(ref detail) = e.tool_detail {
-                    format!("{name}({detail})")
-                } else {
-                    name.to_string()
-                }
-            })
-        })
-        .take(5)
-        .collect();
-    if tool_summaries.is_empty() {
-        "Session idle".to_string()
-    } else {
-        format!("Used tools: {}", tool_summaries.join(", "))
-    }
-}
-
-/// Drive the per-session idle art state machine. Called once per tick.
-fn update_idle_art(
-    idle_art_cache: &mut HashMap<String, IdleArtEntry>,
-    config: &IdleArtConfig,
-    sessions: &HashMap<String, SessionState>,
-    density: CardDensity,
-) {
-    // Gate: feature disabled or not spacious
-    if !config.enabled || density != CardDensity::Spacious {
-        idle_art_cache.clear();
-        tracing::debug!(
-            "idle_art skipped: enabled={}, density={:?}",
-            config.enabled,
-            density
-        );
-        return;
-    }
-
-    let now = Utc::now();
-    let timeout = chrono::Duration::seconds(config.timeout_secs as i64);
-
-    // Remove entries for sessions that no longer exist
-    idle_art_cache.retain(|sid, _| sessions.contains_key(sid));
-
-    // Collect session IDs to process (avoid borrowing conflicts)
-    let session_ids: Vec<String> = sessions.keys().cloned().collect();
-
-    for sid in &session_ids {
-        let session = &sessions[sid];
-
-        if session.status != SessionStatus::Idle {
-            idle_art_cache.remove(sid);
-            continue;
-        }
-
-        let idle_duration = now.signed_duration_since(session.last_activity);
-        tracing::debug!(
-            "idle_art {sid}: status=Idle, idle_for={}s, timeout={}s",
-            idle_duration.num_seconds(),
-            config.timeout_secs
-        );
-
-        // Session is idle — manage the state machine
-        let entry = idle_art_cache.entry(sid.clone()).or_insert(IdleArtEntry {
-            phase: IdleArtPhase::Waiting,
-            idle_since: session.last_activity,
-            dismissed: false,
-        });
-
-        // Reset if this is a new idle stretch
-        if entry.idle_since != session.last_activity {
-            entry.phase = IdleArtPhase::Waiting;
-            entry.idle_since = session.last_activity;
-            entry.dismissed = false;
-        }
-
-        // Retry failed generations after 60s cooldown
-        if let IdleArtPhase::Failed(at) = entry.phase
-            && at.elapsed() >= std::time::Duration::from_secs(60)
-        {
-            tracing::debug!("idle_art {sid}: retrying after failure cooldown");
-            entry.phase = IdleArtPhase::Waiting;
-        }
-
-        // Spawn generation if timeout elapsed
-        if matches!(entry.phase, IdleArtPhase::Waiting)
-            && now.signed_duration_since(entry.idle_since) >= timeout
-        {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let input = build_art_input(session);
-            let output = build_art_output(session);
-            let art_config = config.clone();
-
-            tracing::info!(
-                "idle_art {sid}: spawning generation (input_len={}, output_len={})",
-                input.len(),
-                output.len()
-            );
-
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let result = generate_ascii_art(&input, &output, &art_config).await;
-                    match &result {
-                        Ok(_) => tracing::info!("idle_art generation succeeded"),
-                        Err(e) => tracing::warn!("idle_art generation failed: {e}"),
-                    }
-                    let _ = tx.send(result.ok());
-                });
-                entry.phase = IdleArtPhase::Generating(rx);
-            } else {
-                tracing::warn!("idle_art {sid}: no tokio runtime handle available");
-                entry.phase = IdleArtPhase::Failed(std::time::Instant::now());
-            }
-        }
-
-        // Poll for completion
-        let failed_now = IdleArtPhase::Failed(std::time::Instant::now());
-        let phase = std::mem::replace(&mut entry.phase, failed_now);
-        if let IdleArtPhase::Generating(rx) = phase {
-            match rx.try_recv() {
-                Ok(Some(art)) => entry.phase = IdleArtPhase::HasArt(art),
-                Ok(None) => entry.phase = IdleArtPhase::Failed(std::time::Instant::now()),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    entry.phase = IdleArtPhase::Generating(rx);
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    entry.phase = IdleArtPhase::Failed(std::time::Instant::now());
-                }
-            }
-        } else {
-            // Put back non-Generating phases
-            entry.phase = phase;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // PRD #77 — L1 harness public surface
 // ---------------------------------------------------------------------------
 //
@@ -16196,7 +18933,7 @@ fn update_idle_art(
 // `pub(crate)`-gated.
 
 /// Card density tier picked by the dashboard's adaptive layout
-/// (`choose_density`). Hidden-public so L1 snapshot tests can pin a
+/// (`choose_grid_layout`). Hidden-public so L1 snapshot tests can pin a
 /// specific tier rather than depending on the runtime calculation.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16424,6 +19161,10 @@ pub fn render_card_to_buffer(
 /// assertion about what the user actually sees. `mode` is the ONLY input
 /// [`render_card_to_buffer`] does not expose; that seam is this one pinned to
 /// `UiMode::Normal`.
+///
+/// Issue #308: the pane DECLARATION is the second input this seam does not
+/// expose — see [`render_card_with_declared_agent_to_buffer`], which this one
+/// is pinned to `None` of.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_card_for_mode_to_buffer(
@@ -16434,6 +19175,56 @@ pub fn render_card_for_mode_to_buffer(
     tick: u64,
     selected: bool,
     mode: UiMode,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    render_card_with_declared_agent_to_buffer(
+        session,
+        display_name,
+        card_number,
+        density,
+        tick,
+        selected,
+        mode,
+        // Issue #308: the pre-#308 seams declare nothing, so a fixture that
+        // wants a badge here puts the type on the `SessionState` it hands in —
+        // which exercises the OBSERVED branch, not the declared fallback.
+        None,
+        width,
+        height,
+    )
+}
+
+/// Issue #308 L1 seam: render one session card with a pane DECLARATION in play
+/// — the `agent = "…"` a role or mode wrote in `.dot-agent-deck.toml`, which the
+/// deck keeps in `UiState::pane_declared_agent` and hands to the renderer beside
+/// the session.
+///
+/// This exists because the declared badge has exactly one interesting branch and
+/// no other public seam can reach it. `render_session_card` shows
+/// `session.agent_type` whenever it is anything but `AgentType::None`, and falls
+/// back to the declaration only when it is `None`; every other L1 seam hardcodes
+/// the declaration to `None`, so a fixture could only badge a card through
+/// `SessionState.agent_type` — the *other* branch. The one line this feature
+/// turns on was therefore L1-unreachable and covered only at L2
+/// (`codex/spawn/009`, `011`).
+///
+/// The interesting call is `session.agent_type == AgentType::None` **and**
+/// `declared_agent_type == Some(t)`: the card must badge `t` rather than read
+/// "No agent". Pass a session whose `agent_type` is already set to pin the
+/// precedence rule instead — an agent that has identified itself always wins,
+/// and the declaration must not override it.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn render_card_with_declared_agent_to_buffer(
+    session: &SessionState,
+    display_name: Option<&str>,
+    card_number: Option<u8>,
+    density: CardDensityKind,
+    tick: u64,
+    selected: bool,
+    mode: UiMode,
+    declared_agent_type: Option<&AgentType>,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -16460,8 +19251,8 @@ pub fn render_card_for_mode_to_buffer(
                 display_name_owned.as_ref(),
                 card_number,
                 density.into(),
-                None,
                 mode,
+                declared_agent_type,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -16525,13 +19316,99 @@ pub fn render_dashboard_cards_to_buffer(
                     display_name.as_ref(),
                     card_number,
                     card_density,
-                    None,
                     UiMode::Normal,
+                    None,
                 );
             }
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
+}
+
+/// What the deck's card grid decided, reported back to an L1 test alongside the
+/// buffer it drew (issue #588).
+///
+/// Deliberately one field. Everything else a test wants to know — how many cards
+/// were painted, in how many columns, whether the title carries an overflow
+/// marker — is legible in the buffer itself, and reading it there keeps the
+/// assertions on what was actually drawn instead of on a second copy of the
+/// layout arithmetic. `nav_columns` is the exception because it is not drawable:
+/// it is UI *state*, and a render that draws the grid correctly while leaving
+/// that state wrong is exactly the desync this seam exists to catch.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardGridProbe {
+    /// `UiState::columns` **after** the render — the field left/right card
+    /// navigation reads.
+    pub nav_columns: usize,
+}
+
+/// L1 seam for the whole deck card grid — the real [`render_card_grid`], not a
+/// re-implementation of it: title row, adaptive column/density choice, the card
+/// rows that fit, and the overflow indicator.
+///
+/// Issue #588 added it because every pre-existing dashboard seam renders cards
+/// the caller has already laid out ([`render_dashboard_cards_to_buffer`] stacks
+/// them one per row at a density the test names), so the layout decision itself
+/// — the thing that was dropping cards — had no L1 coverage at all.
+///
+/// `cards` is `(session, display_name)` in deck order; `width` × `height` is the
+/// deck area, including the title and stats-bar rows it reserves.
+#[doc(hidden)]
+pub fn render_card_grid_to_buffer(
+    cards: &[(&SessionState, Option<&str>)],
+    selected: Option<usize>,
+    scroll_offset: usize,
+    width: u16,
+    height: u16,
+) -> (ratatui::buffer::Buffer, CardGridProbe) {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    ui.selected_index = selected;
+    ui.scroll_offset = scroll_offset;
+
+    // `render_card_grid` reads display names out of `ui.display_names` keyed by
+    // session id, falling back to `SessionState.display_name`. Feed the caller's
+    // names through the map so the seam exercises the same lookup the deck does.
+    let ids: Vec<String> = cards
+        .iter()
+        .map(|(session, _)| session.session_id.clone())
+        .collect();
+    for ((_, name), id) in cards.iter().zip(ids.iter()) {
+        if let Some(name) = name {
+            ui.display_names.insert(id.clone(), (*name).to_string());
+        }
+    }
+    let sessions: Vec<&SessionState> = cards.iter().map(|(session, _)| *session).collect();
+    let id_refs: Vec<&String> = ids.iter().collect();
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            render_card_grid(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+                &mut ui,
+                &sessions,
+                &id_refs,
+                sessions.len(),
+                0,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+
+    let probe = CardGridProbe {
+        nav_columns: ui.columns,
+    };
+    (terminal.backend().buffer().clone(), probe)
 }
 
 /// PRD #80 M2: render the persistent global button bar into a one-row
@@ -16699,6 +19576,7 @@ pub fn render_focused_pane_cursor_for_mode_to_position(
                 // been in command mode carries.
                 CommandBannerVisibility::Hidden,
                 None,
+                std::time::Instant::now(),
             );
         })
         .expect("TestBackend draw should succeed");
@@ -16775,21 +19653,15 @@ pub fn render_command_banner_pane_to_buffer(
                 mode,
                 visibility,
                 None,
+                std::time::Instant::now(),
             );
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
 }
 
-/// PRD #341 M5 — what one scroll input did to the focused agent pane: where our
-/// own scrollback stood before and after, and every byte the pane queued for the
-/// child while handling it.
-///
-/// The two numbers and the byte log are the whole M5 contract. "Command mode
-/// scrolls our scrollback" is `scrollback_after != scrollback_before`; "command
-/// mode never reaches the agent's mouse protocol" is `forwarded_bytes.is_empty()`.
-/// Recording the bytes rather than asserting on a flag is deliberate — a flag can
-/// be right while the write still happens.
+/// What one scroll input did to the focused agent pane, including the observable
+/// notice rendered by the same production pane path as the live app.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FocusedPaneScrollObservation {
@@ -16797,17 +19669,27 @@ pub struct FocusedPaneScrollObservation {
     pub scrollback_before: usize,
     /// Our vt100 scrollback offset after the input.
     pub scrollback_after: usize,
+    /// The parser's actual retained-line depth, measured by asking vt100 to clamp
+    /// an unbounded offset and then restoring the live view. This is deliberately
+    /// not the parser's configured 10,000-line capacity.
+    pub scrollback_depth: usize,
+    /// Bytes the seam fed into the real parser at construction, matching the
+    /// production counter's since-spawn unit.
+    pub bytes_fed_since_spawn: u64,
     /// Every byte the pane queued for the child, flattened in order. Empty means
     /// the agent saw nothing at all.
     pub forwarded_bytes: Vec<u8>,
+    /// Whether the completed production pane render contains the named notice.
+    pub notice_visible: bool,
 }
 
-/// Rows/cols and history for the M5 scroll seams. The screen is small and the
-/// history generous so a 3-line scroll always has somewhere to go — vt100 clamps
-/// the offset to the real scrollback size, so a short history would make a
-/// correctly-scrolling path look like a no-op.
-const SCROLL_SEAM_ROWS: u16 = 6;
-const SCROLL_SEAM_COLS: u16 = 20;
+/// Rows/cols and history for the focused-pane scroll seams. The width admits the
+/// complete single-line notice while the history is generous enough that a
+/// 3-line scroll always has somewhere to go.
+#[doc(hidden)]
+pub const SCROLL_SEAM_ROWS: u16 = 6;
+#[doc(hidden)]
+pub const SCROLL_SEAM_COLS: u16 = 96;
 const SCROLL_SEAM_HISTORY_LINES: usize = 60;
 const SCROLL_SEAM_PANE_ID: &str = "1";
 
@@ -16824,17 +19706,40 @@ fn scroll_seam_history() -> String {
 fn scroll_seam_pane(
     mouse_mode_enabled: bool,
     initial_scrollback: usize,
+    pane_output: &[u8],
 ) -> (
     EmbeddedPaneController,
     crate::embedded_pane::SeamChildInput,
     usize,
 ) {
-    let history = scroll_seam_history();
-    let (ctrl, mut child_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
-        SCROLL_SEAM_PANE_ID,
+    scroll_seam_pane_with_size(
+        mouse_mode_enabled,
+        initial_scrollback,
+        pane_output,
         SCROLL_SEAM_ROWS,
         SCROLL_SEAM_COLS,
-        history.as_bytes(),
+    )
+}
+
+/// Width/height-parametric form of [`scroll_seam_pane`] for notice render-tier
+/// coverage. The ordinary routing seams retain the fixed 96x6 fixture above;
+/// only tests that need to exercise a clipping boundary vary these dimensions.
+fn scroll_seam_pane_with_size(
+    mouse_mode_enabled: bool,
+    initial_scrollback: usize,
+    pane_output: &[u8],
+    rows: u16,
+    cols: u16,
+) -> (
+    EmbeddedPaneController,
+    crate::embedded_pane::SeamChildInput,
+    usize,
+) {
+    let (ctrl, mut child_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
+        SCROLL_SEAM_PANE_ID,
+        rows,
+        cols,
+        pane_output,
         mouse_mode_enabled,
     );
     // Park the view where the caller wants it, through the production scroll
@@ -16860,6 +19765,145 @@ fn scroll_seam_scrollback(ctrl: &EmbeddedPaneController, pane_id: &str) -> usize
         .expect("the seam's panes always have a screen")
 }
 
+/// Measure the real retained-line depth without confusing it with either the
+/// current view offset or the configured scrollback capacity. vt100 clamps an
+/// oversized requested offset to the live buffer depth.
+fn scroll_seam_scrollback_depth(ctrl: &EmbeddedPaneController, pane_id: &str) -> usize {
+    ctrl.get_screen(pane_id)
+        .and_then(|screen| {
+            screen.lock().ok().map(|mut parser| {
+                let current = parser.screen().scrollback();
+                parser.screen_mut().set_scrollback(usize::MAX);
+                let depth = parser.screen().scrollback();
+                parser.screen_mut().set_scrollback(current);
+                depth
+            })
+        })
+        .expect("the seam's panes always have a screen")
+}
+
+/// Build the terminal-managed rendering shape measured in the issue diagnosis:
+/// exact-height DECSTBM regions followed by whole-region cursor-positioned
+/// repaints, with no newline-driven output. Repositioning overwrites live cells
+/// instead of scrolling a line off the top, so a correctly-sized vt100 parser
+/// retains zero scrollback even after many screenfuls of bytes.
+#[doc(hidden)]
+pub fn synthetic_decstbm_repaint_stream(rows: u16, cols: u16) -> Vec<u8> {
+    assert!(
+        rows >= 2 && cols >= 2,
+        "the repaint fixture needs a real region"
+    );
+    let target_bytes = SCROLL_NOTICE_MIN_SCREENFULS * u64::from(rows) * u64::from(cols);
+    let mut bytes = Vec::with_capacity(target_bytes as usize + usize::from(rows * cols));
+    let mut frame = 0_u16;
+    while (bytes.len() as u64) < target_bytes {
+        bytes.extend_from_slice(format!("\x1b[1;{rows}r").as_bytes());
+        let alternating_top = 2 + frame % rows.saturating_sub(1);
+        bytes.extend_from_slice(format!("\x1b[{alternating_top};{rows}r").as_bytes());
+        for row in 1..=rows {
+            bytes.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+            bytes.extend(std::iter::repeat_n(
+                b'a' + (frame % 26) as u8,
+                usize::from(cols - 1),
+            ));
+        }
+        frame = frame.wrapping_add(1);
+    }
+    bytes
+}
+
+/// Render the seam pane through [`render_terminal_panes`], with the frame clock
+/// injectable for exact transient-notice edges.
+fn render_scroll_seam_pane_to_buffer(
+    ctrl: &EmbeddedPaneController,
+    mode: UiMode,
+    now: std::time::Instant,
+) -> ratatui::buffer::Buffer {
+    render_sized_scroll_seam_pane_to_buffer(
+        ctrl,
+        mode,
+        CommandBannerVisibility::Hidden,
+        now,
+        SCROLL_SEAM_ROWS,
+        SCROLL_SEAM_COLS,
+        0,
+    )
+}
+
+/// Geometry-parametric form of [`render_scroll_seam_pane_to_buffer`].
+///
+/// `trailing_guard_cols` deliberately leaves visible buffer cells beyond the
+/// pane's right border. Narrow-tier coverage uses them to prove an overlong
+/// notice did not merely disappear from string matching while still bleeding
+/// through the frame and into an adjacent pane.
+#[allow(clippy::too_many_arguments)]
+fn render_sized_scroll_seam_pane_to_buffer(
+    ctrl: &EmbeddedPaneController,
+    mode: UiMode,
+    banner: CommandBannerVisibility,
+    now: std::time::Instant,
+    rows: u16,
+    cols: u16,
+    trailing_guard_cols: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let pane_rect = Rect::new(0, 0, cols + 2, rows + 2);
+    let backend = TestBackend::new(pane_rect.width + trailing_guard_cols, pane_rect.height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            let pane_rects = [pane_rect];
+            render_terminal_panes(
+                frame,
+                Some(ctrl),
+                frame.area(),
+                &[SCROLL_SEAM_PANE_ID.to_string()],
+                PaneLayout::Stacked,
+                &HashMap::new(),
+                &HashMap::new(),
+                &None,
+                Some(SCROLL_SEAM_PANE_ID),
+                mode,
+                banner,
+                Some(&pane_rects),
+                now,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+fn buffer_contains_scroll_notice(buffer: &ratatui::buffer::Buffer) -> bool {
+    let area = buffer.area();
+    (area.y..area.y + area.height).any(|y| {
+        let line = (area.x..area.x + area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>();
+        line.contains(SCROLL_NOTICE_TEXT)
+    })
+}
+
+fn focused_scroll_observation(
+    ctrl: &EmbeddedPaneController,
+    child_input: &mut crate::embedded_pane::SeamChildInput,
+    mode: UiMode,
+    pane_output: &[u8],
+    scrollback_before: usize,
+    now: std::time::Instant,
+) -> FocusedPaneScrollObservation {
+    let rendered = render_scroll_seam_pane_to_buffer(ctrl, mode, now);
+    FocusedPaneScrollObservation {
+        scrollback_before,
+        scrollback_after: scroll_seam_scrollback(ctrl, SCROLL_SEAM_PANE_ID),
+        scrollback_depth: scroll_seam_scrollback_depth(ctrl, SCROLL_SEAM_PANE_ID),
+        bytes_fed_since_spawn: pane_output.len() as u64,
+        forwarded_bytes: child_input.drain_bytes(),
+        notice_visible: buffer_contains_scroll_notice(&rendered),
+    }
+}
+
 /// PRD #341 M5 L1 seam: send ONE wheel event over the focused agent pane and
 /// report what it did.
 ///
@@ -16873,20 +19917,33 @@ pub fn observe_focused_agent_mouse_scroll(
     mode: UiMode,
     mouse_mode_enabled: bool,
     up: bool,
+    pane_output: &[u8],
     initial_scrollback: usize,
     pane_col: u16,
     pane_row: u16,
 ) -> FocusedPaneScrollObservation {
     let (ctrl, mut child_input, scrollback_before) =
-        scroll_seam_pane(mouse_mode_enabled, initial_scrollback);
+        scroll_seam_pane(mouse_mode_enabled, initial_scrollback, pane_output);
+    let now = std::time::Instant::now();
 
-    scroll_focused_agent_pane(&ctrl, SCROLL_SEAM_PANE_ID, mode, up, pane_col, pane_row);
+    scroll_focused_agent_pane(
+        &ctrl,
+        SCROLL_SEAM_PANE_ID,
+        mode,
+        up,
+        pane_col,
+        pane_row,
+        now,
+    );
 
-    FocusedPaneScrollObservation {
+    focused_scroll_observation(
+        &ctrl,
+        &mut child_input,
+        mode,
+        pane_output,
         scrollback_before,
-        scrollback_after: scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID),
-        forwarded_bytes: child_input.drain_bytes(),
-    }
+        now,
+    )
 }
 
 /// PRD #341 M5 L1 seam: press ONE key against the focused agent pane and report
@@ -16901,19 +19958,431 @@ pub fn observe_focused_agent_key_scroll(
     keybindings: &KeybindingConfig,
     mode: UiMode,
     key: KeyEvent,
+    pane_output: &[u8],
     initial_scrollback: usize,
 ) -> FocusedPaneScrollObservation {
     // Child mouse reporting is irrelevant to a keystroke; leaving it ON is the
     // stricter setup — a keyboard path that leaked into the child's mouse protocol
     // would be caught rather than masked.
-    let (ctrl, mut child_input, scrollback_before) = scroll_seam_pane(true, initial_scrollback);
+    let (ctrl, mut child_input, scrollback_before) =
+        scroll_seam_pane(true, initial_scrollback, pane_output);
+    let now = std::time::Instant::now();
 
-    handle_focused_pane_scroll_key(keybindings, mode, &key, &ctrl);
+    handle_focused_pane_scroll_key(keybindings, mode, &key, &ctrl, now);
 
-    FocusedPaneScrollObservation {
+    focused_scroll_observation(
+        &ctrl,
+        &mut child_input,
+        mode,
+        pane_output,
         scrollback_before,
-        scrollback_after: scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID),
-        forwarded_bytes: child_input.drain_bytes(),
+        now,
+    )
+}
+
+/// Reconcile and render two focused-pane frames without sending any scroll or
+/// key input, proving that substantial output alone cannot proactively arm the
+/// notice.
+#[doc(hidden)]
+pub fn observe_focused_agent_without_scroll(pane_output: &[u8]) -> FocusedPaneScrollObservation {
+    let (ctrl, mut child_input, scrollback_before) = scroll_seam_pane(false, 0, pane_output);
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    ui.mode = UiMode::PaneInput;
+    reconcile_pane_input_scrollback(&mut ui, &ctrl);
+    reconcile_pane_input_scrollback(&mut ui, &ctrl);
+    let now = std::time::Instant::now();
+    focused_scroll_observation(
+        &ctrl,
+        &mut child_input,
+        ui.mode,
+        pane_output,
+        scrollback_before,
+        now,
+    )
+}
+
+/// Observable lifecycle of one failed-scroll notice, including its two render
+/// checkpoints and the normal outcomes of both an unbound and a bound key.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ScrollNoticeRenderTierObservation {
+    /// The exact inner width, derived from the full production sentence, where
+    /// that tier first fits.
+    pub full_boundary_render: ratatui::buffer::Buffer,
+    /// One column below the full sentence, where the short tier must take over.
+    pub below_full_boundary_render: ratatui::buffer::Buffer,
+    /// The exact inner width, derived from the short production sentence, where
+    /// that tier still fits.
+    pub short_boundary_render: ratatui::buffer::Buffer,
+    /// One column below the short tier, with guard columns after the pane.
+    pub below_short_boundary_render: ratatui::buffer::Buffer,
+    /// The same narrow frame without an armed notice, used to prove the border
+    /// and guard cells were not touched by an overlong draw.
+    pub below_short_control_render: ratatui::buffer::Buffer,
+}
+
+/// Compact and roomy frames where the command banner and cannot-scroll notice
+/// are both live.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ScrollNoticeBannerPrecedenceObservation {
+    /// Two inner rows, where the command banner uses a single reversed line.
+    pub render: ratatui::buffer::Buffer,
+    /// Seven inner rows, where the command banner would use five block-letter
+    /// rows plus its `Ctrl+D to type` subtitle.
+    pub block_render: ratatui::buffer::Buffer,
+}
+
+/// A two-pane frame after focus has moved away from the pane that armed the
+/// cannot-scroll notice.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ScrollNoticePaneAffinityObservation {
+    pub render: ratatui::buffer::Buffer,
+    pub first_pane_rect: Rect,
+    pub second_pane_rect: Rect,
+}
+
+/// Observable lifecycle and rendering variants of one failed-scroll notice.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ScrollNoticeLifecycleObservation {
+    pub first_render: ratatui::buffer::Buffer,
+    pub repeated_render: ratatui::buffer::Buffer,
+    pub render_tiers: ScrollNoticeRenderTierObservation,
+    pub banner_precedence: ScrollNoticeBannerPrecedenceObservation,
+    pub pane_affinity: ScrollNoticePaneAffinityObservation,
+    pub visible_after_first_scroll: bool,
+    pub visible_just_before_expiry: bool,
+    pub visible_at_expiry: bool,
+    pub visible_before_repeat: bool,
+    pub visible_after_repeat: bool,
+    pub visible_at_original_expiry: bool,
+    pub visible_at_refreshed_expiry: bool,
+    pub visible_before_unbound_key: bool,
+    pub visible_after_unbound_key: bool,
+    pub unbound_key_forwarded_bytes: Vec<u8>,
+    pub unbound_mode_after_key: UiMode,
+    pub visible_before_bound_key: bool,
+    pub visible_after_bound_key: bool,
+    pub bound_key_forwarded_bytes: Vec<u8>,
+    pub bound_mode_after_key: UiMode,
+}
+
+fn scroll_notice_fixture_render(
+    rows: u16,
+    cols: u16,
+    trailing_guard_cols: u16,
+    mode: UiMode,
+    banner: CommandBannerVisibility,
+    now: std::time::Instant,
+    arm_notice: bool,
+) -> ratatui::buffer::Buffer {
+    let pane_output = synthetic_decstbm_repaint_stream(rows, cols);
+    let (ctrl, _child_input, _) = scroll_seam_pane_with_size(false, 0, &pane_output, rows, cols);
+    if arm_notice {
+        scroll_focused_agent_pane(&ctrl, SCROLL_SEAM_PANE_ID, mode, true, 3, 1, now);
+    }
+    render_sized_scroll_seam_pane_to_buffer(
+        &ctrl,
+        mode,
+        banner,
+        now,
+        rows,
+        cols,
+        trailing_guard_cols,
+    )
+}
+
+fn observe_scroll_notice_render_tiers(
+    now: std::time::Instant,
+) -> ScrollNoticeRenderTierObservation {
+    // PRD #611 (audit finding 2): DERIVED from the production strings, never
+    // transcribed from them. These were three hardcoded numbers matching the
+    // then-current wording, so a reword would have moved the real boundary while
+    // the seam kept probing the old one — the boundary would have gone unpinned
+    // silently, which is the one failure a boundary test exists to prevent.
+    let full_boundary_cols = SCROLL_NOTICE_TEXT.chars().count() as u16;
+    let short_boundary_cols = SCROLL_NOTICE_SHORT.chars().count() as u16;
+    // Enough guard columns beyond the pane frame that an overlong tier drawn at
+    // the widest probed geometry would have to spill into them to be seen.
+    let below_short_guard_cols = full_boundary_cols - short_boundary_cols + 1;
+
+    let render = |cols, guard, arm_notice| {
+        scroll_notice_fixture_render(
+            SCROLL_SEAM_ROWS,
+            cols,
+            guard,
+            UiMode::PaneInput,
+            CommandBannerVisibility::Hidden,
+            now,
+            arm_notice,
+        )
+    };
+    ScrollNoticeRenderTierObservation {
+        full_boundary_render: render(full_boundary_cols, 0, true),
+        below_full_boundary_render: render(full_boundary_cols - 1, 0, true),
+        short_boundary_render: render(short_boundary_cols, 0, true),
+        below_short_boundary_render: render(short_boundary_cols - 1, below_short_guard_cols, true),
+        below_short_control_render: render(short_boundary_cols - 1, below_short_guard_cols, false),
+    }
+}
+
+fn observe_scroll_notice_banner_precedence(
+    now: std::time::Instant,
+) -> ScrollNoticeBannerPrecedenceObservation {
+    // Two inner rows select the command banner's single-line tier, putting both
+    // announcements on exactly the same row. The notice is wider, so drawing it
+    // last must replace the banner completely rather than leave interleaved text.
+    ScrollNoticeBannerPrecedenceObservation {
+        render: scroll_notice_fixture_render(
+            2,
+            80,
+            0,
+            UiMode::Normal,
+            CommandBannerVisibility::Expanded,
+            now,
+            true,
+        ),
+        block_render: scroll_notice_fixture_render(
+            7,
+            80,
+            0,
+            UiMode::Normal,
+            CommandBannerVisibility::Expanded,
+            now,
+            true,
+        ),
+    }
+}
+
+fn observe_scroll_notice_pane_affinity(
+    now: std::time::Instant,
+) -> ScrollNoticePaneAffinityObservation {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    const COLS: u16 = 80;
+    let pane_output = synthetic_decstbm_repaint_stream(SCROLL_SEAM_ROWS, COLS);
+    let (ctrl, _first_child_input, _) =
+        scroll_seam_pane_with_size(false, 0, &pane_output, SCROLL_SEAM_ROWS, COLS);
+    let _second_child_input = ctrl.add_scroll_seam_pane(
+        RECONCILE_SEAM_SECOND_PANE_ID,
+        SCROLL_SEAM_ROWS,
+        COLS,
+        &pane_output,
+    );
+    scroll_focused_agent_pane(
+        &ctrl,
+        SCROLL_SEAM_PANE_ID,
+        UiMode::PaneInput,
+        true,
+        3,
+        1,
+        now,
+    );
+    focus_reconcile_seam_pane(&ctrl, ReconcileSeamPane::Second);
+    assert_eq!(
+        ctrl.focused_pane_id().as_deref(),
+        Some(RECONCILE_SEAM_SECOND_PANE_ID),
+        "the affinity seam must move production focus to its second pane"
+    );
+
+    let pane_width = COLS + 2;
+    let pane_height = SCROLL_SEAM_ROWS + 2;
+    let backend = TestBackend::new(pane_width, pane_height * 2);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            render_terminal_panes(
+                frame,
+                Some(&ctrl),
+                frame.area(),
+                &[
+                    SCROLL_SEAM_PANE_ID.to_string(),
+                    RECONCILE_SEAM_SECOND_PANE_ID.to_string(),
+                ],
+                PaneLayout::Tiled,
+                &HashMap::new(),
+                &HashMap::new(),
+                &None,
+                None,
+                UiMode::PaneInput,
+                CommandBannerVisibility::Hidden,
+                None,
+                now,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+
+    ScrollNoticePaneAffinityObservation {
+        render: terminal.backend().buffer().clone(),
+        first_pane_rect: Rect::new(0, 0, pane_width, pane_height),
+        second_pane_rect: Rect::new(0, pane_height, pane_width, pane_height),
+    }
+}
+
+fn observe_scroll_notice_key(key: KeyEvent) -> (bool, bool, Vec<u8>, UiMode) {
+    let pane_output = synthetic_decstbm_repaint_stream(SCROLL_SEAM_ROWS, SCROLL_SEAM_COLS);
+    let (ctrl, mut child_input, _) = scroll_seam_pane(false, 0, &pane_output);
+    let ctrl = Arc::new(ctrl);
+    let now = std::time::Instant::now();
+    scroll_focused_agent_pane(
+        &ctrl,
+        SCROLL_SEAM_PANE_ID,
+        UiMode::PaneInput,
+        true,
+        3,
+        2,
+        now,
+    );
+    let visible_before = buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+        &ctrl,
+        UiMode::PaneInput,
+        now,
+    ));
+
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    ui.mode = UiMode::PaneInput;
+    let mut tab_manager = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let snapshot = AppState::default();
+    let filtered: Vec<(&String, &SessionState)> = Vec::new();
+    let _ = handle_key_event(
+        key,
+        &mut ui,
+        &*ctrl,
+        &state,
+        &mut tab_manager,
+        &snapshot,
+        &filtered,
+        Rect::new(0, 0, SCROLL_SEAM_COLS + 2, SCROLL_SEAM_ROWS + 2),
+    );
+    let after_key = std::time::Instant::now();
+    let visible_after = buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+        &ctrl, ui.mode, after_key,
+    ));
+    (
+        visible_before,
+        visible_after,
+        child_input.drain_bytes(),
+        ui.mode,
+    )
+}
+
+/// Drive the production wheel, pane renderer, and complete key dispatcher while
+/// injecting frame instants at both expiry edges. No notice state is reproduced
+/// in this seam: every visibility observation reads the real production
+/// renderer's output, so a seam that quietly stopped exercising the feature
+/// would report it missing rather than pass against a reimplementation of it.
+#[doc(hidden)]
+pub fn observe_scroll_notice_lifecycle(
+    epoch: std::time::Instant,
+) -> ScrollNoticeLifecycleObservation {
+    let pane_output = synthetic_decstbm_repaint_stream(SCROLL_SEAM_ROWS, SCROLL_SEAM_COLS);
+    let (ctrl, _child_input, _) = scroll_seam_pane(false, 0, &pane_output);
+
+    scroll_focused_agent_pane(
+        &ctrl,
+        SCROLL_SEAM_PANE_ID,
+        UiMode::PaneInput,
+        true,
+        3,
+        2,
+        epoch,
+    );
+    let first_render = render_scroll_seam_pane_to_buffer(&ctrl, UiMode::PaneInput, epoch);
+    let visible_after_first_scroll = buffer_contains_scroll_notice(&first_render);
+    let visible_just_before_expiry =
+        buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+            &ctrl,
+            UiMode::PaneInput,
+            epoch + COMMAND_BANNER_TTL - std::time::Duration::from_nanos(1),
+        ));
+    let visible_at_expiry = buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+        &ctrl,
+        UiMode::PaneInput,
+        epoch + COMMAND_BANNER_TTL,
+    ));
+
+    let (repeat_ctrl, _repeat_child_input, _) = scroll_seam_pane(false, 0, &pane_output);
+    scroll_focused_agent_pane(
+        &repeat_ctrl,
+        SCROLL_SEAM_PANE_ID,
+        UiMode::PaneInput,
+        true,
+        3,
+        2,
+        epoch,
+    );
+    let repeat_at = epoch + COMMAND_BANNER_TTL / 2;
+    let visible_before_repeat = buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+        &repeat_ctrl,
+        UiMode::PaneInput,
+        repeat_at,
+    ));
+    scroll_focused_agent_pane(
+        &repeat_ctrl,
+        SCROLL_SEAM_PANE_ID,
+        UiMode::PaneInput,
+        true,
+        3,
+        2,
+        repeat_at,
+    );
+    let repeated_render =
+        render_scroll_seam_pane_to_buffer(&repeat_ctrl, UiMode::PaneInput, repeat_at);
+    let visible_after_repeat = buffer_contains_scroll_notice(&repeated_render);
+    let visible_at_original_expiry =
+        buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+            &repeat_ctrl,
+            UiMode::PaneInput,
+            epoch + COMMAND_BANNER_TTL,
+        ));
+    let visible_at_refreshed_expiry =
+        buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+            &repeat_ctrl,
+            UiMode::PaneInput,
+            repeat_at + COMMAND_BANNER_TTL,
+        ));
+
+    let (
+        visible_before_unbound_key,
+        visible_after_unbound_key,
+        unbound_key_forwarded_bytes,
+        unbound_mode_after_key,
+    ) = observe_scroll_notice_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    let (
+        visible_before_bound_key,
+        visible_after_bound_key,
+        bound_key_forwarded_bytes,
+        bound_mode_after_key,
+    ) = observe_scroll_notice_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    let render_tiers = observe_scroll_notice_render_tiers(epoch);
+    let banner_precedence = observe_scroll_notice_banner_precedence(epoch);
+    let pane_affinity = observe_scroll_notice_pane_affinity(epoch);
+
+    ScrollNoticeLifecycleObservation {
+        first_render,
+        repeated_render,
+        render_tiers,
+        banner_precedence,
+        pane_affinity,
+        visible_after_first_scroll,
+        visible_just_before_expiry,
+        visible_at_expiry,
+        visible_before_repeat,
+        visible_after_repeat,
+        visible_at_original_expiry,
+        visible_at_refreshed_expiry,
+        visible_before_unbound_key,
+        visible_after_unbound_key,
+        unbound_key_forwarded_bytes,
+        unbound_mode_after_key,
+        visible_before_bound_key,
+        visible_after_bound_key,
+        bound_key_forwarded_bytes,
+        bound_mode_after_key,
     }
 }
 
@@ -17005,7 +20474,8 @@ pub fn observe_pane_input_scrollback_reconcile(
 ) -> PaneInputScrollbackObservation {
     // Pane one is the M5 fixture verbatim — same history, same inert backend, parked
     // at live output. Pane two is the same fixture pane, added unfocused.
-    let (ctrl, _first_child_input, _) = scroll_seam_pane(false, 0);
+    let history = scroll_seam_history();
+    let (ctrl, _first_child_input, _) = scroll_seam_pane(false, 0, history.as_bytes());
     let _second_child_input = ctrl.add_scroll_seam_pane(
         RECONCILE_SEAM_SECOND_PANE_ID,
         SCROLL_SEAM_ROWS,
@@ -17283,11 +20753,14 @@ pub fn render_rename_bar_to_buffer(rename_text: &str, width: u16) -> ratatui::bu
 /// rendered cells (e.g. the presence of a `[×]` close glyph on Mode /
 /// Orchestration tabs and its absence on the Dashboard tab) without a PTY.
 /// `closeable[i]` marks whether tab `i` carries a close affordance.
+/// `orchestration_statuses[i]` is `Some(pane statuses)` for an orchestration
+/// tab (PRD #333) or `None` for a tab this feature doesn't touch.
 pub fn render_tab_bar_to_buffer(
     labels: &[&str],
     closeable: &[bool],
     active_index: usize,
     width: u16,
+    orchestration_statuses: &[Option<&[SessionStatus]>],
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -17303,7 +20776,14 @@ pub fn render_tab_bar_to_buffer(
                 width,
                 height: 1,
             };
-            render_tab_strip(frame, area, &owned, closeable, active_index);
+            render_tab_strip(
+                frame,
+                area,
+                &owned,
+                closeable,
+                active_index,
+                orchestration_statuses,
+            );
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -17373,6 +20853,7 @@ pub fn render_new_pane_form_to_buffer(
     let modes: Vec<ModeConfig> = mode_names
         .iter()
         .map(|n| ModeConfig {
+            agent: None,
             name: (*n).to_string(),
             init_command: None,
             seed_prompt: None,
@@ -17401,10 +20882,10 @@ pub fn render_new_pane_form_to_buffer(
 /// Drives the production `render_new_pane_form` through a `TestBackend`, so the
 /// warning decision it exercises is literally the one the interactive `Ctrl+n`
 /// flow runs ([`live_orchestration_in_same_cwd`], fed there by
-/// [`live_orchestration_cwds`] instead of this parameter). A `form_cwd` present
-/// in the list renders [`SAME_CWD_ORCHESTRATION_WARNING`]; a fresh one renders
-/// the form unchanged. Either way the `[Submit]` action stays — the warning
-/// never blocks. Mirrors [`render_new_pane_form_to_buffer`].
+/// [`live_orchestration_cwds_and_titles`] instead of this parameter). A
+/// `form_cwd` present in the list renders [`SAME_CWD_ORCHESTRATION_WARNING`]; a
+/// fresh one renders the form unchanged. Either way the `[Submit]` action stays
+/// — the warning never blocks. Mirrors [`render_new_pane_form_to_buffer`].
 pub fn render_new_pane_orchestration_guard_to_buffer(
     form_cwd: &str,
     live_orchestration_cwds: &[&str],
@@ -17412,8 +20893,10 @@ pub fn render_new_pane_orchestration_guard_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     let orchestrations = vec![OrchestrationConfig {
+        default: false,
         name: "tdd-cycle".to_string(),
         roles: vec![crate::project_config::OrchestrationRoleConfig {
+            agent: None,
             name: "orchestrator".to_string(),
             command: "claude".to_string(),
             start: true,
@@ -17437,6 +20920,55 @@ pub fn render_new_pane_orchestration_guard_to_buffer(
     );
     // Select the single orchestration option (index 0 is "No mode"; there are no
     // plain modes) — the state the guard applies to.
+    form.selection_index = 1;
+    render_overlay_to_buffer(width, height, |frame| {
+        render_new_pane_form(frame, &form);
+    })
+}
+
+/// L1 seam: render the new-pane form with an ORCHESTRATION
+/// selected and its Name field set to `typed_name`, against the
+/// `live_orchestration_names` the daemon reports as already held by a live
+/// orchestration. Sibling of [`render_new_pane_orchestration_guard_to_buffer`]
+/// on the SAME guard seam — unlike that one's non-blocking same-cwd warning,
+/// a name collision here BLOCKS: the rendered form drops `[Submit]` from the
+/// action row entirely (see [`NewPaneFormState::name_collision`]). A distinct
+/// `typed_name` renders the form normally, `[Submit]` intact.
+pub fn render_new_pane_orchestration_name_collision_to_buffer(
+    typed_name: &str,
+    live_orchestration_names: &[&str],
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    let orchestrations = vec![OrchestrationConfig {
+        default: false,
+        name: "tdd-cycle".to_string(),
+        roles: vec![crate::project_config::OrchestrationRoleConfig {
+            agent: None,
+            name: "orchestrator".to_string(),
+            command: "claude".to_string(),
+            start: true,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        }],
+    }];
+    let mut form = NewPaneFormState::new(
+        std::path::PathBuf::from("/work/collision-check"),
+        typed_name.to_string(),
+        "mycmd".to_string(),
+        Vec::new(),
+        orchestrations,
+    )
+    .with_live_orchestration_names(
+        live_orchestration_names
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect(),
+    );
+    // Select the single orchestration option directly (bypassing
+    // `select_next_mode`'s auto-suggest) so `typed_name` renders exactly as
+    // given — the state the guard applies to.
     form.selection_index = 1;
     render_overlay_to_buffer(width, height, |frame| {
         render_new_pane_form(frame, &form);
@@ -17479,6 +21011,7 @@ pub fn render_new_pane_form_schedule_to_buffer(
 mod tests {
     use super::*;
     use crate::event::{AgentEvent, AgentType, EventType};
+    use crate::orchestrator_context::build_orchestrator_context;
     use crate::project_config::OrchestrationRoleConfig;
     use chrono::{Duration, Utc};
     use ratatui::Terminal;
@@ -17696,8 +21229,14 @@ mod tests {
         // 100 * 66 / 100 = 66; cols = 64. Critical assertion: cols = 64,
         // NOT 65 (which is what `dashboard_pane_dims` would return for
         // the same input). The 1-col gap is exactly the F3 drift bug.
-        let (rows, cols) =
-            orchestration_role_pane_dims(Rect::new(0, 0, 100, 30), 2, 0, PaneLayout::Tiled, false);
+        let (rows, cols) = orchestration_role_pane_dims(
+            Rect::new(0, 0, 100, 30),
+            2,
+            0,
+            PaneLayout::Tiled,
+            false,
+            false,
+        );
         assert_eq!((rows, cols), (12, 64));
     }
 
@@ -17710,7 +21249,7 @@ mod tests {
         // re-introduces the F3 spawn-vs-render drift.
         let area = Rect::new(0, 0, 200, 50);
         let (_rows, helper_cols) =
-            orchestration_role_pane_dims(area, 3, 0, PaneLayout::Tiled, false);
+            orchestration_role_pane_dims(area, 3, 0, PaneLayout::Tiled, false, false);
         // Inner cols = right-column width - 2 (pane borders).
         let renderer_cols = (area.width * ORCHESTRATION_PANES_PERCENT / 100).saturating_sub(2);
         assert_eq!(helper_cols, renderer_cols);
@@ -17724,10 +21263,10 @@ mod tests {
     fn orchestration_role_pane_dims_tiled_divides_height_equally() {
         // 4 roles, Tiled: every role_index returns the same dims.
         let area = Rect::new(0, 0, 100, 30);
-        let r0 = orchestration_role_pane_dims(area, 4, 0, PaneLayout::Tiled, true);
-        let r1 = orchestration_role_pane_dims(area, 4, 1, PaneLayout::Tiled, true);
-        let r2 = orchestration_role_pane_dims(area, 4, 2, PaneLayout::Tiled, true);
-        let r3 = orchestration_role_pane_dims(area, 4, 3, PaneLayout::Tiled, true);
+        let r0 = orchestration_role_pane_dims(area, 4, 0, PaneLayout::Tiled, true, false);
+        let r1 = orchestration_role_pane_dims(area, 4, 1, PaneLayout::Tiled, true, false);
+        let r2 = orchestration_role_pane_dims(area, 4, 2, PaneLayout::Tiled, true, false);
+        let r3 = orchestration_role_pane_dims(area, 4, 3, PaneLayout::Tiled, true, false);
         assert_eq!(r0, r1);
         assert_eq!(r1, r2);
         assert_eq!(r2, r3);
@@ -17743,9 +21282,9 @@ mod tests {
         // resize callers gate on (`rows > 0` skips the resize).
         let area = Rect::new(0, 0, 100, 30);
         let (rows_focused, _) =
-            orchestration_role_pane_dims(area, 3, 0, PaneLayout::Stacked, false);
+            orchestration_role_pane_dims(area, 3, 0, PaneLayout::Stacked, false, false);
         let (rows_unfocused, _) =
-            orchestration_role_pane_dims(area, 3, 1, PaneLayout::Stacked, false);
+            orchestration_role_pane_dims(area, 3, 1, PaneLayout::Stacked, false, false);
         assert!(rows_focused > rows_unfocused);
         assert_eq!(rows_unfocused, 0);
     }
@@ -17769,8 +21308,14 @@ mod tests {
         let chrome_rows: u16 = 1; // hints bar; no tab bar in this test
         let main_height = area.height.saturating_sub(chrome_rows);
         let expanded_inner = main_height.saturating_sub(2);
-        let (helper_rows, _) =
-            orchestration_role_pane_dims(area, role_count as usize, 0, PaneLayout::Stacked, false);
+        let (helper_rows, _) = orchestration_role_pane_dims(
+            area,
+            role_count as usize,
+            0,
+            PaneLayout::Stacked,
+            false,
+            false,
+        );
         assert_eq!(helper_rows, expanded_inner);
     }
 
@@ -17778,8 +21323,14 @@ mod tests {
     fn orchestration_role_pane_dims_zero_role_count_does_not_divide_by_zero() {
         // Defensive: role_count = 0 (transient state during a tab
         // teardown). Clamp to 1 so the helper returns a sane value.
-        let (rows, cols) =
-            orchestration_role_pane_dims(Rect::new(0, 0, 100, 30), 0, 0, PaneLayout::Tiled, false);
+        let (rows, cols) = orchestration_role_pane_dims(
+            Rect::new(0, 0, 100, 30),
+            0,
+            0,
+            PaneLayout::Tiled,
+            false,
+            false,
+        );
         // main_height = 29, count = 1, chunk = 29, rows = 27.
         // right_width = 66, cols = 64.
         assert_eq!((rows, cols), (27, 64));
@@ -17803,6 +21354,7 @@ mod tests {
             show: true,
             labels: vec!["Dashboard".into(), "Mode".into()],
             active_index: 0,
+            orchestration_statuses: vec![],
         };
         let pane_ids = vec!["p0".to_string(), "p1".to_string()];
         // A 1-row bottom bar (this fixture exercises the split math, not the
@@ -17868,6 +21420,7 @@ mod tests {
             show: true,
             labels: vec!["Dashboard".into(), "demo".into()],
             active_index: 1,
+            orchestration_statuses: vec![],
         };
         let layout = compute_frame_layout(
             frame_area,
@@ -17945,11 +21498,13 @@ mod tests {
 
         let tab_view = ActiveTabView::Orchestration {
             role_pane_ids: pane_ids.clone(),
+            split_narrow: false,
         };
         let tab_bar = TabBarInfo {
             show: true,
             labels: vec!["seven-roles".into()],
             active_index: 0,
+            orchestration_statuses: vec![Some(vec![])],
         };
 
         let mut expanded_rect: Option<Rect> = None;
@@ -18014,6 +21569,413 @@ mod tests {
                 "non-focused role pane {id} must not render a collapsed title \
                  frame in PaneLayout::Stacked:\n{rendered}"
             );
+        }
+    }
+
+    /// Build the orchestration render snapshot for `role_pane_ids` at a given
+    /// split state, then return `compute_frame_layout`'s resolved
+    /// `(sidebar_width, pane_column_width)`. PRD #336: the split now travels on
+    /// `ActiveTabView::Orchestration`, so a test can pin the geometry for a
+    /// given toggle state with no shared state to set up or reset.
+    fn orch_split_widths(frame_area: Rect, role_pane_ids: &[String], narrow: bool) -> (u16, u16) {
+        let tab_view = ActiveTabView::Orchestration {
+            role_pane_ids: role_pane_ids.to_vec(),
+            split_narrow: narrow,
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Orchestration".into()],
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+        let layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            role_pane_ids,
+            PaneLayout::Tiled,
+            None,
+            1,
+        );
+        let FrameContent::Cards {
+            dashboard_area,
+            panes_area,
+            ..
+        } = layout.content
+        else {
+            panic!("Orchestration tab must produce FrameContent::Cards");
+        };
+        (
+            dashboard_area.width,
+            panes_area.expect("role panes => a right column").width,
+        )
+    }
+
+    /// Scenario: PRD #336 — `Ctrl+l` must resolve to `ToggleOrchestrationSplit`
+    /// through `key_action_for_mode` (the public L1 seam over the same mode-aware
+    /// resolver chain the event loop runs; the tab-scoping that narrows this
+    /// action is a separate step, covered by `orchestration/layout/005`), and an
+    /// orchestration tab's frame geometry must be
+    /// the default 34/66 split untoggled and the narrower-sidebar 25/75 split
+    /// toggled. Drives `compute_frame_layout`, the single per-frame layout pass
+    /// that both `render_frame` and the pre-draw PTY-resize pass read, so the
+    /// rendered columns and the role panes' PTY widths are pinned together.
+    #[spec("orchestration/layout/003")]
+    #[test]
+    fn orchestration_layout_003_ctrl_l_toggles_orchestration_split_narrow() {
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let role_pane_ids = vec!["r0".to_string(), "r1".to_string()];
+
+        // The chord resolves to the split-toggle action specifically — not just
+        // to "some action", which would still pass if the resolver were wired
+        // to the wrong variant or the ACTIONS entry were dropped. (`Action`
+        // derives no `PartialEq`, hence `matches!` rather than `assert_eq!`.)
+        let kb = KeybindingConfig::default();
+        let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        let resolved = key_action_for_mode(&kb, UiMode::Normal, &ctrl_l);
+        assert!(
+            matches!(resolved, Some(Action::ToggleOrchestrationSplit)),
+            "default Ctrl+l must resolve to Action::ToggleOrchestrationSplit, got {resolved:?}"
+        );
+
+        // Untoggled: today's fixed default, 34% sidebar / 66% pane column.
+        assert_eq!(
+            orch_split_widths(frame_area, &role_pane_ids, false),
+            (34, 66),
+            "an untoggled orchestration tab must use the 34/66 default split"
+        );
+
+        // Toggled: the sidebar narrows and the pane column widens.
+        assert_eq!(
+            orch_split_widths(frame_area, &role_pane_ids, true),
+            (25, 75),
+            "a toggled orchestration tab must use the narrower-sidebar 25/75 split"
+        );
+    }
+
+    /// Scenario: PRD #336 (post-review inversion) — the split is GLOBAL, not
+    /// per-tab. Open a single orchestration tab A, dispatch the real
+    /// `Action::ToggleOrchestrationSplit` against it, then open a second
+    /// orchestration tab B afterward: B must come up already narrow, adopting
+    /// the current global split rather than resetting to the 34/66 default.
+    /// Toggling again from B (now active) must flip A's flag too — the split
+    /// is one shared value observable from either tab, in either direction —
+    /// and a further toggle from A confirms the same holds switching back.
+    /// Also asserts the dispatch is a no-op on a non-orchestration tab, so the
+    /// action cannot mutate unrelated tab state.
+    #[spec("orchestration/layout/004")]
+    #[test]
+    fn orchestration_layout_004_orchestration_split_is_global_and_round_trips() {
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let frame_area = Rect::new(0, 0, 200, 50);
+
+        let toggle = |tm: &mut TabManager, ui: &mut UiState| {
+            dispatch_action(
+                Action::ToggleOrchestrationSplit,
+                ui,
+                pc.as_ref(),
+                &state,
+                tm,
+                &snapshot,
+                &[],
+                None,
+                frame_area,
+            );
+        };
+
+        // On the Dashboard (the only tab so far) the action must do nothing.
+        toggle(&mut tm, &mut ui);
+        assert!(
+            matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "dispatch must not disturb the Dashboard tab"
+        );
+
+        let cfg = |name: &str| OrchestrationConfig {
+            default: false,
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        };
+
+        let split_of = |tm: &TabManager, idx: usize| match &tm.tabs()[idx] {
+            Tab::Orchestration { split_narrow, .. } => *split_narrow,
+            _ => panic!("tab {idx} should be an orchestration tab"),
+        };
+
+        // Open tab A alone, at the default split, and toggle it narrow.
+        tm.open_orchestration_tab(
+            &cfg("tab-a"),
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab");
+        assert!(!split_of(&tm, 1), "tab A must start at the default split");
+
+        toggle(&mut tm, &mut ui);
+        assert!(split_of(&tm, 1), "tab A must be narrow after one toggle");
+
+        // Open tab B AFTER the toggle: it must adopt the current GLOBAL split
+        // (narrow), not reset to the old per-tab 34/66 default.
+        tm.open_orchestration_tab(
+            &cfg("tab-b"),
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab");
+        assert!(
+            split_of(&tm, 2),
+            "a newly opened orchestration tab must adopt the current GLOBAL \
+             split, not reset to the 34/66 default"
+        );
+
+        // B is now active (most recently opened). Toggling from B must flip
+        // BOTH tabs back to the default — the split is a single global value,
+        // not per-tab.
+        toggle(&mut tm, &mut ui);
+        assert!(!split_of(&tm, 2), "tab B must round-trip to the default");
+        assert!(
+            !split_of(&tm, 1),
+            "toggling from tab B must ALSO flip tab A — the split is global"
+        );
+
+        // Switch back to A and toggle again: the effect must be observable on
+        // B too, proving the global scope holds in either direction.
+        tm.switch_to(1);
+        toggle(&mut tm, &mut ui);
+        assert!(
+            split_of(&tm, 1),
+            "tab A must be narrow after toggling from A"
+        );
+        assert!(
+            split_of(&tm, 2),
+            "toggling from tab A must ALSO flip tab B — the split is global"
+        );
+    }
+
+    /// Scenario: PRD #336 gap-fill — `orchestration/layout/004` pins that the
+    /// GLOBAL split flag propagates to a newly opened tab's `split_narrow`
+    /// mirror field, but its own "Does not assert" line explicitly leaves
+    /// spawn-time PTY dims uncovered. This test dispatches the REAL
+    /// `Action::SpawnPane` (the production new-tab-open path inside
+    /// `dispatch_action`, not `TabManager::open_orchestration_tab` called
+    /// directly) so the exact branch that computes `spawn_dims` from
+    /// `tab_manager.orchestration_split_narrow()` runs. Open tab A at the
+    /// default split, toggle the global narrow FROM tab A (the only way a
+    /// real user reaches the narrow state — `Ctrl+l` only resolves on an
+    /// active orchestration tab, `orchestration/layout/005`), then open tab B
+    /// while the global is ALREADY narrow: tab B's role panes must be spawned
+    /// at the 75%-width narrow column (73 inner cols on this 100-wide frame),
+    /// not the 66%-width default (64 cols) that a hardcoded `false` at the
+    /// spawn call site would still produce. Before PR #342's fix, a role PTY
+    /// opened while the deck was already narrow opened at 64 cols and only
+    /// reflowed to 73 on the first frame.
+    #[spec("orchestration/layout/006")]
+    #[test]
+    fn orchestration_layout_006_spawn_dims_honor_the_global_split_when_already_narrow() {
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        // 100-wide frame: default 66% split -> 64 inner cols; narrow 75%
+        // split -> 73 inner cols (`right_column_pane_dims`:
+        // width * percent / 100 - 2 for the pane border).
+        let frame_area = Rect::new(0, 0, 100, 40);
+
+        let cfg = |name: &str| OrchestrationConfig {
+            default: false,
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        };
+
+        let open = |tm: &mut TabManager, ui: &mut UiState, name: &str| {
+            let req = NewPaneRequest {
+                dir: tmp.path().to_path_buf(),
+                name: name.to_string(),
+                command: String::new(),
+                mode_config: None,
+                orchestration_config: Some(cfg(name)),
+                seed_prompt: None,
+            };
+            let _ = dispatch_action(
+                Action::SpawnPane(Box::new(req)),
+                ui,
+                pc.as_ref(),
+                &state,
+                tm,
+                &snapshot,
+                &[],
+                None,
+                frame_area,
+            );
+        };
+
+        // Open tab A at the default (unnarrowed) split.
+        open(&mut tm, &mut ui, "tab-a");
+        assert!(
+            matches!(tm.active_tab(), Tab::Orchestration { .. }),
+            "opening tab A must land on an orchestration tab"
+        );
+
+        // Toggle the global narrow FROM tab A.
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationSplit,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            tm.orchestration_split_narrow(),
+            "the global split must be narrow after one toggle from an orchestration tab"
+        );
+
+        // Open tab B while the global is ALREADY narrow — this is the gap:
+        // pre-fix, the new-tab-open branch hardcoded `false` here regardless
+        // of the live global.
+        let spawned_before_b = pc.recorded_spawn_dims().len();
+        open(&mut tm, &mut ui, "tab-b");
+        let dims_after = pc.recorded_spawn_dims();
+        let b_dims = &dims_after[spawned_before_b..];
+        assert_eq!(
+            b_dims.len(),
+            2,
+            "tab B has 2 roles, so exactly 2 new spawns must be recorded"
+        );
+        for (role_index, (_rows, cols)) in b_dims.iter().enumerate() {
+            assert_eq!(
+                *cols, 73,
+                "role {role_index} of a tab opened while the global split is \
+                 narrow must spawn its PTY at the 75%-width column (73 cols \
+                 on this 100-wide frame), not the 66%-width default (64 \
+                 cols) — a role pane opened while narrow must not start too \
+                 wide and only reflow on the first frame"
+            );
+        }
+    }
+
+    /// Scenario: PRD #336 — `scope_orchestration_split` is the guard that keeps
+    /// `Ctrl+l` from being swallowed anywhere it cannot act. It must claim
+    /// `ToggleOrchestrationSplit` ONLY on an orchestration tab in command mode,
+    /// and un-resolve it to `None` (so the key falls through to the pane-input
+    /// forwarding path) on any other tab and in any other mode — the
+    /// `close_pane` precedent from PRD #241 M1. Every other action must pass
+    /// through untouched for every tab/mode pair.
+    #[spec("orchestration/layout/005")]
+    #[test]
+    fn orchestration_layout_005_scope_orchestration_split_only_claims_ctrl_l_on_orchestration_tabs()
+    {
+        let split = || Some(Action::ToggleOrchestrationSplit);
+
+        // The ONLY combination that resolves: orchestration tab + command mode.
+        // (`Action` derives no `PartialEq`, so these assert on the variant.)
+        assert!(
+            matches!(
+                scope_orchestration_split(split(), true, UiMode::Normal),
+                Some(Action::ToggleOrchestrationSplit)
+            ),
+            "orchestration tab + command mode must claim the toggle"
+        );
+
+        // Wrong tab, any mode → un-resolved, so the chord reaches the PTY.
+        for mode in [UiMode::Normal, UiMode::PaneInput] {
+            assert!(
+                scope_orchestration_split(split(), false, mode).is_none(),
+                "off an orchestration tab the toggle must be un-resolved so \
+                 Ctrl+l reaches the focused pane's PTY ({mode:?})"
+            );
+        }
+
+        // Right tab, wrong mode → un-resolved. This is the `close_pane`
+        // precedent (PRD #241 M1): typing in a role pane, Ctrl+l is the
+        // agent's clear-screen, not a layout command.
+        for mode in [
+            UiMode::PaneInput,
+            UiMode::Filter,
+            UiMode::Help,
+            UiMode::NewPaneForm,
+        ] {
+            assert!(
+                scope_orchestration_split(split(), true, mode).is_none(),
+                "the toggle must be command-mode only; {mode:?} must un-resolve \
+                 it so the keystroke is not swallowed"
+            );
+        }
+
+        // Unrelated actions pass through untouched for every tab/mode pair —
+        // the guard must be surgical, not a general-purpose filter.
+        for is_orch in [false, true] {
+            for mode in [UiMode::Normal, UiMode::PaneInput] {
+                assert!(
+                    matches!(
+                        scope_orchestration_split(Some(Action::ToggleLayout), is_orch, mode),
+                        Some(Action::ToggleLayout)
+                    ),
+                    "ToggleLayout must survive (is_orch={is_orch}, {mode:?})"
+                );
+                assert!(
+                    matches!(
+                        scope_orchestration_split(Some(Action::DetachToNormal), is_orch, mode),
+                        Some(Action::DetachToNormal)
+                    ),
+                    "DetachToNormal must survive (is_orch={is_orch}, {mode:?})"
+                );
+                assert!(
+                    scope_orchestration_split(None, is_orch, mode).is_none(),
+                    "None stays None (is_orch={is_orch}, {mode:?})"
+                );
+            }
         }
     }
 
@@ -18897,6 +22859,7 @@ mod tests {
 
         fn mk_role(name: &str, start: bool) -> OrchestrationRoleConfig {
             OrchestrationRoleConfig {
+                agent: None,
                 name: name.to_string(),
                 command: String::new(),
                 start,
@@ -18908,6 +22871,7 @@ mod tests {
 
         let state = AppState::default();
         let cfg = OrchestrationConfig {
+            default: false,
             name: "tdd-cycle".into(),
             roles: vec![
                 mk_role("orch", true),
@@ -19493,9 +23457,11 @@ mod tests {
     fn local_config_enrichment_preserved_when_available() {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
         let local = OrchestrationConfig {
+            default: false,
             name: "review".into(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".into(),
                     command: "claude".into(),
                     start: true,
@@ -19504,6 +23470,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "reviewer".into(),
                     command: "claude --model sonnet".into(),
                     start: false,
@@ -19589,8 +23556,11 @@ mod tests {
     fn test_status_style() {
         // PRD #155: status colors now resolve through the centralized palette
         // (single source of truth). LOCKED mapping: Working=Green,
-        // Thinking=Blue, WaitingForInput=Yellow, Error=Red, Idle=DarkGray, with
-        // Compacting sharing the thinking/Blue role.
+        // Thinking=Blue, WaitingForInput=Magenta, Error=Red, Idle=DarkGray, with
+        // Compacting sharing the thinking/Blue role. Waiting left Yellow in
+        // issue #579 — 1.70:1 against a white terminal background, and 1.07:1
+        // once the BOLD below is rendered as the bright variant. The ratios
+        // themselves are asserted by `theme/contrast/002`.
         let (label, style) = status_style(&SessionStatus::Thinking);
         assert_eq!(label, "Thinking");
         assert_eq!(style.fg, Some(Color::Blue));
@@ -19601,7 +23571,7 @@ mod tests {
 
         let (label, style) = status_style(&SessionStatus::WaitingForInput);
         assert_eq!(label, "Needs Input");
-        assert_eq!(style.fg, Some(Color::Yellow));
+        assert_eq!(style.fg, Some(Color::Magenta));
 
         let (label, style) = status_style(&SessionStatus::Idle);
         assert_eq!(label, "Idle");
@@ -19689,6 +23659,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
+                    orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -19778,6 +23749,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
+                    orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -19854,6 +23826,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -19916,6 +23889,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
+                    orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -19948,9 +23922,11 @@ mod tests {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
 
         let config = OrchestrationConfig {
+            default: false,
             name: "code-review".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "claude".to_string(),
                     start: true,
@@ -19959,6 +23935,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -19967,6 +23944,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "reviewer".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -19988,7 +23966,10 @@ mod tests {
         assert!(!content.contains("**orchestrator**"));
         // Contains delegation protocol.
         assert!(content.contains("Delegation protocol"));
-        assert!(content.contains("dot-agent-deck work-done"));
+        assert!(content.contains(&format!(
+            "{} work-done",
+            crate::platform::paths::binary_name()
+        )));
         // Issue #303: the protocol advertises the shell-safe input path, says
         // when it is required, and explains why — an orchestrator told only
         // "use --task-file" without the reason drifts back to `--task`.
@@ -20113,9 +24094,11 @@ mod tests {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
 
         let config = OrchestrationConfig {
+            default: false,
             name: "test".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "lead".to_string(),
                     command: "claude".to_string(),
                     start: true,
@@ -20124,6 +24107,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -20145,9 +24129,11 @@ mod tests {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
 
         let config = OrchestrationConfig {
+            default: false,
             name: "test".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "lead".to_string(),
                     command: "claude".to_string(),
                     start: true,
@@ -20156,6 +24142,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -20168,7 +24155,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
-        let prompt = prepare_orchestrator_prompt(&config, cwd);
+        let prompt = prepare_orchestrator_prompt(&config, cwd, None);
         assert!(prompt.is_some());
         let prompt = prompt.unwrap();
         // One-liner referencing the file.
@@ -20263,6 +24250,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
+                    orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -20355,6 +24343,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
+                    orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -20422,6 +24411,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
+                    orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -21691,6 +25681,7 @@ mod tests {
     /// Mirrors the verified helper in `tab.rs`'s test module (private there).
     fn mode_config_local(name: &str, side_pane_count: usize) -> ModeConfig {
         ModeConfig {
+            agent: None,
             name: name.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -22343,6 +26334,7 @@ mod tests {
             pane_id: Some(pane.to_string()),
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -22375,9 +26367,11 @@ mod tests {
     /// exercised. Mirrors the verified helper in `tab.rs`'s test module.
     fn orch_config_local(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "echo orch".to_string(),
                     start: true,
@@ -22386,6 +26380,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "echo coder".to_string(),
                     start: false,
@@ -23160,9 +27155,11 @@ mod tests {
         // valid role index — otherwise `dashboard_focus_target`'s clamp to
         // `role_count - 1` would mask the leak by coincidentally yielding 1.
         let three_role_orch = OrchestrationConfig {
+            default: false,
             name: "orch".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "echo orch".to_string(),
                     start: true,
@@ -23171,6 +27168,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "echo coder".to_string(),
                     start: false,
@@ -23179,6 +27177,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "reviewer".to_string(),
                     command: "echo reviewer".to_string(),
                     start: false,
@@ -23263,6 +27262,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         }
     }
 
@@ -23376,47 +27376,173 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn test_choose_density() {
-        // Spacious=10, Normal=8, Compact=5
+    fn choose_grid_layout_density_ladder() {
+        // Spacious=10, Normal=8, Compact=5. Widths pick the starting column
+        // count: <100 -> 1, >=100 -> 2 (see `grid_columns`).
 
-        // 1 session, 1 col, plenty of height -> Spacious
-        assert_eq!(choose_density(1, 1, 20), CardDensity::Spacious);
+        // 1 card, 1 col, plenty of height -> Spacious
+        assert_eq!(
+            choose_grid_layout(1, 90, 20),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Spacious
+            }
+        );
 
-        // 2 sessions, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(2, 2, 10), CardDensity::Spacious);
+        // 2 cards, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
+        assert_eq!(
+            choose_grid_layout(2, 100, 10),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Spacious
+            }
+        );
 
-        // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
-        assert_eq!(choose_density(2, 2, 9), CardDensity::Normal);
+        // 2 cards, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
+        assert_eq!(
+            choose_grid_layout(2, 100, 9),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Normal
+            }
+        );
 
-        // 4 sessions, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
-        assert_eq!(choose_density(4, 2, 16), CardDensity::Normal);
+        // 4 cards, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
+        assert_eq!(
+            choose_grid_layout(4, 100, 16),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Normal
+            }
+        );
 
-        // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*5=10 fits)
-        assert_eq!(choose_density(4, 2, 15), CardDensity::Compact);
+        // 4 cards, 2 cols = 2 rows, height 15 -> Compact (2*5=10 fits)
+        assert_eq!(
+            choose_grid_layout(4, 100, 15),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Compact
+            }
+        );
 
-        // Many sessions, small screen -> Compact
-        assert_eq!(choose_density(10, 1, 20), CardDensity::Compact);
-
-        // Edge: 0 sessions -> Spacious (0 rows needed)
-        assert_eq!(choose_density(0, 1, 10), CardDensity::Spacious);
+        // Edge: 0 cards -> Spacious (0 rows needed)
+        assert_eq!(
+            choose_grid_layout(0, 90, 10),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Spacious
+            }
+        );
     }
 
     #[test]
-    fn test_choose_density_boundaries() {
-        // Density is a function of card count, columns, and height only.
-        // Spacious=10, Normal=8, Compact=5.
+    fn choose_grid_layout_density_boundaries() {
+        // Density is a function of card count, columns, and height only once the
+        // column count is settled. Spacious=10, Normal=8, Compact=5.
 
-        // 1 session, height 11 -> Spacious (1*10=10)
-        assert_eq!(choose_density(1, 1, 11), CardDensity::Spacious);
+        // 1 card, height 11 -> Spacious (1*10=10)
+        assert_eq!(choose_grid_layout(1, 90, 11).density, CardDensity::Spacious);
 
-        // 1 session, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(1, 1, 10), CardDensity::Spacious);
+        // 1 card, height 10 -> Spacious (1*10=10)
+        assert_eq!(choose_grid_layout(1, 90, 10).density, CardDensity::Spacious);
 
-        // 2 sessions, 1 col, height 18 -> Normal (2*8=16)
-        assert_eq!(choose_density(2, 1, 18), CardDensity::Normal);
+        // 2 cards, 1 col, height 18 -> Normal (2*8=16)
+        assert_eq!(choose_grid_layout(2, 90, 18).density, CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 17 -> Normal (2*8=16)
-        assert_eq!(choose_density(2, 1, 17), CardDensity::Normal);
+        // 2 cards, 1 col, height 17 -> Normal (2*8=16)
+        assert_eq!(choose_grid_layout(2, 90, 17).density, CardDensity::Normal);
+    }
+
+    /// Issue #588: `MIN_CARD_W` may only ever *widen* the search. If the ceiling
+    /// it derives ever fell below `grid_columns`, a deck that fits today would
+    /// lose a column — the fix would have become a regression. Swept rather than
+    /// spot-checked because the two functions have unrelated shapes (a step
+    /// function against integer division) and cross wherever they like.
+    #[test]
+    fn max_columns_for_width_never_below_grid_columns() {
+        for width in 0u16..=400 {
+            assert!(
+                max_columns_for_width(width) >= grid_columns(width),
+                "width {width}: ceiling {} is below the historical column count {}",
+                max_columns_for_width(width),
+                grid_columns(width),
+            );
+        }
+    }
+
+    /// Issue #588's reported case and its neighbours. Seven roles on a
+    /// 90-column deck: one column needs 7*5 = 35 rows at the densest tier, two
+    /// columns need 7.div_ceil(2)*5 = 20.
+    #[test]
+    fn choose_grid_layout_widens_only_to_fit_every_card() {
+        // 35 rows available: one column already fits all seven, so nothing is
+        // spent. This is the property that keeps every existing layout intact.
+        assert_eq!(choose_grid_layout(7, 90, 35).cols, 1);
+
+        // 25 rows — the reported geometry. One column fits five of seven at
+        // Compact; a second column fits all seven with room to spare.
+        assert_eq!(
+            choose_grid_layout(7, 90, 25),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Compact
+            }
+        );
+
+        // 34 rows: one column misses Compact by a single row. The second column
+        // buys back enough height for Normal — the issue's open question
+        // answered as it suggests, richer cards over a narrower grid.
+        assert_eq!(
+            choose_grid_layout(7, 90, 34),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Normal
+            }
+        );
+
+        // 10 rows: two columns still need 20, and 90 columns allows no third at
+        // MIN_CARD_W. Nothing fits, so the deck keeps the column count it has
+        // always had and the caller signals the overflow instead.
+        assert_eq!(
+            choose_grid_layout(7, 90, 10),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Compact
+            }
+        );
+    }
+
+    /// A card is never narrowed past [`MIN_CARD_W`] in pursuit of completeness:
+    /// widening is only allowed while each resulting card still clears the floor.
+    /// The historical count is exempt — a terminal narrower than one whole card
+    /// still gets its single column.
+    #[test]
+    fn choose_grid_layout_respects_the_minimum_card_width() {
+        for width in [10u16, 39, 40, 79, 80, 90, 99, 100, 120, 179, 180, 240] {
+            // A card count no layout can fit, so the search runs to its ceiling.
+            let cols = choose_grid_layout(40, width, 12).cols;
+            assert!(
+                cols == grid_columns(width) || (cols as u16) * MIN_CARD_W <= width,
+                "width {width}: {cols} columns leaves each card under {MIN_CARD_W} columns",
+            );
+            // And the same for a count that fits only after widening.
+            let cols = choose_grid_layout(7, width, 25).cols;
+            assert!(
+                cols == grid_columns(width) || (cols as u16) * MIN_CARD_W <= width,
+                "width {width}: {cols} columns leaves each card under {MIN_CARD_W} columns",
+            );
+        }
+    }
+
+    /// The `(↑a ↓b)` indicator shared by the scheduled-tasks modal and the deck
+    /// title (issue #588). Silence means "everything is on screen" — the one
+    /// output that must not appear when anything is hidden.
+    #[test]
+    fn scroll_indicator_reports_only_what_is_hidden() {
+        assert_eq!(scroll_indicator(0, 0), "");
+        assert_eq!(scroll_indicator(12, 0), "  (\u{2191}12)");
+        assert_eq!(scroll_indicator(0, 34), "  (\u{2193}34)");
+        assert_eq!(scroll_indicator(12, 34), "  (\u{2191}12 \u{2193}34)");
     }
 
     /// Acceptance criterion 1: `card_height` is derived from rendered content,
@@ -23483,6 +27609,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
 
         // Spacious: get all 3
@@ -23517,6 +27644,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -23542,6 +27670,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -24329,24 +28458,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Idle ASCII art tests
-    // -----------------------------------------------------------------------
-
-    fn idle_art_config(enabled: bool, timeout_secs: u64) -> IdleArtConfig {
-        IdleArtConfig {
-            enabled,
-            provider: "anthropic".to_string(),
-            model: "claude-haiku-4-5".to_string(),
-            timeout_secs,
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // Unified NewPaneFormState tests
     // -----------------------------------------------------------------------
 
     fn make_mode(name: &str) -> ModeConfig {
         ModeConfig {
+            agent: None,
             name: name.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -24358,9 +28475,11 @@ mod tests {
 
     fn make_orchestration(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "claude".to_string(),
                     start: true,
@@ -24369,6 +28488,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "reviewer".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -24381,43 +28501,6 @@ mod tests {
     }
 
     #[test]
-    fn test_update_idle_art_gated_on_config_disabled() {
-        let mut cache = HashMap::new();
-        let config = idle_art_config(false, 10);
-        let mut sessions = HashMap::new();
-        let mut s = make_session(SessionStatus::Idle);
-        s.session_id = "s1".to_string();
-        s.last_activity = Utc::now() - Duration::seconds(100);
-        sessions.insert("s1".to_string(), s);
-
-        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
-        assert!(cache.is_empty(), "Should not create entries when disabled");
-    }
-
-    #[test]
-    fn test_update_idle_art_gated_on_density() {
-        let mut cache = HashMap::new();
-        let config = idle_art_config(true, 10);
-        let mut sessions = HashMap::new();
-        let mut s = make_session(SessionStatus::Idle);
-        s.session_id = "s1".to_string();
-        s.last_activity = Utc::now() - Duration::seconds(100);
-        sessions.insert("s1".to_string(), s);
-
-        update_idle_art(&mut cache, &config, &sessions, CardDensity::Normal);
-        assert!(
-            cache.is_empty(),
-            "Should not create entries in Normal density"
-        );
-
-        update_idle_art(&mut cache, &config, &sessions, CardDensity::Compact);
-        assert!(
-            cache.is_empty(),
-            "Should not create entries in Compact density"
-        );
-    }
-
-    #[test]
     fn unified_form_mode_option_count() {
         let f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
@@ -24427,7 +28510,9 @@ mod tests {
             vec![],
         );
         // PRD #127 M3.2: + the built-in "schedule" authoring option.
-        assert_eq!(f.mode_option_count(), 3); // "No mode" + 1 mode + "schedule"
+        // PRD #220: + the built-in "dispatcher" option, which graduated out of the
+        // experimental flag and is now offered on every `Ctrl+n` form.
+        assert_eq!(f.mode_option_count(), 4); // "No mode" + 1 mode + "schedule" + "dispatcher"
 
         let f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
@@ -24436,7 +28521,7 @@ mod tests {
             vec![],
             vec![],
         );
-        assert_eq!(f.mode_option_count(), 2); // "No mode" + "schedule"
+        assert_eq!(f.mode_option_count(), 3); // "No mode" + "schedule" + "dispatcher"
     }
 
     #[test]
@@ -24463,9 +28548,15 @@ mod tests {
         assert_eq!(f.selection_index, 3);
         assert!(f.is_schedule_selected());
 
-        // Can't go past last (schedule)
+        // PRD #220: index 4 is the built-in "dispatcher" option, now the LAST slot
+        // (it graduated out of the experimental flag, so every form offers it).
         f.select_next_mode();
-        assert_eq!(f.selection_index, 3);
+        assert_eq!(f.selection_index, 4);
+        assert!(f.is_dispatcher_selected());
+
+        // Can't go past last (dispatcher)
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 4);
     }
 
     #[test]
@@ -24527,8 +28618,9 @@ mod tests {
             vec![make_mode("dev")],
             vec![make_orchestration("tdd")],
         );
-        // 0=No mode, 1=dev, 2=tdd, 3=schedule (PRD #127 M3.2 built-in).
-        assert_eq!(f.mode_option_count(), 4);
+        // 0=No mode, 1=dev, 2=tdd, 3=schedule (PRD #127 M3.2 built-in),
+        // 4=dispatcher (PRD #220, graduated out of the experimental flag).
+        assert_eq!(f.mode_option_count(), 5);
 
         f.select_next_mode();
         f.select_next_mode();
@@ -24541,9 +28633,14 @@ mod tests {
         assert!(f.is_schedule_selected());
         assert!(f.selected_orchestration().is_none());
 
-        // Can't go past last (schedule)
+        // PRD #220: index 4 is the built-in "dispatcher" option, now the LAST slot.
         f.select_next_mode();
-        assert_eq!(f.selection_index, 3);
+        assert_eq!(f.selection_index, 4);
+        assert!(f.is_dispatcher_selected());
+
+        // Can't go past last (dispatcher)
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 4);
     }
 
     #[test]
@@ -24597,6 +28694,190 @@ mod tests {
 
         f.focused = f.prev_field();
         assert_eq!(f.focused, FormField::Command);
+    }
+
+    // --- PRD #220: dispatcher mode constants and builder ---
+
+    #[test]
+    fn dispatcher_mode_name_and_seed_constants() {
+        assert_eq!(DISPATCHER_MODE_NAME, "dispatcher");
+        assert!(
+            DISPATCHER_SEED_PROMPT.contains("dispatch"),
+            "seed must contain 'dispatch'"
+        );
+        assert!(
+            DISPATCHER_SEED_PROMPT.contains("worktree"),
+            "seed must contain 'worktree'"
+        );
+    }
+
+    #[test]
+    fn build_dispatcher_mode_produces_correct_config() {
+        let mode = build_dispatcher_mode(std::path::Path::new("/tmp/test-repo"));
+        assert_eq!(mode.name, DISPATCHER_MODE_NAME);
+        let seed = mode
+            .seed_prompt
+            .expect("dispatcher mode must have a seed prompt");
+        assert!(
+            seed.starts_with(DISPATCHER_SEED_PROMPT),
+            "seed must start with the constant prompt, got:\n{seed}"
+        );
+        assert!(
+            seed.contains("working_dir: /tmp/test-repo"),
+            "seed must contain the working_dir, got:\n{seed}"
+        );
+        assert!(
+            seed.contains("siblings of"),
+            "seed must mention sibling worktree layout, got:\n{seed}"
+        );
+    }
+
+    /// PRD #220 seed scope: the seed teaches Agent Deck MECHANICS, not work
+    /// methodology. The planner framing was cut deliberately (see the Design
+    /// record in `prds/220-…md`), and "NEVER do the work yourself" in particular
+    /// forbade the pane from doing anything else the user asked. Pinned so it
+    /// cannot drift back in.
+    #[test]
+    fn dispatcher_seed_teaches_mechanics_not_work_methodology() {
+        for banned in [
+            "decompose",
+            "independent units",
+            "parallel-ready",
+            "2-6",
+            "NEVER do the work yourself",
+        ] {
+            assert!(
+                !DISPATCHER_SEED_PROMPT.contains(banned),
+                "the dispatcher seed must not carry work-methodology copy, found {banned:?}"
+            );
+        }
+        // The mechanics it MUST still carry.
+        for required in [
+            "dot-agent-deck dispatch <name>",
+            "SELF-CONTAINED",
+            "../<repo>-dispatch-<name>",
+            "single-use",
+            "fire-and-forget",
+            // The shape choice is a deck mechanic (which spawn shape to start),
+            // not a work-methodology opinion — so it belongs, and the seed must
+            // tell the agent to ASK rather than infer it.
+            "--list-targets",
+            "--single",
+            "--orchestration",
+            "ASK, do not guess",
+            // The unit shares the repo, so referencing beats pasting — and paths
+            // must be relative, or an absolute one points the unit back at the
+            // caller's checkout and undoes the isolation.
+            "REFERENCE them by path",
+            "RELATIVE to the repo root",
+        ] {
+            assert!(
+                DISPATCHER_SEED_PROMPT.contains(required),
+                "the dispatcher seed must still teach {required:?}"
+            );
+        }
+    }
+
+    /// PRD #220: the flag-ON cycler wiring. `dispatcher_index()` is index
+    /// arithmetic over two independently-gated options, which is exactly what
+    /// breaks silently — and the only other coverage is the credential-gated e2e
+    /// test, so without this the wiring is untested on a machine with no agent
+    /// CLI installed.
+    #[test]
+    fn dispatcher_occupies_the_last_cycler_slot_when_shown() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            vec![],
+        );
+        // Both experimental options on, independent of the ambient env flag.
+        f.show_issue_dispatch = true;
+        f.show_dispatcher = true;
+
+        // "No mode" + 1 mode + schedule + schedule: issues + dispatcher.
+        assert_eq!(f.mode_option_count(), 5);
+        let last = f.mode_option_count() - 1;
+        assert_eq!(
+            f.dispatcher_index(),
+            last,
+            "dispatcher must be the LAST cycler slot, after schedule: issues"
+        );
+        assert_eq!(f.mode_option_name(last), DISPATCHER_MODE_NAME);
+
+        f.selection_index = last;
+        assert!(f.is_dispatcher_selected());
+        assert_eq!(
+            f.selected_mode().map(|m| m.name.as_str()),
+            Some(DISPATCHER_MODE_NAME)
+        );
+        // PRD #220: a dispatcher pane has continued purpose, so it must NOT be
+        // labelled "↳ authoring (one-off)" the way the schedule options are.
+        assert!(
+            !f.is_authoring_selected(),
+            "dispatcher is a real mode tab, not throwaway authoring"
+        );
+
+        // Flag off: the cycler shape is the pre-feature baseline and the
+        // dispatcher is unreachable.
+        f.show_dispatcher = false;
+        f.selection_index = 0;
+        assert_eq!(f.mode_option_count(), 4);
+        assert!(!f.is_dispatcher_selected());
+    }
+
+    /// PRD #220: submitting the dispatcher option must spawn a dashboard CARD,
+    /// never a mode tab.
+    ///
+    /// A mode tab routes through `render_mode_tab`'s 50/50 split, and
+    /// `mode_side_pane_dims` halves the width unconditionally — so a mode with no
+    /// side panes (which the dispatcher is) renders the agent at half width beside
+    /// an empty column. PRD #127 hit this first and fixed it the same way for the
+    /// `schedule` option. This pins the spawn shape so it cannot regress: the
+    /// synthetic mode is for the cycler's title/chip only, and the seed must ride
+    /// on the REQUEST.
+    #[test]
+    fn dispatcher_submits_as_a_dashboard_card_not_a_mode_tab() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp/repo"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![],
+        );
+        f.show_issue_dispatch = true;
+        f.show_dispatcher = true;
+        f.selection_index = f.dispatcher_index();
+        assert!(
+            f.is_dispatcher_selected(),
+            "test targets the dispatcher slot"
+        );
+
+        let req = build_new_pane_request(&f, "claude");
+        assert!(
+            req.mode_config.is_none(),
+            "the dispatcher must NOT spawn a mode tab — that is the 50/50-split bug"
+        );
+        assert!(req.orchestration_config.is_none());
+        let seed = req
+            .seed_prompt
+            .as_deref()
+            .expect("the dispatcher card must carry its seed on the request");
+        assert!(
+            seed.starts_with(DISPATCHER_SEED_PROMPT),
+            "the card's seed must be the dispatcher seed, got:\n{seed}"
+        );
+        assert!(
+            seed.contains("working_dir: /tmp/repo"),
+            "the seed must still be dir-qualified, got:\n{seed}"
+        );
+
+        // The cycler still names it, via the synthetic mode.
+        assert_eq!(
+            f.selected_mode().map(|m| m.name.as_str()),
+            Some(DISPATCHER_MODE_NAME)
+        );
     }
 
     // --- PRD #127 M3.3: "Scheduled Tasks" manager dialog pure-data helpers ---
@@ -24902,7 +29183,7 @@ mod tests {
     // carries it. This test pins both: the option is last/selectable, and
     // submitting it produces a seeded request.
     #[test]
-    fn unified_form_builtin_schedule_option_is_last_and_seeded() {
+    fn unified_form_builtin_schedule_option_is_offered_and_seeded() {
         let mut f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
             String::new(),
@@ -24910,14 +29191,22 @@ mod tests {
             vec![make_mode("build")],
             vec![make_orchestration("review")],
         );
-        // 0=No mode, 1=build, 2=review, 3=schedule.
+        // 0=No mode, 1=build, 2=review, 3=schedule, 4=dispatcher.
         assert_eq!(f.schedule_index(), 3);
-        assert_eq!(f.mode_option_count(), 4);
+        assert_eq!(f.mode_option_count(), 5);
 
-        // Cycling Right to the cap lands on the schedule option.
+        // PRD #220: `schedule` is no longer the LAST slot — the graduated
+        // `dispatcher` option now sits after it, so cycling to the cap lands
+        // there. This test is about the schedule option's own identity and seed,
+        // so select it directly rather than by saturating the cycler.
         for _ in 0..10 {
             f.select_next_mode();
         }
+        assert!(
+            f.is_dispatcher_selected(),
+            "the cycler cap must now land on `dispatcher`, the last slot"
+        );
+        f.selection_index = f.schedule_index();
         assert!(f.is_schedule_selected());
 
         // It is a real (synthetic) mode named `schedule`, NOT misread as an
@@ -25170,6 +29459,16 @@ mod tests {
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_new_pane_form_key(enter, &mut ui); // Mode → Name
 
+        // Selecting the orchestration just pre-filled Name with a suggested
+        // `proj-orchestrator-1`. Clear it — as a user
+        // overwriting the suggestion would backspace first — before typing a
+        // fully custom name, so the assertion below is unambiguous.
+        let suggested_len = ui.new_pane_form.as_ref().unwrap().name.len();
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0..suggested_len {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
+
         // Type a custom name
         for c in "user-typed-name".chars() {
             let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
@@ -25214,12 +29513,21 @@ mod tests {
             vec![make_orchestration("config-name")],
         ));
 
-        // Select orchestration, skip Name field (leave it empty), submit.
-        // PRD #106: Command is hidden, so Enter on Name submits.
+        // Select orchestration, then explicitly clear the Name field (leave
+        // it empty), submit. PRD #106: Command is hidden, so Enter on Name
+        // submits. Selecting the orchestration pre-fills Name with a
+        // suggested `proj-orchestrator-1` — backspace it out, as a user
+        // clearing the suggestion would, to reach the empty-name state this
+        // test is actually about.
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         handle_new_pane_form_key(right, &mut ui);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        let suggested_len = ui.new_pane_form.as_ref().unwrap().name.len();
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0..suggested_len {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
         let result = handle_new_pane_form_key(enter, &mut ui); // submit
 
         let req = match result {
@@ -25476,23 +29784,46 @@ mod tests {
     }
 
     #[test]
-    fn footer_hint_switches_to_submit_when_name_focused_with_orchestration() {
+    fn footer_hint_names_only_the_enter_action_the_form_will_honour() {
         // PRD #106 follow-up: when the Command field is hidden and focus is
         // on Name, Enter submits — the footer must say so.
-        let submit_hint = new_pane_form_footer_hint(true, true, false);
+        let submit_hint = new_pane_form_footer_hint(true, true, false, false);
         assert!(
             submit_hint.contains("Enter: submit"),
             "expected submit hint, got {submit_hint:?}"
         );
 
+        // Issue #589: the one state where that promise is false — the name
+        // collides, so the Enter guard returns `Action::Continue` and nothing
+        // happens. The hint drops the `Enter:` clause entirely rather than
+        // naming a refused key, matching the action row dropping `[Submit]`.
+        let refused_hint = new_pane_form_footer_hint(true, true, true, false);
+        assert!(
+            !refused_hint.contains("Enter"),
+            "a refused submit must advertise no Enter action at all, got {refused_hint:?}"
+        );
+        assert!(
+            refused_hint.contains("Tab: switch") && refused_hint.contains("Esc: cancel"),
+            "the keys that DO still work must survive the refusal, got {refused_hint:?}"
+        );
+
         // Sanity checks: every other focus/visibility combination keeps the
         // legacy 'Enter: next' wording.
-        let next_hint = new_pane_form_footer_hint(true, false, false);
+        let next_hint = new_pane_form_footer_hint(true, false, false, false);
         assert!(
             next_hint.contains("Enter: next") && !next_hint.contains("submit"),
             "expected next hint, got {next_hint:?}"
         );
-        let no_mode_hint = new_pane_form_footer_hint(false, false, false);
+        // Issue #589 control: a collision must NOT mute Enter where Enter only
+        // moves focus. Off the Name field the guard is unreachable, so
+        // `Enter: next` stays honest and the hint is unchanged by the collision
+        // — the refusal above is attributable to the submitting field alone.
+        assert_eq!(
+            new_pane_form_footer_hint(true, false, true, false),
+            next_hint,
+            "a collision must not change the hint on a field where Enter advances focus"
+        );
+        let no_mode_hint = new_pane_form_footer_hint(false, false, false, false);
         assert!(
             no_mode_hint.contains("Enter: next/confirm"),
             "expected next/confirm hint when there's no mode field, got {no_mode_hint:?}"
@@ -25501,7 +29832,7 @@ mod tests {
         // PRD #170 finding 6: the mode-locked schedule form has a single
         // navigable field (Command), so it drops the misleading "Tab: switch
         // field" wording for a Command-only confirm/cancel hint.
-        let locked_hint = new_pane_form_footer_hint(false, false, true);
+        let locked_hint = new_pane_form_footer_hint(false, false, false, true);
         assert!(
             locked_hint.contains("Enter: confirm")
                 && locked_hint.contains("Esc: cancel")
@@ -25550,229 +29881,6 @@ mod tests {
         assert!(
             matches!(result, Action::SendConfigGenPrompt { ref pane_id, ref cwd }
                 if pane_id == "pane-1" && cwd == "/my/project")
-        );
-    }
-
-    #[test]
-    fn test_update_idle_art_waiting_before_timeout() {
-        let mut cache = HashMap::new();
-        let config = idle_art_config(true, 300);
-        let mut sessions = HashMap::new();
-        let mut s = make_session(SessionStatus::Idle);
-        s.session_id = "s1".to_string();
-        s.last_activity = Utc::now() - Duration::seconds(10); // only 10s, timeout is 300s
-        sessions.insert("s1".to_string(), s);
-
-        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
-        assert!(cache.contains_key("s1"));
-        assert!(matches!(cache["s1"].phase, IdleArtPhase::Waiting));
-    }
-
-    #[test]
-    fn test_update_idle_art_reset_on_active() {
-        let mut cache = HashMap::new();
-        cache.insert(
-            "s1".to_string(),
-            IdleArtEntry {
-                phase: IdleArtPhase::HasArt(AsciiArtResult {
-                    frames: vec!["art".to_string()],
-                }),
-                idle_since: Utc::now() - Duration::seconds(600),
-                dismissed: false,
-            },
-        );
-
-        let config = idle_art_config(true, 300);
-        let mut sessions = HashMap::new();
-        let mut s = make_session(SessionStatus::Working); // no longer idle
-        s.session_id = "s1".to_string();
-        sessions.insert("s1".to_string(), s);
-
-        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
-        assert!(
-            !cache.contains_key("s1"),
-            "Should remove entry when session is no longer idle"
-        );
-    }
-
-    #[test]
-    fn test_update_idle_art_reset_on_new_idle_stretch() {
-        let old_idle_since = Utc::now() - Duration::seconds(600);
-        let new_idle_since = Utc::now() - Duration::seconds(5);
-        let mut cache = HashMap::new();
-        cache.insert(
-            "s1".to_string(),
-            IdleArtEntry {
-                phase: IdleArtPhase::HasArt(AsciiArtResult {
-                    frames: vec!["old art".to_string()],
-                }),
-                idle_since: old_idle_since,
-                dismissed: false,
-            },
-        );
-
-        let config = idle_art_config(true, 300);
-        let mut sessions = HashMap::new();
-        let mut s = make_session(SessionStatus::Idle);
-        s.session_id = "s1".to_string();
-        s.last_activity = new_idle_since; // different from old idle_since
-        sessions.insert("s1".to_string(), s);
-
-        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
-        assert!(
-            matches!(cache["s1"].phase, IdleArtPhase::Waiting),
-            "Should reset to Waiting on new idle stretch"
-        );
-        assert_eq!(cache["s1"].idle_since, new_idle_since);
-    }
-
-    #[test]
-    fn test_update_idle_art_removes_stale_sessions() {
-        let mut cache = HashMap::new();
-        cache.insert(
-            "gone".to_string(),
-            IdleArtEntry {
-                phase: IdleArtPhase::Waiting,
-                idle_since: Utc::now(),
-                dismissed: false,
-            },
-        );
-
-        let config = idle_art_config(true, 300);
-        let sessions = HashMap::new(); // empty — "gone" no longer exists
-
-        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
-        assert!(
-            !cache.contains_key("gone"),
-            "Should remove entries for non-existent sessions"
-        );
-    }
-
-    #[test]
-    fn test_build_art_input_combines_prompts() {
-        let mut s = make_session(SessionStatus::Idle);
-        s.first_prompts = vec!["Fix auth".to_string(), "Add tests".to_string()];
-        s.last_user_prompt = Some("Run deploy".to_string());
-
-        let input = build_art_input(&s);
-        assert_eq!(input, "Fix auth | Add tests | Run deploy");
-    }
-
-    #[test]
-    fn test_build_art_input_deduplicates_last_prompt() {
-        let mut s = make_session(SessionStatus::Idle);
-        s.first_prompts = vec!["Fix auth".to_string()];
-        s.last_user_prompt = Some("Fix auth".to_string()); // same as first
-
-        let input = build_art_input(&s);
-        assert_eq!(input, "Fix auth");
-    }
-
-    #[test]
-    fn test_build_art_input_empty() {
-        let s = make_session(SessionStatus::Idle);
-        let input = build_art_input(&s);
-        assert_eq!(input, "");
-    }
-
-    #[test]
-    fn test_build_art_output_with_tools() {
-        let mut s = make_session(SessionStatus::Idle);
-        s.recent_events.push_back(AgentEvent {
-            session_id: "s1".to_string(),
-            agent_type: AgentType::ClaudeCode,
-            event_type: EventType::ToolStart,
-            tool_name: Some("Bash".to_string()),
-            tool_detail: None,
-            cwd: None,
-            timestamp: Utc::now(),
-            user_prompt: None,
-            metadata: HashMap::new(),
-            pane_id: None,
-            agent_id: None,
-            agent_version: None,
-            schema_version: None,
-            live_target: None,
-        });
-        let output = build_art_output(&s);
-        assert!(output.contains("Bash"));
-    }
-
-    #[test]
-    fn test_build_art_output_no_tools() {
-        let s = make_session(SessionStatus::Idle);
-        let output = build_art_output(&s);
-        assert_eq!(output, "Session idle");
-    }
-
-    #[test]
-    fn test_frame_cycling() {
-        // 3 frames, cycling at 120 ticks per frame
-        let num_frames = 3;
-        let frame_for = |tick: u64| (tick / 120) as usize % num_frames;
-        assert_eq!(frame_for(0), 0);
-        assert_eq!(frame_for(119), 0);
-        assert_eq!(frame_for(120), 1);
-        assert_eq!(frame_for(239), 1);
-        assert_eq!(frame_for(240), 2);
-        assert_eq!(frame_for(360), 0); // wraps
-    }
-
-    #[test]
-    fn test_idle_art_has_art_cached() {
-        let idle_since = Utc::now() - Duration::seconds(600);
-        let mut cache = HashMap::new();
-        let art = AsciiArtResult {
-            frames: vec!["frame1".to_string(), "frame2".to_string()],
-        };
-        cache.insert(
-            "s1".to_string(),
-            IdleArtEntry {
-                phase: IdleArtPhase::HasArt(art),
-                idle_since,
-                dismissed: false,
-            },
-        );
-
-        let config = idle_art_config(true, 300);
-        let mut sessions = HashMap::new();
-        let mut s = make_session(SessionStatus::Idle);
-        s.session_id = "s1".to_string();
-        s.last_activity = idle_since;
-        sessions.insert("s1".to_string(), s);
-
-        // Update should NOT reset HasArt to Waiting (same idle_since)
-        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
-        assert!(
-            matches!(cache["s1"].phase, IdleArtPhase::HasArt(_)),
-            "Should keep cached art for same idle stretch"
-        );
-    }
-
-    #[test]
-    fn test_idle_art_failed_stays_failed_within_cooldown() {
-        let mut cache = HashMap::new();
-        let idle_since = Utc::now() - Duration::seconds(600);
-        cache.insert(
-            "s1".to_string(),
-            IdleArtEntry {
-                phase: IdleArtPhase::Failed(std::time::Instant::now()),
-                idle_since,
-                dismissed: false,
-            },
-        );
-
-        let config = idle_art_config(true, 300);
-        let mut sessions = HashMap::new();
-        let mut s = make_session(SessionStatus::Idle);
-        s.session_id = "s1".to_string();
-        s.last_activity = idle_since;
-        sessions.insert("s1".to_string(), s);
-
-        update_idle_art(&mut cache, &config, &sessions, CardDensity::Spacious);
-        assert!(
-            matches!(cache["s1"].phase, IdleArtPhase::Failed(_)),
-            "Failed should stay Failed within cooldown period"
         );
     }
 
@@ -26100,6 +30208,11 @@ mod tests {
         next: std::sync::Mutex<u32>,
         memberships: std::sync::Mutex<Vec<Option<TabMembership>>>,
         agent_generation: std::sync::Mutex<String>,
+        // PRD #336: (rows, cols) passed to `AgentSpawnOptions` for every
+        // `create_pane_with_options` call, in call order — lets a test assert
+        // the PTY dims a role pane was actually spawned/restored at, not just
+        // that a pane was created.
+        spawn_dims: std::sync::Mutex<Vec<(u16, u16)>>,
     }
 
     impl CapturingPaneController {
@@ -26108,6 +30221,7 @@ mod tests {
                 next: std::sync::Mutex::new(0),
                 memberships: std::sync::Mutex::new(Vec::new()),
                 agent_generation: std::sync::Mutex::new("original".to_string()),
+                spawn_dims: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -26128,6 +30242,11 @@ mod tests {
         fn rebind_agents(&self) {
             *self.agent_generation.lock().unwrap() = "replacement".to_string();
         }
+
+        /// The `(rows, cols)` recorded for every spawned pane, in call order.
+        fn recorded_spawn_dims(&self) -> Vec<(u16, u16)> {
+            self.spawn_dims.lock().unwrap().clone()
+        }
     }
 
     impl PaneController for CapturingPaneController {
@@ -26141,6 +30260,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(opts.tab_membership.clone());
+            self.spawn_dims.lock().unwrap().push((opts.rows, opts.cols));
             let mut n = self.next.lock().unwrap();
             let id = format!("pane-{n}");
             *n += 1;
@@ -26218,9 +30338,11 @@ mod tests {
         // "dot-agent-deck", a worker role `coder` with clear = true (the
         // respawn the bug silently drops on each delegate).
         let config = OrchestrationConfig {
+            default: false,
             name: CONFIG_NAME.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "echo orch".to_string(),
                     start: true,
@@ -26229,6 +30351,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "echo coder".to_string(),
                     start: false,
@@ -26298,6 +30421,409 @@ mod tests {
         }
     }
 
+    /// Scenario: Build the new-pane form the way `transition_after_dir_pick`
+    /// does today — the Name field pre-filled with the bare directory
+    /// basename `myproj` — then select the form's one orchestration (Right
+    /// arrow). With no orchestration live yet, selecting it must suggest
+    /// `myproj-orchestrator-1` in the Name field in place of the bare
+    /// basename. A single further keystroke (Enter, no character typed) then
+    /// accepts that suggestion as-is at submit.
+    #[spec("orchestration/identity/002")]
+    #[test]
+    fn identity_002_selecting_orchestration_suggests_orchestrator_1_and_one_keystroke_accepts_it() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            // The bare basename `transition_after_dir_pick` pre-fills today.
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the orchestration
+
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-1",
+            "selecting the orchestration with none live yet must suggest N=1, \
+             not keep the bare basename pre-fill"
+        );
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        // One further keystroke — no characters typed — submits the
+        // suggestion as-is.
+        let result = handle_new_pane_form_key(enter, &mut ui);
+
+        match result {
+            Action::SpawnPane(req) => assert_eq!(
+                req.name, "myproj-orchestrator-1",
+                "the accepted name must be the suggestion, untouched"
+            ),
+            other => panic!("expected SpawnPane, got {other:?}"),
+        }
+    }
+
+    /// Scenario: Open the new-pane form the way `Ctrl+n` does — Name
+    /// pre-filled with the bare directory basename `myproj` — then cycle the
+    /// Mode field RIGHT onto the orchestration (which suggests
+    /// `myproj-orchestrator-1`) and back LEFT to "No mode". The Name field
+    /// must read `myproj` again, and submitting must spawn a plain pane
+    /// called `myproj`: a pane with no mode is not an orchestrator, and a
+    /// generated suggestion must not outlive the selection that generated it.
+    /// Same for cycling FORWARD off the orchestration onto the built-in
+    /// `schedule` option — which is how the user reaches `schedule` /
+    /// `dispatcher` at all, since the cycler puts the orchestrations in
+    /// between.
+    #[spec("orchestration/identity/006")]
+    #[test]
+    fn identity_006_leaving_the_orchestration_restores_the_basename() {
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        // --- back to "No mode" (index 0) ---
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+
+        handle_new_pane_form_key(right, &mut ui); // land on the orchestration
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-1",
+            "control: landing on the orchestration still suggests N=1"
+        );
+
+        handle_new_pane_form_key(left, &mut ui); // back to "No mode"
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().selection_index,
+            0,
+            "precondition: Left from the orchestration lands on \"No mode\""
+        );
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "myproj",
+            "leaving the orchestration must restore the basename pre-fill — a \
+             plain pane must not be named `-orchestrator-N`"
+        );
+
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        handle_new_pane_form_key(enter, &mut ui); // Name -> Command
+        let result = handle_new_pane_form_key(enter, &mut ui);
+        match result {
+            Action::SpawnPane(req) => assert_eq!(
+                req.name, "myproj",
+                "the plain pane must submit under the basename, not the stale \
+                 orchestrator suggestion"
+            ),
+            other => panic!("expected SpawnPane, got {other:?}"),
+        }
+
+        // --- forward off the orchestration onto `schedule` ---
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+
+        handle_new_pane_form_key(right, &mut ui); // orchestration
+        handle_new_pane_form_key(right, &mut ui); // `schedule`
+        let form = ui.new_pane_form.as_ref().unwrap();
+        assert!(
+            form.is_schedule_selected(),
+            "precondition: two Rights land on the built-in `schedule` option"
+        );
+        assert_eq!(
+            form.name, "myproj",
+            "cycling PAST the orchestration to reach `schedule` must not leave \
+             the orchestrator suggestion behind"
+        );
+    }
+
+    /// Scenario: With `myproj-orchestrator-1` already live (a name a running
+    /// orchestration in the same folder currently holds, injected via the
+    /// test-only `with_live_orchestration_names` builder that mirrors
+    /// `with_live_orchestration_cwds`), selecting the form's orchestration
+    /// must suggest `myproj-orchestrator-2`, skipping the taken slot. Then
+    /// simulate a stale/resubmitted taken name still sitting in the Name
+    /// field and confirm submit is REFUSED — no `Action::SpawnPane`, and the
+    /// form stays open — rather than silently recording a second
+    /// orchestration under an identical owner.
+    #[spec("orchestration/identity/003")]
+    #[test]
+    fn identity_003_next_open_suggests_orchestrator_2_and_refuses_a_taken_name() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(
+            NewPaneFormState::new(
+                PathBuf::from("/tmp/myproj"),
+                "myproj".to_string(),
+                String::new(),
+                vec![],
+                vec![make_orchestration("review")],
+            )
+            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+        );
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the orchestration
+
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-2",
+            "with -orchestrator-1 already live, selecting the orchestration must \
+             suggest N=2, skipping the taken slot"
+        );
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+
+        // Simulate a stale/resubmitted taken name still sitting in the field
+        // (e.g. the user typed over the suggestion with a value someone
+        // else's live orchestration already holds) — reached through the
+        // real key handler, not by direct field assignment, so the test pins
+        // the user-facing path rather than a shortcut around it.
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0.."myproj-orchestrator-2".len() {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
+        for c in "myproj-orchestrator-1".chars() {
+            handle_new_pane_form_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+        }
+
+        let result = handle_new_pane_form_key(enter, &mut ui); // attempted submit
+
+        assert!(
+            !matches!(result, Action::SpawnPane(_)),
+            "submitting a name a live orchestration already holds must be refused, got {result:?}"
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::NewPaneForm,
+            "a refused submit must keep the form open, not close it"
+        );
+    }
+
+    /// Scenario: Select the form's orchestration, type a custom name over the
+    /// suggestion character by character through the real key handler, then
+    /// dispatch `Action::FormSelectMode` at the SAME index — re-clicking the
+    /// already-selected chip. The typed name must survive; the suggestion
+    /// must not silently overwrite it (Finding A, the reported case). Then
+    /// arrow off the orchestration onto a mode and back onto it — a genuine
+    /// selection CHANGE — and assert the name still survives: a guard keyed
+    /// only on "did the selection index change" would catch the first case
+    /// and miss this one, and pinning it stops that weaker fix from being
+    /// substituted later.
+    #[spec("orchestration/identity/004")]
+    #[test]
+    fn identity_004_reselecting_or_arrowing_never_clobbers_a_typed_name() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj".to_string(),
+            String::new(),
+            vec![make_mode("chat")],
+            vec![make_orchestration("review")],
+        ));
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // "No mode" -> chat
+        handle_new_pane_form_key(right, &mut ui); // chat -> the orchestration
+        let orchestration_idx = ui.new_pane_form.as_ref().unwrap().selection_index;
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+
+        // Type a custom name over the suggestion, one keystroke at a time
+        // through the real handler — the exact arm Finding A's fix hooks.
+        let suggested_len = ui.new_pane_form.as_ref().unwrap().name.len();
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0..suggested_len {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
+        for c in "my-custom-name".chars() {
+            handle_new_pane_form_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+        }
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "my-custom-name",
+            "the typed name should be in place before the clobber is attempted"
+        );
+
+        // Return focus to Mode so the click/arrow actions below act on the
+        // cycler, mirroring how the real form gets there (Tab/BackTab).
+        ui.new_pane_form.as_mut().unwrap().focused = FormField::Mode;
+
+        // Case 1 (Finding A, the reported case): re-click the
+        // ALREADY-selected chip via the real `Action::FormSelectMode`
+        // dispatch.
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let _ = dispatch_action(
+            Action::FormSelectMode(orchestration_idx),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "my-custom-name",
+            "re-clicking the already-selected chip must not clobber a typed name"
+        );
+
+        // Case 2: arrow off the orchestration onto a mode and back — a
+        // genuine selection change, which an `idx != selection_index` guard
+        // would miss.
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        handle_new_pane_form_key(left, &mut ui); // orchestration -> chat mode
+        handle_new_pane_form_key(right, &mut ui); // chat mode -> orchestration
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "my-custom-name",
+            "arrowing off the orchestration and back must not clobber a typed name"
+        );
+    }
+
+    /// Scenario: With a live orchestration already holding the canonical
+    /// title `tdd-cycle` (an earlier spawn that left the Name field empty,
+    /// so its title fell back to the config name), open the form, select the
+    /// orchestration, and clear the Name field to empty through real
+    /// `KeyCode::Backspace` events. Submitting must be REFUSED — an empty
+    /// field is not "no title", it resolves to the same canonical
+    /// `tdd-cycle` and would produce a second, indistinguishable tab. The
+    /// refused state must also LOOK refused: `[Submit]` is gone from the
+    /// action row, and the footer beneath it stops advertising `Enter:
+    /// submit` (issue #589) — while typing a free name restores both.
+    #[spec("orchestration/identity/005")]
+    #[test]
+    fn identity_005_an_empty_name_is_checked_against_its_resolved_title() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(
+            NewPaneFormState::new(
+                PathBuf::from("/tmp/myproj"),
+                "myproj".to_string(),
+                String::new(),
+                vec![],
+                vec![make_orchestration("review")],
+            )
+            .with_live_orchestration_names(vec!["review".to_string()]),
+        );
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the orchestration
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+
+        // Clear the field through real Backspace events, not by assigning
+        // `form.name` — the point is that the path a user walks reaches
+        // this state.
+        let suggested_len = ui.new_pane_form.as_ref().unwrap().name.len();
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0..suggested_len {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "");
+
+        assert!(
+            ui.new_pane_form.as_ref().unwrap().name_collision(),
+            "an empty Name field resolves to the canonical config name \
+             `review`, which a live orchestration already holds — the guard \
+             must catch it"
+        );
+
+        let result = handle_new_pane_form_key(enter, &mut ui); // attempted submit
+        assert!(
+            !matches!(result, Action::SpawnPane(_)),
+            "submitting an empty name that resolves to a taken title must be \
+             refused, got {result:?}"
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::NewPaneForm,
+            "a refused submit must keep the form open, not close it"
+        );
+
+        // The refusal's most user-visible behaviour is that [Submit]
+        // disappears from the action row entirely (rather than being
+        // dimmed) — pin that through the dedicated render seam. The seam's
+        // fixture orchestration is named `tdd-cycle` (not `review`, this
+        // test's own fixture), so the live name passed here matches THAT.
+        let buf =
+            render_new_pane_orchestration_name_collision_to_buffer("", &["tdd-cycle"], 100, 28);
+        let rendered = buffer_to_string(&buf);
+        assert!(
+            !rendered.contains("[Submit]"),
+            "an empty Name that resolves to a taken title must drop [Submit] \
+             from the action row, got:\n{rendered}"
+        );
+
+        // Issue #589: the FOOTER must keep the same promise the action row
+        // does. Rendered from the form these keystrokes actually produced —
+        // not the seam above, which opens focused on Mode where `Enter: next`
+        // is honest. Focus is on Name here, the one state where Enter reaches
+        // the refusal.
+        let collided = {
+            let form = ui.new_pane_form.as_ref().expect("form still open");
+            buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
+                render_new_pane_form(frame, form);
+            }))
+        };
+        assert!(
+            !collided.contains("Enter: submit"),
+            "the collision guard refuses Enter, so the footer must not \
+             advertise `Enter: submit`, got:\n{collided}"
+        );
+
+        // Control: one keystroke away from the collision. Typing a free name
+        // restores BOTH [Submit] and the `Enter: submit` promise, so the
+        // assertion above is attributable to the collision state and not to
+        // the hint having been dropped wholesale.
+        for ch in "review-2".chars() {
+            handle_new_pane_form_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &mut ui,
+            );
+        }
+        let free = {
+            let form = ui.new_pane_form.as_ref().expect("form still open");
+            assert!(
+                !form.name_collision(),
+                "control setup: `review-2` must not collide with the live `review`"
+            );
+            buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
+                render_new_pane_form(frame, form);
+            }))
+        };
+        assert!(
+            free.contains("[Submit]") && free.contains("Enter: submit"),
+            "a free name must restore both the [Submit] button and the \
+             `Enter: submit` footer promise, got:\n{free}"
+        );
+    }
+
     /// Scenario: Open an orchestration with an initial start-role agent, then
     /// rebind that pane before readiness. The queued prompt must remain bound to
     /// the original agent identity captured when the tab was created.
@@ -26306,8 +30832,10 @@ mod tests {
     fn pane_input_016_orchestrator_prompt_captures_identity_at_tab_creation() {
         let tmp = tempdir().expect("tempdir");
         let config = OrchestrationConfig {
+            default: false,
             name: "capture-at-creation".to_string(),
             roles: vec![OrchestrationRoleConfig {
+                agent: None,
                 name: "orchestrator".to_string(),
                 command: "cat".to_string(),
                 start: true,
@@ -26763,6 +31291,372 @@ mod tests {
         );
     }
 
+    /// A mode config that DECLARES the agent its agent pane launches (issue
+    /// #308), so the `pane_declared_agent` entry the rollback has to unwind
+    /// actually gets registered. Everything else matches
+    /// [`mode_config_local`].
+    fn declared_mode_config_local(name: &str, side_pane_count: usize, agent: &str) -> ModeConfig {
+        ModeConfig {
+            agent: Some(agent.to_string()),
+            ..mode_config_local(name, side_pane_count)
+        }
+    }
+
+    /// Pane controller for the mode-activation FAILURE path that survives a
+    /// RETRY: on every attempt the agent pane succeeds with a fresh
+    /// `mock-pane-N` id and its single side pane fails, so `open_mode_tab`
+    /// returns `Err` on attempt one, attempt two, and every attempt after.
+    /// `FailSidePanePC` above cannot do this — it succeeds exactly once and
+    /// then fails the AGENT pane too, so a second attempt dies before the
+    /// registration block and never reaches the `open_mode_tab` Err arm.
+    ///
+    /// Pair it with a `mode_config_local(_, 1)`-shaped config: one persistent
+    /// side pane and no reactive panes means exactly two `create_pane` calls
+    /// per attempt, so the even/odd split IS the agent-pane/side-pane split.
+    ///
+    /// `close_fails` drives the other half of the rollback guard: a pane whose
+    /// `close_pane` failed is still LIVE, so its registrations must survive.
+    struct ModeRetryPC {
+        calls: std::sync::Mutex<u32>,
+        created: std::sync::Mutex<Vec<String>>,
+        close_fails: bool,
+    }
+    impl ModeRetryPC {
+        fn new(close_fails: bool) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+                created: std::sync::Mutex::new(Vec::new()),
+                close_fails,
+            }
+        }
+        /// Every agent-pane id handed out, in order — one per activation
+        /// attempt that genuinely got as far as registering a pane.
+        fn created(&self) -> Vec<String> {
+            self.created.lock().unwrap().clone()
+        }
+    }
+    impl crate::pane::PaneController for ModeRetryPC {
+        fn create_pane(
+            &self,
+            _cmd: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<String, crate::pane::PaneError> {
+            let mut n = self.calls.lock().unwrap();
+            let idx = *n;
+            *n += 1;
+            if idx.is_multiple_of(2) {
+                let id = format!("mock-pane-{idx}");
+                self.created.lock().unwrap().push(id.clone());
+                Ok(id)
+            } else {
+                Err(crate::pane::PaneError::CommandFailed(
+                    "side pane spawn failed".to_string(),
+                ))
+            }
+        }
+        fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            if self.close_fails {
+                Err(crate::pane::PaneError::CommandFailed(
+                    "pane is still live".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn rename_pane(
+            &self,
+            _id: &str,
+            name: &str,
+        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+            Ok(crate::pane::RenameOutcome::applied(name))
+        }
+        fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "mode-retry-mock"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Dispatch one mode `Action::SpawnPane` whose `open_mode_tab` fails, and
+    /// assert the handler really took the Err arm. Shared by the three
+    /// `rollback_abandoned_pane` tests below so each one asserts only its own
+    /// property.
+    fn dispatch_failing_mode_activation(
+        pc: &ModeRetryPC,
+        ui: &mut UiState,
+        state: &SharedState,
+        tab_manager: &mut TabManager,
+        snapshot: &AppState,
+        filtered: &[(&String, &SessionState)],
+    ) {
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(mode_card_request(
+                "/work/mode-card",
+                "claude --model haiku",
+                declared_mode_config_local("m", 1, "claude"),
+            ))),
+            ui,
+            pc,
+            state,
+            tab_manager,
+            snapshot,
+            filtered,
+            None,
+            Rect::new(0, 0, 80, 24),
+        );
+        assert!(
+            ui.status_message
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("Mode activation failed")),
+            "precondition: the mode activation actually failed (Err arm), got {:?}",
+            ui.status_message.as_ref().map(|(m, _)| m)
+        );
+    }
+
+    /// Issue #308 follow-up: a mode spawn that SUCCEEDS and is then abandoned
+    /// because `open_mode_tab` failed must leave NO trace of its pane. Dispatch
+    /// a mode `Action::SpawnPane` against a controller that fails the side pane
+    /// (so the agent pane is created and registered, then given up on) and
+    /// assert all six per-pane registrations are gone: `managed_pane_ids`, the
+    /// placeholder session, `pane_display_names`, `pane_names`, `pane_metadata`
+    /// and `pane_declared_agent`. The session is the user-visible half — a
+    /// surviving placeholder renders a dashboard card for a pane that no longer
+    /// exists. The `close_pane`-fails sibling below is the positive control
+    /// that these six really are registered on this path, so the absences here
+    /// are not vacuous.
+    #[test]
+    fn mode_activation_failure_unwinds_every_pane_registration() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(ModeRetryPC::new(false));
+        let mut tab_manager = TabManager::new(pc.clone());
+
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        dispatch_failing_mode_activation(
+            &pc,
+            &mut ui,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+        );
+
+        let pane_id = pc
+            .created()
+            .first()
+            .cloned()
+            .expect("the agent pane was created before the mode tab failed");
+
+        let st = state.blocking_read();
+        assert!(
+            !st.managed_pane_ids.contains(&pane_id),
+            "the abandoned pane must be unregistered"
+        );
+        assert!(
+            !st.sessions.contains_key(&format!("pane-{pane_id}")),
+            "the placeholder session must go — it renders a card for a pane that is gone"
+        );
+        assert!(
+            st.sessions
+                .values()
+                .all(|s| s.pane_id.as_deref() != Some(pane_id.as_str())),
+            "no session may still point at the abandoned pane"
+        );
+        assert!(
+            st.sessions.contains_key("s0"),
+            "unrelated sessions must survive the rollback"
+        );
+        drop(st);
+
+        assert!(
+            !ui.pane_display_names.contains_key(&pane_id),
+            "pane_display_names must not keep the abandoned pane"
+        );
+        assert!(
+            !ui.pane_names.contains_key(&pane_id),
+            "pane_names must not keep the abandoned pane"
+        );
+        assert!(
+            !ui.pane_metadata.contains_key(&pane_id),
+            "pane_metadata must not keep the abandoned pane"
+        );
+        assert!(
+            !ui.pane_declared_agent.contains_key(&pane_id),
+            "pane_declared_agent must not keep the abandoned pane"
+        );
+    }
+
+    /// Issue #308 follow-up, the other side of the guard: when the abandoned
+    /// pane's `close_pane` FAILS the pane is still live, so nothing may be
+    /// rolled back — a running agent behind no card at all is strictly worse
+    /// than a stale one, and PRD #92 F4 already draws that line for an explicit
+    /// `Ctrl+W` close. Same dispatch as the sibling above but with a controller
+    /// whose `close_pane` returns `Err`, asserting all six registrations
+    /// SURVIVE. Flipping the handler's `match pane.close_pane(..)` back to an
+    /// unconditional `rollback_abandoned_pane` fails every one of them.
+    #[test]
+    fn mode_activation_failure_with_unclosable_pane_preserves_every_registration() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(ModeRetryPC::new(true));
+        let mut tab_manager = TabManager::new(pc.clone());
+
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        dispatch_failing_mode_activation(
+            &pc,
+            &mut ui,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+        );
+
+        let pane_id = pc
+            .created()
+            .first()
+            .cloned()
+            .expect("the agent pane was created before the mode tab failed");
+
+        let st = state.blocking_read();
+        assert!(
+            st.managed_pane_ids.contains(&pane_id),
+            "a pane that could not be closed is still live and must stay registered"
+        );
+        assert!(
+            st.sessions.contains_key(&format!("pane-{pane_id}")),
+            "a still-live pane must keep its card — the placeholder session must survive"
+        );
+        drop(st);
+
+        assert_eq!(
+            ui.pane_display_names.get(&pane_id).map(String::as_str),
+            Some("card"),
+            "a still-live pane must keep its display name"
+        );
+        assert_eq!(
+            ui.pane_names.get(&pane_id).map(String::as_str),
+            Some("card"),
+            "a still-live pane must keep its name"
+        );
+        assert_eq!(
+            ui.pane_metadata
+                .get(&pane_id)
+                .map(|saved| saved.dir.as_str()),
+            Some("/work/mode-card"),
+            "a still-live pane must keep its metadata so it stays recoverable"
+        );
+        assert_eq!(
+            ui.pane_declared_agent.get(&pane_id),
+            Some(&AgentType::ClaudeCode),
+            "a still-live pane must keep its declared agent, so its badge is still right"
+        );
+    }
+
+    /// Issue #308 follow-up: the original leak symptom. Retrying a broken mode
+    /// used to grow every per-pane map by an entry per attempt for the life of
+    /// the session. Two failed activations in a row — each one a genuinely
+    /// distinct pane id, asserted below — must leave the maps exactly as they
+    /// were before the first, which is also what catches a rollback that
+    /// unwinds five of the six maps.
+    #[test]
+    fn repeated_mode_activation_failures_do_not_accumulate_pane_state() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(ModeRetryPC::new(false));
+        let mut tab_manager = TabManager::new(pc.clone());
+
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        let sessions_before = state.blocking_read().sessions.len();
+        assert!(
+            ui.pane_display_names.is_empty()
+                && ui.pane_names.is_empty()
+                && ui.pane_metadata.is_empty()
+                && ui.pane_declared_agent.is_empty(),
+            "precondition: zero activations means zero per-pane entries"
+        );
+
+        for _ in 0..2 {
+            dispatch_failing_mode_activation(
+                &pc,
+                &mut ui,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &filtered,
+            );
+        }
+
+        assert_eq!(
+            pc.created(),
+            vec!["mock-pane-0".to_string(), "mock-pane-2".to_string()],
+            "precondition: both attempts registered a DISTINCT pane before failing, \
+             so a leak would show up as two entries rather than one"
+        );
+
+        let st = state.blocking_read();
+        assert!(
+            st.managed_pane_ids.is_empty(),
+            "two failed activations must leave no registered panes, got {:?}",
+            st.managed_pane_ids
+        );
+        assert_eq!(
+            st.sessions.len(),
+            sessions_before,
+            "two failed activations must leave no extra session cards"
+        );
+        drop(st);
+
+        assert!(
+            ui.pane_display_names.is_empty(),
+            "pane_display_names leaked"
+        );
+        assert!(ui.pane_names.is_empty(), "pane_names leaked");
+        assert!(ui.pane_metadata.is_empty(), "pane_metadata leaked");
+        assert!(
+            ui.pane_declared_agent.is_empty(),
+            "pane_declared_agent leaked"
+        );
+    }
+
     /// Pane controller like `OpenTabPC` (unique `mock-pane-N` ids, records every
     /// `focus_pane`) but it ALSO reports the last-focused pane back through
     /// `focused_pane_id()` — the live process-wide focus a real controller
@@ -26925,6 +31819,8 @@ mod tests {
 
     #[derive(Debug, Clone, Copy)]
     enum InjectedSendOutcome {
+        Applied,
+        Queued,
         Error,
         HistoryOnly,
         NoLiveTarget,
@@ -26992,6 +31888,8 @@ mod tests {
         ) -> Result<crate::event::SendResult, PaneError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             match self.outcome {
+                InjectedSendOutcome::Applied => Ok(crate::event::SendResult::Applied),
+                InjectedSendOutcome::Queued => Ok(crate::event::SendResult::Queued),
                 InjectedSendOutcome::Error => Err(PaneError::CommandFailed(
                     "injected transport failure".into(),
                 )),
@@ -27030,6 +31928,2272 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    #[derive(Default)]
+    struct CachingLedgerState {
+        cached: HashMap<String, crate::event::SendResult>,
+        request_ids: Vec<String>,
+        physical_writes: usize,
+        first_response_lost: bool,
+    }
+
+    /// A controller-shaped delivery ledger: the first physical write is cached
+    /// as `Applied` but its response is lost, the duplicate request replays the
+    /// cache without writing, and the next distinct id performs a second write
+    /// whose partial result is terminal `Ambiguous`.
+    struct CachingLedgerPaneController {
+        state: Arc<std::sync::Mutex<CachingLedgerState>>,
+    }
+
+    impl CachingLedgerPaneController {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(std::sync::Mutex::new(CachingLedgerState::default())),
+            }
+        }
+    }
+
+    impl PaneController for CachingLedgerPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _expected_agent_id: Option<&str>,
+            _expected_session_id: Option<&str>,
+            delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            let delivery_id = delivery_id.expect("automatic delivery must carry an attempt id");
+            let mut state = self.state.lock().unwrap();
+            state.request_ids.push(delivery_id.to_string());
+            if let Some(cached) = state.cached.get(delivery_id).copied() {
+                return Ok(cached);
+            }
+
+            state.physical_writes += 1;
+            let result = if state.physical_writes == 1 {
+                crate::event::SendResult::Applied
+            } else {
+                crate::event::SendResult::Ambiguous
+            };
+            state.cached.insert(delivery_id.to_string(), result);
+            if !state.first_response_lost {
+                state.first_response_lost = true;
+                return Err(PaneError::CommandFailed(
+                    "injected lost response after the ledger cached Applied".into(),
+                ));
+            }
+            Ok(result)
+        }
+        fn name(&self) -> &str {
+            "caching-ledger"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct IdentityGuardPaneController {
+        current_agent: std::sync::Mutex<String>,
+        writes: std::sync::Mutex<HashMap<String, Vec<String>>>,
+    }
+
+    impl IdentityGuardPaneController {
+        fn new(agent_id: &str) -> Self {
+            Self {
+                current_agent: std::sync::Mutex::new(agent_id.to_string()),
+                writes: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn rebind(&self, agent_id: &str) {
+            *self.current_agent.lock().unwrap() = agent_id.to_string();
+        }
+
+        fn writes_for(&self, agent_id: &str) -> usize {
+            self.writes
+                .lock()
+                .unwrap()
+                .get(agent_id)
+                .map_or(0, Vec::len)
+        }
+    }
+
+    impl PaneController for IdentityGuardPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
+            Some(self.current_agent.lock().unwrap().clone())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            _pane_id: &str,
+            text: &str,
+            expected_agent_id: Option<&str>,
+            _expected_session_id: Option<&str>,
+            _delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            let current = self.current_agent.lock().unwrap().clone();
+            if expected_agent_id.is_some_and(|expected| expected != current) {
+                return Ok(crate::event::SendResult::WrongSession);
+            }
+            self.writes
+                .lock()
+                .unwrap()
+                .entry(current)
+                .or_default()
+                .push(text.to_string());
+            Ok(crate::event::SendResult::Applied)
+        }
+        fn name(&self) -> &str {
+            "identity-guard"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn ready_prompt_snapshot(pane_id: &str, agent_id: &str) -> AppState {
+        let mut snapshot = AppState::default();
+        snapshot.register_pane(pane_id.to_string());
+        snapshot.insert_placeholder_session(
+            pane_id.to_string(),
+            None,
+            Some(AgentType::Codex),
+            Some(agent_id.to_string()),
+        );
+        snapshot
+    }
+
+    fn apply_prompt_confirmation(
+        snapshot: &mut AppState,
+        pane_id: &str,
+        agent_id: &str,
+        prompt: &str,
+    ) {
+        snapshot.apply_event(AgentEvent {
+            session_id: format!("confirmed-{pane_id}"),
+            agent_type: AgentType::Codex,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: Some(prompt.to_string()),
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+    }
+
+    fn apply_generation_event(
+        snapshot: &mut AppState,
+        pane_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        event_type: EventType,
+    ) {
+        snapshot.apply_event(AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+    }
+
+    fn ready_seed_prompt(pane_id: &str, prompt: &str) -> PendingSeedPrompt {
+        PendingSeedPrompt {
+            pane_id: pane_id.to_string(),
+            prompt: prompt.to_string(),
+            created_at: std::time::Instant::now(),
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("ready timestamp"),
+            ),
+        }
+    }
+
+    /// Scenario: Write an orchestrator's spawn-time prompt to a ready pane and have the controller report Applied or Queued without an agent hook. The prompt, identity, retry, and non-Working role must remain provisional until a matching UserPromptSubmit-derived event arrives, after which all delivery state clears and the role becomes Working.
+    #[spec("prompt/pane-input/023")]
+    #[test]
+    fn pane_input_023_orchestrator_write_is_provisional_until_confirmation() {
+        const PANE_ID: &str = "provisional-orchestrator-pane";
+        const AGENT_ID: &str = "provisional-orchestrator-agent";
+        const PROMPT: &str = "Read the orchestrator seed and begin";
+
+        for outcome in [InjectedSendOutcome::Applied, InjectedSendOutcome::Queued] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn PaneController> =
+                Arc::new(SendResultPaneController::new(outcome, attempts.clone()));
+            let now = std::time::Instant::now();
+            let tab_id: TabId = match outcome {
+                InjectedSendOutcome::Applied => 23,
+                InjectedSendOutcome::Queued => 230,
+                _ => unreachable!(),
+            };
+            let mut ui = default_ui();
+            ui.orchestration_created_at.insert(tab_id, now);
+            ui.orchestration_ready_since.insert(
+                tab_id,
+                now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("ready timestamp"),
+            );
+            let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+            let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+            let mut prompt = Some(PROMPT.to_string());
+
+            deliver_orchestrator_prompt(
+                &mut ui,
+                pane.as_ref(),
+                &snapshot,
+                now,
+                tab_id,
+                &[PANE_ID.to_string()],
+                0,
+                &mut role_statuses,
+                &mut prompt,
+            );
+
+            assert_eq!(
+                prompt.as_deref(),
+                Some(PROMPT),
+                "{outcome:?} means only that the PTY accepted bytes; the orchestrator prompt must remain provisional until UserPromptSubmit confirms it"
+            );
+            assert!(
+                ui.prompt_delivery.contains_key(PANE_ID),
+                "{outcome:?} must retain the delivery identity while confirmation is pending"
+            );
+            assert!(
+                ui.send_retry_backoff.contains_key(PANE_ID),
+                "{outcome:?} must arm retry backoff while confirmation is pending"
+            );
+            assert_ne!(
+                role_statuses[0],
+                OrchestrationRoleStatus::Working,
+                "a PTY write alone must not finalize the orchestrator role as Working"
+            );
+            assert!(
+                !ui.orchestration_prompted.contains(&tab_id),
+                "a PTY write alone must not mark the orchestration prompt confirmed"
+            );
+
+            apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+            deliver_orchestrator_prompt(
+                &mut ui,
+                pane.as_ref(),
+                &snapshot,
+                now.checked_add(std::time::Duration::from_millis(1))
+                    .expect("confirmation timestamp"),
+                tab_id,
+                &[PANE_ID.to_string()],
+                0,
+                &mut role_statuses,
+                &mut prompt,
+            );
+
+            assert!(
+                prompt.is_none(),
+                "the matching UserPromptSubmit event must finalize the orchestrator prompt"
+            );
+            assert!(
+                !ui.prompt_delivery.contains_key(PANE_ID)
+                    && !ui.send_retry_backoff.contains_key(PANE_ID),
+                "confirmation must clear delivery identity and retry state"
+            );
+            assert_eq!(role_statuses, [OrchestrationRoleStatus::Working]);
+            assert!(ui.orchestration_prompted.contains(&tab_id));
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "confirmation should finalize the first write without another PTY submission"
+            );
+        }
+    }
+
+    /// Scenario: Queue seed prompts for reporting, non-reporting, and unidentifiable consumers, including swallowed-CR duplicate submissions joined by a newline or no separator. Reporting panes stay provisional until matching submission evidence arrives, while Pi and identity-less panes write once without arming retries, and every doubled submitted seed clears retry state before a third write.
+    #[spec("prompt/pane-input/024")]
+    #[test]
+    fn pane_input_024_seed_write_is_provisional_until_confirmation() {
+        const PANE_ID: &str = "provisional-seed-pane";
+        const AGENT_ID: &str = "provisional-seed-agent";
+        const PROMPT: &str = "Read the dispatch seed and begin";
+
+        for outcome in [InjectedSendOutcome::Applied, InjectedSendOutcome::Queued] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn PaneController> =
+                Arc::new(SendResultPaneController::new(outcome, attempts.clone()));
+            let mut ui = default_ui();
+            ui.pending_seed_prompts.push(PendingSeedPrompt {
+                pane_id: PANE_ID.to_string(),
+                prompt: PROMPT.to_string(),
+                created_at: std::time::Instant::now(),
+                ready_since: Some(
+                    std::time::Instant::now()
+                        .checked_sub(
+                            SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1),
+                        )
+                        .expect("ready timestamp"),
+                ),
+            });
+            let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+            assert_eq!(
+                ui.pending_seed_prompts
+                    .first()
+                    .map(|pending| pending.prompt.as_str()),
+                Some(PROMPT),
+                "{outcome:?} means only that the PTY accepted bytes; the seed prompt must remain provisional until UserPromptSubmit confirms it"
+            );
+            assert!(ui.prompt_delivery.contains_key(PANE_ID));
+            assert!(
+                ui.send_retry_backoff.contains_key(PANE_ID),
+                "an unconfirmed {outcome:?} seed write must arm retry backoff"
+            );
+
+            apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+            assert!(
+                ui.pending_seed_prompts.is_empty(),
+                "the matching UserPromptSubmit event must finalize the seed prompt"
+            );
+            assert!(
+                !ui.prompt_delivery.contains_key(PANE_ID)
+                    && !ui.send_retry_backoff.contains_key(PANE_ID),
+                "confirmation must clear the seed's delivery identity and retry state"
+            );
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "confirmation should finalize the first seed write without another PTY submission"
+            );
+        }
+
+        // Reviewer B4: a real Pi-shaped status event identifies the pane and
+        // agent but can never carry `user_prompt`. It must settle the write as
+        // unconfirmable instead of arming an endless sequence of retypes.
+        let pi_attempts = Arc::new(AtomicUsize::new(0));
+        let pi_pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            pi_attempts.clone(),
+        ));
+        let mut pi_ui = default_ui();
+        pi_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt("pi-status-pane", "one Pi seed"));
+        let mut pi_snapshot = AppState::default();
+        pi_snapshot.register_pane("pi-status-pane".to_string());
+        pi_snapshot.apply_event(AgentEvent {
+            session_id: "pi-status-session".into(),
+            agent_type: AgentType::Pi,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("pi-status-pane".into()),
+            agent_id: Some("pi-status-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+        process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
+        process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
+        assert!(
+            pi_ui.pending_seed_prompts.is_empty()
+                && !pi_ui.prompt_delivery.contains_key("pi-status-pane")
+                && !pi_ui.send_retry_backoff.contains_key("pi-status-pane")
+                && pi_attempts.load(Ordering::SeqCst) == 1,
+            "one Pi status event cannot prove prompt-reporting capability or arm repeated writes"
+        );
+
+        // No identity anywhere is also structurally unconfirmable: even a
+        // reporting producer's text would be rejected as wildcard evidence.
+        let unidentified_attempts = Arc::new(AtomicUsize::new(0));
+        let unidentified_pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            unidentified_attempts.clone(),
+        ));
+        let mut unidentified_ui = default_ui();
+        unidentified_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt("unidentified-pane", "one anonymous seed"));
+        let mut unidentified_snapshot = AppState::default();
+        unidentified_snapshot.register_pane("unidentified-pane".to_string());
+        unidentified_snapshot.insert_placeholder_session(
+            "unidentified-pane".to_string(),
+            None,
+            Some(AgentType::Codex),
+            None,
+        );
+        process_pending_seed_prompts(
+            &mut unidentified_ui,
+            &unidentified_pane,
+            &unidentified_snapshot,
+        );
+        process_pending_seed_prompts(
+            &mut unidentified_ui,
+            &unidentified_pane,
+            &unidentified_snapshot,
+        );
+        assert!(
+            unidentified_ui.pending_seed_prompts.is_empty()
+                && unidentified_attempts.load(Ordering::SeqCst) == 1,
+            "a pane with no identity anywhere must be written once and never retyped"
+        );
+
+        // Reviewer B5 plus the real `/015` failure: a swallowed CR can leave
+        // the first seed in the input as either `seed\nseed` or bare
+        // `seedseed` (observed as the `waitUse` seam). Both are terminal
+        // delivery evidence, for short and hook-truncated long reports, so even
+        // a retry made immediately eligible after the event must not write a
+        // third copy.
+        let field_seed = "Use Bash to verify seed-confirm-alpha-7f31.txt exists in the current directory then print its exact filename and wait";
+        let seeds = [
+            ("short", field_seed.to_string()),
+            (
+                "long",
+                format!(
+                    "{field_seed} {}",
+                    "keep the exact sentinel-bearing task unchanged; ".repeat(4)
+                ),
+            ),
+        ];
+        assert!(
+            seeds[1].1.len() > crate::prompt_delivery::USER_PROMPT_MAX_LEN,
+            "the long fixture must exercise hook truncation"
+        );
+        let mut doubled_outcomes = Vec::new();
+        for (length, seed) in seeds {
+            for (separator_name, separator) in [("newline", "\n"), ("bare", "")] {
+                let doubled_attempts = Arc::new(AtomicUsize::new(0));
+                let doubled_pane: Arc<dyn PaneController> =
+                    Arc::new(SendResultPaneController::new(
+                        InjectedSendOutcome::Applied,
+                        doubled_attempts.clone(),
+                    ));
+                let mut doubled_ui = default_ui();
+                doubled_ui
+                    .pending_seed_prompts
+                    .push(ready_seed_prompt("doubled-seed-pane", &seed));
+                let mut doubled_snapshot =
+                    ready_prompt_snapshot("doubled-seed-pane", "doubled-seed-agent");
+
+                process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
+                doubled_ui
+                    .send_retry_backoff
+                    .get_mut("doubled-seed-pane")
+                    .expect("first unconfirmed write arms retry")
+                    .next_attempt_at = std::time::Instant::now();
+                process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
+                assert_eq!(doubled_attempts.load(Ordering::SeqCst), 2);
+
+                let doubled = format!("{seed}{separator}{seed}");
+                let reported = crate::prompt_delivery::truncate_on_char_boundary(
+                    &doubled,
+                    crate::prompt_delivery::USER_PROMPT_MAX_LEN,
+                );
+                apply_prompt_confirmation(
+                    &mut doubled_snapshot,
+                    "doubled-seed-pane",
+                    "doubled-seed-agent",
+                    &reported,
+                );
+                doubled_ui
+                    .send_retry_backoff
+                    .get_mut("doubled-seed-pane")
+                    .expect("second unconfirmed write keeps retry armed")
+                    .next_attempt_at = std::time::Instant::now();
+                process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
+                process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
+                doubled_outcomes.push((
+                    format!("{length}-{separator_name}"),
+                    doubled_ui.pending_seed_prompts.is_empty(),
+                    !doubled_ui.prompt_delivery.contains_key("doubled-seed-pane")
+                        && !doubled_ui
+                            .send_retry_backoff
+                            .contains_key("doubled-seed-pane"),
+                    doubled_attempts.load(Ordering::SeqCst),
+                ));
+            }
+        }
+        assert!(
+            doubled_outcomes
+                .iter()
+                .all(|(_, delivered, retry_cleared, attempts)| {
+                    *delivered && *retry_cleared && *attempts == 2
+                }),
+            "every reported doubled seed must be delivered with retry state cleared and no third write; outcomes={doubled_outcomes:#?}"
+        );
+
+        let repeated = "bounded repetition";
+        assert!(prompt_submission_matches(
+            repeated,
+            &std::iter::repeat_n(repeated, 16)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        assert!(
+            !prompt_submission_matches(
+                repeated,
+                &std::iter::repeat_n(repeated, 17)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            "the recovery shape is deliberately bounded to 16 copies"
+        );
+        assert!(!prompt_submission_matches(
+            repeated,
+            &format!("{repeated}\nsomething else")
+        ));
+    }
+
+    /// A controller that records the exact payload and bound session of every
+    /// identity-bearing write, which is what the D1/D5 policies are stated in
+    /// terms of. Deliberately separate from `SendResultPaneController` so
+    /// nothing existing changes shape.
+    /// One recorded identity-bearing write: the payload, the generation it was
+    /// bound to, and the wire delivery id.
+    type RecordedWrite = (String, Option<String>, Option<String>);
+
+    #[derive(Default)]
+    struct RecordingPaneController {
+        writes: Arc<std::sync::Mutex<Vec<RecordedWrite>>>,
+        lose_first_response: bool,
+    }
+
+    impl RecordingPaneController {
+        fn losing_first_response() -> Self {
+            Self {
+                writes: Arc::default(),
+                lose_first_response: true,
+            }
+        }
+    }
+
+    impl PaneController for RecordingPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            _pane_id: &str,
+            text: &str,
+            _expected_agent_id: Option<&str>,
+            expected_session_id: Option<&str>,
+            delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            let mut writes = self.writes.lock().unwrap();
+            writes.push((
+                text.to_string(),
+                expected_session_id.map(str::to_string),
+                delivery_id.map(str::to_string),
+            ));
+            let first_write = writes.len() == 1;
+            drop(writes);
+            if self.lose_first_response && first_write {
+                return Err(PaneError::CommandFailed(
+                    "injected lost response after physical write".into(),
+                ));
+            }
+            Ok(crate::event::SendResult::Applied)
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A TUI-facing controller whose submissions go through the production
+    /// registry guard and land on a real byte-observation PTY. This lets the
+    /// consumer test assert what physically reached the pane after the daemon's
+    /// user-input clock advanced, without coupling the assertion to where the
+    /// safety check is implemented.
+    #[cfg(unix)]
+    struct RegistryBackedPaneController {
+        registry: Arc<crate::agent_pty::AgentPtyRegistry>,
+        agent_id: String,
+        runtime: tokio::runtime::Runtime,
+    }
+
+    #[cfg(unix)]
+    impl RegistryBackedPaneController {
+        fn new(pane_id: &str) -> Self {
+            let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+            let agent_id = registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane_id.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn TUI byte-observation target");
+            Self {
+                registry,
+                agent_id,
+                runtime: tokio::runtime::Runtime::new().expect("test runtime"),
+            }
+        }
+
+        fn snapshot(&self) -> Vec<u8> {
+            self.registry
+                .snapshot(&self.agent_id)
+                .expect("TUI byte-observation snapshot")
+        }
+
+        fn type_user_draft(&self, pane_id: &str, draft: &str) {
+            let handle = self
+                .registry
+                .subscribe(&self.agent_id)
+                .expect("attach TUI byte-observation target");
+            self.runtime.block_on(async {
+                use std::io::Write as _;
+
+                let mut writer = handle.writer.lock().await;
+                writer
+                    .write_all(draft.as_bytes())
+                    .expect("write unsent TUI user draft");
+                writer.flush().expect("flush unsent TUI user draft");
+            });
+            self.registry.note_user_input(pane_id);
+            std::thread::sleep(std::time::Duration::from_millis(75));
+        }
+    }
+
+    #[cfg(unix)]
+    impl PaneController for RegistryBackedPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
+            Some(self.agent_id.clone())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            pane_id: &str,
+            text: &str,
+            expected_agent_id: Option<&str>,
+            _expected_session_id: Option<&str>,
+            _delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            let outcome = self
+                .runtime
+                .block_on(self.registry.write_and_submit_guarded(
+                    pane_id,
+                    text,
+                    expected_agent_id,
+                    || async { true },
+                ))
+                .map_err(|error| PaneError::CommandFailed(error.to_string()))?;
+            Ok(match outcome {
+                crate::agent_pty::GuardedSend::Applied => crate::event::SendResult::Applied,
+                crate::agent_pty::GuardedSend::WrongSession => {
+                    crate::event::SendResult::WrongSession
+                }
+                crate::agent_pty::GuardedSend::Stale => crate::event::SendResult::Stale,
+                crate::agent_pty::GuardedSend::NoLiveTarget => {
+                    crate::event::SendResult::NoLiveTarget
+                }
+                crate::agent_pty::GuardedSend::Ambiguous => crate::event::SendResult::Ambiguous,
+            })
+        }
+        fn name(&self) -> &str {
+            "registry-backed"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Scenario: Let a TUI seed reach its reporting pane, type an unsent user draft before the replacement payload is due, and independently type another draft after the replacement but before the submit-only probe. In both timelines the next automatic attempt must send no bytes, so it neither appends its payload nor submits the user's draft.
+    #[cfg(unix)]
+    #[spec("prompt/pane-input/032")]
+    #[test]
+    fn pane_input_032_user_input_disarms_submit_only_probe() {
+        const PANE_ID: &str = "user-draft-safety-pane";
+        const PROMPT: &str = "automatic prompt before the user's draft";
+        const USER_DRAFT: &str = "user draft deliberately left unsent";
+
+        const REPLACEMENT_PANE_ID: &str = "user-draft-before-replacement-pane";
+        const REPLACEMENT_PROMPT: &str = "automatic prompt before replacement guard";
+        const REPLACEMENT_DRAFT: &str = "draft before replacement payload";
+
+        let replacement_controller =
+            Arc::new(RegistryBackedPaneController::new(REPLACEMENT_PANE_ID));
+        let replacement_pane: Arc<dyn PaneController> = replacement_controller.clone();
+        let mut replacement_ui = default_ui();
+        replacement_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt(REPLACEMENT_PANE_ID, REPLACEMENT_PROMPT));
+        let replacement_snapshot =
+            ready_prompt_snapshot(REPLACEMENT_PANE_ID, &replacement_controller.agent_id);
+
+        process_pending_seed_prompts(
+            &mut replacement_ui,
+            &replacement_pane,
+            &replacement_snapshot,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        let after_initial_delivery = replacement_controller.snapshot();
+        assert!(
+            after_initial_delivery
+                .windows(REPLACEMENT_PROMPT.len())
+                .any(|window| window == REPLACEMENT_PROMPT.as_bytes()),
+            "precondition: attempt 1 must reach the TUI pane before any automatic-write timestamp exists; output={:?}",
+            String::from_utf8_lossy(&after_initial_delivery)
+        );
+
+        replacement_controller.type_user_draft(REPLACEMENT_PANE_ID, REPLACEMENT_DRAFT);
+        let before_replacement = replacement_controller.snapshot();
+        assert!(
+            before_replacement
+                .windows(REPLACEMENT_DRAFT.len())
+                .any(|window| window == REPLACEMENT_DRAFT.as_bytes()),
+            "precondition: the unsent user draft must physically reach the TUI PTY; output={:?}",
+            String::from_utf8_lossy(&before_replacement)
+        );
+        replacement_ui
+            .send_retry_backoff
+            .get_mut(REPLACEMENT_PANE_ID)
+            .expect("first write arms replacement payload")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(
+            &mut replacement_ui,
+            &replacement_pane,
+            &replacement_snapshot,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        let after_replacement = replacement_controller.snapshot();
+
+        replacement_controller.registry.shutdown_all();
+        assert_eq!(
+            after_replacement,
+            before_replacement,
+            "TUI attempt 2 must append no replacement payload and send no submit CR after user input; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_replacement),
+            String::from_utf8_lossy(&after_replacement)
+        );
+
+        let controller = Arc::new(RegistryBackedPaneController::new(PANE_ID));
+        let pane: Arc<dyn PaneController> = controller.clone();
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        let snapshot = ready_prompt_snapshot(PANE_ID, &controller.agent_id);
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("first write arms replacement attempt")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        std::thread::sleep(std::time::Duration::from_millis(75));
+
+        controller.type_user_draft(PANE_ID, USER_DRAFT);
+        let before_probe = controller.snapshot();
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("second write arms submit-only probe")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        let after_probe = controller.snapshot();
+
+        controller.registry.shutdown_all();
+        assert_eq!(
+            after_probe,
+            before_probe,
+            "a TUI retry must send no submit CR after the registry recorded user input; before={:?}, after={:?}",
+            String::from_utf8_lossy(&before_probe),
+            String::from_utf8_lossy(&after_probe)
+        );
+    }
+
+    /// Scenario: Write seed and orchestrator prompts into launcher panes with no hook generation, including writes whose successful daemon response is lost, then let generations arrive or roll over during backoff. A live generation may be bound before retry, but neither an observed end nor a whole start/end/successor burst may let either TUI path write into a successor; a later safe attempt probes submission rather than retyping.
+    #[spec("prompt/pane-input/030")]
+    #[test]
+    fn pane_input_030_late_generation_binds_before_the_retry_that_enters_it() {
+        const PANE_ID: &str = "late-generation-pane";
+        const AGENT_ID: &str = "late-generation-agent";
+        const PROMPT: &str = "Read the dispatch seed and begin";
+
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        // The launcher shape: identity and a reporting agent type are known, but
+        // nothing has announced a conversation yet.
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        assert_eq!(
+            snapshot.pane_hook_session_id(PANE_ID),
+            None,
+            "precondition: the fallback writes into a pane with no generation"
+        );
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].0, PROMPT);
+            assert_eq!(
+                writes[0].1, None,
+                "the first write has no generation to name, and must not invent one"
+            );
+        }
+
+        // The real agent finally announces itself — the 10.1 s launcher case.
+        snapshot.apply_event(AgentEvent {
+            session_id: "genuine-generation".into(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE_ID.into()),
+            agent_id: Some(AGENT_ID.into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("an unconfirmed write arms retry")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 2, "the retry must reach the pane");
+            assert_eq!(
+                writes[1].1.as_deref(),
+                Some("genuine-generation"),
+                "D1: a retry sent INTO a generation must declare it, or a later \
+                 /clear can take the same prompt with no session guard at all"
+            );
+            assert_eq!(
+                writes[1].0, PROMPT,
+                "attempt 2 is the one bounded replacement payload"
+            );
+        }
+        assert_eq!(
+            ui.prompt_delivery
+                .get(PANE_ID)
+                .and_then(|d| d.expected_session_id.clone())
+                .as_deref(),
+            Some("genuine-generation"),
+            "the binding must be retained, not merely sent once"
+        );
+
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("still unconfirmed")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 3);
+            assert_eq!(
+                writes[2].0, "",
+                "D5: by attempt 3 a payload may be sitting in the input box, so \
+                 the attempt probes submission instead of appending another copy"
+            );
+            assert_eq!(
+                writes[2].1.as_deref(),
+                Some("genuine-generation"),
+                "a probe carries the same identity guards as any other attempt"
+            );
+            assert_ne!(
+                writes[2].2, writes[1].2,
+                "a probe's payload differs, so it needs its own ledger identity"
+            );
+        }
+
+        // Auditor E2: the generation can appear while attempt 1 is held in
+        // backoff and disappear again before attempt 2. `expected_session_id`
+        // is still None in that sequence, but observing the generation and its
+        // end must nevertheless revoke the unbound delivery. A successor is
+        // present at retry time to catch the especially dangerous false rebind.
+        const HELD_SEED_PANE: &str = "held-ended-seed-generation";
+        const HELD_SEED_AGENT: &str = "held-ended-seed-agent";
+        let held_seed_controller = Arc::new(RecordingPaneController::default());
+        let held_seed_writes = held_seed_controller.writes.clone();
+        let held_seed_pane: Arc<dyn PaneController> = held_seed_controller;
+        let mut held_seed_ui = default_ui();
+        held_seed_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt(HELD_SEED_PANE, PROMPT));
+        let mut held_seed_snapshot = ready_prompt_snapshot(HELD_SEED_PANE, HELD_SEED_AGENT);
+
+        process_pending_seed_prompts(&mut held_seed_ui, &held_seed_pane, &held_seed_snapshot);
+        apply_generation_event(
+            &mut held_seed_snapshot,
+            HELD_SEED_PANE,
+            HELD_SEED_AGENT,
+            "generation-seen-during-seed-backoff",
+            EventType::SessionStart,
+        );
+        process_pending_seed_prompts(&mut held_seed_ui, &held_seed_pane, &held_seed_snapshot);
+        apply_generation_event(
+            &mut held_seed_snapshot,
+            HELD_SEED_PANE,
+            HELD_SEED_AGENT,
+            "generation-seen-during-seed-backoff",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut held_seed_snapshot,
+            HELD_SEED_PANE,
+            HELD_SEED_AGENT,
+            "seed-successor-generation",
+            EventType::SessionStart,
+        );
+        held_seed_ui
+            .send_retry_backoff
+            .get_mut(HELD_SEED_PANE)
+            .expect("held seed keeps its retry state")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut held_seed_ui, &held_seed_pane, &held_seed_snapshot);
+        let held_seed_write_count = held_seed_writes.lock().unwrap().len();
+
+        // The orchestrator twin must remember the same observed transition.
+        const HELD_ROLE_PANE: &str = "held-ended-orchestrator-generation";
+        const HELD_ROLE_AGENT: &str = "held-ended-orchestrator-agent";
+        let held_role_controller = Arc::new(RecordingPaneController::default());
+        let held_role_writes = held_role_controller.writes.clone();
+        let held_role_pane: Arc<dyn PaneController> = held_role_controller;
+        let started = std::time::Instant::now();
+        let tab_id: TabId = 30030;
+        let mut held_role_ui = default_ui();
+        held_role_ui
+            .orchestration_created_at
+            .insert(tab_id, started);
+        held_role_ui.orchestration_ready_since.insert(
+            tab_id,
+            started
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut held_role_snapshot = ready_prompt_snapshot(HELD_ROLE_PANE, HELD_ROLE_AGENT);
+        let role_panes = [HELD_ROLE_PANE.to_string()];
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut role_prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut held_role_ui,
+            held_role_pane.as_ref(),
+            &held_role_snapshot,
+            started,
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        apply_generation_event(
+            &mut held_role_snapshot,
+            HELD_ROLE_PANE,
+            HELD_ROLE_AGENT,
+            "generation-seen-during-role-backoff",
+            EventType::SessionStart,
+        );
+        deliver_orchestrator_prompt(
+            &mut held_role_ui,
+            held_role_pane.as_ref(),
+            &held_role_snapshot,
+            started + std::time::Duration::from_millis(1),
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        apply_generation_event(
+            &mut held_role_snapshot,
+            HELD_ROLE_PANE,
+            HELD_ROLE_AGENT,
+            "generation-seen-during-role-backoff",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut held_role_snapshot,
+            HELD_ROLE_PANE,
+            HELD_ROLE_AGENT,
+            "role-successor-generation",
+            EventType::SessionStart,
+        );
+        held_role_ui
+            .send_retry_backoff
+            .get_mut(HELD_ROLE_PANE)
+            .expect("held role keeps its retry state")
+            .next_attempt_at = started;
+        deliver_orchestrator_prompt(
+            &mut held_role_ui,
+            held_role_pane.as_ref(),
+            &held_role_snapshot,
+            started + std::time::Duration::from_millis(2),
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        let held_role_write_count = held_role_writes.lock().unwrap().len();
+
+        assert!(
+            held_seed_write_count == 1 && held_role_write_count == 1,
+            "an unbound delivery that observed a generation and its end must not follow into a successor on either TUI path; seed_writes={held_seed_write_count}, orchestrator_writes={held_role_write_count}"
+        );
+
+        // Auditor round 6: production does not guarantee a render pass while a
+        // short-lived generation exists. Force the entire R start/end/R2 start
+        // burst into AppState between two passes so no fixture-side witness can
+        // serialize the rollover into the favorable ordering above.
+        const BURST_SEED_PANE: &str = "between-pass-seed-generation-burst";
+        const BURST_SEED_AGENT: &str = "between-pass-seed-agent";
+        let burst_seed_controller = Arc::new(RecordingPaneController::default());
+        let burst_seed_writes = burst_seed_controller.writes.clone();
+        let burst_seed_pane: Arc<dyn PaneController> = burst_seed_controller;
+        let mut burst_seed_ui = default_ui();
+        burst_seed_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt(BURST_SEED_PANE, PROMPT));
+        let mut burst_seed_snapshot = ready_prompt_snapshot(BURST_SEED_PANE, BURST_SEED_AGENT);
+
+        process_pending_seed_prompts(&mut burst_seed_ui, &burst_seed_pane, &burst_seed_snapshot);
+        apply_generation_event(
+            &mut burst_seed_snapshot,
+            BURST_SEED_PANE,
+            BURST_SEED_AGENT,
+            "seed-generation-entirely-between-passes",
+            EventType::SessionStart,
+        );
+        apply_generation_event(
+            &mut burst_seed_snapshot,
+            BURST_SEED_PANE,
+            BURST_SEED_AGENT,
+            "seed-generation-entirely-between-passes",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut burst_seed_snapshot,
+            BURST_SEED_PANE,
+            BURST_SEED_AGENT,
+            "seed-successor-after-missed-generation",
+            EventType::SessionStart,
+        );
+        burst_seed_ui
+            .send_retry_backoff
+            .get_mut(BURST_SEED_PANE)
+            .expect("burst seed keeps its retry state")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut burst_seed_ui, &burst_seed_pane, &burst_seed_snapshot);
+        let burst_seed_write_count = burst_seed_writes.lock().unwrap().len();
+
+        const BURST_ROLE_PANE: &str = "between-pass-role-generation-burst";
+        const BURST_ROLE_AGENT: &str = "between-pass-role-agent";
+        let burst_role_controller = Arc::new(RecordingPaneController::default());
+        let burst_role_writes = burst_role_controller.writes.clone();
+        let burst_role_pane: Arc<dyn PaneController> = burst_role_controller;
+        let burst_started = std::time::Instant::now();
+        let burst_tab_id: TabId = 30031;
+        let mut burst_role_ui = default_ui();
+        burst_role_ui
+            .orchestration_created_at
+            .insert(burst_tab_id, burst_started);
+        burst_role_ui.orchestration_ready_since.insert(
+            burst_tab_id,
+            burst_started
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut burst_role_snapshot = ready_prompt_snapshot(BURST_ROLE_PANE, BURST_ROLE_AGENT);
+        let burst_role_panes = [BURST_ROLE_PANE.to_string()];
+        let mut burst_role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut burst_role_prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut burst_role_ui,
+            burst_role_pane.as_ref(),
+            &burst_role_snapshot,
+            burst_started,
+            burst_tab_id,
+            &burst_role_panes,
+            0,
+            &mut burst_role_statuses,
+            &mut burst_role_prompt,
+        );
+        apply_generation_event(
+            &mut burst_role_snapshot,
+            BURST_ROLE_PANE,
+            BURST_ROLE_AGENT,
+            "role-generation-entirely-between-passes",
+            EventType::SessionStart,
+        );
+        apply_generation_event(
+            &mut burst_role_snapshot,
+            BURST_ROLE_PANE,
+            BURST_ROLE_AGENT,
+            "role-generation-entirely-between-passes",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut burst_role_snapshot,
+            BURST_ROLE_PANE,
+            BURST_ROLE_AGENT,
+            "role-successor-after-missed-generation",
+            EventType::SessionStart,
+        );
+        burst_role_ui
+            .send_retry_backoff
+            .get_mut(BURST_ROLE_PANE)
+            .expect("burst role keeps its retry state")
+            .next_attempt_at = burst_started;
+        deliver_orchestrator_prompt(
+            &mut burst_role_ui,
+            burst_role_pane.as_ref(),
+            &burst_role_snapshot,
+            burst_started + std::time::Duration::from_millis(1),
+            burst_tab_id,
+            &burst_role_panes,
+            0,
+            &mut burst_role_statuses,
+            &mut burst_role_prompt,
+        );
+        let burst_role_write_count = burst_role_writes.lock().unwrap().len();
+
+        assert!(
+            burst_seed_write_count == 1 && burst_role_write_count == 1,
+            "a whole generation that starts and ends between render passes must revoke both unbound TUI deliveries before either can bind its successor; seed_writes={burst_seed_write_count}, orchestrator_writes={burst_role_write_count}"
+        );
+
+        // A transport error is not proof that the daemon did not apply the
+        // write. Force the first request to record a physical write and then
+        // lose its response, so the whole closure burst lands while the TUI's
+        // ordinary success counters still say zero.
+        const LOST_SEED_PANE: &str = "lost-response-seed-generation-burst";
+        const LOST_SEED_AGENT: &str = "lost-response-seed-agent";
+        let lost_seed_controller = Arc::new(RecordingPaneController::losing_first_response());
+        let lost_seed_writes = lost_seed_controller.writes.clone();
+        let lost_seed_pane: Arc<dyn PaneController> = lost_seed_controller;
+        let mut lost_seed_ui = default_ui();
+        lost_seed_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt(LOST_SEED_PANE, PROMPT));
+        let mut lost_seed_snapshot = ready_prompt_snapshot(LOST_SEED_PANE, LOST_SEED_AGENT);
+
+        process_pending_seed_prompts(&mut lost_seed_ui, &lost_seed_pane, &lost_seed_snapshot);
+        apply_generation_event(
+            &mut lost_seed_snapshot,
+            LOST_SEED_PANE,
+            LOST_SEED_AGENT,
+            "lost-seed-generation-entirely-between-passes",
+            EventType::SessionStart,
+        );
+        apply_generation_event(
+            &mut lost_seed_snapshot,
+            LOST_SEED_PANE,
+            LOST_SEED_AGENT,
+            "lost-seed-generation-entirely-between-passes",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut lost_seed_snapshot,
+            LOST_SEED_PANE,
+            LOST_SEED_AGENT,
+            "lost-seed-successor-after-missed-generation",
+            EventType::SessionStart,
+        );
+        lost_seed_ui
+            .send_retry_backoff
+            .get_mut(LOST_SEED_PANE)
+            .expect("lost seed response keeps transport retry state")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut lost_seed_ui, &lost_seed_pane, &lost_seed_snapshot);
+        let lost_seed_records = lost_seed_writes.lock().unwrap().clone();
+
+        const LOST_ROLE_PANE: &str = "lost-response-role-generation-burst";
+        const LOST_ROLE_AGENT: &str = "lost-response-role-agent";
+        let lost_role_controller = Arc::new(RecordingPaneController::losing_first_response());
+        let lost_role_writes = lost_role_controller.writes.clone();
+        let lost_role_pane: Arc<dyn PaneController> = lost_role_controller;
+        let lost_started = std::time::Instant::now();
+        let lost_tab_id: TabId = 30032;
+        let mut lost_role_ui = default_ui();
+        lost_role_ui
+            .orchestration_created_at
+            .insert(lost_tab_id, lost_started);
+        lost_role_ui.orchestration_ready_since.insert(
+            lost_tab_id,
+            lost_started
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut lost_role_snapshot = ready_prompt_snapshot(LOST_ROLE_PANE, LOST_ROLE_AGENT);
+        let lost_role_panes = [LOST_ROLE_PANE.to_string()];
+        let mut lost_role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut lost_role_prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut lost_role_ui,
+            lost_role_pane.as_ref(),
+            &lost_role_snapshot,
+            lost_started,
+            lost_tab_id,
+            &lost_role_panes,
+            0,
+            &mut lost_role_statuses,
+            &mut lost_role_prompt,
+        );
+        apply_generation_event(
+            &mut lost_role_snapshot,
+            LOST_ROLE_PANE,
+            LOST_ROLE_AGENT,
+            "lost-role-generation-entirely-between-passes",
+            EventType::SessionStart,
+        );
+        apply_generation_event(
+            &mut lost_role_snapshot,
+            LOST_ROLE_PANE,
+            LOST_ROLE_AGENT,
+            "lost-role-generation-entirely-between-passes",
+            EventType::SessionEnd,
+        );
+        apply_generation_event(
+            &mut lost_role_snapshot,
+            LOST_ROLE_PANE,
+            LOST_ROLE_AGENT,
+            "lost-role-successor-after-missed-generation",
+            EventType::SessionStart,
+        );
+        lost_role_ui
+            .send_retry_backoff
+            .get_mut(LOST_ROLE_PANE)
+            .expect("lost role response keeps transport retry state")
+            .next_attempt_at = lost_started;
+        deliver_orchestrator_prompt(
+            &mut lost_role_ui,
+            lost_role_pane.as_ref(),
+            &lost_role_snapshot,
+            lost_started + std::time::Duration::from_millis(1),
+            lost_tab_id,
+            &lost_role_panes,
+            0,
+            &mut lost_role_statuses,
+            &mut lost_role_prompt,
+        );
+        let lost_role_records = lost_role_writes.lock().unwrap().clone();
+
+        assert!(
+            lost_seed_records.len() == 1 && lost_role_records.len() == 1,
+            "a physically applied write whose response was lost must retain its pre-RPC closure baseline on both TUI paths and never write the old task into a successor; seed_writes={lost_seed_records:?}, orchestrator_writes={lost_role_records:?}"
+        );
+    }
+
+    /// Scenario: Write a seed to a target with no usable prompt-reporting channel, then supply daemon-synthetic evidence beside an untagged legacy hook. Those events must not arm a second physical write into a target that cannot actually confirm submission.
+    #[spec("prompt/pane-input/031")]
+    #[test]
+    fn pane_input_031_daemon_synthetic_events_are_not_a_reporting_channel() {
+        const PANE_ID: &str = "synthetic-evidence-pane";
+        const PROMPT: &str = "one legacy-hook seed";
+
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        let mut snapshot = AppState::default();
+        snapshot.register_pane(PANE_ID.to_string());
+        snapshot.insert_placeholder_session(
+            PANE_ID.to_string(),
+            None,
+            Some(AgentType::ClaudeCode),
+            Some("legacy-agent".to_string()),
+        );
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(writes.lock().unwrap().len(), 1);
+
+        let mut synthetic = |event_type: EventType, notice: bool| {
+            let mut metadata = std::collections::HashMap::new();
+            if notice {
+                metadata.insert(
+                    crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+                    "a spawn-time prompt was never confirmed".to_string(),
+                );
+            }
+            snapshot.apply_event(AgentEvent {
+                session_id: "legacy-session".into(),
+                agent_type: AgentType::None,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata,
+                // Identified, because that is how a daemon-authored event lands
+                // on the right card — and exactly what defeated C6.
+                pane_id: Some(PANE_ID.into()),
+                agent_id: Some("legacy-agent".into()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            });
+        };
+        synthetic(EventType::ShellBusy, false);
+        synthetic(EventType::Error, true);
+
+        // ...while the pane's REAL producer speaks through a pre-F9 untagged
+        // hook, which `prompt_submission_confirmed` can never accept.
+        snapshot.apply_event(AgentEvent {
+            session_id: "legacy-session".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE_ID.into()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+
+        ui.send_retry_backoff
+            .entry(PANE_ID.to_string())
+            .or_insert(SendRetryState {
+                next_attempt_at: std::time::Instant::now(),
+                attempts: 1,
+            })
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "D4: events the daemon wrote itself prove only that the DAEMON can \
+             tag an event; they must not re-arm retyping through a channel that \
+             still cannot confirm anything"
+        );
+    }
+
+    /// Scenario: Lose the response after a ledger caches the first physical seed write, retry that same attempt id, then let the unconfirmed-delivery retry rotate to a new id whose physical write is ambiguous. The duplicate must replay without writing, the rotated attempt must reach the writer, and Ambiguous must abandon without another attempt.
+    #[spec("prompt/pane-input/027")]
+    #[test]
+    fn pane_input_027_rotated_attempt_ids_cross_a_caching_ledger() {
+        const PANE_ID: &str = "caching-ledger-pane";
+        const PROMPT: &str = "retry through the delivery ledger";
+
+        let controller = Arc::new(CachingLedgerPaneController::new());
+        let ledger_state = controller.state.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        let snapshot = ready_prompt_snapshot(PANE_ID, "caching-ledger-agent");
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let state = ledger_state.lock().unwrap();
+            assert_eq!(state.physical_writes, 1);
+            assert_eq!(state.request_ids.len(), 1);
+        }
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("lost response schedules a transport retry")
+            .next_attempt_at = std::time::Instant::now();
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        {
+            let state = ledger_state.lock().unwrap();
+            assert_eq!(
+                state.physical_writes, 1,
+                "a duplicate of the same attempt must replay cached Applied without a second write"
+            );
+            assert_eq!(state.request_ids.len(), 2);
+            assert_eq!(
+                state.request_ids[0], state.request_ids[1],
+                "a lost response retries the exact same physical attempt id"
+            );
+        }
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("cached Applied remains provisional and arms confirmation retry")
+            .next_attempt_at = std::time::Instant::now();
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        let state = ledger_state.lock().unwrap();
+        assert_eq!(
+            state.physical_writes, 2,
+            "the second logical attempt must rotate its id and reach the physical writer"
+        );
+        assert_eq!(state.request_ids.len(), 3);
+        assert_ne!(
+            state.request_ids[1], state.request_ids[2],
+            "an unconfirmed retry must not replay the first attempt's cached Applied"
+        );
+        assert!(
+            state.request_ids[0].ends_with("#a1") && state.request_ids[2].ends_with("#a2"),
+            "wire ids must identify the logical attempts: {:?}",
+            state.request_ids
+        );
+        assert!(ui.pending_seed_prompts.is_empty());
+        assert!(
+            !ui.prompt_delivery.contains_key(PANE_ID)
+                && !ui.send_retry_backoff.contains_key(PANE_ID),
+            "Ambiguous on the rotated attempt is terminal and must abandon all retry state"
+        );
+    }
+
+    /// Scenario: Write an automatic prompt successfully without confirmation, including a launcher that identifies its real producer only after the readiness timeout. Reporting panes must retry under bounded backoff and reach the deadline, while the late producer must retain the provisional first write and arm a retry once SessionStart finally arrives.
+    #[spec("prompt/pane-input/025")]
+    #[test]
+    fn pane_input_025_unconfirmed_retry_deadline_and_late_readiness() {
+        const PANE_ID: &str = "unconfirmed-deadline-pane";
+        const AGENT_ID: &str = "unconfirmed-deadline-agent";
+        const PROMPT: &str = "This prompt is swallowed before submission";
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let created = std::time::Instant::now();
+        let tab_id: TabId = 25;
+        let mut ui = default_ui();
+        ui.orchestration_created_at.insert(tab_id, created);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            created
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            created,
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(
+            prompt.as_deref(),
+            Some(PROMPT),
+            "an Applied-but-unconfirmed write must stay pending for retry"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let retry_at = created
+            .checked_add(std::time::Duration::from_secs(1))
+            .expect("retry timestamp");
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("provisional write must arm retry")
+            .next_attempt_at = retry_at;
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            retry_at,
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "an unconfirmed PTY write must be re-sent after its bounded backoff"
+        );
+        assert_eq!(prompt.as_deref(), Some(PROMPT));
+
+        let past_deadline = created
+            .checked_add(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
+            .expect("deadline timestamp");
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            past_deadline,
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+
+        assert!(prompt.is_none(), "past-deadline prompt must be abandoned");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "deadline abandonment must not perform one final write"
+        );
+        assert!(
+            !ui.prompt_delivery.contains_key(PANE_ID)
+                && !ui.send_retry_backoff.contains_key(PANE_ID),
+            "deadline abandonment must clear all retry state"
+        );
+        assert_ne!(
+            role_statuses[0],
+            OrchestrationRoleStatus::Working,
+            "an unconfirmed prompt must never mark the role Working"
+        );
+        assert!(
+            ui.status_message.as_ref().is_some_and(|(message, _)| {
+                let message = message.to_ascii_lowercase();
+                message.contains("timed out") && message.contains("abandoned")
+            }),
+            "deadline abandonment must surface the existing timeout status, got {:?}",
+            ui.status_message.as_ref().map(|(message, _)| message)
+        );
+
+        // Reviewer B3: the `devbox run claude ...` shape has no identifiable
+        // producer when the 10s fallback writes. That first write must stay
+        // provisional (without retyping), then a late SessionStart must arm a
+        // real retry instead of finding the prompt already finalized.
+        const SLOW_PANE_ID: &str = "slow-launcher-pane";
+        const SLOW_PROMPT: &str = "prompt written before late SessionStart";
+        let slow_attempts = Arc::new(AtomicUsize::new(0));
+        let slow_pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            slow_attempts.clone(),
+        ));
+        let mut slow_ui = default_ui();
+        slow_ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: SLOW_PANE_ID.to_string(),
+            prompt: SLOW_PROMPT.to_string(),
+            created_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(11))
+                .expect("late-launch timestamp"),
+            ready_since: None,
+        });
+        let mut slow_snapshot = AppState::default();
+        slow_snapshot.register_pane(SLOW_PANE_ID.to_string());
+
+        process_pending_seed_prompts(&mut slow_ui, &slow_pane, &slow_snapshot);
+        assert_eq!(slow_attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            slow_ui.pending_seed_prompts.len() == 1
+                && slow_ui.prompt_delivery.contains_key(SLOW_PANE_ID)
+                && !slow_ui.send_retry_backoff.contains_key(SLOW_PANE_ID),
+            "fallback write with unknown capability must stay provisional without immediately retyping"
+        );
+
+        slow_snapshot.apply_event(AgentEvent {
+            session_id: "late-real-session".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(SLOW_PANE_ID.into()),
+            agent_id: Some("slow-launcher-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+        process_pending_seed_prompts(&mut slow_ui, &slow_pane, &slow_snapshot);
+        slow_ui
+            .pending_seed_prompts
+            .first_mut()
+            .expect("late producer keeps the pending prompt")
+            .ready_since = Some(
+            std::time::Instant::now()
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("late readiness buffer timestamp"),
+        );
+        process_pending_seed_prompts(&mut slow_ui, &slow_pane, &slow_snapshot);
+        assert_eq!(
+            slow_attempts.load(Ordering::SeqCst),
+            2,
+            "a late reporting producer must arm the retry that the timeout fallback preserved"
+        );
+        assert!(
+            slow_ui.send_retry_backoff.contains_key(SLOW_PANE_ID),
+            "the late producer's unconfirmed retry remains provisionally watched"
+        );
+    }
+
+    /// Scenario: Keep a seed prompt provisional after its PTY accepts the bytes, then inject matching text without an agent id, from another pane, and from before the write, plus unrelated target-pane text. None may confirm or disarm the retry; only fresh matching text carrying the target identity finalizes it.
+    #[spec("prompt/pane-input/026")]
+    #[test]
+    fn pane_input_026_only_matching_pane_and_prompt_confirm_delivery() {
+        const PANE_ID: &str = "matching-target-pane";
+        const AGENT_ID: &str = "matching-target-agent";
+        const OTHER_PANE_ID: &str = "wrong-confirmation-pane";
+        const OTHER_AGENT_ID: &str = "wrong-confirmation-agent";
+        const PROMPT: &str = "Exact automatic seed text";
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: PANE_ID.to_string(),
+            prompt: PROMPT.to_string(),
+            created_at: std::time::Instant::now(),
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("ready timestamp"),
+            ),
+        });
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        snapshot.register_pane(OTHER_PANE_ID.to_string());
+        snapshot.insert_placeholder_session(
+            OTHER_PANE_ID.to_string(),
+            None,
+            Some(AgentType::Codex),
+            Some(OTHER_AGENT_ID.to_string()),
+        );
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            ui.pending_seed_prompts.len(),
+            1,
+            "the first PTY write must remain provisional"
+        );
+        assert!(ui.send_retry_backoff.contains_key(PANE_ID));
+
+        snapshot.apply_event(AgentEvent {
+            session_id: "identity-less-confirmation".into(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: Some(PROMPT.into()),
+            metadata: Default::default(),
+            pane_id: Some(PANE_ID.into()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            ui.pending_seed_prompts.len(),
+            1,
+            "matching text with no agent identity is unusable evidence"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        apply_prompt_confirmation(&mut snapshot, OTHER_PANE_ID, OTHER_AGENT_ID, PROMPT);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            ui.pending_seed_prompts.len(),
+            1,
+            "the exact prompt text submitted by another pane must not confirm this delivery"
+        );
+        assert!(ui.send_retry_backoff.contains_key(PANE_ID));
+
+        apply_prompt_confirmation(
+            &mut snapshot,
+            PANE_ID,
+            AGENT_ID,
+            "the human typed an unrelated prompt",
+        );
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            ui.pending_seed_prompts.len(),
+            1,
+            "an unrelated human prompt in the target pane must not confirm the automatic delivery"
+        );
+        assert!(
+            ui.prompt_delivery.contains_key(PANE_ID) && ui.send_retry_backoff.contains_key(PANE_ID),
+            "non-matching events must leave delivery identity and retry armed"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "non-matching confirmations must not bypass the active retry backoff"
+        );
+
+        apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert!(
+            ui.pending_seed_prompts.is_empty(),
+            "only matching pane plus matching prompt may confirm the delivery"
+        );
+
+        // The same text in the journal before the write is the exact event the
+        // causal watermark must exclude. A later fresh copy still confirms.
+        let stale_attempts = Arc::new(AtomicUsize::new(0));
+        let stale_pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            stale_attempts.clone(),
+        ));
+        let mut stale_ui = default_ui();
+        stale_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt("stale-history-pane", PROMPT));
+        let mut stale_snapshot = ready_prompt_snapshot("stale-history-pane", "stale-history-agent");
+        apply_prompt_confirmation(
+            &mut stale_snapshot,
+            "stale-history-pane",
+            "stale-history-agent",
+            PROMPT,
+        );
+
+        process_pending_seed_prompts(&mut stale_ui, &stale_pane, &stale_snapshot);
+        process_pending_seed_prompts(&mut stale_ui, &stale_pane, &stale_snapshot);
+        assert!(
+            stale_ui.pending_seed_prompts.len() == 1
+                && stale_ui.prompt_delivery.contains_key("stale-history-pane")
+                && stale_ui
+                    .send_retry_backoff
+                    .contains_key("stale-history-pane"),
+            "matching pre-write history must not confirm a delivery that did not yet exist"
+        );
+        assert_eq!(stale_attempts.load(Ordering::SeqCst), 1);
+
+        apply_prompt_confirmation(
+            &mut stale_snapshot,
+            "stale-history-pane",
+            "stale-history-agent",
+            PROMPT,
+        );
+        process_pending_seed_prompts(&mut stale_ui, &stale_pane, &stale_snapshot);
+        assert!(
+            stale_ui.pending_seed_prompts.is_empty(),
+            "fresh matching evidence after the watermark must still confirm"
+        );
+    }
+
+    /// Scenario: Write a seed to one registry agent, block its retry, then rebind the pane to a replacement; separately end the bound hook session as a same-agent clear. The successor must receive zero bytes in both cases, and each stale delivery must terminate instead of remaining armed.
+    #[spec("prompt/pane-input/028")]
+    #[test]
+    fn pane_input_028_retry_never_reaches_replacement_or_cleared_session() {
+        const PROMPT: &str = "task belonging only to the original conversation";
+
+        let replacement_controller = Arc::new(IdentityGuardPaneController::new("original-agent"));
+        let replacement_pane: Arc<dyn PaneController> = replacement_controller.clone();
+        let mut replacement_ui = default_ui();
+        replacement_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt("rebound-pane", PROMPT));
+        let mut replacement_snapshot = ready_prompt_snapshot("rebound-pane", "original-agent");
+        process_pending_seed_prompts(
+            &mut replacement_ui,
+            &replacement_pane,
+            &replacement_snapshot,
+        );
+        assert_eq!(replacement_controller.writes_for("original-agent"), 1);
+
+        replacement_controller.rebind("replacement-agent");
+        replacement_snapshot.apply_event(AgentEvent {
+            session_id: "replacement-session".into(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("rebound-pane".into()),
+            agent_id: Some("replacement-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+        replacement_ui
+            .send_retry_backoff
+            .get_mut("rebound-pane")
+            .expect("original write arms a retry")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(
+            &mut replacement_ui,
+            &replacement_pane,
+            &replacement_snapshot,
+        );
+        assert_eq!(
+            replacement_controller.writes_for("replacement-agent"),
+            0,
+            "the old delivery must never type into a replacement registry agent"
+        );
+        let replacement_terminal = replacement_ui.pending_seed_prompts.is_empty()
+            && !replacement_ui.prompt_delivery.contains_key("rebound-pane")
+            && !replacement_ui
+                .send_retry_backoff
+                .contains_key("rebound-pane");
+
+        let clear_controller = Arc::new(IdentityGuardPaneController::new("same-agent"));
+        let clear_pane: Arc<dyn PaneController> = clear_controller.clone();
+        let mut clear_ui = default_ui();
+        clear_ui
+            .pending_seed_prompts
+            .push(ready_seed_prompt("clear-pane", PROMPT));
+        let mut clear_snapshot = AppState::default();
+        clear_snapshot.register_pane("clear-pane".to_string());
+        clear_snapshot.apply_event(AgentEvent {
+            session_id: "bound-before-clear".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("clear-pane".into()),
+            agent_id: Some("same-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+        process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
+        assert_eq!(clear_controller.writes_for("same-agent"), 1);
+
+        clear_snapshot.apply_event(AgentEvent {
+            session_id: "bound-before-clear".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionEnd,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("clear-pane".into()),
+            agent_id: Some("same-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
+        let clear_writes = clear_controller.writes_for("same-agent");
+        let clear_terminal = clear_ui.pending_seed_prompts.is_empty()
+            && !clear_ui.prompt_delivery.contains_key("clear-pane")
+            && !clear_ui.send_retry_backoff.contains_key("clear-pane");
+        assert!(
+            replacement_terminal && clear_writes == 1 && clear_terminal,
+            "replacement and clear must both terminate without successor bytes; replacement_terminal={replacement_terminal}, replacement_writes={}, clear_terminal={clear_terminal}, clear_writes={clear_writes}",
+            replacement_controller.writes_for("replacement-agent")
+        );
+    }
+
+    /// Issue #424 (reviewer blocker 2, coder-authored): the lost-response +
+    /// late-bind interaction that strands a delivery in a permanent ledger
+    /// conflict. Reusing the attempt id after a lost response is CORRECT (it
+    /// replays a write that physically landed), and binding the generation
+    /// changes the fingerprint that id is bound to — so the wire identity has to
+    /// rotate, or every later retry re-sends the same conflicting request until
+    /// the deadline.
+    #[test]
+    fn late_generation_bind_rotates_the_wire_identity_after_a_lost_response() {
+        const PANE_ID: &str = "epoch-rotation-pane";
+        let delivery = || PromptDelivery {
+            expected_agent_id: Some("epoch-agent".into()),
+            expected_session_id: None,
+            observed_generation: None,
+            closures_at_write: None,
+            delivery_id: "delivery-7".into(),
+            attempts: 0,
+            watermark: None,
+            can_report_prompts: false,
+            epoch: 0,
+            wire_issued: false,
+        };
+        let mut snapshot = AppState::default();
+        snapshot.register_pane(PANE_ID.to_string());
+        snapshot.apply_event(AgentEvent {
+            session_id: "generation-that-appeared-late".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE_ID.into()),
+            agent_id: Some("epoch-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+
+        // The lost-response shape: one wire request issued, no outcome learned,
+        // so `attempts` is still 0 and the next request reuses attempt 1.
+        let mut lost = delivery();
+        lost.wire_issued = true;
+        let before = wire_attempt_id(&lost.delivery_id, lost.epoch, lost.attempts + 1, false);
+        bind_delivery_generation(&mut lost, &snapshot, PANE_ID);
+        let after = wire_attempt_id(&lost.delivery_id, lost.epoch, lost.attempts + 1, false);
+        assert_eq!(
+            lost.expected_session_id.as_deref(),
+            Some("generation-that-appeared-late")
+        );
+        assert_ne!(
+            before, after,
+            "a bind that changes the fingerprint must not reuse the recorded wire id"
+        );
+        assert_ne!(
+            crate::agent_pty::AgentPtyRegistry::delivery_fingerprint(
+                lost.expected_agent_id.as_deref(),
+                None,
+                PANE_ID,
+                "prompt"
+            ),
+            crate::agent_pty::AgentPtyRegistry::delivery_fingerprint(
+                lost.expected_agent_id.as_deref(),
+                lost.expected_session_id.as_deref(),
+                PANE_ID,
+                "prompt"
+            ),
+            "the fixture is only meaningful while the session is part of the fingerprint"
+        );
+        assert!(
+            after.ends_with("#a1"),
+            "rotation must change the delivery identity, not the attempt number: {after}"
+        );
+
+        // With nothing issued, the same bind must NOT rotate: an unrotated id is
+        // what makes a genuine lost-response retry replay instead of writing a
+        // second copy.
+        let mut clean = delivery();
+        let unrotated = wire_attempt_id(&clean.delivery_id, clean.epoch, 1, false);
+        bind_delivery_generation(&mut clean, &snapshot, PANE_ID);
+        assert_eq!(clean.epoch, 0);
+        assert_eq!(
+            wire_attempt_id(&clean.delivery_id, clean.epoch, 1, false),
+            unrotated
+        );
+    }
+
+    /// Scenario: Record an untagged scheduler-style event before a seed write, then an untagged hook event after it, followed by identified evidence. Pre-write history must not disable confirmation, post-write unidentified-only evidence must hold without retrying, and an identified event must recover the reporting channel.
+    #[test]
+    fn untagged_hook_events_are_not_a_confirmation_channel() {
+        const PANE_ID: &str = "legacy-hook-pane";
+        let untagged = |snapshot: &mut AppState, event_type: EventType, prompt: Option<&str>| {
+            snapshot.apply_event(AgentEvent {
+                session_id: "legacy-session".into(),
+                agent_type: AgentType::ClaudeCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: prompt.map(str::to_string),
+                metadata: Default::default(),
+                pane_id: Some(PANE_ID.into()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            });
+        };
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, "legacy-hook-agent");
+        // `surface_spawned_pane` emits this untagged SessionStart shape before
+        // the delivery writes. The watermark must exclude it, or every
+        // scheduler-spawned pane would look like a post-write legacy channel.
+        untagged(&mut snapshot, EventType::SessionStart, None);
+        let mut delivery = PromptDelivery {
+            expected_agent_id: Some("legacy-hook-agent".into()),
+            expected_session_id: None,
+            observed_generation: None,
+            closures_at_write: None,
+            delivery_id: "legacy-1".into(),
+            attempts: 1,
+            watermark: pane_event_watermark(&snapshot, PANE_ID),
+            can_report_prompts: true,
+            epoch: 0,
+            wire_issued: true,
+        };
+        assert_eq!(
+            delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
+            ConfirmationCapability::Reports,
+            "a quiet pane has not yet shown anything about its evidence channel"
+        );
+
+        untagged(
+            &mut snapshot,
+            EventType::Thinking,
+            Some("something the agent submitted"),
+        );
+        assert_eq!(
+            delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
+            ConfirmationCapability::Unknown,
+            "post-write evidence that can never identify its producer is not a channel"
+        );
+
+        // One identified event settles it the other way, and the classification
+        // is recoverable rather than final — a pre-F9 hook is a property of the
+        // binary in the pane, not a verdict on the prompt.
+        apply_prompt_confirmation(&mut snapshot, PANE_ID, "legacy-hook-agent", "unrelated");
+        assert_eq!(
+            delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
+            ConfirmationCapability::Reports
+        );
+
+        // And it never fires before the delivery has written: there is nothing
+        // for the evidence to be about.
+        delivery.attempts = 0;
+        let mut untouched = AppState::default();
+        untouched.register_pane(PANE_ID.to_string());
+        untagged(
+            &mut untouched,
+            EventType::Thinking,
+            Some("pre-write chatter"),
+        );
+        assert!(!evidence_channel_is_unidentified(
+            &untouched, PANE_ID, &delivery
+        ));
+    }
+
+    /// Issue #424 (tester's finding / C2, coder-authored): which seed-path
+    /// outcomes are terminal, and why "already written" is part of the answer.
+    #[test]
+    fn seed_terminal_outcomes_depend_on_whether_a_write_exists() {
+        // A partial write must never be blindly repeated, whatever preceded it.
+        assert!(seed_result_is_terminal(SendResult::Ambiguous, false));
+        assert!(seed_result_is_terminal(SendResult::Ambiguous, true));
+        // A refusal AFTER a provisional write proves the bound target is gone.
+        assert!(seed_result_is_terminal(SendResult::WrongSession, true));
+        assert!(seed_result_is_terminal(SendResult::Unknown, true));
+        // Before any write nothing has been injected anywhere, so the same
+        // refusal is an ordinary non-delivery, retained under backoff and
+        // bounded by the deadline (`prompt/pane-input/006`).
+        assert!(!seed_result_is_terminal(SendResult::WrongSession, false));
+        assert!(!seed_result_is_terminal(SendResult::Unknown, false));
+        // Liveness transitions stay retryable on both sides.
+        for retryable in [
+            SendResult::HistoryOnly,
+            SendResult::Stale,
+            SendResult::NoLiveTarget,
+        ] {
+            assert!(!seed_result_is_terminal(retryable, false));
+            assert!(!seed_result_is_terminal(retryable, true));
+        }
+        // Epoch 0 — every delivery whose identity never moved — keeps exactly
+        // the wire id shape the ledger and the logs already knew.
+        assert_eq!(
+            wire_attempt_id("d", 0, 2, false),
+            attempt_delivery_id("d", 2)
+        );
+        assert_ne!(
+            wire_attempt_id("d", 1, 2, false),
+            attempt_delivery_id("d", 2)
+        );
+        assert!(wire_attempt_id("d", 1, 2, false).ends_with("#a2"));
+        // Issue #424 D5: a submit-only probe carries a different payload, so it
+        // must never share a ledger identity with the payload attempt it follows.
+        assert_ne!(
+            wire_attempt_id("d", 0, 3, true),
+            wire_attempt_id("d", 0, 3, false)
+        );
+        assert!(wire_attempt_id("d", 0, 3, true).ends_with("#a3"));
     }
 
     /// Scenario: Queue mode seed prompts and inject permanent non-delivery through
@@ -27401,5 +34565,1061 @@ mod tests {
         let acted =
             apply_stream_rejection_feedback(&mut ui, Some("focused"), "focused", "exited", now);
         assert!(!acted, "a rejection while not in PaneInput must be ignored");
+    }
+
+    // -----------------------------------------------------------------------
+    // The command-entry lock on Orchestration tabs
+    // -----------------------------------------------------------------------
+
+    /// Exhaustive match over every `UiMode` variant, returning `mode`
+    /// unchanged — a compile-time guard so the cross product below cannot
+    /// silently go stale if a new `UiMode` variant is added without updating
+    /// the list this function is applied to.
+    fn assert_exhaustive_ui_mode(mode: UiMode) -> UiMode {
+        match mode {
+            UiMode::Normal
+            | UiMode::Filter
+            | UiMode::Help
+            | UiMode::Rename
+            | UiMode::DirPicker
+            | UiMode::NewPaneForm
+            | UiMode::PaneInput
+            | UiMode::StarPrompt
+            | UiMode::ConfigGenPrompt
+            | UiMode::QuitConfirm
+            | UiMode::StopConfirm
+            | UiMode::ScheduledTasks
+            | UiMode::CloseConfirm => mode,
+        }
+    }
+
+    /// Every `UiMode` variant, run through [`assert_exhaustive_ui_mode`] so
+    /// the list can't quietly drop a variant a future edit adds to the enum.
+    fn all_ui_modes() -> Vec<UiMode> {
+        [
+            UiMode::Normal,
+            UiMode::Filter,
+            UiMode::Help,
+            UiMode::Rename,
+            UiMode::DirPicker,
+            UiMode::NewPaneForm,
+            UiMode::PaneInput,
+            UiMode::StarPrompt,
+            UiMode::ConfigGenPrompt,
+            UiMode::QuitConfirm,
+            UiMode::StopConfirm,
+            UiMode::ScheduledTasks,
+            UiMode::CloseConfirm,
+        ]
+        .into_iter()
+        .map(assert_exhaustive_ui_mode)
+        .collect()
+    }
+
+    /// Two-role `orchestrator` (start) / `worker` orchestration config, shared
+    /// by the lock tests below.
+    fn lock_test_orch_config(name: &str) -> OrchestrationConfig {
+        OrchestrationConfig {
+            default: false,
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        }
+    }
+
+    /// Dispatches a real `Action::SpawnPane` opening a fresh orchestration
+    /// (via [`lock_test_orch_config`]) against `tm`, making it the active tab.
+    /// Shared setup for the lock tests below.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_lock_test_orchestration(
+        tm: &mut TabManager,
+        pc: &dyn crate::pane::PaneController,
+        ui: &mut UiState,
+        state: &SharedState,
+        snapshot: &AppState,
+        frame_area: Rect,
+        tmp_dir: &std::path::Path,
+        name: &str,
+    ) {
+        let req = NewPaneRequest {
+            dir: tmp_dir.to_path_buf(),
+            name: name.to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(lock_test_orch_config(name)),
+            seed_prompt: None,
+        };
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            ui,
+            pc,
+            state,
+            tm,
+            snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+    }
+
+    /// Scenario: Table-driven unit test of the pure `scope_command_entry_lock`
+    /// function over the full cross product of `is_orchestration_tab`
+    /// (true/false) x every `UiMode` variant x the action being
+    /// `ToggleOrchestrationLock`, some other action (`Quit`), or `None`.
+    /// Confirms `ToggleOrchestrationLock` survives ONLY at
+    /// `(is_orchestration_tab = true, UiMode::Normal)`, that every other action
+    /// passes through completely untouched in every cell (including
+    /// `(false, non-Normal)`, ruling out a blanket "drop the action"
+    /// implementation), and that `None` in always yields `None` out. This is a
+    /// mechanism test only — it proves nothing about a real pane on its own;
+    /// that real-pane proof is `orchestration/lock/009`'s job.
+    #[spec("orchestration/lock/001")]
+    #[test]
+    fn lock_001_scope_command_entry_lock_claims_only_when_orchestration_and_normal_mode() {
+        let modes = all_ui_modes();
+
+        for is_orchestration_tab in [true, false] {
+            for &mode in &modes {
+                let claims = is_orchestration_tab && mode == UiMode::Normal;
+
+                let lock_result = scope_command_entry_lock(
+                    Some(Action::ToggleOrchestrationLock),
+                    is_orchestration_tab,
+                    mode,
+                );
+                if claims {
+                    assert!(
+                        matches!(lock_result, Some(Action::ToggleOrchestrationLock)),
+                        "ToggleOrchestrationLock should survive at \
+                         (is_orchestration_tab={is_orchestration_tab}, mode={mode:?}), \
+                         got {lock_result:?}"
+                    );
+                } else {
+                    assert!(
+                        lock_result.is_none(),
+                        "ToggleOrchestrationLock should be un-resolved (None) at \
+                         (is_orchestration_tab={is_orchestration_tab}, mode={mode:?}), \
+                         got {lock_result:?}"
+                    );
+                }
+
+                // Every OTHER action must pass through completely untouched in
+                // EVERY cell, including (false, non-Normal) — this is the
+                // assertion that rules out implementing the scoping as a
+                // blanket "drop the action" rather than one scoped
+                // specifically to ToggleOrchestrationLock.
+                let other_result =
+                    scope_command_entry_lock(Some(Action::Quit), is_orchestration_tab, mode);
+                assert!(
+                    matches!(other_result, Some(Action::Quit)),
+                    "a non-ToggleOrchestrationLock action must pass through \
+                     untouched at (is_orchestration_tab={is_orchestration_tab}, \
+                     mode={mode:?}), got {other_result:?}"
+                );
+
+                // None in, None out, in every cell.
+                let none_result = scope_command_entry_lock(None, is_orchestration_tab, mode);
+                assert!(
+                    none_result.is_none(),
+                    "None must pass through as None at \
+                     (is_orchestration_tab={is_orchestration_tab}, mode={mode:?}), \
+                     got {none_result:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: Dispatch a real `Action::SpawnPane` opening a fresh
+    /// orchestration and assert the deck-global command-entry lock starts
+    /// LOCKED. Locked-by-default is load-bearing rather than an opinionated
+    /// default — a lock you must remember to engage protects nothing.
+    #[spec("orchestration/lock/002")]
+    #[test]
+    fn lock_002_new_orchestration_tab_starts_locked() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-default",
+        );
+
+        assert!(
+            matches!(tm.active_tab(), Tab::Orchestration { .. }),
+            "expected a real orchestration tab to be active"
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must observe the deck-global \
+             command-entry lock LOCKED — only the orchestrator pane accepts \
+             direct input until Ctrl+e unlocks it"
+        );
+    }
+
+    /// Scenario: Confirm `Ctrl+e` resolves to `Action::ToggleOrchestrationLock`
+    /// through the production `key_action_for_mode` seam from `UiMode::Normal`
+    /// (command mode, the only mode the chord is claimed in), then dispatch the
+    /// action twice against a real orchestration tab and confirm the deck-global
+    /// `ui.command_entry_locked` flips locked -> unlocked -> locked. The full
+    /// `is_orchestration_tab x mode` matrix is `orchestration/lock/001`'s job,
+    /// not this test's.
+    #[spec("orchestration/lock/003")]
+    #[test]
+    fn lock_003_ctrl_e_toggles_the_lock() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-toggle",
+        );
+
+        // Ctrl+e must resolve to the toggle action from Normal (command) mode
+        // using the DEFAULT keybinding config (no user remap involved).
+        let kb = KeybindingConfig::default();
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        let resolved = key_action_for_mode(&kb, UiMode::Normal, &ctrl_e);
+        assert!(
+            matches!(resolved, Some(Action::ToggleOrchestrationLock)),
+            "Ctrl+e must resolve to Action::ToggleOrchestrationLock from \
+             Normal (command) mode"
+        );
+
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationLock,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            !ui.command_entry_locked,
+            "the first Ctrl+e toggle should UNLOCK the deck-global lock"
+        );
+
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationLock,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            ui.command_entry_locked,
+            "the second Ctrl+e toggle should RE-LOCK the deck-global lock"
+        );
+    }
+
+    /// Scenario: Spawn orchestration tab A, toggle the lock while A is active,
+    /// then spawn a brand-new orchestration tab B and confirm B observes the
+    /// SAME now-unlocked deck-global value rather than defaulting back to
+    /// locked. Switch back to A and confirm it observes the same unlocked value
+    /// too. Then toggle FROM tab B and confirm tab A observes THAT change as
+    /// well — toggling on any Orchestration tab changes what every Orchestration
+    /// tab observes, so unlocking never has to be repeated per tab.
+    #[spec("orchestration/lock/004")]
+    #[test]
+    fn lock_004_toggle_is_deck_global_across_orchestration_tabs() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        // Tab A: spawn (starts LOCKED, the deck-global default), then toggle it
+        // via the real toggle action.
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-shared-a",
+        );
+        let idx_a = tm.active_index();
+        assert!(
+            ui.command_entry_locked,
+            "tab A must start locked — the deck-global default"
+        );
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationLock,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            !ui.command_entry_locked,
+            "toggling on tab A should unlock the deck-global lock"
+        );
+
+        // Tab B: a brand-new orchestration tab must ADOPT the current
+        // deck-global value (unlocked) rather than resetting to locked — there
+        // is no per-tab field left for it to default from.
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-shared-b",
+        );
+        let idx_b = tm.active_index();
+        assert_ne!(idx_a, idx_b, "tab B must be a distinct tab from tab A");
+        assert!(
+            !ui.command_entry_locked,
+            "a newly opened orchestration tab must ADOPT the current \
+             deck-global value (unlocked, set by tab A's toggle) rather than \
+             defaulting back to locked"
+        );
+
+        // Switch back to A: still unlocked — one shared value, unaffected by
+        // which tab happens to be active.
+        assert!(tm.switch_to(idx_a), "switching back to tab A must succeed");
+        assert!(
+            !ui.command_entry_locked,
+            "tab A must observe the same unlocked deck-global value after \
+             spawning tab B — there is no per-tab state left to diverge"
+        );
+
+        // Toggle FROM tab B, then switch back to A: A must observe the change
+        // too.
+        assert!(tm.switch_to(idx_b), "switching to tab B must succeed");
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationLock,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            ui.command_entry_locked,
+            "toggling on tab B should re-lock the deck-global lock"
+        );
+        assert!(tm.switch_to(idx_a), "switching back to tab A must succeed");
+        assert!(
+            ui.command_entry_locked,
+            "tab A must observe tab B's toggle — toggling on ANY Orchestration \
+             tab must change what every Orchestration tab observes"
+        );
+    }
+
+    /// Scenario: Deck-global storage moves WHERE the lock value lives, not WHERE
+    /// it reaches. Set the deck-global lock ENGAGED (the strongest case) and
+    /// confirm `gate_pane_input_key` passes an `Action::ForwardToPane` through
+    /// UNCHANGED on the always-present Dashboard tab and on a freshly opened
+    /// Mode tab — the gate must still match only `Tab::Orchestration`, never
+    /// widening onto other tab types now that the lock it reads is deck-global.
+    #[spec("orchestration/lock/005")]
+    #[test]
+    fn lock_005_dashboard_and_mode_tabs_stay_ungated_when_deck_locked() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone()); // tab 0 = Dashboard, always present
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        // The strongest case: the deck-global lock is engaged.
+        ui.command_entry_locked = true;
+
+        // An EMPTY status map is the neutral value for the carve-out's
+        // parameter. No pane reports `WaitingForInput`, so the carve-out cannot
+        // fire and the pass-through asserted below can only come from the
+        // tab-kind match — which is exactly this test's claim, unweakened.
+        let no_status: HashMap<&str, SessionStatus> = HashMap::new();
+
+        assert!(
+            matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "expected the always-present Dashboard tab to be active"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &no_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a Dashboard tab must never gate ForwardToPane, even while the \
+                 deck-global lock is engaged"
+            ),
+            other => panic!(
+                "expected ForwardToPane to pass through unchanged on a \
+                 Dashboard tab, got {other:?}"
+            ),
+        }
+
+        // Open a Mode tab and repeat: same never-gated guarantee.
+        let req = mode_card_request(
+            tmp.path().to_str().expect("utf8 tmp path"),
+            "cat",
+            mode_config_local("lock-mode", 1),
+        );
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            matches!(tm.active_tab(), Tab::Mode { .. }),
+            "expected the Mode tab to be active after spawning it"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &no_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a Mode tab must never gate ForwardToPane, even while the \
+                 deck-global lock is engaged"
+            ),
+            other => panic!(
+                "expected ForwardToPane to pass through unchanged on a Mode \
+                 tab, got {other:?}"
+            ),
+        }
+    }
+
+    /// Scenario: While a locked non-orchestrator pane's live status is
+    /// `WaitingForInput`, `gate_pane_input_key` must pass an
+    /// `Action::ForwardToPane` through UNCHANGED instead of dropping it — the
+    /// agent has stopped and asked, so a keystroke answering it is a response to
+    /// a request, not an unsolicited intrusion. Spawns a real two-role
+    /// orchestration (deck LOCKED, the default) with a focus-echoing pane
+    /// controller, then walks both edges on the SAME worker pane: no recorded
+    /// status (dropped) -> `WaitingForInput` (passes through) -> `Working`
+    /// (dropped again, proving the hole doesn't outlive the status that opened
+    /// it). Also pins that the orchestrator pane's own input stays unaffected by
+    /// ANY status, and that an unlocked deck ignores `WaitingForInput` entirely.
+    #[spec("orchestration/lock/006")]
+    #[test]
+    fn lock_006_waiting_for_input_carve_out() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-waiting",
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must start locked"
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+
+        // Focus the worker explicitly rather than relying on incidental mock
+        // behaviour — `FocusEchoPC` genuinely echoes it back.
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        let no_status: HashMap<&str, SessionStatus> = HashMap::new();
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &no_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "baseline: a locked worker pane with no recorded status must still \
+             be gated, got {gated:?}"
+        );
+
+        let mut waiting_status: HashMap<&str, SessionStatus> = HashMap::new();
+        waiting_status.insert(worker_id.as_str(), SessionStatus::WaitingForInput);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &waiting_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a locked worker pane reporting WaitingForInput must pass a \
+                 keystroke through UNCHANGED — the agent stopped and asked, so \
+                 answering it is a response, not an intrusion"
+            ),
+            other => panic!(
+                "expected ForwardToPane to pass through unchanged while the \
+                 focused pane is WaitingForInput, got {other:?}"
+            ),
+        }
+
+        // Re-engage: the SAME pane, now Working — the carve-out must not
+        // outlive the status that opened it.
+        let mut working_status: HashMap<&str, SessionStatus> = HashMap::new();
+        working_status.insert(worker_id.as_str(), SessionStatus::Working);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &working_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "the gate must RE-ENGAGE the instant the worker's status clears \
+             from WaitingForInput — got {gated:?} while status was Working"
+        );
+
+        // The orchestrator pane's own input is unaffected either way — never
+        // gated, waiting or not. Repeated here WITH a status attached (the
+        // closest status the carve-out reasons about) to prove the never-gated
+        // rule doesn't get reordered behind the new check.
+        pc.focus_pane(&orchestrator_id)
+            .expect("focus orchestrator pane");
+        let mut orch_waiting: HashMap<&str, SessionStatus> = HashMap::new();
+        orch_waiting.insert(orchestrator_id.as_str(), SessionStatus::WaitingForInput);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &orch_waiting,
+        );
+        assert!(
+            matches!(gated, Action::ForwardToPane(_)),
+            "the orchestrator pane's own input must never be gated, regardless \
+             of its status, got {gated:?}"
+        );
+
+        // Unlocked deck: WaitingForInput is irrelevant when the lock itself is
+        // off — there is nothing to carve a hole out of.
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+        ui.command_entry_locked = false;
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &waiting_status,
+        );
+        assert!(
+            matches!(gated, Action::ForwardToPane(_)),
+            "an unlocked deck must pass ForwardToPane through regardless of \
+             WaitingForInput, got {gated:?}"
+        );
+    }
+
+    /// Scenario: `build_pane_status` joins session values into a
+    /// `pane_id`-keyed map with NO dedupe, so when two sessions share a
+    /// `pane_id` the surviving value is whichever iteration order reaches last
+    /// — and a `HashMap` cannot even REPRESENT the collision, so the ambiguity
+    /// is already gone by the time the carve-out reads it. This test spawns a
+    /// real locked orchestration and focuses its worker pane (so the tab-kind
+    /// and lock guards ahead of the carve-out are exercised for real), then
+    /// builds two synthetic `AppState`s — one with a SINGLE `WaitingForInput`
+    /// session on the worker's `pane_id`, one with TWO sessions sharing it
+    /// (`Working` and `WaitingForInput`) — and resolves each through
+    /// `build_pane_status_for_gate` before handing the result to
+    /// `gate_pane_input_key`. Ambiguous must DENY the exemption; unambiguous
+    /// must still grant it, so failing closed can't be bought by breaking the
+    /// carve-out outright.
+    #[spec("orchestration/lock/007")]
+    #[test]
+    fn lock_007_ambiguous_status_fails_closed() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-ambiguous",
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must start locked"
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        // Two sessions collide on the SAME pane_id, disagreeing on
+        // WaitingForInput-ness: the locked, focused worker's real session is
+        // Working, while a colliding session says WaitingForInput.
+        let mut real = make_session(SessionStatus::Working);
+        real.session_id = "sess-real-working".into();
+        real.pane_id = Some(worker_id.clone());
+
+        let mut duplicate = make_session(SessionStatus::WaitingForInput);
+        duplicate.session_id = "sess-duplicate-waiting".into();
+        duplicate.pane_id = Some(worker_id.clone());
+
+        let mut collision_state = AppState::default();
+        collision_state
+            .sessions
+            .insert(real.session_id.clone(), real);
+        collision_state
+            .sessions
+            .insert(duplicate.session_id.clone(), duplicate);
+
+        let ambiguous_status = build_pane_status_for_gate(&collision_state);
+        assert_ne!(
+            ambiguous_status.get(worker_id.as_str()),
+            Some(&SessionStatus::WaitingForInput),
+            "a pane_id with two disagreeing sessions must not resolve to \
+             WaitingForInput for the gate — that is the fact the carve-out \
+             needs in order to fail closed"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &ambiguous_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "an ambiguous pane_id (colliding sessions disagreeing on \
+             WaitingForInput) must DENY the exemption and drop the keystroke — \
+             fail closed, not fail open — got {gated:?}"
+        );
+
+        // The unambiguous case must still work, through the SAME resolver.
+        let mut clean = make_session(SessionStatus::WaitingForInput);
+        clean.session_id = "sess-clean-waiting".into();
+        clean.pane_id = Some(worker_id.clone());
+        let mut clean_state = AppState::default();
+        clean_state.sessions.insert(clean.session_id.clone(), clean);
+
+        let single_status = build_pane_status_for_gate(&clean_state);
+        assert_eq!(
+            single_status.get(worker_id.as_str()),
+            Some(&SessionStatus::WaitingForInput),
+            "a single, unambiguous WaitingForInput session must still resolve \
+             to WaitingForInput for the gate"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &single_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a single, unambiguous WaitingForInput session must still pass \
+                 the keystroke through unchanged"
+            ),
+            other => panic!(
+                "expected the unambiguous WaitingForInput carve-out to still \
+                 pass ForwardToPane through unchanged, got {other:?}"
+            ),
+        }
+    }
+
+    /// Scenario: A single, unambiguous session on a locked worker pane reports
+    /// `WaitingForInput`, but that status was written by a producer carrying no
+    /// `agent_id`. The gate must still deny the carve-out and drop the
+    /// keystroke, and must allow it once an identified producer asserts the
+    /// same status.
+    #[spec("orchestration/lock/013")]
+    #[test]
+    fn lock_013_untagged_status_provenance_fails_closed() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-untagged",
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        // ONE session, genuinely WaitingForInput — the shape that earns the
+        // carve-out. The only thing wrong with it is where the status came from.
+        let mut waiting = make_session(SessionStatus::WaitingForInput);
+        waiting.session_id = "sess-waiting".into();
+        waiting.pane_id = Some(worker_id.clone());
+        let mut untagged_state = AppState::default();
+        untagged_state
+            .sessions
+            .insert(waiting.session_id.clone(), waiting);
+        untagged_state
+            .untagged_status_panes
+            .insert(worker_id.clone());
+
+        let untagged_status = build_pane_status_for_gate(&untagged_state);
+        assert_ne!(
+            untagged_status.get(worker_id.as_str()),
+            Some(&SessionStatus::WaitingForInput),
+            "a status written by a producer that named no generation must not \
+             resolve to WaitingForInput for the gate"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &untagged_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "an unidentified producer must not be able to open the lock by \
+             reporting WaitingForInput — fail closed, got {gated:?}"
+        );
+
+        // Clearing the mark — what a real, identified hook does — restores it.
+        untagged_state.untagged_status_panes.remove(&worker_id);
+        let tagged_status = build_pane_status_for_gate(&untagged_state);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &tagged_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "an identified WaitingForInput report must still pass through"
+            ),
+            other => panic!(
+                "expected the carve-out to hold for an identified producer, \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    /// Issue #478: the synchronous client's response read is bounded by the
+    /// SAME `MAX_FRAME_LEN` the async `read_frame` enforces. A forged 5-byte
+    /// header is all a peer needs — the allocation used to happen before
+    /// `read_exact`, so no body bytes had to follow. Mirrors
+    /// `daemon_protocol::tests::frame_rejects_oversize`.
+    #[test]
+    fn resp_frame_rejects_oversize_before_allocating() {
+        use crate::daemon_protocol::{KIND_RESP, MAX_FRAME_LEN};
+
+        for len in [MAX_FRAME_LEN as u32 + 1, u32::MAX] {
+            // Header only: five bytes, no body. If the bound were missing,
+            // `vec![0u8; len]` would run for up to ~4 GiB right here.
+            let mut buf: Vec<u8> = vec![KIND_RESP];
+            buf.extend_from_slice(&len.to_be_bytes());
+            let mut cursor = std::io::Cursor::new(buf);
+
+            let err = read_resp_frame_blocking(&mut cursor)
+                .expect_err("expected Err for an over-long response frame");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "over-long frame must fail as InvalidData like read_frame does, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("exceeds"),
+                "error should name the bound it blew, got {err}"
+            );
+            // Nothing past the 5-byte header was consumed: the read bailed at
+            // the length check, so no body buffer was ever sized from `len`.
+            assert_eq!(
+                cursor.position(),
+                5,
+                "the body read must not be attempted once the length is rejected"
+            );
+        }
+    }
+
+    /// The bound is `>`, not `>=`: a frame of exactly `MAX_FRAME_LEN` is legal
+    /// and must reach the body read (which then fails as a truncated frame
+    /// here, since the test supplies no payload) rather than being rejected as
+    /// over-long. Guards the off-by-one between the two implementations.
+    #[test]
+    fn resp_frame_accepts_exactly_max_frame_len() {
+        use crate::daemon_protocol::{KIND_RESP, MAX_FRAME_LEN};
+
+        let mut buf: Vec<u8> = vec![KIND_RESP];
+        buf.extend_from_slice(&(MAX_FRAME_LEN as u32).to_be_bytes());
+        let mut cursor = std::io::Cursor::new(buf);
+
+        let err = read_resp_frame_blocking(&mut cursor)
+            .expect_err("no body supplied, so the read must still fail");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "at-limit frame must be truncated-body, not rejected as over-long, got {err:?}"
+        );
+    }
+
+    /// The happy path still decodes: a well-formed RESP frame round-trips
+    /// through the same helper the socket path now uses.
+    #[test]
+    fn resp_frame_decodes_well_formed_response() {
+        use crate::daemon_protocol::{AttachResponse, KIND_RESP};
+
+        let resp = AttachResponse {
+            ok: true,
+            ..Default::default()
+        };
+        let payload = serde_json::to_vec(&resp).unwrap();
+        let mut buf: Vec<u8> = vec![KIND_RESP];
+        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&payload);
+        let mut cursor = std::io::Cursor::new(buf);
+
+        let decoded = read_resp_frame_blocking(&mut cursor).expect("well-formed frame must decode");
+        assert!(decoded.ok);
+    }
+
+    /// A non-RESP kind is still rejected up front — the bound was added
+    /// without disturbing the existing kind check.
+    #[test]
+    fn resp_frame_rejects_wrong_kind() {
+        use crate::daemon_protocol::KIND_STREAM_OUT;
+
+        let mut buf: Vec<u8> = vec![KIND_STREAM_OUT];
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let mut cursor = std::io::Cursor::new(buf);
+
+        let err = read_resp_frame_blocking(&mut cursor).expect_err("expected Err for wrong kind");
+        assert!(err.to_string().contains("expected RESP frame"), "got {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #576 — the post-`ratatui::restore()` session-warning flush.
+    // `session/restore/015` proves the property through the real binary on
+    // a real PTY; these pin the escape spelling and the per-warning framing
+    // in the fast tier, where a regression is cheap to catch.
+    // -----------------------------------------------------------------
+
+    /// A warning with nothing to escape is passed through verbatim — and
+    /// borrowed, not reallocated, since that is every ordinary warning.
+    #[test]
+    fn escape_control_chars_leaves_clean_text_borrowed() {
+        let clean = "Warning: skipping pane 'api-server' — directory /srv/app not found";
+        let out = escape_control_chars(clean);
+        assert_eq!(out, clean);
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "a warning with no control characters must borrow, not allocate"
+        );
+    }
+
+    /// The three control characters that actually matter on a terminal —
+    /// ESC (arbitrary SGR/OSC), CR (overwrite the printed line), LF (forge a
+    /// line) — come out escaped, and nothing raw survives.
+    #[test]
+    fn escape_control_chars_escapes_esc_cr_and_lf() {
+        let hostile = "name\u{1b}[31m\rSPOOFED\nWarning: everything is fine";
+        let out = escape_control_chars(hostile);
+        assert_eq!(out, r"name\u{1b}[31m\rSPOOFED\nWarning: everything is fine");
+        assert!(
+            !out.contains(char::is_control),
+            "no control character may survive: {out:?}"
+        );
+    }
+
+    /// The predicate is `char::is_control` — the same one `ratatui-core`
+    /// filters on for the in-session sink — so DEL and the C1 range are
+    /// covered too, while printable non-ASCII is left alone.
+    #[test]
+    fn escape_control_chars_covers_del_and_c1_but_not_printable_unicode() {
+        assert_eq!(escape_control_chars("a\u{7f}b"), r"a\u{7f}b");
+        assert_eq!(escape_control_chars("a\u{9b}b"), r"a\u{9b}b");
+        // Two-digit, zero-padded: every `Cc` codepoint fits in two hex digits.
+        assert_eq!(escape_control_chars("a\u{0}b"), r"a\u{00}b");
+        assert_eq!(escape_control_chars("a\tb"), r"a\tb");
+        // Printable Unicode is not a control character and must survive: pane
+        // names and directories legitimately carry it.
+        let printable = "pane 'café-🚀' — directory /srv/naïve not found";
+        assert_eq!(escape_control_chars(printable), printable);
+    }
+
+    /// A literal backslash is deliberately left alone, so a Windows path in a
+    /// warning stays readable instead of coming back doubled.
+    #[test]
+    fn escape_control_chars_does_not_double_backslashes() {
+        let win = r"Warning: no project config in C:\Users\dev\app, restoring as plain pane";
+        assert_eq!(escape_control_chars(win), win);
+    }
+
+    /// The flush loop is the single sanitisation point: whatever a push site
+    /// put in, exactly one line per warning reaches the terminal and no
+    /// control character does — so a hostile pane name can neither repaint
+    /// the shell nor forge an extra line of deck output.
+    #[test]
+    fn flush_session_warnings_emits_one_sanitised_line_per_warning() {
+        let warnings = vec![
+            "Warning: failed to save session: disk full".to_string(),
+            "Warning: skipping pane 'x\u{1b}[2J\rSPOOFED\nWarning: forged' — directory /d not found"
+                .to_string(),
+        ];
+        let mut out: Vec<u8> = Vec::new();
+        flush_session_warnings(&warnings, &mut out);
+        let text = String::from_utf8(out).expect("flush output is UTF-8");
+
+        assert_eq!(
+            text.lines().count(),
+            warnings.len(),
+            "one line per warning, however many newlines a hostile value smuggled in: {text:?}"
+        );
+        assert_eq!(
+            text,
+            "Warning: failed to save session: disk full\n\
+             Warning: skipping pane 'x\\u{1b}[2J\\rSPOOFED\\nWarning: forged' — directory /d not found\n"
+        );
+        // The separators the loop itself writes are the ONLY control
+        // characters in the output.
+        assert!(
+            !text.replace('\n', "").contains(char::is_control),
+            "no control character from a warning body may reach the terminal: {text:?}"
+        );
     }
 }
