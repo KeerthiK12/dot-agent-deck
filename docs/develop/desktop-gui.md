@@ -94,6 +94,7 @@ Live sessions continue to use the commands and models that created them through 
 ## Current milestone limits
 
 - The Tauri crate directly reuses the root library; the standalone protocol-crate extraction remains pending.
+- **Local daemons only.** The GUI assumes the daemon is on the same machine. A forwarded socket does attach and streams remote agents and their PTYs correctly, but project resolution stays client-side, so a remote workflow launch reads the wrong `.dot-agent-deck.toml` and writes coordinator context to the wrong host. Treat remote as observation-only until that moves daemon-side.
 - The deterministic loop, transition evidence, diffs, checks, artifacts, spend, and profile/workflow editors are preview data or local-only UI where the daemon does not expose structured data yet.
 - Live orchestration graph events (`delegate`, `work-done`, and `dispatch`) and the graph view remain pending.
 - OS-native notifications, packaging, signing, notarization, auto-update, remote/web hosting, and mobile layouts are out of the current spike.
