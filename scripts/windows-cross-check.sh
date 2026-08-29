@@ -11,6 +11,15 @@
 #
 # Usage: scripts/windows-cross-check.sh [extra cargo args…]
 #
+# `--workspace` is load-bearing, for the same reason it is on the clippy and
+# nextest gates (CLAUDE.md rules 2 and 5): cargo's default target selection is
+# the ROOT PACKAGE ALONE, so without it this script type-checks none of the
+# workspace members. That was a false negative, not a gap in theory — this job
+# passed on PR #416 while `build-windows` failed to compile
+# `dot-agent-deck-desktop` for Windows with E0277, which is precisely the class
+# of break this script exists to catch from Linux in ~1 minute instead of ~9 on
+# a Windows runner.
+#
 # Run it with no arguments. Extra args pass through to `cargo check`, but
 # `--features e2e` is not a gate yet: no `tests/e2e_*.rs` carries a file-level
 # `#![cfg(unix)]` while the L2 helpers they call are per-item `#[cfg(unix)]`, so
@@ -143,7 +152,7 @@ _cache_root="${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}"
 TARGET_DIR="${WINDOWS_CROSS_CHECK_TARGET_DIR:-${_cache_root:-${TMPDIR:-/tmp}}/dot-agent-deck/win-check}"
 mkdir -p "$TARGET_DIR"
 
-echo "==> cargo check --tests --target $TARGET (target-dir: $TARGET_DIR)"
+echo "==> cargo check --workspace --tests --target $TARGET (target-dir: $TARGET_DIR)"
 # The compiler and archiver overrides are per-target and their names are
 # computed, so they go through `env` — bash only recognises a literal
 # `name=value` as an assignment prefix, and would try to *execute* an expanded
@@ -155,4 +164,4 @@ env \
     WINDOWS_CROSS_CHECK_EMPTY_OBJ="$EMPTY_OBJ" \
     RUSTC="$TOOLCHAIN/bin/rustc" \
     CARGO_TARGET_DIR="$TARGET_DIR" \
-    "$TOOLCHAIN/bin/cargo" check --tests --target "$TARGET" "$@"
+    "$TOOLCHAIN/bin/cargo" check --workspace --tests --target "$TARGET" "$@"
