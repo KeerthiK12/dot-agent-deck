@@ -51,6 +51,20 @@ Tauri selects live transport automatically and initially performs a connect-only
 
 If another build already owns the default socket, do not stop it until you have confirmed that terminating its agents is safe; use `dot-agent-deck daemon stop` only as a deliberate lifecycle action.
 
+### Attaching across a build stamp difference (development only)
+
+The handshake makes two checks, and they are not equally strict. `PROTOCOL_VERSION` must match — that is the wire contract. The **build stamp** (`git describe`) must then match too, which is right for a shipped app but hostile in development: every commit restamps the desktop on its next rebuild, and a released daemon never matches a branch build at all. The result is that the daemon you actually use is the one daemon the preview refuses to open.
+
+Set `DOT_AGENT_DECK_DESKTOP_ALLOW_BUILD_MISMATCH=1` before launching to downgrade the **stamp** difference from a refusal to a warning:
+
+```sh
+DOT_AGENT_DECK_DESKTOP_ALLOW_BUILD_MISMATCH=1 pnpm tauri dev
+```
+
+The protocol check is unaffected and still refuses an incompatible daemon, and the mismatch is not swallowed — the connection banner keeps naming both builds for the whole session. Only `1` and `true` arm it.
+
+This is a **development** switch, not a compatibility guarantee. Two builds can agree on `PROTOCOL_VERSION` and still disagree about what a field means — precisely the semantic break `CLAUDE.md` rule 12 describes — so the stamp check is what protects a daemon that owns live agents from a client that reads its state differently. Use it to inspect a daemon, not to run work you care about, and never in a packaged build.
+
 In live mode the preview lists daemon-owned agents, attaches xterm.js to each PTY stream, forwards terminal input and resize requests, refreshes status, and exposes a confirmed stop action. Open **Workflows**, provide the exact orchestration name from the target project's `.dot-agent-deck.toml` and an absolute project directory, then choose **Launch live loop** to start its configured role set with the enabled profile commands. **Start daemon** and **Launch live loop** both require a confirmation. The project configuration must contain exactly the submitted roles and one start role; the current bundled `dot-agent-deck` profile uses `orchestrator` as that start role and requires every listed profile to remain enabled for a live launch. Before spawning, the desktop materializes the same canonical coordinator context used by the TUI. Non-Pi coordinators use a readiness-gated, identity-bound, idempotent submission with bounded retry. Pi cannot be the desktop workflow coordinator in this preview: its native seed path has no delivery acknowledgement, so the bridge rejects that launch before spawning any role. Use a non-Pi coordinator or launch that orchestration from the TUI until acknowledged native seed delivery is available. A partially-created workflow—or one whose coordinator context cannot be delivered—is rolled back in reverse role order.
 
 Desktop bundles include `dot-agent-deck` as a Tauri sidecar built from the same checkout. Run `pnpm bundle:app` to prepare the matching sidecar and produce the native app; the separate bundle config keeps ordinary workspace `cargo test` runs independent of generated binaries. A build/protocol mismatch exposes **Replace daemon** only when the old daemon reports zero live agents; replacement uses the bundled binary and never force-stops live agents.

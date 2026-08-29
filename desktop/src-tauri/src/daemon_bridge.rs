@@ -47,7 +47,34 @@ impl TrustedDaemon {
     }
 }
 
-fn classify_handshake(response: &AttachResponse, client_build: &str) -> HandshakeInfo {
+/// Opt-in development escape hatch for the build-stamp check.
+///
+/// The handshake refuses a daemon whose git-describe stamp differs from the
+/// desktop's, which is right for a shipped app: two builds can share a wire
+/// format and still disagree about what a field means, and the desktop may not
+/// recycle a daemon that owns live agents. In development the same rule makes
+/// the app unusable against the daemon you already run — every commit restamps
+/// the desktop, and a released daemon never matches a branch build at all.
+///
+/// This ONLY relaxes the stamp comparison. The `PROTOCOL_VERSION` check runs
+/// first and is never bypassed, so an actually-incompatible wire is still
+/// refused; and the mismatch stays visible in the connection message rather
+/// than being swallowed.
+fn build_mismatch_bypassed() -> bool {
+    matches!(
+        std::env::var(BUILD_MISMATCH_BYPASS_ENV).as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Env var enabling [`build_mismatch_bypassed`].
+const BUILD_MISMATCH_BYPASS_ENV: &str = "DOT_AGENT_DECK_DESKTOP_ALLOW_BUILD_MISMATCH";
+
+fn classify_handshake(
+    response: &AttachResponse,
+    client_build: &str,
+    allow_build_mismatch: bool,
+) -> HandshakeInfo {
     let server_protocol_version = response.server_version;
     let daemon_build_version = response.build_version.clone();
     let daemon_version = response.daemon_version.clone();
@@ -56,6 +83,7 @@ fn classify_handshake(response: &AttachResponse, client_build: &str) -> Handshak
         .as_ref()
         .map(|summary| summary.count);
 
+    let mut build_mismatch_was_bypassed = false;
     let error = if !response.ok {
         Some(
             response
@@ -71,24 +99,36 @@ fn classify_handshake(response: &AttachResponse, client_build: &str) -> Handshak
                 .unwrap_or_else(|| "no version".into())
         ))
     } else if daemon_build_version.as_deref() != Some(client_build) {
-        let recovery = match running_agent_count {
-            Some(0) => "No live agents are reported; use Replace daemon to start the matching bundled build.".into(),
-            Some(count) => format!(
-                "The daemon reports {count} live agent{}; stop them individually before replacing the daemon.",
-                if count == 1 { "" } else { "s" }
-            ),
-            None => "The daemon could not report its live-agent count, so automatic replacement is disabled.".into(),
-        };
-        Some(format!(
-            "build mismatch: desktop is {client_build}, daemon is {}. {recovery}",
+        let stamps = format!(
+            "build mismatch: desktop is {client_build}, daemon is {}",
             daemon_build_version.as_deref().unwrap_or("unreported")
-        ))
+        );
+        if allow_build_mismatch {
+            // Reached only AFTER the protocol check above returned equal, so
+            // the wire shape is already agreed; what differs is the git-describe
+            // stamp. Kept in `error` (not dropped) so the caveat stays on screen
+            // for the whole session rather than being silently forgotten.
+            build_mismatch_was_bypassed = true;
+            Some(format!(
+                "{stamps}. Bypassed by {BUILD_MISMATCH_BYPASS_ENV}; protocol {PROTOCOL_VERSION} matched on both sides. Development only — a stamp difference can still mean divergent behaviour behind an identical wire."
+            ))
+        } else {
+            let recovery = match running_agent_count {
+                Some(0) => "No live agents are reported; use Replace daemon to start the matching bundled build.".into(),
+                Some(count) => format!(
+                    "The daemon reports {count} live agent{}; stop them individually before replacing the daemon.",
+                    if count == 1 { "" } else { "s" }
+                ),
+                None => "The daemon could not report its live-agent count, so automatic replacement is disabled.".into(),
+            };
+            Some(format!("{stamps}. {recovery}"))
+        }
     } else {
         None
     };
 
     HandshakeInfo {
-        status: if error.is_some() {
+        status: if error.is_some() && !build_mismatch_was_bypassed {
             ConnectionStatus::Incompatible
         } else {
             ConnectionStatus::Connected
@@ -131,7 +171,11 @@ async fn hello(socket_path: &Path) -> Result<HandshakeInfo, String> {
     )
     .await
     .map_err(|error| safe_message(error.to_string()))?;
-    Ok(classify_handshake(&response, &client_build))
+    Ok(classify_handshake(
+        &response,
+        &client_build,
+        build_mismatch_bypassed(),
+    ))
 }
 
 pub(crate) async fn trusted_daemon() -> Result<TrustedDaemon, String> {
@@ -279,7 +323,7 @@ mod tests {
     #[test]
     fn matching_hello_is_connected() {
         let response = AttachResponse::hello(PROTOCOL_VERSION);
-        let info = classify_handshake(&response, response.build_version.as_deref().unwrap());
+        let info = classify_handshake(&response, response.build_version.as_deref().unwrap(), false);
         assert_eq!(info.status, ConnectionStatus::Connected);
         assert!(info.error.is_none());
     }
@@ -287,7 +331,7 @@ mod tests {
     #[test]
     fn protocol_mismatch_is_visible_and_never_treated_as_disconnected() {
         let response = AttachResponse::hello(PROTOCOL_VERSION + 1);
-        let info = classify_handshake(&response, response.build_version.as_deref().unwrap());
+        let info = classify_handshake(&response, response.build_version.as_deref().unwrap(), false);
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         assert!(info.error.unwrap().contains("protocol mismatch"));
     }
@@ -296,7 +340,7 @@ mod tests {
     fn zero_agent_build_mismatch_points_to_safe_replacement() {
         let response = AttachResponse::hello(PROTOCOL_VERSION)
             .with_running_agents(RunningAgentsSummary::default());
-        let info = classify_handshake(&response, "desktop-other-build");
+        let info = classify_handshake(&response, "desktop-other-build", false);
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.unwrap();
         assert!(error.contains("build mismatch"));
@@ -310,12 +354,76 @@ mod tests {
                 count: 2,
                 names: vec!["coder".into(), "tester".into()],
             });
-        let info = classify_handshake(&response, "desktop-other-build");
+        let info = classify_handshake(&response, "desktop-other-build", false);
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         assert!(
             info.error
                 .unwrap()
                 .contains("stop them individually before replacing")
         );
+    }
+
+    /// A stamp difference is downgraded to a warning, not silence: the deck
+    /// connects, but the connection message still names both builds so the
+    /// caveat survives for the whole session.
+    #[test]
+    fn bypassed_build_mismatch_connects_and_keeps_the_warning_visible() {
+        let response = AttachResponse::hello(PROTOCOL_VERSION)
+            .with_running_agents(RunningAgentsSummary::default());
+        let info = classify_handshake(&response, "desktop-other-build", true);
+        assert_eq!(info.status, ConnectionStatus::Connected);
+        let error = info.error.expect("bypass must not swallow the mismatch");
+        assert!(error.contains("build mismatch"), "{error}");
+        assert!(error.contains(BUILD_MISMATCH_BYPASS_ENV), "{error}");
+    }
+
+    /// The load-bearing one. The bypass exists to relax a *stamp* comparison
+    /// once the wire is known to agree; it must never let an actually
+    /// incompatible protocol through, because that is the check that keeps a
+    /// newer client from misreading an older daemon's frames.
+    #[test]
+    fn bypass_never_rescues_a_protocol_mismatch() {
+        let response = AttachResponse::hello(PROTOCOL_VERSION + 1);
+        let info = classify_handshake(&response, "desktop-other-build", true);
+        assert_eq!(info.status, ConnectionStatus::Incompatible);
+        assert!(info.error.unwrap().contains("protocol mismatch"));
+    }
+
+    /// A daemon that reports no build stamp at all is still a mismatch, and the
+    /// bypass covers it the same way — otherwise the escape hatch would have a
+    /// hole exactly where the least is known about the peer.
+    #[test]
+    fn bypass_covers_an_unreported_daemon_stamp() {
+        let mut response = AttachResponse::hello(PROTOCOL_VERSION);
+        response.build_version = None;
+        let info = classify_handshake(&response, "desktop-build", true);
+        assert_eq!(info.status, ConnectionStatus::Connected);
+        assert!(info.error.unwrap().contains("unreported"));
+    }
+
+    /// Only `1` and `true` arm it. An unset variable, an empty string, or a
+    /// stray value leaves the refusal in place: this is a switch someone turns
+    /// on deliberately, not one they trip over.
+    #[test]
+    fn bypass_env_is_opt_in_and_ignores_stray_values() {
+        for (value, expected) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("yes"), false),
+            (Some("1"), true),
+            (Some("true"), true),
+        ] {
+            // SAFETY: nextest runs each test in its own process, and this test
+            // owns the variable for that process.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(BUILD_MISMATCH_BYPASS_ENV, value),
+                    None => std::env::remove_var(BUILD_MISMATCH_BYPASS_ENV),
+                }
+            }
+            assert_eq!(build_mismatch_bypassed(), expected, "value {value:?}");
+        }
+        unsafe { std::env::remove_var(BUILD_MISMATCH_BYPASS_ENV) };
     }
 }
