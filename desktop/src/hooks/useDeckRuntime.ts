@@ -9,11 +9,36 @@ export function useDeckRuntime(): DeckRuntimeState {
   const mode = useMemo(selectRuntimeMode, []);
   const bridge = useMemo(() => createDeckBridge(mode), [mode]);
   const [snapshot, setSnapshot] = useState<DeckSnapshot>(() => {
+    if (mode === "live") {
+      // PR #416 review B2: live mode gets its own HONEST empty seed. The old
+      // seed spread createFixtureSnapshot("empty"), which empties the arrays
+      // but keeps the scalars — so with no daemon running the top bar showed a
+      // fixture branch, run id, elapsed time and node count as steady state,
+      // with no DEMO DATA banner to disclaim them. Nothing here is invented:
+      // every field says "unavailable" until the daemon says otherwise.
+      const fixtureShape = createFixtureSnapshot("empty");
+      return {
+        ...fixtureShape,
+        runId: "—",
+        repo: "No active project",
+        branch: "Unavailable",
+        worktree: "No active project",
+        elapsed: "—",
+        spend: 0,
+        currentNode: 0,
+        totalNodes: 0,
+        currentAttempt: 0,
+        stages: [],
+        agents: [],
+        evidence: [],
+        handoffs: [],
+        connection: { status: "loading", message: "Connecting to local daemon…" },
+      };
+    }
     const initial = createFixtureSnapshot("empty");
     return {
       ...initial,
-      worktree: mode === "live" ? "No active project" : initial.worktree,
-      connection: { status: "loading", message: mode === "live" ? "Connecting to local daemon…" : "Loading deterministic fixture…" },
+      connection: { status: "loading", message: "Loading deterministic fixture…" },
     };
   });
   const [error, setError] = useState<string>();

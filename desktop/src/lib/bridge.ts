@@ -113,14 +113,30 @@ export interface DeckBridge {
   dispose(): Promise<void>;
 }
 
+/**
+ * The daemon's closed status vocabulary (src-tauri `session_status_name`),
+ * mapped exhaustively — PR #416 review B1/M3. The record makes a NEW daemon
+ * status a visible fallthrough here instead of a silent one, and the
+ * fallthrough itself is "waiting", never a terminal state: the daemon's own
+ * `SessionStatus::Unknown` doc says it must be "rendered neutrally (like
+ * Idle) so it never masquerades as an active state" — and a status this
+ * build has never heard of gets the same treatment, because per PRD #162 a
+ * newer daemon can add one without a protocol bump. The old substring
+ * matcher sent "unknown" to "stopped", which locked a LIVE agent's terminal
+ * read-only.
+ */
+const DAEMON_STATUS: Record<string, AgentStatus> = {
+  thinking: "running",
+  working: "running",
+  compacting: "running",
+  waiting_for_input: "waiting",
+  idle: "waiting",
+  error: "failed",
+  unknown: "waiting",
+};
+
 function statusFromDaemon(status: string): AgentStatus {
-  const normalized = status.toLowerCase();
-  if (["running", "thinking", "working", "compacting"].includes(normalized)) return "running";
-  if (["waiting_for_input", "idle"].includes(normalized)) return "waiting";
-  if (normalized.includes("pass") || normalized.includes("complete") || normalized.includes("done")) return "passed";
-  if (normalized.includes("fail") || normalized.includes("error")) return "failed";
-  if (normalized.includes("queue") || normalized.includes("start")) return "queued";
-  return "stopped";
+  return DAEMON_STATUS[status.toLowerCase()] ?? "waiting";
 }
 
 function roleFromAgent(agent: DesktopAgentDto, index: number): string {
@@ -163,6 +179,16 @@ function agentFromDto(agent: DesktopAgentDto, index: number): AgentSession {
     inOrchestration: Boolean(orchestration),
     isStartRole: orchestration?.isStartRole ?? false,
   };
+}
+
+/**
+ * PR #416 review M1: every persisted-preferences key is scoped by runtime
+ * mode. Fixture sessions used to write projects/profiles/prompts under the
+ * SAME keys live mode read back — so one fixture visit could hand a real
+ * workflow launch a working directory that never existed.
+ */
+export function modeScopedKey(base: string): string {
+  return `${base}.${selectRuntimeMode()}`;
 }
 
 export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[], handoffs?: HandoffEdge[]): DeckSnapshot {

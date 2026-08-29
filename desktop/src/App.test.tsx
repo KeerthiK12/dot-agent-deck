@@ -65,7 +65,7 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByRole("button", { name: "Use this project" }));
 
     await waitFor(() => expect(screen.getByText("Active project updated. Open Workflows when you are ready to launch its agents.")).toBeVisible());
-    expect(window.localStorage.getItem("dot-agent-deck.desktop.projects.v1")).toContain("clipmaker-loop");
+    expect(window.localStorage.getItem("dot-agent-deck.desktop.projects.v1.fixture")).toContain("clipmaker-loop");
     fireEvent.click(screen.getByRole("button", { name: "Configure workflow" }));
     expect(screen.getByLabelText("Workflow name")).toHaveValue("clipmaker-loop");
     expect(screen.getByLabelText("Absolute project directory")).toHaveValue("/Users/prabhusriramulu/dev/active/clipmaker");
@@ -93,7 +93,7 @@ describe("ControlDeck", () => {
     expect((screen.getByLabelText("Generated launch command") as HTMLTextAreaElement).value).toContain("--model gpt-5.6-sol-fast");
     expect(screen.getByTestId("agent-profiles-panel")).toHaveTextContent("Local draft");
     expect(screen.getByRole("button", { name: /Coder/ })).toHaveTextContent("LOCAL");
-    expect(window.localStorage.getItem("dot-agent-deck.desktop.agent-profiles.v1")).toContain("gpt-5.6-sol-fast");
+    expect(window.localStorage.getItem("dot-agent-deck.desktop.agent-profiles.v1.fixture")).toContain("gpt-5.6-sol-fast");
   });
 
   it("launches the provider-derived command after CLI, model, effort, and permission edits", async () => {

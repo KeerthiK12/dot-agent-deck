@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import type { DeckProject } from "../types";
+import { modeScopedKey } from "../lib/bridge";
 
-const PROJECTS_STORAGE_KEY = "dot-agent-deck.desktop.projects.v1";
+const PROJECTS_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.projects.v1");
 
 interface StoredProjects {
   activeId?: string;

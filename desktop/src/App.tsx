@@ -41,8 +41,9 @@ import { useProjects } from "./hooks/useProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import type { DeckAction, DeckActionResult, DeckRuntimeState, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
+import { modeScopedKey } from "./lib/bridge";
 
-const WORKFLOW_STORAGE_KEY = "dot-agent-deck.desktop.workflow-preview.v1";
+const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
 const DESKTOP_EVIDENCE_QUERY = "(min-width: 1260px)";
 
 function evidenceOpenOnFirstLoad(): boolean {

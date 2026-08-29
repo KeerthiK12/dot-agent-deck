@@ -94,9 +94,17 @@ export function defaultCliForProvider(provider: Provider): string {
   return "";
 }
 
-/** Quote one untrusted value as exactly one POSIX-shell word. */
+/**
+ * Quote one untrusted value as exactly one POSIX-shell word.
+ *
+ * PR #416 review Part C finding 1: `=` is allowed mid-word but not LEADING.
+ * The daemon hands the command to `$SHELL -c`, which on macOS is zsh, and
+ * zsh's default-on EQUALS expansion rewrites a bare leading-`=` word into a
+ * PATH lookup — `--model =codex` becomes a path or aborts the launch with
+ * "zsh: codex not found". Expansion, not evaluation; quoting removes it.
+ */
 export function quoteShellWord(value: string): string {
-  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value) && value.length > 0) return value;
+  if (/^[A-Za-z0-9_@%+:,./-][A-Za-z0-9_@%+=:,./-]*$/.test(value)) return value;
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 

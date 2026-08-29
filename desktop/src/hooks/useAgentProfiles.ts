@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { normalizeAgentProfile } from "../lib/profileCommands";
 import type { AgentProfile } from "../types";
+import { modeScopedKey } from "../lib/bridge";
 
-const STORAGE_KEY = "dot-agent-deck.desktop.agent-profiles.v1";
+const STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.agent-profiles.v1");
 
 function readStoredProfiles(): AgentProfile[] | undefined {
   try {
@@ -14,7 +15,11 @@ function readStoredProfiles(): AgentProfile[] | undefined {
       typeof profile === "object" && profile !== null &&
       typeof (profile as AgentProfile).id === "string" &&
       typeof (profile as AgentProfile).role === "string" &&
-      typeof (profile as AgentProfile).command === "string"
+      typeof (profile as AgentProfile).command === "string" &&
+      // PR #416 review Part C finding 3: roleId reaches StartWorkflow as the
+      // role name; a persisted non-string yields an opaque serde error with no
+      // correctable UI field. Absent is fine (derived below); wrong-typed is not.
+      ["string", "undefined"].includes(typeof (profile as AgentProfile).roleId)
     ));
     return valid.length ? valid.map((profile) => normalizeAgentProfile({
       ...profile,

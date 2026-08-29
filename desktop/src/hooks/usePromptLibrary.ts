@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import type { DeckPrompt } from "../types";
+import { modeScopedKey } from "../lib/bridge";
 
-const PROMPTS_STORAGE_KEY = "dot-agent-deck.desktop.prompts.v1";
+const PROMPTS_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.prompts.v1");
 
 interface StoredPrompts {
   prompts?: DeckPrompt[];
