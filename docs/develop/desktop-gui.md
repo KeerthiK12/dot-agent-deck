@@ -4,8 +4,7 @@ The desktop GUI under `desktop/` is an opt-in Tauri preview for PRD #176. It is 
 
 ## Prerequisites
 
-- Enter `devbox shell` for the repository's pinned Rust 1.97.1 toolchain, `cargo-nextest`, Clippy, and rustfmt, or provide equivalent versions yourself.
-- Install Node.js 20.19 or newer and pnpm. The repository Devbox definition does not currently install either one.
+- Enter `devbox shell` for the repository's pinned toolchain: Rust 1.97.1, `cargo-nextest`, Clippy, rustfmt, Node.js 24.12.0, and pnpm 10.34.5. Provide equivalent versions yourself if you do not use Devbox — the frontend needs Node.js 20.19 or newer, and pnpm 10.x, which is the line that reads `desktop/pnpm-lock.yaml`'s `lockfileVersion: '9.0'` without rewriting it. CI's `desktop-web` job deliberately runs Node 20 rather than the Devbox pin, so the stated floor stays tested rather than merely claimed.
 - Install the [Tauri 2 system prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform. On macOS this includes the Xcode command-line tools; Linux needs the documented WebKitGTK and related development packages.
 - Install the desktop JavaScript dependencies once:
 
