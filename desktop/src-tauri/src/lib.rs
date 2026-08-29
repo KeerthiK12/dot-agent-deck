@@ -15,8 +15,16 @@ use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{AgentType, BroadcastMsg, EventType, SendResult};
 use dot_agent_deck::project_config::{OrchestrationConfig, load_project_config};
 use dot_agent_deck::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE;
+
+/// Maximum wait for an agent readiness signal before the coordinator seed
+/// falls back to direct delivery. The crate constant this mirrored
+/// (`ui::SPAWN_TIME_READINESS_TIMEOUT`) was removed by issue #243's
+/// signal-based readiness rework; the nearest crate value
+/// (`state::SESSION_START_WAIT_TIMEOUT`, 30s, pub(crate)) answers a different
+/// question. Kept desktop-local so this client adds no daemon-side surface.
+const SPAWN_TIME_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 use dot_agent_deck::ui::{
-    SPAWN_TIME_READINESS_TIMEOUT, describe_send_result, is_terminal_send_result, send_retry_delay,
+    describe_send_result, is_terminal_send_result, send_retry_delay,
 };
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State, Webview};

@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -1055,23 +1055,6 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     // mode to point at.
     cmd.env_remove(DOT_AGENT_DECK_SOCKET);
     cmd.env_remove("DOT_AGENT_DECK_ATTACH_SOCKET");
-
-    // The delegation protocol hands agents shell commands (`dot-agent-deck
-    // delegate`, `work-done`) by bare name. On a machine where the binary was
-    // never installed onto PATH (it only exists in target/debug/), every such
-    // call is `command not found`, the orchestrator improvises solo, and no
-    // handoff ever happens — with zero hook events as the only symptom.
-    // Prepend the running daemon's own directory so the CLI the agents invoke
-    // is always the exact binary that spawned them. Callers that pin PATH via
-    // `opts.env` still win under the overlay below.
-    if let Ok(Some(dir)) = std::env::current_exe().map(|exe| exe.parent().map(Path::to_path_buf)) {
-        let inherited = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths = vec![dir];
-        paths.extend(std::env::split_paths(&inherited));
-        if let Ok(joined) = std::env::join_paths(paths) {
-            cmd.env("PATH", joined);
-        }
-    }
 
     for (k, v) in &opts.env {
         // PRD #127 C2: `SHELL` in `opts.env` is a wrapper-choice override only

@@ -1877,11 +1877,7 @@ async fn run_hook_loop(
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
-                                    state
-                                        .read()
-                                        .await
-                                        .handle_work_done(signal, &pty_registry, &event_tx)
-                                        .await;
+                                    state.read().await.handle_work_done(signal, &pty_registry).await;
                                 }
                                 DaemonMessage::GetSeed(req) => {
                                     // PRD #201 native prompt delivery: hand the

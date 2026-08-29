@@ -2497,13 +2497,6 @@ fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
         | EventType::SubagentStop
         | EventType::Compacting
         | EventType::PermissionRequest => true,
-        // Handoff-lifecycle events are daemon-emitted bookkeeping, never
-        // produced by the worker itself — no proof of anything worker-side.
-        EventType::DelegationDispatched
-        | EventType::DelegationDelivered
-        | EventType::DelegationFailed
-        | EventType::WorkerRespawned
-        | EventType::WorkDoneReceived => false,
     }
 }
 
@@ -4072,41 +4065,6 @@ fn write_work_done_summary(
 /// independently so a single pane's failure (a missing role config,
 /// a respawn that couldn't exec the command, a write that hit a
 /// closed PTY) doesn't poison the other panes' dispatches.
-/// Monotonic discriminator for delegation ids minted by this daemon process
-/// (local handoff-visibility PRD D1).
-static DELEGATION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Mint a delegation id unique within this daemon's lifetime and readable in
-/// logs and event streams: `dlg-<unix-millis>-<seq>`.
-fn mint_delegation_id() -> String {
-    let seq = DELEGATION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("dlg-{}-{}", chrono::Utc::now().timestamp_millis(), seq)
-}
-
-/// Emit one handoff-lifecycle event on the daemon-wide broadcast (local
-/// handoff-visibility PRD D1). A send error means "no subscribers", which is
-/// the normal idle case — ignored, matching the hook loop's own fan-out.
-fn emit_handoff(
-    event_tx: &broadcast::Sender<BroadcastMsg>,
-    event_type: EventType,
-    delegation_id: &str,
-    pane_id: Option<&str>,
-    cwd: Option<&str>,
-    pairs: &[(&str, &str)],
-) {
-    let metadata: std::collections::HashMap<String, String> = pairs
-        .iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect();
-    let _ = event_tx.send(BroadcastMsg::Event(AgentEvent::handoff(
-        event_type,
-        delegation_id,
-        pane_id,
-        cwd,
-        metadata,
-    )));
-}
-
 ///
 /// # The commission ledger's no-delivery invariant
 ///
@@ -4188,7 +4146,6 @@ async fn dispatch_one_owned(
     task: String,
     cwd: Option<String>,
     silence_watch: Option<SilenceWatch>,
-    delegation_id: String,
     delegation_seq: Option<u64>,
     // Issue #606: the daemon's own state, when the caller has one, so a worker
     // pane that had to be RE-CREATED can have its orchestration role registered
@@ -4424,17 +4381,6 @@ async fn dispatch_one_owned(
                         Some(&new_agent_id),
                     );
                 }
-                emit_handoff(
-                    &event_tx,
-                    EventType::WorkerRespawned,
-                    &delegation_id,
-                    Some(&pane_id),
-                    cwd.as_deref(),
-                    &[
-                        ("to_role", target_role.as_str()),
-                        ("agent_id", new_agent_id.as_str()),
-                    ],
-                );
                 if is_pi_native {
                     // PRD #201: NATIVE delivery — stash the pointer as the
                     // respawned pi's seed and arm the PTY-injection safety net.
@@ -4917,20 +4863,6 @@ async fn dispatch_one_owned(
                                 reserved_silence.take(),
                                 "the worker pane began closing during the readiness buffer",
                             );
-                            emit_handoff(
-                                &event_tx,
-                                EventType::DelegationFailed,
-                                &delegation_id,
-                                Some(&pane_id),
-                                cwd.as_deref(),
-                                &[
-                                    ("to_role", target_role.as_str()),
-                                    (
-                                        "reason",
-                                        "worker pane closed during the readiness buffer; task was never written",
-                                    ),
-                                ],
-                            );
                             return;
                         }
                         _ = tokio::time::sleep(buffer) => {}
@@ -4971,17 +4903,6 @@ async fn dispatch_one_owned(
                     "delegate: respawn for clear=true failed; \
                      surfacing high-level notice in orchestrator \
                      pane and skipping the subsequent prompt write"
-                );
-                emit_handoff(
-                    &event_tx,
-                    EventType::DelegationFailed,
-                    &delegation_id,
-                    Some(&pane_id),
-                    cwd.as_deref(),
-                    &[
-                        ("to_role", target_role.as_str()),
-                        ("reason", &format!("worker respawn failed: {e}")),
-                    ],
                 );
                 let notice = format!(
                     "⚠ respawn failed for role '{target_role}' on pane \
@@ -5271,36 +5192,6 @@ async fn dispatch_one_owned(
             &pane_id,
             &target_role,
             "the identity gate refused the task pointer",
-        );
-    }
-
-    // Local handoff-visibility PRD D1: the moment the operator most needs to
-    // see. "Delivered" means the guarded write reached the authorized worker's
-    // PTY; anything else means the handoff did NOT happen and would previously
-    // have been visible only as a daemon-log warn.
-    if delivered {
-        emit_handoff(
-            &event_tx,
-            EventType::DelegationDelivered,
-            &delegation_id,
-            Some(&pane_id),
-            cwd.as_deref(),
-            &[("to_role", target_role.as_str())],
-        );
-    } else {
-        emit_handoff(
-            &event_tx,
-            EventType::DelegationFailed,
-            &delegation_id,
-            Some(&pane_id),
-            cwd.as_deref(),
-            &[
-                ("to_role", target_role.as_str()),
-                (
-                    "reason",
-                    "task pointer was not delivered (identity gate refused it or the PTY write failed)",
-                ),
-            ],
         );
     }
     let Some((watch, armed, rx)) = silence else {
@@ -6137,43 +6028,6 @@ impl AppState {
         // orchestrator's own pane) lives in `delegate_targets`, which also
         // applies PRD #126 M1 audit finding 3's duplicate-role de-duplication.
         let targets = self.delegate_targets(&signal.pane_id, &signal.to);
-        // Local handoff-visibility PRD D1: a requested role that resolved to
-        // no live pane is a dropped handoff. Until now that was one invisible
-        // daemon-log warn while the CLI exited 0 — an orchestrator could
-        // delegate its whole run into the void with no observable signal.
-        // Broadcast the failure so every attached client can show it.
-        {
-            let matched: std::collections::HashSet<&str> =
-                targets.iter().map(|(role, _)| role.as_str()).collect();
-            let mut reported: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            for missing in signal
-                .to
-                .iter()
-                .filter(|role| !matched.contains(role.as_str()))
-            {
-                if !reported.insert(missing.as_str()) {
-                    continue;
-                }
-                emit_handoff(
-                    event_tx,
-                    EventType::DelegationFailed,
-                    &mint_delegation_id(),
-                    None,
-                    orchestration_cwd.as_deref(),
-                    &[
-                        ("to_role", missing.as_str()),
-                        (
-                            "orchestration",
-                            orchestration.as_ref().map(|o| o.name()).unwrap_or(""),
-                        ),
-                        (
-                            "reason",
-                            "no live pane is registered for this role in the orchestration",
-                        ),
-                    ],
-                );
-            }
-        }
 
         // Which of the caller's `--to` roles actually resolved to a worker pane.
         // `delegate_targets` already logs a `warn!` per empty role and then
@@ -6237,26 +6091,6 @@ impl AppState {
             let orchestrator_pane_id = signal.pane_id.clone();
             let task = signal.task.clone();
             let cwd = self.pane_cwd_map.get(&pane_id).cloned();
-            // Local handoff-visibility PRD D1: announce the handoff the moment
-            // it is queued. The id threads through the dispatch task so
-            // delivered/failed events correlate back to this dispatch.
-            let delegation_id = mint_delegation_id();
-            let task_preview: String = task.chars().take(200).collect();
-            emit_handoff(
-                &event_tx,
-                EventType::DelegationDispatched,
-                &delegation_id,
-                Some(&pane_id),
-                cwd.as_deref(),
-                &[
-                    ("to_role", target_role.as_str()),
-                    (
-                        "orchestration",
-                        orchestration.as_ref().map(|o| o.name()).unwrap_or(""),
-                    ),
-                    ("task_preview", task_preview.as_str()),
-                ],
-            );
 
             // PRD #126: this worker now owes a `work-done`. Arm the record
             // (and its watch task) here, in the synchronous fan-out loop
@@ -6317,7 +6151,6 @@ impl AppState {
                     task,
                     cwd,
                     silence_watch,
-                    delegation_id,
                     delegation_seq,
                     state_for_dispatch,
                 )
@@ -6352,38 +6185,7 @@ impl AppState {
     /// `done: true` from the orchestrator pane itself signals the whole
     /// orchestration is complete; we log and exit without writing back a
     /// "completed" prompt to the orchestrator (it just issued it).
-    pub async fn handle_work_done(
-        &self,
-        signal: WorkDoneSignal,
-        registry: &AgentPtyRegistry,
-        event_tx: &broadcast::Sender<BroadcastMsg>,
-    ) {
-        // Local handoff-visibility PRD D1: the return leg of the handoff.
-        // Emitted before any early return below, so even a work-done the
-        // routing logic rejects (unknown pane, orchestrator's own --done) is
-        // visible to attached clients rather than silently absorbed.
-        {
-            let role = self
-                .pane_role_map
-                .get(&signal.pane_id)
-                .cloned()
-                .unwrap_or_default();
-            emit_handoff(
-                event_tx,
-                EventType::WorkDoneReceived,
-                &mint_delegation_id(),
-                Some(&signal.pane_id),
-                self.pane_cwd_map.get(&signal.pane_id).map(String::as_str),
-                &[
-                    ("from_role", role.as_str()),
-                    ("done", if signal.done { "true" } else { "false" }),
-                    (
-                        "task_preview",
-                        signal.task.chars().take(200).collect::<String>().as_str(),
-                    ),
-                ],
-            );
-        }
+    pub async fn handle_work_done(&self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
         // PRD #126: the worker answered, so one outstanding delegation is
         // resolved. Retire FIRST — above every early return below — so an
         // unknown pane, an orchestrator's own `--done`, or a missing
@@ -7499,19 +7301,6 @@ impl AppState {
             EventType::Unknown => {
                 // Forward-compat catch-all — informational at most, never
                 // produced by this build. No status change.
-                false
-            }
-            // Daemon-emitted handoff bookkeeping (local handoff-visibility
-            // PRD): not produced by any agent session, so it never lands here
-            // in practice — and if it ever did, it must not perturb the
-            // session's status machine.
-            EventType::DelegationDispatched
-            | EventType::DelegationDelivered
-            | EventType::DelegationFailed
-            | EventType::WorkerRespawned
-            | EventType::WorkDoneReceived => {
-                // Daemon-emitted handoff bookkeeping: never a session's own
-                // status assertion.
                 false
             }
             EventType::SessionEnd => unreachable!(),
@@ -8970,90 +8759,6 @@ mod tests {
         );
     }
 
-    /// Scenario (handoff-visibility PRD D4): an orchestrator delegates to a
-    /// role that has no live pane in its orchestration ("reviewer" — the tab
-    /// only registers orchestrator + coder). Beyond the `unresolved_roles`
-    /// answer the CLI now gets, the daemon must ALSO broadcast a
-    /// `delegation_failed` handoff event naming the role and the no-pane
-    /// reason, so attached UIs can show the dropped handoff in place.
-    #[tokio::test]
-    async fn delegate_to_unregistered_role_broadcasts_delegation_failed() {
-        let state = two_same_name_cwd_tabs(true);
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let (event_tx, mut event_rx) = broadcast::channel(16);
-        let resp = state
-            .handle_delegate(
-                DelegateSignal {
-                    pane_id: "A_orch".to_string(),
-                    task: "Review the diff.".to_string(),
-                    to: vec!["reviewer".to_string()],
-                    timestamp: chrono::Utc::now(),
-                },
-                &registry,
-                &event_tx,
-            )
-            .await;
-        assert_eq!(resp.unresolved_roles, vec!["reviewer".to_string()]);
-        let msg = event_rx
-            .try_recv()
-            .expect("a delegation_failed event must be broadcast for the missing role");
-        let BroadcastMsg::Event(event) = msg else {
-            panic!("expected BroadcastMsg::Event, got {msg:?}");
-        };
-        assert_eq!(event.event_type, EventType::DelegationFailed);
-        assert_eq!(
-            event.metadata.get("to_role").map(String::as_str),
-            Some("reviewer")
-        );
-        assert!(
-            event
-                .metadata
-                .get("reason")
-                .is_some_and(|reason| reason.contains("no live pane")),
-            "reason must name the no-pane cause, got {:?}",
-            event.metadata.get("reason")
-        );
-    }
-
-    /// Scenario (handoff-visibility PRD D4): one delegate names a role with a
-    /// pane (coder) and one without (auditor). The registered role must
-    /// broadcast `delegation_dispatched` and the missing one
-    /// `delegation_failed` — per-role outcomes, not one aggregate.
-    #[tokio::test]
-    async fn partial_fanout_reports_dispatched_and_failed_per_role() {
-        let state = two_same_name_cwd_tabs(true);
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let (event_tx, mut event_rx) = broadcast::channel(16);
-        let resp = state
-            .handle_delegate(
-                DelegateSignal {
-                    pane_id: "A_orch".to_string(),
-                    task: "Split work.".to_string(),
-                    to: vec!["coder".to_string(), "auditor".to_string()],
-                    timestamp: chrono::Utc::now(),
-                },
-                &registry,
-                &event_tx,
-            )
-            .await;
-        assert_eq!(resp.unresolved_roles, vec!["auditor".to_string()]);
-        let mut seen = Vec::new();
-        while let Ok(BroadcastMsg::Event(event)) = event_rx.try_recv() {
-            seen.push((
-                event.event_type.clone(),
-                event.metadata.get("to_role").cloned().unwrap_or_default(),
-            ));
-        }
-        assert!(
-            seen.contains(&(EventType::DelegationFailed, "auditor".to_string())),
-            "auditor (no pane) must fail loudly, got {seen:?}"
-        );
-        assert!(
-            seen.contains(&(EventType::DelegationDispatched, "coder".to_string())),
-            "coder (registered pane) must be announced as dispatched, got {seen:?}"
-        );
-    }
-
     /// The dispatched spawn path registers its orchestrator by `orch_idx`, not
     /// by the raw `start = true` flag — which is the whole point, because
     /// `orchestrator_role_index` falls back (role named `orchestrator` → any
@@ -10061,7 +9766,6 @@ mod tests {
             "probe task".to_string(),
             None,
             None,
-            "dlg-test-0".to_string(),
             None,
             None,
         )
@@ -10112,7 +9816,6 @@ mod tests {
                     orchestration: None,
                 },
             }),
-            "dlg-test-0".to_string(),
             None,
             None,
         )

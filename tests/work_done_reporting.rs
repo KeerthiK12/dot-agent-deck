@@ -213,7 +213,6 @@ impl WorkDoneHarness {
                     timestamp: chrono::Utc::now(),
                 },
                 &self.registry,
-                &self.event_tx,
             )
             .await;
     }

@@ -1855,10 +1855,6 @@ const SNAPSHOT_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// to make the failure mode disappear.
 pub const SPAWN_TIME_READINESS_BUFFER: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Maximum wait for an agent readiness signal before a spawn-time prompt uses
-/// the hookless-agent fallback and attempts delivery directly.
-pub const SPAWN_TIME_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// PRD #128 Direction B-1 — returns whether the spawn-time orchestrator
 /// role prompt should fire NOW. Returns `false` if `ready_since` is set
 /// but `SPAWN_TIME_READINESS_BUFFER` hasn't elapsed yet; `true` once it
@@ -3427,7 +3423,8 @@ fn process_pending_dispatches(
         });
         // Slow path: no SessionStart after 10 seconds (e.g., opencode).
         // The agent is likely running but hasn't signaled — inject anyway.
-        let timeout_ready = !agent_ready && pd.created_at.elapsed() > SPAWN_TIME_READINESS_TIMEOUT;
+        let timeout_ready =
+            !agent_ready && pd.created_at.elapsed() > std::time::Duration::from_secs(10);
         if agent_ready || timeout_ready {
             let _ = pane.write_to_pane(&pd.pane_id, &pd.prompt);
             return false;
@@ -4653,7 +4650,7 @@ fn deliver_orchestrator_prompt(
         && ui
             .orchestration_created_at
             .get(&tab_id)
-            .is_some_and(|t| now.duration_since(*t) > SPAWN_TIME_READINESS_TIMEOUT);
+            .is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(10));
     if agent_ready {
         ui.orchestration_ready_since.entry(tab_id).or_insert(now);
     }

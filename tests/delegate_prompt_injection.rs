@@ -3691,7 +3691,6 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                             timestamp: chrono::Utc::now(),
                         },
                         &harness.registry,
-                        &harness.event_tx,
                     )
                     .await;
                 tokio::time::sleep(Duration::from_millis(900)).await;
@@ -3721,7 +3720,6 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                         timestamp: chrono::Utc::now(),
                     },
                     &harness.registry,
-                    &harness.event_tx,
                 )
                 .await;
             let notice = wait_for_silence_notice(

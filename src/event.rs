@@ -17,19 +17,6 @@ pub enum EventType {
     Error,
     SessionStart,
     SessionEnd,
-    /// Handoff lifecycle (local handoff-visibility PRD): the daemon emits
-    /// these on the same `SubscribeEvents` broadcast the hook events ride, so
-    /// any attached client can render who delegated what to whom and whether
-    /// it actually arrived. Payload details travel in [`AgentEvent::metadata`]
-    /// (see [`AgentEvent::handoff`]), keeping the record shape unchanged.
-    /// Additive under the `#[serde(other)]` catch-all below — an older reader
-    /// degrades these to `Unknown` rather than failing the frame, so no
-    /// `PROTOCOL_VERSION` bump is required.
-    DelegationDispatched,
-    DelegationDelivered,
-    DelegationFailed,
-    WorkerRespawned,
-    WorkDoneReceived,
     /// PRD #370 M2: synthesized daemon-side (never sent by an agent's own
     /// hooks/wrapper) when a pane's agent process has a transitive descendant
     /// running in a POSIX session of its own — i.e. a shelled-out command is
@@ -757,37 +744,6 @@ impl AgentEvent {
         self.metadata
             .get(SESSION_START_ORIGIN_METADATA_KEY)
             .is_some_and(|origin| origin == WRAPPER_FORK_SESSION_START_ORIGIN)
-    }
-
-    /// Build a handoff-lifecycle event (delegation dispatched / delivered /
-    /// failed, worker respawn, work-done). These carry no per-agent session
-    /// identity of their own: `session_id` is the DELEGATION id, so a client
-    /// can correlate one handoff's lifecycle across events, and all routing
-    /// detail (roles, orchestration, task preview, failure reason) rides
-    /// `metadata` — the record shape on the wire is unchanged.
-    pub fn handoff(
-        event_type: EventType,
-        delegation_id: &str,
-        pane_id: Option<&str>,
-        cwd: Option<&str>,
-        metadata: HashMap<String, String>,
-    ) -> Self {
-        Self {
-            session_id: delegation_id.to_string(),
-            agent_type: AgentType::None,
-            event_type,
-            tool_name: None,
-            tool_detail: None,
-            cwd: cwd.map(str::to_string),
-            timestamp: Utc::now(),
-            user_prompt: None,
-            metadata,
-            pane_id: pane_id.map(str::to_string),
-            agent_id: None,
-            agent_version: None,
-            schema_version: None,
-            live_target: None,
-        }
     }
 
     /// Issue #243: does this event carry the wrapper's INTERFACE-READY origin

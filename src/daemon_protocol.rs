@@ -203,11 +203,6 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// of a mid-session crash. `EventType` now also carries `#[serde(other)]`
 /// (mirroring `AgentType`'s retrofit), so future event-type additions need
 /// no further bump.
-///
-/// The local handoff-visibility variants (`delegation_dispatched` /
-/// `delegation_delivered` / `delegation_failed` / `worker_respawned` /
-/// `work_done_received`) ride `KIND_EVENT` under that same catch-all rule:
-/// additive, no further bump required.
 pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
